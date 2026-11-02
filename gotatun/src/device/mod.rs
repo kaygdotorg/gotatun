@@ -61,8 +61,11 @@ pub use peer::Peer;
 /// The number of handshakes per second to tolerate before using cookies
 const HANDSHAKE_RATE_LIMIT: u64 = 100;
 
-/// Maximum number of packet buffers that each channel may contain
-const MAX_PACKET_BUFS: usize = 4000;
+/// Maximum number of packet buffers retained for reuse by the device.
+const PACKET_BUFFER_POOL_CAPACITY: usize = 4000;
+
+/// Bound packet handoff queues so stale traffic cannot add several milliseconds of latency.
+const PACKET_CHANNEL_CAPACITY: usize = 256;
 
 /// Error of [`Device`]-related operations.
 #[derive(Debug, thiserror::Error)]
@@ -186,7 +189,7 @@ impl<T: DeviceTransports> Connection<T> {
             return Ok(());
         }
 
-        let pool = PacketBufPool::new_lazy(MAX_PACKET_BUFS);
+        let pool = PacketBufPool::new_lazy(PACKET_BUFFER_POOL_CAPACITY);
 
         // clean up existing connection
         if let Some(conn) = device.connection.take() {
@@ -201,16 +204,17 @@ impl<T: DeviceTransports> Connection<T> {
         }
 
         let (buffered_ip_tx, buffered_ip_rx) = crate::tun::buffer::channel(
-            MAX_PACKET_BUFS,
+            PACKET_CHANNEL_CAPACITY,
             pool.clone(),
             Arc::clone(&device.tun_tx),
             Arc::clone(&device.tun_rx),
         )
         .await;
 
-        let buffered_udp_tx = BufferedUdpSend::new(MAX_PACKET_BUFS, udp_tx.clone());
+        let buffered_udp_tx = BufferedUdpSend::new(PACKET_CHANNEL_CAPACITY, udp_tx.clone());
 
-        let buffered_udp_rx = BufferedUdpReceive::new(MAX_PACKET_BUFS, udp_rx, pool.clone());
+        let buffered_udp_rx =
+            BufferedUdpReceive::new(PACKET_CHANNEL_CAPACITY, udp_rx, pool.clone());
 
         // Start DAITA/hooks tasks
         #[cfg(feature = "daita")]
