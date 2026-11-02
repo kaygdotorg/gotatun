@@ -11,8 +11,19 @@
 
 //! Implementations of [`IpSend`] and [`IpRecv`] for the [`tun`] crate.
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+mod tso;
+#[cfg(target_os = "linux")]
+mod virtio;
+
+#[cfg(target_os = "linux")]
+use bytes::BytesMut;
 use tokio::{sync::watch, time::sleep};
 use tun::AbstractDevice;
+#[cfg(target_os = "linux")]
+use zerocopy::IntoBytes;
 
 use crate::{
     packet::{Ip, Packet, PacketBufPool},
@@ -20,7 +31,17 @@ use crate::{
     tun::{IpRecv, IpSend, MtuWatcher},
 };
 
-use std::{convert::Infallible, io, iter, sync::Arc, time::Duration};
+#[cfg(not(target_os = "linux"))]
+use std::iter;
+#[cfg(target_os = "linux")]
+use std::ops::Deref;
+use std::{convert::Infallible, io, sync::Arc, time::Duration};
+
+#[cfg(target_os = "linux")]
+const MAX_TUN_PACKET_LEN: usize = 40 + u16::MAX as usize;
+
+#[cfg(target_os = "linux")]
+const MAX_TUN_FRAME_LEN: usize = virtio::VirtioNetHeader::LEN + MAX_TUN_PACKET_LEN;
 
 /// Error from [`TunDevice`].
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +78,11 @@ struct TunDeviceState {
 
     /// Task which monitors TUN device MTU. Aborted when dropped.
     _mtu_monitor: Task,
+
+    vnet_header: bool,
+
+    #[cfg(target_os = "linux")]
+    read_buf: tokio::sync::Mutex<BytesMut>,
 }
 
 impl TunDevice {
@@ -79,11 +105,24 @@ impl TunDevice {
         tun_config.platform_config(|p| {
             p.enable_routing(false);
         });
-        // TODO: for wintun, must set path or enable signature check
-        // we should upstream to `tun`
-        let tun = tun::create_as_async(&tun_config).map_err(Error::OpenTun)?;
-        let tun = TunDevice::from_tun_device(tun)?;
-        Ok(tun)
+
+        #[cfg(target_os = "linux")]
+        {
+            let (tun, vnet_header) =
+                linux::create_tun_with_vnet_fallback(&mut tun_config).map_err(Error::OpenTun)?;
+            if vnet_header {
+                linux::enable_tso_with_fallback(tun.deref());
+            }
+            return TunDevice::from_tun_device_with_vnet_header(tun, vnet_header);
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            // TODO: for wintun, must set path or enable signature check
+            // we should upstream to `tun`
+            let tun = tun::create_as_async(&tun_config).map_err(Error::OpenTun)?;
+            TunDevice::from_tun_device(tun)
+        }
     }
 
     /// Construct from a name with an explicit path to `wintun.dll`.
@@ -105,6 +144,13 @@ impl TunDevice {
 
     /// Construct from a [`tun::AsyncDevice`].
     pub fn from_tun_device(tun: tun::AsyncDevice) -> Result<Self, Error> {
+        Self::from_tun_device_with_vnet_header(tun, false)
+    }
+
+    fn from_tun_device_with_vnet_header(
+        tun: tun::AsyncDevice,
+        vnet_header: bool,
+    ) -> Result<Self, Error> {
         #[cfg(target_os = "linux")]
         if tun.packet_information() {
             return Err(Error::UnsupportedFeature("packet_information".to_string()));
@@ -140,6 +186,9 @@ impl TunDevice {
             state: Arc::new(TunDeviceState {
                 mtu: rx.into(),
                 _mtu_monitor: mtu_monitor,
+                vnet_header,
+                #[cfg(target_os = "linux")]
+                read_buf: tokio::sync::Mutex::new(BytesMut::zeroed(MAX_TUN_FRAME_LEN)),
             }),
         })
     }
@@ -152,11 +201,29 @@ impl TunDevice {
 
 impl IpSend for TunDevice {
     async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
+        let mut packet = packet.into_bytes();
+        #[cfg(target_os = "linux")]
+        if self.state.vnet_header {
+            let header = virtio::VirtioNetHeader {
+                flags: virtio::Flags::new(),
+                gso_type: virtio::GsoType::VIRTIO_NET_HDR_GSO_NONE,
+                hdr_len: 0,
+                gso_size: 0,
+                csum_start: 0,
+                csum_offset: 0,
+            };
+            let mut buf =
+                BytesMut::with_capacity(header.as_bytes().len() + packet.as_bytes().len());
+            buf.extend_from_slice(header.as_bytes());
+            buf.extend_from_slice(packet.as_bytes());
+            *packet.buf_mut() = buf;
+        }
         self.tun.send(&packet.into_bytes()).await?;
         Ok(())
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 impl IpRecv for TunDevice {
     async fn recv<'a>(
         &'a mut self,
@@ -168,6 +235,43 @@ impl IpRecv for TunDevice {
         match packet.try_into_ip() {
             Ok(packet) => Ok(iter::once(packet)),
             Err(e) => Err(io::Error::other(e.to_string())),
+        }
+    }
+
+    fn mtu(&self) -> MtuWatcher {
+        self.state.mtu.clone()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl IpRecv for TunDevice {
+    async fn recv<'a>(
+        &'a mut self,
+        pool: &mut PacketBufPool,
+    ) -> io::Result<impl Iterator<Item = Packet<Ip>> + 'a> {
+        let mut read_buf = self.state.read_buf.lock().await;
+        let n = self.tun.recv(&mut read_buf).await?;
+        if n > read_buf.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TUN read exceeded the receive buffer",
+            ));
+        }
+
+        // Keep one oversized scratch allocation per TUN device. The packet pool still owns the
+        // returned packet, so its lifetime is independent of the next read into this buffer.
+        let mut packet = pool.get();
+        packet.buf_mut().clear();
+        packet.buf_mut().extend_from_slice(&read_buf[..n]);
+        drop(read_buf);
+
+        if self.state.vnet_header {
+            tso::new_tso_iter_from_vnet(packet)
+        } else {
+            let packet = packet
+                .try_into_ip()
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            Ok(tso::single_packet(packet))
         }
     }
 
