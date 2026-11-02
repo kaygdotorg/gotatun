@@ -575,12 +575,12 @@ mod gso_tests {
         let target: SocketAddr = receiver.local_addr().unwrap();
         let pool = PacketBufPool::<4096>::new(4);
         let mut send_buf = super::SendmmsgBuf::default();
-        let mut packets = [1200usize, 1200, 800]
+        let mut packets = [(1200usize, 0x11), (1200, 0x22), (800, 0x33)]
             .into_iter()
-            .map(|len| {
+            .map(|(len, contents)| {
                 let mut packet = pool.get();
                 packet.truncate(len);
-                packet.fill(0x42);
+                packet.fill(contents);
                 (packet, target)
             })
             .collect();
@@ -605,14 +605,66 @@ mod gso_tests {
         receiver
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
-        let mut received_lens = Vec::new();
         let mut recv_buf = vec![0u8; 1200];
-        for _ in 0..3 {
+        for (expected_len, expected_contents) in [(1200, 0x11), (1200, 0x22), (800, 0x33)] {
             let (len, from) = receiver.recv_from(&mut recv_buf).unwrap();
             assert_eq!(from, socket.local_addr().unwrap());
-            received_lens.push(len);
+            assert_eq!(len, expected_len);
+            assert!(
+                recv_buf[..len]
+                    .iter()
+                    .all(|contents| *contents == expected_contents)
+            );
         }
-        assert_eq!(received_lens, vec![1200, 1200, 800]);
+    }
+
+    #[tokio::test]
+    async fn send_many_to_preserves_datagrams_when_gso_is_disabled() {
+        use crate::packet::PacketBufPool;
+        use crate::udp::UdpSend;
+        use crate::udp::socket::SockOpt;
+        use std::net::{Ipv4Addr, SocketAddr};
+        use std::time::Duration;
+
+        let socket = crate::udp::socket::UdpSocket::bind(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            SockOpt::default(),
+        )
+        .unwrap();
+        socket.disable_udp_gso();
+        let receiver = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let target: SocketAddr = receiver.local_addr().unwrap();
+        let pool = PacketBufPool::<4096>::new(3);
+        let mut packets = [(3usize, 0x11), (0, 0x22), (5, 0x33)]
+            .into_iter()
+            .map(|(len, contents)| {
+                let mut packet = pool.get();
+                packet.truncate(len);
+                packet.fill(contents);
+                (packet, target)
+            })
+            .collect();
+
+        socket
+            .send_many_to(&mut super::SendmmsgBuf::default(), &mut packets)
+            .await
+            .unwrap();
+
+        assert!(packets.is_empty());
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut recv_buf = [0u8; 8];
+        for (expected_len, expected_contents) in [(3, 0x11), (0, 0x22), (5, 0x33)] {
+            let (len, from) = receiver.recv_from(&mut recv_buf).unwrap();
+            assert_eq!(from, socket.local_addr().unwrap());
+            assert_eq!(len, expected_len);
+            assert!(
+                recv_buf[..len]
+                    .iter()
+                    .all(|contents| *contents == expected_contents)
+            );
+        }
     }
 
     #[tokio::test]
@@ -801,6 +853,47 @@ mod gro {
     use std::os::fd::AsRawFd;
     use tokio::io::Interest;
 
+    fn append_received_packets(
+        buffer: &[u8],
+        received_len: usize,
+        gro_size: Option<usize>,
+        source_addr: SocketAddr,
+        pool: &mut PacketBufPool,
+        packets: &mut Vec<(Packet, SocketAddr)>,
+    ) -> io::Result<()> {
+        // The iovec may keep its full capacity after recvmsg, while only received_len bytes are
+        // payload. Never let unused capacity become an extra packet or zero-filled tail.
+        let received = buffer.get(..received_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UDP receive length exceeded its buffer",
+            )
+        })?;
+
+        if let Some(gro_size) = gro_size {
+            if gro_size == 0 || received.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid empty UDP GRO datagram",
+                ));
+            }
+
+            for segment in received.chunks(gro_size) {
+                let mut packet = pool.get();
+                packet.buf_mut().clear();
+                packet.buf_mut().extend_from_slice(segment);
+                packets.push((packet, source_addr));
+            }
+        } else {
+            let mut packet = pool.get();
+            packet.buf_mut().clear();
+            packet.buf_mut().extend_from_slice(received);
+            packets.push((packet, source_addr));
+        }
+
+        Ok(())
+    }
+
     pub struct RecvManyBuf {
         pub(crate) gro_bufs: Box<[BytesMut; MAX_PACKET_COUNT]>,
     }
@@ -877,6 +970,16 @@ mod gro {
                             continue;
                         };
 
+                        if result
+                            .flags
+                            .intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC)
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "truncated UDP GRO receive",
+                            ));
+                        }
+
                         let Some(source_addr) = result.address.as_ref().and_then(|addr| {
                             addr.as_sockaddr_in()
                                 .map(|&addr| SocketAddr::from(addr))
@@ -901,30 +1004,14 @@ mod gro {
                             .and_then(|gro_size| usize::try_from(gro_size).ok())
                             .filter(|&gro_size| gro_size > 0);
 
-                        // Generic Receive Offload
-                        if let Some(gro_size) = gro_size {
-                            // Divide packet into GRO-sized segments and copy them into Packet bufs
-                            for gro_segment in iov.chunks(gro_size) {
-                                let mut buf = pool.get();
-                                // Copy the segment into a packet buffer, growing the buffer if the
-                                // segment is larger than the pool's buffer size.
-                                // TODO: consider splitting the iov backing buffer into multiple
-                                // BytesMut to avoid copying the data here.
-                                buf.buf_mut().clear();
-                                buf.buf_mut().extend_from_slice(gro_segment);
-                                packets.push((buf, source_addr));
-                            }
-                        } else {
-                            // Single packet
-                            let size = result.bytes;
-                            let mut buf = pool.get();
-                            // Copy the datagram into a packet buffer, growing the buffer if the
-                            // datagram is larger than the pool's buffer size (reachable via IP
-                            // fragment reassembly, up to 64k).
-                            buf.buf_mut().clear();
-                            buf.buf_mut().extend_from_slice(&iov[..size]);
-                            packets.push((buf, source_addr));
-                        }
+                        append_received_packets(
+                            iov,
+                            result.bytes,
+                            gro_size,
+                            source_addr,
+                            pool,
+                            packets,
+                        )?;
                     }
 
                     Ok(())
@@ -948,12 +1035,44 @@ mod gro {
 
     #[cfg(test)]
     mod tests {
-        use super::UdpSocket;
+        use super::{UdpSocket, append_received_packets};
         use crate::packet::{Packet, PacketBufPool};
         use crate::udp::socket::SockOpt;
         use crate::udp::{UdpRecv, UdpSend};
         use std::net::{Ipv6Addr, SocketAddr};
         use std::time::Duration;
+
+        #[test]
+        fn gro_receive_splits_only_the_bytes_reported_by_recvmmsg() {
+            let mut pool = PacketBufPool::<4096>::new(3);
+            let source: SocketAddr = (Ipv6Addr::LOCALHOST, 51820).into();
+            let mut packets = Vec::new();
+
+            append_received_packets(b"abcdefghXXXX", 8, Some(3), source, &mut pool, &mut packets)
+                .unwrap();
+
+            assert_eq!(
+                packets
+                    .iter()
+                    .map(|(packet, _)| packet.as_ref())
+                    .collect::<Vec<_>>(),
+                [b"abc".as_slice(), b"def", b"gh"]
+            );
+            assert!(packets.iter().all(|(_, addr)| *addr == source));
+        }
+
+        #[test]
+        fn gro_receive_rejects_a_length_larger_than_its_iovec() {
+            let mut pool = PacketBufPool::<4096>::new(1);
+            let source: SocketAddr = (Ipv6Addr::LOCALHOST, 51820).into();
+            let mut packets = Vec::new();
+
+            let err = append_received_packets(b"abc", 4, None, source, &mut pool, &mut packets)
+                .unwrap_err();
+
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(packets.is_empty());
+        }
 
         #[tokio::test]
         async fn recv_many_from_preserves_ipv6_source_addr() {
