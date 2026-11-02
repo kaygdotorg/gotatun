@@ -69,8 +69,8 @@ impl From<WireGuardError> for TunnResult {
 pub struct Tunn<R: RngCore + Send = StdRng> {
     /// The handshake currently in progress.
     handshake: handshake::Handshake,
-    /// The [`N_SESSIONS`] most recent sessions.
-    sessions: [Option<session::Session>; N_SESSIONS],
+    /// The [`N_SESSIONS`] most recent sessions, allocated after the first handshake.
+    sessions: Option<Box<[Option<session::Session>; N_SESSIONS]>>,
     /// Index of the most recently used session.
     current: usize,
     /// Counter for slot selection when inserting new sessions.
@@ -131,7 +131,7 @@ impl<R: RngCore + Send> Tunn<R> {
                 index_table,
                 preshared_key,
             ),
-            sessions: Default::default(),
+            sessions: None,
             current: Default::default(),
             session_counter: Default::default(),
             tx_bytes: Default::default(),
@@ -170,9 +170,7 @@ impl<R: RngCore + Send> Tunn<R> {
         self.rate_limiter = rate_limiter;
         self.handshake
             .set_static_private(static_private, static_public);
-        for s in &mut self.sessions {
-            *s = None;
-        }
+        self.sessions = None;
     }
 
     /// Update the preshared key used for future handshakes.
@@ -225,7 +223,11 @@ impl<R: RngCore + Send> Tunn<R> {
     /// sending counter has reached `REJECT_AFTER_MESSAGES`.
     pub fn encapsulate_with_session(&mut self, packet: Packet) -> Result<Packet<WgData>, Packet> {
         let current = self.current;
-        if let Some(ref session) = self.sessions[current % N_SESSIONS] {
+        if let Some(session) = self
+            .sessions
+            .as_ref()
+            .and_then(|sessions| sessions[current % N_SESSIONS].as_ref())
+        {
             // Send the packet using an established session
             let packet = session.format_packet_data(packet)?;
             self.timer_tick(TimerName::TimeLastPacketSent);
@@ -325,7 +327,10 @@ impl<R: RngCore + Send> Tunn<R> {
             // There is nothing to do, already using this session, this is the common case
             return;
         }
-        if self.sessions[cur_slot % N_SESSIONS].is_none()
+        if self
+            .sessions
+            .as_ref()
+            .is_none_or(|sessions| sessions[cur_slot % N_SESSIONS].is_none())
             || self.timers.session_timers[new_slot % N_SESSIONS]
                 >= self.timers.session_timers[cur_slot % N_SESSIONS]
         {
@@ -346,7 +351,10 @@ impl<R: RngCore + Send> Tunn<R> {
     /// If the slot was occupied, the old session (and its [`Index`](index_table::Index)) is dropped,
     /// which automatically frees the index from the shared table.
     fn put_session(&mut self, slot: usize, session: session::Session) {
-        self.sessions[slot % N_SESSIONS] = Some(session);
+        let sessions = self
+            .sessions
+            .get_or_insert_with(|| Box::new(std::array::from_fn(|_| None)));
+        sessions[slot % N_SESSIONS] = Some(session);
     }
 
     /// Decrypt a data packet, and return a [`TunnResult::WriteToTunnel`] (`Ipv4` or `Ipv6`) if
@@ -374,8 +382,11 @@ impl<R: RngCore + Send> Tunn<R> {
 
         // Search for the matching session. Almost always self.current, but older
         // sessions may still receive packets during a key transition.
-        let (slot, session) = self
-            .sessions
+        let Some(sessions) = self.sessions.as_ref() else {
+            tracing::trace!("No session available: {r_idx}");
+            return Err(WireGuardError::NoCurrentSession);
+        };
+        let (slot, session) = sessions
             .iter()
             .enumerate()
             .filter_map(|(i, s)| s.as_ref().map(|s| (i, s)))
@@ -459,8 +470,12 @@ impl<R: RngCore + Send> Tunn<R> {
         let mut cur_avg = 0.0;
         let mut total_weight = 0.0;
 
+        let Some(sessions) = self.sessions.as_ref() else {
+            return 0.0;
+        };
+
         for i in 0..N_SESSIONS {
-            if let Some(ref session) = self.sessions[session_idx.wrapping_sub(i) % N_SESSIONS] {
+            if let Some(ref session) = sessions[session_idx.wrapping_sub(i) % N_SESSIONS] {
                 let (expected, received) = session.current_packet_cnt();
 
                 let loss = if expected == 0 {
@@ -533,6 +548,16 @@ fn pad_to_x16(mut packet: Packet, tun_mtu: &mut MtuWatcher) -> Packet {
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn tunnel_does_not_embed_the_session_ring() {
+        let tunnel_size = std::mem::size_of::<Tunn>();
+        let session_ring_size = std::mem::size_of::<[Option<session::Session>; N_SESSIONS]>();
+        assert!(
+            tunnel_size < session_ring_size,
+            "empty tunnels should not embed {session_ring_size} bytes of session state (tunnel is {tunnel_size} bytes)"
+        );
+    }
 
     #[cfg(feature = "mock_instant")]
     use crate::noise::timers::{MAX_JITTER, REKEY_AFTER_TIME, REKEY_TIMEOUT, TimerName};
@@ -852,7 +877,10 @@ mod tests {
 
         // Fast-forward the established session to its last usable counter value.
         let slot = my_tun.current % N_SESSIONS;
-        my_tun.sessions[slot]
+        my_tun
+            .sessions
+            .as_ref()
+            .expect("session ring allocated after handshake")[slot]
             .as_ref()
             .expect("session established after handshake")
             .set_sending_key_counter(session::REJECT_AFTER_MESSAGES - 1);

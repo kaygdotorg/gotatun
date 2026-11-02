@@ -279,9 +279,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
     // We don't really clear the timers, but we set them to the current time to
     // so the reference time frame is the same
     pub(super) fn clear_all(&mut self) {
-        for session in &mut self.sessions {
-            *session = None;
-        }
+        self.sessions = None;
 
         self.packet_queue.clear();
 
@@ -290,11 +288,12 @@ impl<R: rand::RngCore + Send> Tunn<R> {
 
     fn update_session_timers(&mut self, time_now: Duration) {
         let timers = &mut self.timers;
+        let sessions = &mut self.sessions;
 
         for (i, t) in timers.session_timers.iter_mut().enumerate() {
             if time_now - *t > REJECT_AFTER_TIME {
                 // Forget about expired sesssions
-                if let Some(session) = self.sessions[i].take() {
+                if let Some(session) = sessions.as_mut().and_then(|ring| ring[i].take()) {
                     tracing::trace!(
                         "SESSION_EXPIRED(REJECT_AFTER_TIME): {}",
                         session.receiving_index
@@ -457,7 +456,11 @@ impl<R: rand::RngCore + Send> Tunn<R> {
     /// Returns `None` if no session has been established.
     pub fn time_since_last_handshake(&self) -> Option<Duration> {
         let current_session = self.current;
-        if self.sessions[current_session % super::N_SESSIONS].is_some() {
+        if self
+            .sessions
+            .as_ref()
+            .is_some_and(|sessions| sessions[current_session % super::N_SESSIONS].is_some())
+        {
             let duration_since_tun_start = self.timers.now();
             let duration_since_session_established = self.timers[TimeSessionEstablished];
 
@@ -474,7 +477,10 @@ impl<R: rand::RngCore + Send> Tunn<R> {
             .timers
             .now()
             .saturating_sub(self.timers.session_timers[current_session]);
-        self.sessions[current_session].is_some() && session_age < self.timers.rekey_after_time
+        self.sessions
+            .as_ref()
+            .is_some_and(|sessions| sessions[current_session].is_some())
+            && session_age < self.timers.rekey_after_time
     }
 
     /// Get the persistent keepalive interval in seconds.
