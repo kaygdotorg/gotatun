@@ -24,12 +24,19 @@ mod allocator;
 #[cfg(unix)]
 mod unix;
 
+// Linux process policy
+#[cfg(target_os = "linux")]
+mod thp;
+
 // Windows implementation
 #[cfg(windows)]
 mod windows;
 
 #[cfg(unix)]
 fn main() {
+    #[cfg(target_os = "linux")]
+    // THP policy is a memory optimization, so kernels that reject the prctl must still run.
+    let _ = thp::disable_if_supported();
     unix::main();
 }
 
