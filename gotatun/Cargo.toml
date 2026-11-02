@@ -27,6 +27,7 @@ name = "main"
 [dependencies]
 aead = { workspace = true }
 base64 = { workspace = true }
+bitfield-struct = { workspace = true }
 blake2 = { workspace = true }
 bytes = { workspace = true }
 chacha20poly1305 = { workspace = true }

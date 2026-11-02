@@ -71,7 +71,7 @@ mod ipv6;
 mod pool;
 mod tcp;
 mod udp;
-mod util;
+pub(crate) mod util;
 mod wg;
 
 pub use decode::*;
