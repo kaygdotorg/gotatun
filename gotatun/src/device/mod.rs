@@ -64,8 +64,8 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100;
 /// Maximum number of packet buffers retained for reuse by the device.
 const PACKET_BUFFER_POOL_CAPACITY: usize = 4000;
 
-/// Bound packet handoff queues so stale traffic cannot add several milliseconds of latency.
-const PACKET_CHANNEL_CAPACITY: usize = 256;
+/// Bound packet handoff queues near one observed TUN receive batch while limiting stale backlog.
+const PACKET_CHANNEL_CAPACITY: usize = 1024;
 
 /// Error of [`Device`]-related operations.
 #[derive(Debug, thiserror::Error)]
