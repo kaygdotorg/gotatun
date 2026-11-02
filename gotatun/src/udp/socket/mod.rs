@@ -11,6 +11,10 @@
 
 //! Implementations of [`super::UdpSend`] and [`super::UdpRecv`] traits for [`UdpSocket`].
 
+#[cfg(target_os = "linux")]
+use nix::sys::socket::{getsockopt, sockopt};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -84,8 +88,16 @@ impl UdpTransportFactory for UdpSocketFactory {
 /// Default UDP socket implementation
 #[derive(Clone)]
 pub struct UdpSocket {
-    inner: Arc<tokio::net::UdpSocket>,
+    inner: Arc<UdpSocketState>,
     map_ipv4_to_ipv6: bool,
+}
+
+struct UdpSocketState {
+    socket: tokio::net::UdpSocket,
+    #[cfg(target_os = "linux")]
+    udp_gso_supported: bool,
+    #[cfg(target_os = "linux")]
+    udp_gso_disabled: AtomicBool,
 }
 
 /// Options set on the socket created by [`UdpSocket::bind`].
@@ -153,10 +165,19 @@ impl UdpSocket {
 
         udp_sock.bind(&addr.into())?;
 
+        #[cfg(target_os = "linux")]
+        let udp_gso_supported = getsockopt(&udp_sock, sockopt::UdpGsoSegment).is_ok();
+
         let inner = tokio::net::UdpSocket::from_std(udp_sock.into())?;
 
         Ok(Self {
-            inner: Arc::new(inner),
+            inner: Arc::new(UdpSocketState {
+                socket: inner,
+                #[cfg(target_os = "linux")]
+                udp_gso_supported,
+                #[cfg(target_os = "linux")]
+                udp_gso_disabled: AtomicBool::new(false),
+            }),
             map_ipv4_to_ipv6: addr.is_ipv6() && opts.only_v6 == Some(false),
         })
     }
@@ -164,12 +185,27 @@ impl UdpSocket {
     /// Get the inner [`tokio::net::UdpSocket`].
     #[inline(always)]
     pub fn socket(&self) -> &tokio::net::UdpSocket {
-        &self.inner
+        &self.inner.socket
     }
 
     /// Returns the local address that this socket is bound to.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.local_addr()
+        self.inner.socket.local_addr()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn udp_gso_supported(&self) -> bool {
+        self.inner.udp_gso_supported
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn udp_gso_disabled(&self) -> bool {
+        self.inner.udp_gso_disabled.load(Ordering::Relaxed)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn disable_udp_gso(&self) {
+        self.inner.udp_gso_disabled.store(true, Ordering::Relaxed);
     }
 
     /// Map an IPv4 address to IPv6 if necessary.
@@ -193,14 +229,14 @@ impl UdpSocket {
 #[cfg(not(windows))]
 impl std::os::fd::AsFd for UdpSocket {
     fn as_fd(&self) -> std::os::unix::prelude::BorrowedFd<'_> {
-        self.inner.as_fd()
+        self.inner.socket.as_fd()
     }
 }
 
 #[cfg(windows)]
 impl std::os::windows::io::AsSocket for UdpSocket {
     fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
-        self.inner.as_socket()
+        self.inner.socket.as_socket()
     }
 }
 
@@ -260,6 +296,22 @@ mod tests {
     use std::iter;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use std::time::Duration;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn udp_gso_disabled_state_is_shared_by_clones() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0).into(), SockOpt::default()).unwrap();
+        let clone = socket.clone();
+
+        assert_eq!(socket.udp_gso_supported(), clone.udp_gso_supported());
+        assert!(!socket.udp_gso_disabled());
+        assert!(!clone.udp_gso_disabled());
+
+        clone.disable_udp_gso();
+
+        assert!(socket.udp_gso_disabled());
+        assert!(clone.udp_gso_disabled());
+    }
 
     async fn set_up_dual_stack_test() -> (
         (UdpSocket, u16),
