@@ -196,7 +196,7 @@ impl<T: DeviceTransports> DeviceRead<'_, T> {
                 peer: Peer {
                     public_key: *pubkey,
                     preshared_key: p.tunnel.preshared_key(),
-                    allowed_ips: p.allowed_ips.iter().map(|(_, net)| net).collect(),
+                    allowed_ips: p.allowed_ips().collect(),
                     endpoint: p.endpoint.addr,
                     keepalive: p.tunnel.persistent_keepalive(),
                     #[cfg(feature = "daita")]
@@ -351,15 +351,7 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
             existing_peer.endpoint.addr = addr;
         }
 
-        if clear_allowed_ips {
-            existing_peer.allowed_ips.clear();
-        }
-
-        for allowed_ip in add_allowed_ips {
-            existing_peer
-                .allowed_ips
-                .insert(allowed_ip.network(), allowed_ip.prefix(), ());
-        }
+        existing_peer.update_allowed_ips(clear_allowed_ips, add_allowed_ips);
 
         // Update device.peers_by_ip by clearing all entries that refer to this peer and
         // adding them again.
@@ -372,7 +364,7 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
         for network in remove_list {
             self.device.peers_by_ip.remove_network(network);
         }
-        for (_, allowed_ip) in existing_peer.allowed_ips.iter() {
+        for allowed_ip in existing_peer.allowed_ips() {
             self.device.peers_by_ip.insert(
                 allowed_ip.network(),
                 allowed_ip.prefix(),

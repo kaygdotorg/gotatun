@@ -10,13 +10,14 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+//! Stores per-peer tunnel state and compact route metadata; packet routing uses the device trie.
+
 use ipnetwork::IpNetwork;
 
 use std::net::SocketAddr;
 
 use tokio::sync::watch;
 
-use crate::device::AllowedIps;
 #[cfg(feature = "daita")]
 use crate::device::daita::{DaitaHooks, DaitaSettings};
 use crate::noise::errors::WireGuardError;
@@ -46,7 +47,7 @@ pub struct PeerState {
     /// The associated tunnel struct
     pub(crate) tunnel: Tunn,
     pub(crate) endpoint: Endpoint,
-    pub(crate) allowed_ips: AllowedIps<()>,
+    pub(crate) allowed_ips: Vec<IpNetwork>,
 
     #[cfg(feature = "daita")]
     daita_settings: Option<DaitaSettings>,
@@ -57,6 +58,17 @@ pub struct PeerState {
     handshake_completed: watch::Sender<()>,
 }
 
+/// Canonicalizes and deduplicates route metadata while preserving the old trie iteration order.
+fn normalize_allowed_ips(allowed_ips: &mut Vec<IpNetwork>) {
+    for allowed_ip in allowed_ips.iter_mut() {
+        *allowed_ip = IpNetwork::new(allowed_ip.network(), allowed_ip.prefix())
+            .expect("an existing IP network has a valid prefix");
+    }
+
+    allowed_ips.sort_unstable_by_key(|allowed_ip| (allowed_ip.network(), allowed_ip.prefix()));
+    allowed_ips.dedup_by_key(|allowed_ip| (allowed_ip.network(), allowed_ip.prefix()));
+}
+
 impl PeerState {
     pub fn new(
         tunnel: Tunn,
@@ -64,10 +76,13 @@ impl PeerState {
         allowed_ips: &[IpNetwork],
         #[cfg(feature = "daita")] daita_settings: Option<DaitaSettings>,
     ) -> PeerState {
+        let mut allowed_ips = allowed_ips.to_vec();
+        normalize_allowed_ips(&mut allowed_ips);
+
         Self {
             tunnel,
             endpoint: Endpoint { addr: endpoint },
-            allowed_ips: allowed_ips.iter().map(|ip| (ip, ())).collect(),
+            allowed_ips,
             #[cfg(feature = "daita")]
             daita_settings,
             #[cfg(feature = "daita")]
@@ -181,8 +196,21 @@ impl PeerState {
         &self.endpoint
     }
 
+    /// Update the compact UAPI route list; packet lookup remains owned by the device routing trie.
+    pub(crate) fn update_allowed_ips(
+        &mut self,
+        clear: bool,
+        added: impl IntoIterator<Item = IpNetwork>,
+    ) {
+        if clear {
+            self.allowed_ips.clear();
+        }
+        self.allowed_ips.extend(added);
+        normalize_allowed_ips(&mut self.allowed_ips);
+    }
+
     pub fn allowed_ips(&self) -> impl Iterator<Item = IpNetwork> + '_ {
-        self.allowed_ips.iter().map(|((), network)| network)
+        self.allowed_ips.iter().copied()
     }
 
     pub fn time_since_last_handshake(&self) -> Option<std::time::Duration> {
@@ -195,5 +223,21 @@ impl PeerState {
 
     pub fn preshared_key(&self) -> Option<[u8; 32]> {
         self.tunnel.preshared_key()
+    }
+}
+
+#[cfg(all(test, target_pointer_width = "64", not(feature = "daita")))]
+mod tests {
+    //! Guard the per-peer inline footprint against retaining the duplicate route trie.
+
+    use super::PeerState;
+
+    #[test]
+    fn idle_peer_state_stays_below_two_kibibytes() {
+        let size = std::mem::size_of::<PeerState>();
+        assert!(
+            size <= 2 * 1024,
+            "PeerState keeps {size} inline bytes; the peer-local route trie must be removed"
+        );
     }
 }

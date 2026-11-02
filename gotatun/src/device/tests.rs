@@ -225,6 +225,56 @@ async fn add_peers_rejects_duplicate_public_keys() {
     }));
 }
 
+/// Replacing a peer's routes keeps canonical IPv4/IPv6 entries in its listing and the device trie.
+#[tokio::test]
+#[test_log::test]
+async fn allowed_ip_updates_preserve_v4_v6_listing_and_routes() {
+    use ipnetwork::IpNetwork;
+    use std::{net::IpAddr, sync::Arc};
+
+    let (_alice, mut bob, _eve) = mock::device_pair().await;
+    let peer_key = get_first_and_only_peer(&bob).await.public_key;
+    let v4_with_host_bits: IpNetwork = "192.0.2.7/24".parse().unwrap();
+    let v4_canonical: IpNetwork = "192.0.2.0/24".parse().unwrap();
+    let v6_with_host_bits: IpNetwork = "2001:db8:1::abcd/64".parse().unwrap();
+    let v6_canonical: IpNetwork = "2001:db8:1::/64".parse().unwrap();
+
+    let updated = bob
+        .device
+        .modify_peer(&peer_key, |peer_mut| {
+            peer_mut.clear_allowed_ips();
+            peer_mut.add_allowed_ips([v4_with_host_bits, v4_canonical, v6_with_host_bits]);
+        })
+        .await
+        .expect("device reconfiguration should not fail");
+    assert!(updated, "existing peer should be updated");
+
+    let listed = get_first_and_only_peer(&bob).await;
+    assert_eq!(listed.allowed_ips.len(), 2);
+    assert!(listed.allowed_ips.contains(&v4_canonical));
+    assert!(listed.allowed_ips.contains(&v6_canonical));
+
+    let state = bob.device.inner.read().await;
+    let peer = state
+        .peers
+        .get(&peer_key)
+        .expect("configured peer should remain");
+    for address in ["192.0.2.123", "2001:db8:1::1"] {
+        let address: IpAddr = address.parse().unwrap();
+        let route_owner = state
+            .peers_by_ip
+            .find(address)
+            .expect("updated address should remain routable");
+        assert!(Arc::ptr_eq(peer, route_owner));
+    }
+    assert!(
+        state
+            .peers_by_ip
+            .find("198.51.100.1".parse().unwrap())
+            .is_none()
+    );
+}
+
 /// A peer must not inject a packet whose inner source IP belongs
 /// (by longest-prefix match) to a *different* peer, even when the
 /// sending peer's own allowed-ips would cover it. The most specific
