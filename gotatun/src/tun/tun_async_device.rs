@@ -113,6 +113,11 @@ impl TunDevice {
             if vnet_header {
                 linux::enable_tso_with_fallback(tun.deref());
             }
+            // Only a device we created here: one handed to us via `from_tun_device` keeps
+            // whatever its owner configured.
+            if let Ok(name) = tun.tun_name() {
+                linux::raise_tx_queue_len(&name);
+            }
             return TunDevice::from_tun_device_with_vnet_header(tun, vnet_header);
         }
 
