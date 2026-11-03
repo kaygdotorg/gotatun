@@ -74,13 +74,20 @@ impl BufferedIpSend {
                 .await
                 .expect("Deadlock on IpSend. There must be no more than one IpSend active at any given time.");
 
+            let mut refused: u64 = 0;
             while let Some(packet) = rx.recv().await {
                 if let Err(e) = inner.send(packet).await {
                     if is_fatal_tun_error(&e) {
                         tracing::error!("TUN device was deleted: {e}");
                         break;
                     }
-                    tracing::error!("Error sending IP packet: {e}");
+                    // The device refused this one packet; the next one may be fine.
+                    refused += 1;
+                    if refused.is_power_of_two() {
+                        tracing::warn!(
+                            "Dropped IP packet the TUN device refused ({refused} so far): {e}"
+                        );
+                    }
                 }
             }
 
@@ -170,6 +177,7 @@ impl<I: IpRecv> BufferedIpRecv<I> {
         let drop_guard = token.clone().drop_guard();
 
         let task = async move {
+            let mut dropped: u64 = 0;
             loop {
                 match inner.recv(&mut pool).await {
                     Ok(packets) => {
@@ -193,7 +201,13 @@ impl<I: IpRecv> BufferedIpRecv<I> {
                             tracing::error!("TUN device was deleted: {e}");
                             break;
                         }
-                        tracing::error!("Error receiving IP packet: {e}");
+                        // One frame we could not decode: drop it and read the next. Yield so
+                        // a device that keeps failing cannot spin this worker.
+                        dropped += 1;
+                        if dropped.is_power_of_two() {
+                            tracing::warn!("Dropped undecodable IP packet ({dropped} so far): {e}");
+                        }
+                        tokio::task::yield_now().await;
                     }
                 }
             }
@@ -267,6 +281,11 @@ fn take_ready(rx: &mut mpsc::Receiver<Packet<Ip>>, buf: &mut Vec<Packet<Ip>>) {
 }
 
 /// Checks if an I/O error indicates the TUN device has been deleted or is unusable.
+///
+/// Only a gone device counts. `InvalidData` and `InvalidInput` describe one frame (a malformed
+/// header we refuse to decode, a packet the device refuses to take) and are not fatal: anything
+/// on the host able to send a raw packet could otherwise stop a whole direction of traffic
+/// with one bad frame (#260).
 fn is_fatal_tun_error(err: &io::Error) -> bool {
     #[cfg(target_os = "linux")]
     if matches!(
@@ -300,11 +319,7 @@ fn is_fatal_tun_error(err: &io::Error) -> bool {
 
     matches!(
         err.kind(),
-        io::ErrorKind::NotFound
-            | io::ErrorKind::UnexpectedEof
-            | io::ErrorKind::BrokenPipe
-            | io::ErrorKind::InvalidData
-            | io::ErrorKind::InvalidInput
+        io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe
     )
 }
 
@@ -368,13 +383,76 @@ mod tests {
         recv
     }
 
-    async fn next_ids(recv: &mut BufferedIpRecv<Batches>) -> Vec<u16> {
+    async fn next_ids<I: IpRecv>(recv: &mut BufferedIpRecv<I>) -> Vec<u16> {
         let mut pool = PacketBufPool::new(1);
         recv.recv(&mut pool)
             .await
             .unwrap()
             .map(|p| id(&p))
             .collect()
+    }
+
+    /// Hands out scripted receive results, then waits forever.
+    struct Script(VecDeque<io::Result<Vec<Packet<Ip>>>>);
+
+    impl IpRecv for Script {
+        async fn recv<'a>(
+            &'a mut self,
+            _pool: &mut PacketBufPool,
+        ) -> io::Result<impl Iterator<Item = Packet<Ip>> + Send + 'a> {
+            match self.0.pop_front() {
+                Some(result) => result.map(Vec::into_iter),
+                None => std::future::pending().await,
+            }
+        }
+
+        fn mtu(&self) -> MtuWatcher {
+            MtuWatcher::new(1420)
+        }
+    }
+
+    async fn scripted_recv(script: Vec<io::Result<Vec<Packet<Ip>>>>) -> BufferedIpRecv<Script> {
+        let inner = Arc::new(Mutex::new(Script(VecDeque::from(script))));
+        BufferedIpRecv::new(64, PacketBufPool::new(1), inner, CancellationToken::new()).await
+    }
+
+    /// One frame the TUN reader refuses (malformed headers) is dropped; the next frame still
+    /// reaches encryption. Before #260 it was taken for a deleted device and stopped the whole
+    /// outbound direction.
+    #[tokio::test]
+    async fn bad_frame_is_dropped_and_the_next_one_passes() {
+        let mut recv = scripted_recv(vec![
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid IPv6 extension length",
+            )),
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bad virtio header",
+            )),
+            Ok(vec![packet(1400, 7)]),
+        ])
+        .await;
+
+        let ids = tokio::time::timeout(Duration::from_secs(5), next_ids(&mut recv))
+            .await
+            .expect("the valid frame must arrive");
+        assert_eq!(ids, [7]);
+    }
+
+    /// A gone device still ends the reader, so the device can report it.
+    #[tokio::test]
+    async fn device_gone_still_stops_the_reader() {
+        let mut recv = scripted_recv(vec![Err(io::Error::from_raw_os_error(libc::EBADF))]).await;
+        let mut pool = PacketBufPool::new(1);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), recv.recv(&mut pool))
+            .await
+            .expect("the reader must stop promptly");
+        assert_eq!(
+            result.err().map(|e| e.kind()),
+            Some(io::ErrorKind::UnexpectedEof)
+        );
     }
 
     /// A small packet queued behind bulk is handed out first, and each lane keeps its order.

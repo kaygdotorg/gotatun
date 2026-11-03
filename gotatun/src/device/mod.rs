@@ -728,6 +728,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         let idle_check = tokio::time::sleep(IDLE_RELEASE_PERIOD);
         tokio::pin!(idle_check);
         let mut busy = false;
+        let mut dropped_datagrams: u64 = 0;
 
         loop {
             received_packets.clear();
@@ -737,7 +738,22 @@ impl<T: DeviceTransports> DeviceState<T> {
                     &mut udp_recv_buf,
                     &mut packet_pool,
                     &mut received_packets,
-                ) => received.map_err(Error::IoError)?,
+                ) => {
+                    if let Err(err) = received {
+                        if crate::udp::is_fatal_udp_error(&err) {
+                            return Err(Error::IoError(err));
+                        }
+                        // One bad datagram (or batch tail) must not stop receiving. Packets
+                        // the batch delivered before the error are still processed below.
+                        dropped_datagrams += 1;
+                        if dropped_datagrams.is_power_of_two() {
+                            tracing::warn!(
+                                "Dropped undecodable UDP datagram ({dropped_datagrams} so far): {err}"
+                            );
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }
                 () = &mut idle_check => {
                     idle_check
                         .as_mut()

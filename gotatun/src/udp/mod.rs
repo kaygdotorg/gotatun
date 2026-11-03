@@ -61,6 +61,26 @@ pub struct UdpTransportFactoryParams {
     pub fwmark: Option<u32>,
 }
 
+/// Whether a UDP receive error means the socket is gone, so receiving must stop.
+///
+/// Everything else is one bad datagram or a passing condition (a truncated or malformed GRO
+/// batch, an ICMP error surfaced on the socket, ...): the receiver drops it and keeps going.
+/// Treating those as fatal let a single bad datagram stop a whole direction of traffic (#260).
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
+pub(crate) fn is_fatal_udp_error(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::EBADF) | Some(libc::ENOTSOCK) | Some(libc::ENODEV)
+    ) {
+        return true;
+    }
+    matches!(
+        err.kind(),
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected
+    )
+}
+
 /// An abstraction of `recv_from` for a UDP socket.
 ///
 /// This allows us to, for example, swap out UDP sockets with a channel.
