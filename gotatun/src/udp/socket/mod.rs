@@ -12,7 +12,7 @@
 //! Implementations of [`super::UdpSend`] and [`super::UdpRecv`] traits for [`UdpSocket`].
 
 #[cfg(target_os = "linux")]
-use nix::sys::socket::{getsockopt, sockopt};
+use nix::sys::socket::{getsockopt, setsockopt, sockopt};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
@@ -106,9 +106,11 @@ pub struct SockOpt {
     /// If `Some`, set `fwmark` on the socket.
     #[cfg(target_os = "linux")]
     pub fwmark: Option<u32>,
-    /// If `Some`, set `SO_RCVBUF` on the socket.
+    /// If `Some`, set the receive buffer size: `SO_RCVBUFFORCE` on Linux when permitted,
+    /// otherwise `SO_RCVBUF`.
     pub recv_buffer_size: Option<usize>,
-    /// If `Some`, set `SO_SNDBUF` on the socket.
+    /// If `Some`, set the send buffer size: `SO_SNDBUFFORCE` on Linux when permitted,
+    /// otherwise `SO_SNDBUF`.
     pub send_buffer_size: Option<usize>,
     /// If `Some`, set `IPV6_V6ONLY` on the socket.
     pub only_v6: Option<bool>,
@@ -145,7 +147,10 @@ impl UdpSocket {
         // fine, even if not as performant as possible. In that case it is still a good idea to
         // tweak the buffer sizes.
         if let Some(recv_buffer_size) = opts.recv_buffer_size
-            && let Err(err) = udp_sock.set_recv_buffer_size(recv_buffer_size)
+            && let Err(err) = apply_buffer_size(
+                || force_recv_buffer_size(&udp_sock, recv_buffer_size),
+                || udp_sock.set_recv_buffer_size(recv_buffer_size),
+            )
         {
             if cfg!(debug_assertions) {
                 return Err(err);
@@ -154,7 +159,10 @@ impl UdpSocket {
             }
         }
         if let Some(send_buffer_size) = opts.send_buffer_size
-            && let Err(err) = udp_sock.set_send_buffer_size(send_buffer_size)
+            && let Err(err) = apply_buffer_size(
+                || force_send_buffer_size(&udp_sock, send_buffer_size),
+                || udp_sock.set_send_buffer_size(send_buffer_size),
+            )
         {
             if cfg!(debug_assertions) {
                 return Err(err);
@@ -279,6 +287,54 @@ fn check_send_max_number_of_packets(
         ));
     }
     Ok(())
+}
+
+/// Which socket call applied a requested buffer size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BufferSizeApplied {
+    /// The privileged call that ignores the system ceiling.
+    Forced,
+    /// The plain call, silently clamped to `net.core.{r,w}mem_max`.
+    Capped,
+}
+
+/// Apply a socket buffer size, preferring the call that is not capped by the system limit.
+///
+/// `SO_RCVBUF`/`SO_SNDBUF` are clamped without error to `net.core.rmem_max`/`wmem_max`
+/// (212,992 bytes on a stock kernel), so a 7 MiB request ends up near 416 KiB. Under a
+/// sustained transfer that overflows: on the #260 R4b perf VM the receiving socket logged
+/// 11,770 `RcvbufErrors` in a 10 s single-flow run, losing tunnel datagrams and loaded
+/// latency probes. A Linux process that owns a TUN device already holds `CAP_NET_ADMIN`,
+/// which permits `SO_RCVBUFFORCE`/`SO_SNDBUFFORCE`. Try those first; without the capability
+/// (or off Linux) fall back to the clamped call, which keeps the previous behaviour.
+fn apply_buffer_size(
+    forced: impl FnOnce() -> io::Result<()>,
+    capped: impl FnOnce() -> io::Result<()>,
+) -> io::Result<BufferSizeApplied> {
+    match forced() {
+        Ok(()) => Ok(BufferSizeApplied::Forced),
+        Err(_) => capped().map(|()| BufferSizeApplied::Capped),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn force_recv_buffer_size(socket: &socket2::Socket, size: usize) -> io::Result<()> {
+    setsockopt(socket, sockopt::RcvBufForce, &size).map_err(io::Error::from)
+}
+
+#[cfg(target_os = "linux")]
+fn force_send_buffer_size(socket: &socket2::Socket, size: usize) -> io::Result<()> {
+    setsockopt(socket, sockopt::SndBufForce, &size).map_err(io::Error::from)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn force_recv_buffer_size(_: &socket2::Socket, _: usize) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn force_send_buffer_size(_: &socket2::Socket, _: usize) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
 }
 
 #[cfg(test)]
@@ -512,5 +568,54 @@ mod tests {
             }
         }
         recv_none(&mut dual_sock).await;
+    }
+
+    #[test]
+    fn buffer_size_prefers_the_uncapped_call() {
+        let capped_called = std::cell::Cell::new(false);
+        let applied = apply_buffer_size(
+            || Ok(()),
+            || {
+                capped_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(applied, BufferSizeApplied::Forced);
+        assert!(!capped_called.get(), "a forced size must not be re-capped");
+    }
+
+    #[test]
+    fn buffer_size_falls_back_without_privilege() {
+        let applied =
+            apply_buffer_size(|| Err(io::ErrorKind::PermissionDenied.into()), || Ok(())).unwrap();
+        assert_eq!(applied, BufferSizeApplied::Capped);
+    }
+
+    #[test]
+    fn buffer_size_reports_the_fallback_error() {
+        let err = apply_buffer_size(
+            || Err(io::ErrorKind::PermissionDenied.into()),
+            || Err(io::ErrorKind::InvalidInput.into()),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// Without `CAP_NET_ADMIN` the forced call fails; binding must still succeed
+    /// (debug builds turn a buffer-size failure into a bind error) and keep a
+    /// usable, nonzero buffer.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn oversized_buffer_request_binds_with_or_without_privilege() {
+        let opts = SockOpt {
+            recv_buffer_size: Some(7 * 1024 * 1024),
+            send_buffer_size: Some(7 * 1024 * 1024),
+            ..SockOpt::default()
+        };
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0).into(), opts).unwrap();
+        let rcvbuf = getsockopt(socket.socket(), sockopt::RcvBuf).unwrap();
+        let sndbuf = getsockopt(socket.socket(), sockopt::SndBuf).unwrap();
+        assert!(rcvbuf > 0 && sndbuf > 0, "rcvbuf={rcvbuf} sndbuf={sndbuf}");
     }
 }
