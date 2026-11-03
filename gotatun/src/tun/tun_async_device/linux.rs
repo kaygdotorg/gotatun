@@ -87,9 +87,11 @@ fn tx_queue_len_target(current: u32, wanted: u32) -> Option<u32> {
 fn tx_queue_len(name: &str) -> io::Result<u32> {
     let socket = control_socket()?;
     let mut request = interface_request(name)?;
+    let fd = socket.as_raw_fd();
     // SAFETY: `SIOCGIFTXQLEN` reads `ifr_name` and writes the length into the union's integer
     // member; `request` is a valid, initialised `ifreq` for the duration of the call.
-    if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFTXQLEN as _, &raw mut request) } < 0 {
+    let status = unsafe { libc::ioctl(fd, libc::SIOCGIFTXQLEN as _, &raw mut request) };
+    if status < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: the kernel wrote the integer member (`ifr_qlen` is `ifru_ivalue`, which libc
@@ -108,8 +110,10 @@ fn set_tx_queue_len_at_least(name: &str, wanted: u32) -> io::Result<u32> {
     let mut request = interface_request(name)?;
     request.ifr_ifru.ifru_ifindex = libc::c_int::try_from(target)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "qlen too large"))?;
+    let fd = socket.as_raw_fd();
     // SAFETY: `SIOCSIFTXQLEN` reads `ifr_name` and the integer member of a valid `ifreq`.
-    if unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCSIFTXQLEN as _, &raw mut request) } < 0 {
+    let status = unsafe { libc::ioctl(fd, libc::SIOCSIFTXQLEN as _, &raw mut request) };
+    if status < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(target)
