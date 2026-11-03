@@ -116,19 +116,21 @@ impl<X, Y> DeviceBuilder<Nul, X, Y> {
 }
 
 impl<X, Y> DeviceBuilder<UdpSocketFactory, X, Y> {
-    /// Specify the `SO_RCVBUF` argument to the [`UdpTransportFactory`].
+    /// Specify the receive buffer size for the [`UdpTransportFactory`].
     ///
     /// Changes the size of the operating system's receive buffer associated
-    /// with the socket.
+    /// with the socket. On Linux this uses `SO_RCVBUFFORCE` when the process
+    /// has `CAP_NET_ADMIN`, so the size is not clamped to `net.core.rmem_max`.
     pub const fn udp_recv_buffer_size(mut self, recv_buffer_size: usize) -> Self {
         self.udp.recv_buffer_size = Some(recv_buffer_size);
         self
     }
 
-    /// Specify the `SO_SNDBUF` argument to the [`UdpTransportFactory`].
+    /// Specify the send buffer size for the [`UdpTransportFactory`].
     ///
     /// Changes the size of the operating system's send buffer associated with
-    /// the socket.
+    /// the socket. On Linux this uses `SO_SNDBUFFORCE` when the process has
+    /// `CAP_NET_ADMIN`, so the size is not clamped to `net.core.wmem_max`.
     pub const fn udp_send_buffer_size(mut self, send_buffer_size: usize) -> Self {
         self.udp.send_buffer_size = Some(send_buffer_size);
         self
