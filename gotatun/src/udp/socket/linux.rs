@@ -909,6 +909,40 @@ mod gro {
         }
     }
 
+    impl RecvManyBuf {
+        /// Discard the pages the kernel wrote into, keeping the mapping.
+        ///
+        /// The buffers are reserved at 100 × 256 KiB but only touched as far as each
+        /// GRO batch reaches, so after a burst several MiB stay resident for good. Dropping
+        /// the pages in place (instead of freeing and reallocating the buffer) leaves the
+        /// allocator alone: freeing a chunk this large would raise glibc's mmap threshold and
+        /// move the next one into an arena, where `calloc` zero-fills, and so touches, all of it.
+        /// The next receive faults fresh zero pages in on demand.
+        pub(crate) fn release_pages(&mut self) {
+            // SAFETY: sysconf has no preconditions.
+            let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+                .ok()
+                .filter(|&page| page > 0)
+                .unwrap_or(4096);
+            for buf in self.gro_bufs.iter_mut() {
+                let start = buf.as_mut_ptr() as usize;
+                let first = start.next_multiple_of(page);
+                let end = (start + buf.len()) / page * page;
+                if end <= first {
+                    continue;
+                }
+                // SAFETY: [first, end) lies inside this buffer, which we own exclusively
+                // (`&mut self`), and covers whole pages only, so no allocator metadata or
+                // neighbouring allocation shares them. MADV_DONTNEED on private anonymous
+                // memory makes the range read back as zeros, which keeps every byte of the
+                // buffer initialised. Failure only means the pages stay resident.
+                unsafe {
+                    libc::madvise(first as *mut libc::c_void, end - first, libc::MADV_DONTNEED);
+                }
+            }
+        }
+    }
+
     impl UdpRecv for UdpSocket {
         type RecvManyBuf = RecvManyBuf;
 
@@ -1021,6 +1055,10 @@ mod gro {
             Ok(())
         }
 
+        fn release_recv_buf(&self, recv_buf: &mut Self::RecvManyBuf) {
+            recv_buf.release_pages();
+        }
+
         fn enable_udp_gro(&self) -> io::Result<()> {
             // TODO: missing constants on Android
             use std::os::fd::AsFd;
@@ -1035,7 +1073,7 @@ mod gro {
 
     #[cfg(test)]
     mod tests {
-        use super::{UdpSocket, append_received_packets};
+        use super::{RecvManyBuf, UdpSocket, append_received_packets};
         use crate::packet::{Packet, PacketBufPool};
         use crate::udp::socket::SockOpt;
         use crate::udp::{UdpRecv, UdpSend};
@@ -1072,6 +1110,35 @@ mod gro {
 
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
             assert!(packets.is_empty());
+        }
+
+        /// Releasing an idle receive buffer drops its touched pages (they read back as zeros,
+        /// which only happens if the kernel discarded them) and leaves every buffer at full
+        /// length and writable.
+        #[test]
+        fn release_pages_drops_touched_pages_and_keeps_buffers_usable() {
+            // SAFETY: sysconf has no preconditions.
+            let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+            let mut bufs = RecvManyBuf::default();
+            let lens: Vec<usize> = bufs.gro_bufs.iter().map(|b| b.len()).collect();
+            for buf in bufs.gro_bufs.iter_mut() {
+                buf[..64 * 1024].fill(0xAA);
+            }
+
+            bufs.release_pages();
+
+            for (buf, len) in bufs.gro_bufs.iter_mut().zip(lens) {
+                assert_eq!(buf.len(), len);
+                let start = buf.as_ptr() as usize;
+                let first_page = start.next_multiple_of(page) - start;
+                let interior = &buf[first_page..64 * 1024 - page];
+                assert!(
+                    interior.iter().all(|&b| b == 0),
+                    "page-aligned interior must be discarded"
+                );
+                buf[..64 * 1024].fill(0x55);
+                assert!(buf[..64 * 1024].iter().all(|&b| b == 0x55));
+            }
         }
 
         #[tokio::test]
