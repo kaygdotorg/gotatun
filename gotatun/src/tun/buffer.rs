@@ -23,7 +23,6 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
-use zerocopy::IntoBytes;
 
 /// Create a pair of [`BufferedIpSend`] and [`BufferedIpRecv`] with `capacity`.
 ///
@@ -115,34 +114,12 @@ impl IpSend for BufferedIpSend {
     }
 }
 
-/// IP packets up to this length take the small lane of [`BufferedIpRecv`]: TCP ACKs,
-/// keystrokes, DNS, probes and other interactive traffic. Full-size segments do not.
-const SMALL_PACKET_MAX_LEN: usize = 256;
-
-/// Bound of the small lane. When it is full, small packets queue on the bulk lane instead.
-const SMALL_LANE_CAPACITY: usize = 1024;
-
-/// Most packets one [`BufferedIpRecv::recv`] call takes from each lane.
-///
-/// This bounds how long a small packet waits behind bulk that was already handed out: one
-/// quantum of full-size packets, about 0.25 ms of encryption at 3 Gbit/s, instead of up to the
-/// whole 4,000-packet queue.
-const LANE_QUANTUM: usize = 64;
-
 /// An [`IpRecv`] that wraps another [`IpRecv`] to provide buffering.
 ///
 /// This will spawn a background task that continuously calls [`IpRecv::recv`] until the buffer is
 /// full. Any call to [`IpRecv::recv`] on _this_ object will not block unless the buffer is empty.
-///
-/// Packets queue on two lanes. Small ones (see [`SMALL_PACKET_MAX_LEN`]) are handed out before
-/// queued bulk, so interactive traffic does not wait behind a standing queue of full-size
-/// segments under load (#260). Each call takes up to [`LANE_QUANTUM`] packets from each lane, so
-/// a flood of small packets cannot starve bulk. Each lane keeps its own order; a small packet
-/// can overtake bulk queued before it, which TCP and QUIC tolerate as reordering. WireGuard
-/// assigns nonces after this queue, so the tunnel's own counters stay in order.
 pub struct BufferedIpRecv<I> {
     rx: mpsc::Receiver<Packet<Ip>>,
-    small_rx: mpsc::Receiver<Packet<Ip>>,
     rx_packet_buf: Vec<Packet<Ip>>,
     _task: Arc<Task>,
     _phantom: std::marker::PhantomData<I>,
@@ -162,8 +139,6 @@ impl<I: IpRecv> BufferedIpRecv<I> {
         token: CancellationToken,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<Packet<Ip>>(capacity);
-        let (small_tx, small_rx) =
-            mpsc::channel::<Packet<Ip>>(SMALL_LANE_CAPACITY.min(capacity).max(1));
 
         // We use a timeout instead of a try_lock().expect() because there may still be an old
         // BufferedIpRecv that is in the process of being dropped. Otherwise, there would be a
@@ -182,15 +157,6 @@ impl<I: IpRecv> BufferedIpRecv<I> {
                 match inner.recv(&mut pool).await {
                     Ok(packets) => {
                         for packet in packets {
-                            let packet = if packet.as_bytes().len() <= SMALL_PACKET_MAX_LEN {
-                                match small_tx.try_send(packet) {
-                                    Ok(()) => continue,
-                                    Err(mpsc::error::TrySendError::Full(packet)) => packet,
-                                    Err(mpsc::error::TrySendError::Closed(_)) => return,
-                                }
-                            } else {
-                                packet
-                            };
                             if tx.send(packet).await.is_err() {
                                 return;
                             }
@@ -219,7 +185,6 @@ impl<I: IpRecv> BufferedIpRecv<I> {
 
         Self {
             rx,
-            small_rx,
             rx_packet_buf: vec![],
             _task: Arc::new(task),
             _phantom: std::marker::PhantomData,
@@ -233,50 +198,20 @@ impl<I: IpRecv> IpRecv for BufferedIpRecv<I> {
         &'a mut self,
         _pool: &mut PacketBufPool,
     ) -> io::Result<impl Iterator<Item = Packet<Ip>> + 'a> {
-        let Self {
-            rx,
-            small_rx,
-            rx_packet_buf: buf,
-            ..
-        } = self;
-        debug_assert!(buf.is_empty());
-
-        take_ready(small_rx, buf);
-        take_ready(rx, buf);
-        if buf.is_empty() {
-            // Nothing queued: wait for the first packet on either lane, then take what else
-            // arrived with it. A lane only closes when the worker stops, which closes both.
-            let first = tokio::select! {
-                biased;
-                Some(packet) = small_rx.recv() => Some(packet),
-                Some(packet) = rx.recv() => Some(packet),
-                else => None,
-            };
-            let Some(first) = first else {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "channel closed",
-                ));
-            };
-            buf.push(first);
-            take_ready(small_rx, buf);
-            take_ready(rx, buf);
+        let max_n = self.rx.max_capacity();
+        let n = self.rx.recv_many(&mut self.rx_packet_buf, max_n).await;
+        if n == 0 {
+            // Channel is closed
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "channel closed",
+            ));
         }
-        Ok(buf.drain(..))
+        Ok(self.rx_packet_buf.drain(..n))
     }
 
     fn mtu(&self) -> MtuWatcher {
         self.mtu.clone()
-    }
-}
-
-/// Move up to [`LANE_QUANTUM`] already-queued packets from `rx` to `buf` without waiting.
-fn take_ready(rx: &mut mpsc::Receiver<Packet<Ip>>, buf: &mut Vec<Packet<Ip>>) {
-    for _ in 0..LANE_QUANTUM {
-        match rx.try_recv() {
-            Ok(packet) => buf.push(packet),
-            Err(_) => break,
-        }
     }
 }
 
@@ -325,7 +260,7 @@ fn is_fatal_tun_error(err: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{BufferedIpRecv, LANE_QUANTUM};
+    use super::BufferedIpRecv;
     use crate::{
         packet::{Ip, Packet, PacketBufPool},
         tun::{IpRecv, MtuWatcher},
@@ -335,62 +270,6 @@ mod tests {
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
     use zerocopy::IntoBytes;
-
-    /// Hands out pre-built batches, then waits forever.
-    struct Batches(VecDeque<Vec<Packet<Ip>>>);
-
-    impl IpRecv for Batches {
-        async fn recv<'a>(
-            &'a mut self,
-            _pool: &mut PacketBufPool,
-        ) -> io::Result<impl Iterator<Item = Packet<Ip>> + Send + 'a> {
-            match self.0.pop_front() {
-                Some(batch) => Ok(batch.into_iter()),
-                None => std::future::pending().await,
-            }
-        }
-
-        fn mtu(&self) -> MtuWatcher {
-            MtuWatcher::new(1420)
-        }
-    }
-
-    /// An IP packet of `len` bytes, identified by `id` in bytes 4..6 (the IPv4 identification).
-    fn packet(len: usize, id: u16) -> Packet<Ip> {
-        let mut bytes = BytesMut::zeroed(len);
-        bytes[0] = 0x45;
-        bytes[4..6].copy_from_slice(&id.to_be_bytes());
-        Packet::from_bytes(bytes).try_into_ip().unwrap()
-    }
-
-    fn id(packet: &Packet<Ip>) -> u16 {
-        let bytes = packet.as_bytes();
-        u16::from_be_bytes([bytes[4], bytes[5]])
-    }
-
-    async fn queued_recv(batch: Vec<Packet<Ip>>) -> BufferedIpRecv<Batches> {
-        let total = batch.len();
-        let inner = Arc::new(Mutex::new(Batches(VecDeque::from([batch]))));
-        let recv =
-            BufferedIpRecv::new(4000, PacketBufPool::new(1), inner, CancellationToken::new()).await;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while recv.small_rx.len() + recv.rx.len() < total {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the worker must queue the whole batch");
-        recv
-    }
-
-    async fn next_ids<I: IpRecv>(recv: &mut BufferedIpRecv<I>) -> Vec<u16> {
-        let mut pool = PacketBufPool::new(1);
-        recv.recv(&mut pool)
-            .await
-            .unwrap()
-            .map(|p| id(&p))
-            .collect()
-    }
 
     /// Hands out scripted receive results, then waits forever.
     struct Script(VecDeque<io::Result<Vec<Packet<Ip>>>>);
@@ -409,6 +288,14 @@ mod tests {
         fn mtu(&self) -> MtuWatcher {
             MtuWatcher::new(1420)
         }
+    }
+
+    /// An IP packet of `len` bytes, identified by `id` in bytes 4..6 (the IPv4 identification).
+    fn packet(len: usize, id: u16) -> Packet<Ip> {
+        let mut bytes = BytesMut::zeroed(len);
+        bytes[0] = 0x45;
+        bytes[4..6].copy_from_slice(&id.to_be_bytes());
+        Packet::from_bytes(bytes).try_into_ip().unwrap()
     }
 
     async fn scripted_recv(script: Vec<io::Result<Vec<Packet<Ip>>>>) -> BufferedIpRecv<Script> {
@@ -433,10 +320,17 @@ mod tests {
             Ok(vec![packet(1400, 7)]),
         ])
         .await;
+        let mut pool = PacketBufPool::new(1);
 
-        let ids = tokio::time::timeout(Duration::from_secs(5), next_ids(&mut recv))
+        let ids: Vec<u16> = tokio::time::timeout(Duration::from_secs(5), recv.recv(&mut pool))
             .await
-            .expect("the valid frame must arrive");
+            .expect("the valid frame must arrive")
+            .expect("a bad frame must not stop the reader")
+            .map(|p| {
+                let bytes = p.as_bytes();
+                u16::from_be_bytes([bytes[4], bytes[5]])
+            })
+            .collect();
         assert_eq!(ids, [7]);
     }
 
@@ -453,37 +347,5 @@ mod tests {
             result.err().map(|e| e.kind()),
             Some(io::ErrorKind::UnexpectedEof)
         );
-    }
-
-    /// A small packet queued behind bulk is handed out first, and each lane keeps its order.
-    #[tokio::test]
-    async fn small_packets_overtake_queued_bulk() {
-        let mut batch: Vec<_> = (0..200).map(|i| packet(1400, i)).collect();
-        batch.insert(150, packet(92, 1000));
-        batch.push(packet(52, 1001));
-        let mut recv = queued_recv(batch).await;
-
-        let first = next_ids(&mut recv).await;
-        let expected: Vec<u16> = [1000, 1001]
-            .into_iter()
-            .chain(0..LANE_QUANTUM as u16)
-            .collect();
-        assert_eq!(first, expected);
-
-        let second = next_ids(&mut recv).await;
-        assert_eq!(second[0], LANE_QUANTUM as u16, "bulk resumes in order");
-    }
-
-    /// A steady stream of small packets cannot starve bulk: every call that finds bulk
-    /// queued hands some of it out.
-    #[tokio::test]
-    async fn bulk_is_not_starved_by_small_packets() {
-        let mut batch: Vec<_> = (0..300).map(|i| packet(64, i)).collect();
-        batch.extend((1000..1010).map(|i| packet(1400, i)));
-        let mut recv = queued_recv(batch).await;
-
-        let first = next_ids(&mut recv).await;
-        let expected: Vec<u16> = (0..LANE_QUANTUM as u16).chain(1000..1010).collect();
-        assert_eq!(first, expected);
     }
 }
