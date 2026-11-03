@@ -141,15 +141,26 @@ impl BufferedUdpReceive {
         let recv_task = Task::spawn("buffered UDP receive", async move {
             let mut recv_many_buf = Default::default();
             let mut packet_bufs = vec![];
+            let mut dropped: u64 = 0;
 
             loop {
-                // Read packets from the socket.
+                // Read packets from the socket. Only a gone socket ends this task; a bad
+                // datagram is dropped, and what the batch delivered before it is forwarded.
                 if let Err(err) = udp_rx
                     .recv_many_from(&mut recv_many_buf, &mut recv_pool, &mut packet_bufs)
                     .await
                 {
-                    let _ = recv_tx.send(Err(err)).await;
-                    return;
+                    if crate::udp::is_fatal_udp_error(&err) {
+                        let _ = recv_tx.send(Err(err)).await;
+                        return;
+                    }
+                    dropped += 1;
+                    if dropped.is_power_of_two() {
+                        tracing::warn!(
+                            "Dropped undecodable UDP datagram ({dropped} so far): {err}"
+                        );
+                    }
+                    tokio::task::yield_now().await;
                 }
 
                 for (packet_buf, src) in packet_bufs.drain(..) {
@@ -193,6 +204,95 @@ impl UdpRecv for BufferedUdpReceive {
 mod test {
     use super::*;
     use crate::udp::socket::{SockOpt, UdpSocket};
+
+    /// Hands out scripted receive results, then waits forever.
+    struct Script(std::collections::VecDeque<io::Result<(Packet, SocketAddr)>>);
+
+    impl UdpRecv for Script {
+        type RecvManyBuf = ();
+
+        async fn recv_from(
+            &mut self,
+            _pool: &mut PacketBufPool,
+        ) -> io::Result<(Packet, SocketAddr)> {
+            match self.0.pop_front() {
+                Some(result) => result,
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    fn datagram(payload: &[u8]) -> (Packet, SocketAddr) {
+        (
+            Packet::from_bytes(bytes::BytesMut::from(payload)),
+            "127.0.0.1:51820".parse().unwrap(),
+        )
+    }
+
+    /// A datagram the socket layer refuses (e.g. truncated) is dropped and the next one is
+    /// still delivered; before #260 the first error stopped the receive task for good.
+    #[tokio::test]
+    async fn bad_datagram_is_dropped_and_the_next_one_passes() {
+        let script = Script(
+            [
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated UDP GRO receive",
+                )),
+                Ok(datagram(b"after-bad")),
+            ]
+            .into(),
+        );
+        let mut receiver = BufferedUdpReceive::new(16, script, PacketBufPool::new(4));
+
+        let (packet, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            receiver.recv_from(&mut PacketBufPool::new(1)),
+        )
+        .await
+        .expect("the valid datagram must arrive")
+        .expect("a bad datagram must not be reported as a receive failure");
+        assert_eq!(&packet[..], b"after-bad");
+    }
+
+    /// A gone socket is still reported, and the receive task then stops.
+    #[tokio::test]
+    async fn closed_socket_still_stops_the_receiver() {
+        let script = Script([Err(io::Error::from_raw_os_error(libc::EBADF))].into());
+        let mut receiver = BufferedUdpReceive::new(16, script, PacketBufPool::new(4));
+        let mut pool = PacketBufPool::new(1);
+
+        let first = receiver.recv_from(&mut pool).await;
+        assert_eq!(
+            first.err().and_then(|e| e.raw_os_error()),
+            Some(libc::EBADF)
+        );
+        let second = receiver.recv_from(&mut pool).await;
+        assert_eq!(
+            second.err().map(|e| e.kind()),
+            Some(io::ErrorKind::BrokenPipe)
+        );
+    }
+
+    #[test]
+    fn only_a_gone_socket_is_fatal() {
+        use crate::udp::is_fatal_udp_error;
+        for kind in [
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::WouldBlock,
+        ] {
+            assert!(!is_fatal_udp_error(&io::Error::from(kind)), "{kind:?}");
+        }
+        for err in [
+            io::Error::from_raw_os_error(libc::EBADF),
+            io::Error::from_raw_os_error(libc::ENOTSOCK),
+            io::Error::from(io::ErrorKind::UnexpectedEof),
+            io::Error::from(io::ErrorKind::BrokenPipe),
+        ] {
+            assert!(is_fatal_udp_error(&err), "{err:?}");
+        }
+    }
 
     #[tokio::test]
     /// Regression test for security advisory GHSA-6gxq-8xp9-742r.
