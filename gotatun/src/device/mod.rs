@@ -46,7 +46,9 @@ use crate::noise::{Tunn, TunnResult};
 use crate::packet::{PacketBufPool, WgKind};
 use crate::task::Task;
 use crate::tun::{IpRecv, IpSend, MtuWatcher};
-use crate::udp::buffer::{BufferedUdpReceive, BufferedUdpSend};
+#[cfg(not(target_os = "linux"))]
+use crate::udp::buffer::BufferedUdpReceive;
+use crate::udp::buffer::BufferedUdpSend;
 use crate::udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams};
 use crate::x25519;
 use allowed_ips::AllowedIps;
@@ -210,7 +212,12 @@ impl<T: DeviceTransports> Connection<T> {
 
         let buffered_udp_tx = BufferedUdpSend::new(MAX_PACKET_BUFS, udp_tx.clone());
 
-        let buffered_udp_rx = BufferedUdpReceive::new(MAX_PACKET_BUFS, udp_rx, pool.clone());
+        // Linux sockets already return recvmmsg/GRO batches here. Avoid queueing them across a
+        // second worker handoff before packet processing.
+        #[cfg(target_os = "linux")]
+        let incoming_udp_rx = udp_rx;
+        #[cfg(not(target_os = "linux"))]
+        let incoming_udp_rx = BufferedUdpReceive::new(MAX_PACKET_BUFS, udp_rx, pool.clone());
 
         // Start DAITA/hooks tasks
         #[cfg(feature = "daita")]
@@ -256,7 +263,7 @@ impl<T: DeviceTransports> Connection<T> {
                 Arc::downgrade(&device_arc),
                 buffered_ip_tx.clone(),
                 buffered_udp_tx,
-                buffered_udp_rx,
+                incoming_udp_rx,
                 pool.clone(),
             )
             .map_err(register_fatal_error.clone()),
@@ -684,129 +691,140 @@ impl<T: DeviceTransports> DeviceState<T> {
             (private_key, public_key, rate_limiter, tun_mtu)
         };
 
+        let mut udp_recv_buf = Default::default();
+        let mut received_packets = Vec::new();
         loop {
-            let (src_buf, addr) = udp_rx
-                .recv_from(&mut packet_pool)
+            received_packets.clear();
+            udp_rx
+                .recv_many_from(&mut udp_recv_buf, &mut packet_pool, &mut received_packets)
                 .await
                 .map_err(Error::IoError)?;
-            let parsed_packet = match rate_limiter.verify_packet(addr, src_buf) {
-                Ok(packet) => packet,
-                Err(TunnResult::WriteToNetwork(WgKind::CookieReply(cookie))) => {
-                    // Note: Cookies should not affect counters.
-                    udp_tx
-                        .send_to(cookie.into(), addr)
-                        .await
-                        .map_err(Error::IoError)?;
-                    continue;
-                }
-                Err(_) => continue,
-            };
 
-            let Some(device) = device.upgrade() else {
-                return Ok(());
-            };
-
-            let device_guard = device.read().await;
-            let peers = &device_guard.peers;
-            let peer = match &parsed_packet {
-                WgKind::HandshakeInit(p) => parse_handshake_anon(&private_key, &public_key, p)
-                    .ok()
-                    .and_then(|hh| peers.get(&x25519::PublicKey::from(hh.peer_static_public)))
-                    .cloned(),
-                WgKind::HandshakeResp(p) => device_guard
-                    .peers_by_idx
-                    .lock()
-                    .get(&p.receiver_idx.get())
-                    .cloned(),
-                WgKind::CookieReply(p) => device_guard
-                    .peers_by_idx
-                    .lock()
-                    .get(&p.receiver_idx.get())
-                    .cloned(),
-                WgKind::Data(p) => device_guard
-                    .peers_by_idx
-                    .lock()
-                    .get(&p.header.receiver_idx.get())
-                    .cloned(),
-            };
-            let Some(peer_arc) = peer else { continue };
-            let mut peer = peer_arc.lock().await;
-
-            let result = peer.handle_incoming_packet(parsed_packet, addr);
-
-            #[cfg(feature = "daita")]
-            let PeerState { tunnel, daita, .. } = &mut *peer;
-            #[cfg(not(feature = "daita"))]
-            let PeerState { tunnel, .. } = &mut *peer;
-
-            match result {
-                TunnResult::Done => {}
-                TunnResult::Err(_) => continue,
-                // Flush pending queue
-                TunnResult::WriteToNetwork(packet) => {
-                    // Register sender_idx from outgoing handshake packets
-                    Self::register_handshake_idx(&device_guard.peers_by_idx, &packet, &peer_arc);
-
-                    // TODO: does this end up with the packets being out-of-order?
-                    let packets =
-                        std::iter::once(packet).chain(tunnel.get_queued_packets(&mut tun_mtu));
-
-                    #[cfg(feature = "daita")]
-                    let packets = packets.filter_map(|p| match daita {
-                        Some(daita) => daita.on_tunnel_sent(p),
-                        None => Some(p),
-                    });
-
-                    for packet in packets {
-                        if let Err(_err) = udp_tx.send_to(packet.into(), addr).await {
-                            tracing::trace!("udp.send_to failed");
-                            break;
-                        }
-                    }
-                }
-                #[cfg_attr(not(feature = "daita"), expect(unused_mut))]
-                TunnResult::WriteToTunnel(mut packet) => {
-                    #[cfg(feature = "daita")]
-                    if let Some(daita) = daita {
-                        match daita.on_data_recv(packet) {
-                            Some(new) => packet = new,
-                            None => continue,
-                        }
-                    }
-
-                    // keepalive
-                    if packet.is_empty() {
+            for (src_buf, addr) in received_packets.drain(..) {
+                let parsed_packet = match rate_limiter.verify_packet(addr, src_buf) {
+                    Ok(packet) => packet,
+                    Err(TunnResult::WriteToNetwork(WgKind::CookieReply(cookie))) => {
+                        // Note: Cookies should not affect counters.
+                        udp_tx
+                            .send_to(cookie.into(), addr)
+                            .await
+                            .map_err(Error::IoError)?;
                         continue;
                     }
-                    let Ok(packet) = packet.try_into_ipvx() else {
-                        continue;
-                    };
+                    Err(_) => continue,
+                };
 
-                    // Only accept the incoming packet if an outgoing packet to the source IP address
-                    // would be routed to the same peer. This is determined by the most specific
-                    // matching allowed IP range on the device.
-                    let (source, packet): (IpAddr, _) = packet.either(
-                        |ipv4| (ipv4.header.source().into(), ipv4.into()),
-                        |ipv6| (ipv6.header.source().into(), ipv6.into()),
-                    );
-                    let routed_to_this_peer = device_guard
-                        .peers_by_ip
-                        .find(source)
-                        .is_some_and(|owner| Arc::ptr_eq(owner, &peer_arc));
-                    if !routed_to_this_peer {
-                        if cfg!(debug_assertions) {
-                            let unspecified = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into();
-                            tracing::warn!(
-                                "peer at {} is not allowed to send us packets from: {source}",
-                                peer.endpoint().addr.unwrap_or(unspecified)
-                            );
+                let Some(device) = device.upgrade() else {
+                    return Ok(());
+                };
+
+                let device_guard = device.read().await;
+                let peers = &device_guard.peers;
+                let peer = match &parsed_packet {
+                    WgKind::HandshakeInit(p) => parse_handshake_anon(&private_key, &public_key, p)
+                        .ok()
+                        .and_then(|hh| peers.get(&x25519::PublicKey::from(hh.peer_static_public)))
+                        .cloned(),
+                    WgKind::HandshakeResp(p) => device_guard
+                        .peers_by_idx
+                        .lock()
+                        .get(&p.receiver_idx.get())
+                        .cloned(),
+                    WgKind::CookieReply(p) => device_guard
+                        .peers_by_idx
+                        .lock()
+                        .get(&p.receiver_idx.get())
+                        .cloned(),
+                    WgKind::Data(p) => device_guard
+                        .peers_by_idx
+                        .lock()
+                        .get(&p.header.receiver_idx.get())
+                        .cloned(),
+                };
+                let Some(peer_arc) = peer else { continue };
+                let mut peer = peer_arc.lock().await;
+
+                let result = peer.handle_incoming_packet(parsed_packet, addr);
+
+                #[cfg(feature = "daita")]
+                let PeerState { tunnel, daita, .. } = &mut *peer;
+                #[cfg(not(feature = "daita"))]
+                let PeerState { tunnel, .. } = &mut *peer;
+
+                match result {
+                    TunnResult::Done => {}
+                    TunnResult::Err(_) => continue,
+                    // Flush pending queue
+                    TunnResult::WriteToNetwork(packet) => {
+                        // Register sender_idx from outgoing handshake packets
+                        Self::register_handshake_idx(
+                            &device_guard.peers_by_idx,
+                            &packet,
+                            &peer_arc,
+                        );
+
+                        // TODO: does this end up with the packets being out-of-order?
+                        let packets =
+                            std::iter::once(packet).chain(tunnel.get_queued_packets(&mut tun_mtu));
+
+                        #[cfg(feature = "daita")]
+                        let packets = packets.filter_map(|p| match daita {
+                            Some(daita) => daita.on_tunnel_sent(p),
+                            None => Some(p),
+                        });
+
+                        for packet in packets {
+                            if let Err(_err) = udp_tx.send_to(packet.into(), addr).await {
+                                tracing::trace!("udp.send_to failed");
+                                break;
+                            }
                         }
-                        continue;
                     }
+                    #[cfg_attr(not(feature = "daita"), expect(unused_mut))]
+                    TunnResult::WriteToTunnel(mut packet) => {
+                        #[cfg(feature = "daita")]
+                        if let Some(daita) = daita {
+                            match daita.on_data_recv(packet) {
+                                Some(new) => packet = new,
+                                None => continue,
+                            }
+                        }
 
-                    if let Err(e) = tun_tx.send(packet).await {
-                        tracing::trace!("buffered_tun_send.send failed");
-                        return Err(Error::IoError(e));
+                        // keepalive
+                        if packet.is_empty() {
+                            continue;
+                        }
+                        let Ok(packet) = packet.try_into_ipvx() else {
+                            continue;
+                        };
+
+                        // Only accept the incoming packet if an outgoing packet to the source IP address
+                        // would be routed to the same peer. This is determined by the most specific
+                        // matching allowed IP range on the device.
+                        let (source, packet): (IpAddr, _) = packet.either(
+                            |ipv4| (ipv4.header.source().into(), ipv4.into()),
+                            |ipv6| (ipv6.header.source().into(), ipv6.into()),
+                        );
+                        let routed_to_this_peer = device_guard
+                            .peers_by_ip
+                            .find(source)
+                            .is_some_and(|owner| Arc::ptr_eq(owner, &peer_arc));
+                        if !routed_to_this_peer {
+                            if cfg!(debug_assertions) {
+                                let unspecified =
+                                    SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into();
+                                tracing::warn!(
+                                    "peer at {} is not allowed to send us packets from: {source}",
+                                    peer.endpoint().addr.unwrap_or(unspecified)
+                                );
+                            }
+                            continue;
+                        }
+
+                        if let Err(e) = tun_tx.send(packet).await {
+                            tracing::trace!("buffered_tun_send.send failed");
+                            return Err(Error::IoError(e));
+                        }
                     }
                 }
             }

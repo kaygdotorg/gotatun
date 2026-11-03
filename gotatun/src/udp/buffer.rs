@@ -16,9 +16,13 @@ use std::{net::SocketAddr, sync::Arc};
 use futures::{FutureExt, select};
 use tokio::{io, sync::mpsc};
 
-use crate::packet::{Packet, PacketBufPool};
+use crate::packet::Packet;
+#[cfg(any(not(target_os = "linux"), test))]
+use crate::packet::PacketBufPool;
 use crate::task::Task;
-use crate::udp::{UdpRecv, UdpSend};
+#[cfg(any(not(target_os = "linux"), test))]
+use crate::udp::UdpRecv;
+use crate::udp::UdpSend;
 
 /// A [`UdpSend`] that wraps another [`UdpSend`] to provide buffering.
 ///
@@ -118,11 +122,13 @@ impl UdpSend for BufferedUdpSend {
 /// This will spawn a background task that continuously calls [`UdpRecv::recv_from`] until the
 /// buffer is full. Any call to [`UdpRecv::recv_from`] on _this_ object will not block unless the
 /// buffer is empty.
+#[cfg(any(not(target_os = "linux"), test))]
 pub struct BufferedUdpReceive {
     _recv_task: Arc<Task>,
     recv_rx: mpsc::Receiver<io::Result<(Packet, SocketAddr)>>,
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 impl BufferedUdpReceive {
     /// Wrap a [`UdpRecv`] into a [`BufferedUdpReceive`] with `capacity`.
     pub fn new(
@@ -168,6 +174,7 @@ impl BufferedUdpReceive {
     }
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 impl UdpRecv for BufferedUdpReceive {
     type RecvManyBuf = ();
 
