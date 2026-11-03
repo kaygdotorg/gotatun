@@ -747,6 +747,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                         packet_pool.release();
                         udp_rx.release_recv_buf(&mut udp_recv_buf);
                         crate::packet::return_freed_heap_to_os();
+                        tracing::debug!("Link idle: released packet buffers to the OS");
                     }
                     continue;
                 }
