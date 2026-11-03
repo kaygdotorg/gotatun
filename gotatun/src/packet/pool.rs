@@ -181,11 +181,9 @@ impl Drop for ReturnToPool {
 
 /// Ask the C allocator to hand freed heap pages back to the OS.
 ///
-/// glibc keeps freed small chunks inside its arenas, and Apple's allocator keeps freed
-/// regions resident until the system is under memory pressure, so the packet buffers
-/// released by an idle pool would stay resident without this. Other allocators return
-/// memory on their own schedule, and there this does nothing. It walks every arena or zone,
-/// so call it only when idle.
+/// glibc keeps freed small chunks inside its arenas, so the packet buffers released by an
+/// idle pool would stay resident without this. Other allocators return memory on their own
+/// schedule, and there this does nothing. It walks every arena, so call it only when idle.
 #[cfg(feature = "device")]
 pub(crate) fn return_freed_heap_to_os() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -193,20 +191,6 @@ pub(crate) fn return_freed_heap_to_os() {
     unsafe {
         libc::malloc_trim(0);
     }
-
-    #[cfg(target_vendor = "apple")]
-    // SAFETY: a null zone asks every malloc zone to release its free pages; a goal of 0
-    // means as much as possible. No pointer we own is passed.
-    unsafe {
-        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
-    }
-}
-
-#[cfg(all(feature = "device", target_vendor = "apple"))]
-unsafe extern "C" {
-    /// `<malloc/malloc.h>` in libSystem: return free memory of `zone` (all zones if null) to
-    /// the OS, up to `goal` bytes (0: no limit). Returns the number of bytes released.
-    fn malloc_zone_pressure_relief(zone: *mut libc::c_void, goal: libc::size_t) -> libc::size_t;
 }
 
 #[cfg(test)]
