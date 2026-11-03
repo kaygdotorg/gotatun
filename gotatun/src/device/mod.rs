@@ -66,6 +66,33 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100;
 /// Maximum number of packet buffers that each channel may contain
 const MAX_PACKET_BUFS: usize = 4000;
 
+/// How often the receive task checks for an idle link.
+///
+/// After a load the packet pool, the allocator and the UDP receive buffers keep about
+/// 7–22 MiB resident per endpoint (#260). Memory goes back to the OS at the end of the first
+/// idle period after a busy one, so 5–10 s after traffic stops. A shorter pause keeps the
+/// buffers warm. Coming back from idle costs a page fault per newly touched buffer page,
+/// which is microseconds against a network round trip.
+const IDLE_RELEASE_PERIOD: Duration = Duration::from_secs(5);
+
+/// A period in which fewer packet buffers than this were taken counts as idle: under about
+/// 13 packets/s, which covers keepalives (as often as every second) and other trickles that
+/// need only a handful of buffers.
+const IDLE_MAX_BUFFERS_PER_PERIOD: u32 = 64;
+
+/// Whether this idle-check period ends a busy stretch, given the buffers taken in it.
+///
+/// `busy` remembers whether a busy period came since the last release, so a long quiet
+/// stretch releases once rather than every period.
+fn idle_release_due(busy: &mut bool, taken: u32) -> bool {
+    if taken >= IDLE_MAX_BUFFERS_PER_PERIOD {
+        *busy = true;
+        false
+    } else {
+        std::mem::take(busy)
+    }
+}
+
 /// Error of [`Device`]-related operations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -693,12 +720,37 @@ impl<T: DeviceTransports> DeviceState<T> {
 
         let mut udp_recv_buf = Default::default();
         let mut received_packets = Vec::new();
+
+        // Idle memory release. One timer for the task's lifetime, re-armed once per period,
+        // and polled only when the socket has nothing to read (`biased` polls the receive
+        // first), so a busy link pays nothing per packet. Every receive is cancel-safe while
+        // pending: nothing is consumed before its single await completes.
+        let idle_check = tokio::time::sleep(IDLE_RELEASE_PERIOD);
+        tokio::pin!(idle_check);
+        let mut busy = false;
+
         loop {
             received_packets.clear();
-            udp_rx
-                .recv_many_from(&mut udp_recv_buf, &mut packet_pool, &mut received_packets)
-                .await
-                .map_err(Error::IoError)?;
+            tokio::select! {
+                biased;
+                received = udp_rx.recv_many_from(
+                    &mut udp_recv_buf,
+                    &mut packet_pool,
+                    &mut received_packets,
+                ) => received.map_err(Error::IoError)?,
+                () = &mut idle_check => {
+                    idle_check
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + IDLE_RELEASE_PERIOD);
+                    // The pool sees packets in both directions, so it decides idleness.
+                    if idle_release_due(&mut busy, packet_pool.take_count()) {
+                        packet_pool.release();
+                        udp_rx.release_recv_buf(&mut udp_recv_buf);
+                        crate::packet::return_freed_heap_to_os();
+                    }
+                    continue;
+                }
+            }
 
             for (src_buf, addr) in received_packets.drain(..) {
                 let parsed_packet = match rate_limiter.verify_packet(addr, src_buf) {
@@ -941,5 +993,31 @@ impl<T: DeviceTransports> Connection<T> {
         drop(udp);
 
         join!(incoming.stop(), timers.stop(), outgoing.stop(),);
+    }
+}
+
+#[cfg(test)]
+mod idle_release_tests {
+    use super::{IDLE_MAX_BUFFERS_PER_PERIOD, idle_release_due};
+
+    /// Memory is released once, at the first quiet period after a busy one. Trickles such as
+    /// keepalives count as quiet, and a long quiet stretch does not release again.
+    #[test]
+    fn idle_release_fires_once_per_busy_to_quiet_transition() {
+        let busy_period = IDLE_MAX_BUFFERS_PER_PERIOD;
+        let keepalive_trickle = 10;
+        let mut busy = false;
+
+        assert!(
+            !idle_release_due(&mut busy, 0),
+            "nothing to release at start"
+        );
+        assert!(!idle_release_due(&mut busy, busy_period));
+        assert!(!idle_release_due(&mut busy, busy_period * 100));
+        assert!(idle_release_due(&mut busy, keepalive_trickle));
+        assert!(!idle_release_due(&mut busy, keepalive_trickle));
+        assert!(!idle_release_due(&mut busy, 0));
+        assert!(!idle_release_due(&mut busy, busy_period));
+        assert!(idle_release_due(&mut busy, 0));
     }
 }

@@ -96,6 +96,14 @@ pub trait UdpRecv: Send + Sync {
         }
     }
 
+    /// Give the memory behind an idle `recv_buf` back to the OS while keeping it usable.
+    ///
+    /// The device calls this after the link has been idle, never while a
+    /// [`UdpRecv::recv_many_from`] call is using the buffer. The default does nothing.
+    fn release_recv_buf(&self, recv_buf: &mut Self::RecvManyBuf) {
+        let _ = recv_buf;
+    }
+
     /// Enable UDP GRO, if available
     fn enable_udp_gro(&self) -> io::Result<()> {
         Ok(())

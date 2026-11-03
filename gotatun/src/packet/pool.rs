@@ -20,32 +20,51 @@ use crate::packet::Packet;
 /// A pool of packet buffers.
 #[derive(Clone)]
 pub struct PacketBufPool<const N: usize = 4096> {
-    queue: Arc<Mutex<VecDeque<BytesMut>>>,
+    queue: Arc<Mutex<PoolQueue>>,
     capacity: usize,
+}
+
+/// Buffers waiting for re-use, plus the use count the idle release reads.
+///
+/// All of it sits behind the mutex that every `get` and every returned buffer already take,
+/// so counting use adds no extra synchronisation to the packet path.
+struct PoolQueue {
+    buffers: VecDeque<BytesMut>,
+    /// Most buffers this queue retains. Stored, not read from `buffers.capacity()`, because
+    /// an idle release frees the deque's storage too.
+    capacity: usize,
+    /// Buffers taken since the last [`PacketBufPool::take_count`]. Read only by `device`.
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
+    taken: u32,
 }
 
 impl<const N: usize> PacketBufPool<N> {
     /// Create a new [`PacketBufPool`] with space for at least `capacity` packets,
     /// each allocated with a capacity of `N` bytes.
     pub fn new(capacity: usize) -> Self {
-        let mut queue = VecDeque::with_capacity(capacity);
+        let mut buffers = VecDeque::with_capacity(capacity);
 
         // pre-allocate buffers
         for _ in 0..capacity {
-            queue.push_back(BytesMut::zeroed(N).split_to(0));
+            buffers.push_back(BytesMut::zeroed(N).split_to(0));
         }
 
-        PacketBufPool {
-            queue: Arc::new(Mutex::new(queue)),
-            capacity,
-        }
+        Self::from_buffers(buffers, capacity)
     }
 
     /// Create an empty [`PacketBufPool`] with space for at least `capacity` returned buffers.
     #[cfg(feature = "device")]
     pub(crate) fn new_lazy(capacity: usize) -> Self {
-        Self {
-            queue: Arc::new(Mutex::new(VecDeque::with_capacity(capacity))),
+        Self::from_buffers(VecDeque::new(), capacity)
+    }
+
+    fn from_buffers(buffers: VecDeque<BytesMut>, capacity: usize) -> Self {
+        PacketBufPool {
+            queue: Arc::new(Mutex::new(PoolQueue {
+                buffers,
+                capacity,
+                taken: 0,
+            })),
             capacity,
         }
     }
@@ -55,11 +74,35 @@ impl<const N: usize> PacketBufPool<N> {
         self.capacity
     }
 
+    /// Number of buffers taken from the pool since the previous call (saturating).
+    #[cfg(feature = "device")]
+    pub(crate) fn take_count(&self) -> u32 {
+        std::mem::take(&mut self.queue.lock().unwrap().taken)
+    }
+
+    /// Free every retained buffer, including the queue's own storage.
+    ///
+    /// Buffers still in flight return to the pool as usual afterwards, so the pool keeps
+    /// working and refills on demand.
+    #[cfg(feature = "device")]
+    pub(crate) fn release(&self) {
+        let released = std::mem::take(&mut self.queue.lock().unwrap().buffers);
+        // Free outside the lock; a packet arriving now must not wait on thousands of frees.
+        drop(released);
+    }
+
+    #[cfg(all(test, feature = "device"))]
+    fn retained(&self) -> usize {
+        self.queue.lock().unwrap().buffers.len()
+    }
+
     /// Try to re-use a [`Packet`] from the pool.
     fn re_use(&self) -> Option<Packet<[u8]>> {
-        while let Some(mut pointer_to_start_of_allocation) =
-            { self.queue.lock().unwrap().pop_front() }
-        {
+        while let Some(mut pointer_to_start_of_allocation) = {
+            let mut queue = self.queue.lock().unwrap();
+            queue.taken = queue.taken.saturating_add(1);
+            queue.buffers.pop_front()
+        } {
             debug_assert_eq!(pointer_to_start_of_allocation.len(), 0);
             if pointer_to_start_of_allocation.try_reclaim(N) {
                 let mut buf = pointer_to_start_of_allocation.split_off(0);
@@ -122,17 +165,31 @@ pub struct ReturnToPool {
     /// - Points to the start of an `N`-sized allocation.
     // Note: Option is faster than mem::take
     pointer_to_start_of_allocation: Option<BytesMut>,
-    queue: Arc<Mutex<VecDeque<BytesMut>>>,
+    queue: Arc<Mutex<PoolQueue>>,
 }
 
 impl Drop for ReturnToPool {
     fn drop(&mut self) {
         let p = self.pointer_to_start_of_allocation.take().unwrap();
         let mut queue_g = self.queue.lock().unwrap();
-        if queue_g.len() < queue_g.capacity() {
+        if queue_g.buffers.len() < queue_g.capacity {
             // Add the packet back to the pool unless we're at capacity
-            queue_g.push_back(p);
+            queue_g.buffers.push_back(p);
         }
+    }
+}
+
+/// Ask the C allocator to hand freed heap pages back to the OS.
+///
+/// glibc keeps freed small chunks inside its arenas, so the packet buffers released by an
+/// idle pool would stay resident without this. Other allocators return memory on their own
+/// schedule, and there this does nothing. It walks every arena, so call it only when idle.
+#[cfg(feature = "device")]
+pub(crate) fn return_freed_heap_to_os() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim takes no pointers; it only releases glibc's own free pages.
+    unsafe {
+        libc::malloc_trim(0);
     }
 }
 
@@ -244,7 +301,31 @@ mod tests {
             }
         });
 
-        assert_eq!(pool.queue.lock().unwrap().len(), CAPACITY);
+        assert_eq!(pool.retained(), CAPACITY);
+    }
+
+    /// The pool counts every buffer taken, and after a release it keeps recycling, bounded by
+    /// its capacity.
+    #[cfg(feature = "device")]
+    #[test]
+    fn release_frees_retained_buffers_and_pool_keeps_working() {
+        let pool = PacketBufPool::<1024>::new_lazy(4);
+
+        drop((pool.get(), pool.get(), pool.get()));
+        assert_eq!(pool.take_count(), 3);
+        assert_eq!(pool.take_count(), 0, "reading the count resets it");
+        assert_eq!(pool.retained(), 3);
+
+        pool.release();
+        assert_eq!(pool.retained(), 0);
+
+        let packets: Vec<_> = (0..6).map(|_| pool.get()).collect();
+        drop(packets);
+        assert_eq!(
+            pool.retained(),
+            4,
+            "returned buffers are retained again, up to capacity"
+        );
     }
 
     /// Test buffer recycle semantics of [PacketBufPool].
