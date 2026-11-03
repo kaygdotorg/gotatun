@@ -9,13 +9,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-//! IP send and receive wrappers for the device's TUN side.
-//!
-//! The read side is buffered: a task reads the device and hands packets to encryption over a
-//! channel. The write side is not (#260): the task that decrypts a packet writes it to the device
-//! itself through [`DirectIpSend`]. A channel there cost one task wake-up per packet, and on a
-//! loaded host the woken worker waited for a CPU about as long as it ran, which showed up as
-//! tail latency on every probe and ACK.
+//! Generic buffered IP send and receive implementations.
 
 use std::{io, sync::Arc, time::Duration};
 
@@ -25,74 +19,98 @@ use crate::{
     tun::{IpRecv, IpSend, MtuWatcher},
 };
 use tokio::{
-    sync::{Mutex, OwnedMutexGuard, mpsc},
+    sync::{Mutex, mpsc},
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
 
-/// Create a [`BufferedIpRecv`] with `capacity` over the device reader `recv`.
+/// Create a pair of [`BufferedIpSend`] and [`BufferedIpRecv`] with `capacity`.
 ///
-/// This takes an `Arc<Mutex<R>>` because the inner `R` will be re-used after the
-/// [BufferedIpRecv] is dropped. We will take the mutex lock when this function is called, and
-/// hold onto it for the lifetime of the receiver.
+/// This takes an `Arc<Mutex<S>>` and `Arc<Mutex<R>>` because the inner `S` and `R` will be re-used
+/// after [BufferedIpSend] or [BufferedIpRecv] is dropped. We will take the mutex lock when this
+/// function is called, and hold onto it for the lifetime of the sender or receiver.
 ///
 /// # Panics
-/// Panics if the lock is not released within 5 seconds.
-pub async fn buffered_recv<R: IpRecv>(
+/// Panics if one of the locks is already taken.
+pub async fn channel<S: IpSend, R: IpRecv>(
     capacity: usize,
     pool: PacketBufPool,
+    send: Arc<Mutex<S>>,
     recv: Arc<Mutex<R>>,
-) -> BufferedIpRecv<R> {
-    BufferedIpRecv::new(capacity, pool, recv, CancellationToken::new()).await
+) -> (BufferedIpSend, BufferedIpRecv<R>) {
+    let token = CancellationToken::new();
+    let buffer_send = BufferedIpSend::new(capacity, send, token.clone());
+    let buffer_recv = BufferedIpRecv::new(capacity, pool, recv, token).await;
+    (buffer_send, buffer_recv)
 }
 
-/// An [`IpSend`] that writes to the device from the calling task, with no channel or worker.
+/// An [`IpSend`] that wraps another [`IpSend`] to provide buffering.
 ///
-/// It holds the device writer's lock for its whole lifetime, so it is the only writer: packets
-/// reach the device in exactly the order [`IpSend::send`] is called. The decrypting task is the
-/// one caller, so per-flow order is the order of decryption, as it was through the channel.
-///
-/// A packet the device refuses is dropped and counted, and the next one is still written. Only a
-/// device that is gone returns an error.
-pub struct DirectIpSend<I: IpSend> {
-    inner: OwnedMutexGuard<I>,
-    refused: u64,
+/// Packets sent on this [`IpSend::send`] will be buffered on a channel, and asynchronously
+/// processed on another task. This means [`IpSend::send`] won't block unless the channel is full.
+#[derive(Clone)]
+pub struct BufferedIpSend {
+    tx: mpsc::Sender<Packet<Ip>>,
+    _task: Arc<Task>,
 }
 
-impl<I: IpSend> DirectIpSend<I> {
-    /// Take the device writer's lock.
+impl BufferedIpSend {
+    /// Create a [`BufferedIpSend`] with `capacity`.
+    ///
+    /// This takes an `Arc<Mutex<I>>` because the inner `I` will be re-used after [Self] is
+    /// dropped. We will take the mutex lock when this function is called, and hold onto it for the
+    /// lifetime of [Self].
     ///
     /// # Panics
-    /// Panics if the lock is not released within 5 seconds. A previous connection's writer
-    /// releases it when its task is stopped.
-    pub async fn new(inner: Arc<Mutex<I>>) -> Self {
-        let inner = timeout(Duration::from_secs(5), inner.lock_owned())
-            .await
-            .expect("Deadlock on IpSend. There must be no more than one IpSend active at any given time.");
-        Self { inner, refused: 0 }
+    /// Panics if the lock is already taken.
+    fn new<I: IpSend>(capacity: usize, inner: Arc<Mutex<I>>, token: CancellationToken) -> Self {
+        let (tx, mut rx) = mpsc::channel::<Packet<Ip>>(capacity);
+
+        let drop_guard = token.clone().drop_guard();
+
+        let task = async move {
+            let mut inner = timeout(Duration::from_secs(5), inner.lock())
+                .await
+                .expect("Deadlock on IpSend. There must be no more than one IpSend active at any given time.");
+
+            let mut refused: u64 = 0;
+            while let Some(packet) = rx.recv().await {
+                if let Err(e) = inner.send(packet).await {
+                    if is_fatal_tun_error(&e) {
+                        tracing::error!("TUN device was deleted: {e}");
+                        break;
+                    }
+                    // The device refused this one packet; the next one may be fine.
+                    refused += 1;
+                    if refused.is_power_of_two() {
+                        tracing::warn!(
+                            "Dropped IP packet the TUN device refused ({refused} so far): {e}"
+                        );
+                    }
+                }
+            }
+
+            drop(drop_guard);
+        };
+
+        let task = Task::spawn("buffered IP send", async move {
+            token.run_until_cancelled_owned(task).await;
+        });
+
+        Self {
+            tx,
+            _task: Arc::new(task),
+        }
     }
 }
 
-impl<I: IpSend> IpSend for DirectIpSend<I> {
+impl IpSend for BufferedIpSend {
     async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
-        match self.inner.send(packet).await {
-            Ok(()) => Ok(()),
-            Err(e) if is_fatal_tun_error(&e) => {
-                tracing::error!("TUN device was deleted: {e}");
-                Err(e)
-            }
-            Err(e) => {
-                // The device refused this one packet; the next one may be fine.
-                self.refused += 1;
-                if self.refused.is_power_of_two() {
-                    tracing::warn!(
-                        "Dropped IP packet the TUN device refused ({} so far): {e}",
-                        self.refused
-                    );
-                }
-                Ok(())
-            }
-        }
+        self.tx
+            .send(packet)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+        Ok(())
     }
 }
 
@@ -242,10 +260,10 @@ fn is_fatal_tun_error(err: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{BufferedIpRecv, DirectIpSend};
+    use super::BufferedIpRecv;
     use crate::{
         packet::{Ip, Packet, PacketBufPool},
-        tun::{IpRecv, IpSend, MtuWatcher},
+        tun::{IpRecv, MtuWatcher},
     };
     use bytes::BytesMut;
     use std::{collections::VecDeque, io, sync::Arc, time::Duration};
@@ -314,58 +332,6 @@ mod tests {
             })
             .collect();
         assert_eq!(ids, [7]);
-    }
-
-    /// Records what reaches the device; refuses the packets whose id is in `refuse` and reports
-    /// the device gone for id `gone`.
-    #[derive(Default)]
-    struct Sink {
-        written: Vec<u16>,
-        refuse: Vec<u16>,
-        gone: Option<u16>,
-    }
-
-    impl IpSend for Sink {
-        async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
-            let bytes = packet.as_bytes();
-            let id = u16::from_be_bytes([bytes[4], bytes[5]]);
-            if self.gone == Some(id) {
-                return Err(io::Error::from_raw_os_error(libc::EBADF));
-            }
-            if self.refuse.contains(&id) {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, "refused"));
-            }
-            self.written.push(id);
-            Ok(())
-        }
-    }
-
-    /// The direct writer passes packets through in call order, and a refused packet does not
-    /// stop the ones after it (#260).
-    #[tokio::test]
-    async fn direct_send_keeps_order_and_skips_a_refused_packet() {
-        let sink = Arc::new(Mutex::new(Sink {
-            refuse: vec![2],
-            ..Sink::default()
-        }));
-        let mut send = DirectIpSend::new(Arc::clone(&sink)).await;
-        for id in 0..5 {
-            send.send(packet(64, id)).await.expect("not fatal");
-        }
-        drop(send);
-        assert_eq!(sink.lock().await.written, [0, 1, 3, 4]);
-    }
-
-    /// A gone device is reported to the caller, which stops the receive direction.
-    #[tokio::test]
-    async fn direct_send_reports_a_gone_device() {
-        let sink = Arc::new(Mutex::new(Sink {
-            gone: Some(1),
-            ..Sink::default()
-        }));
-        let mut send = DirectIpSend::new(sink).await;
-        send.send(packet(64, 0)).await.expect("written");
-        assert!(send.send(packet(64, 1)).await.is_err());
     }
 
     /// A gone device still ends the reader, so the device can report it.
