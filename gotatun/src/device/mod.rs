@@ -229,13 +229,14 @@ impl<T: DeviceTransports> Connection<T> {
             device.port = addr.port();
         }
 
-        let (buffered_ip_tx, buffered_ip_rx) = crate::tun::buffer::channel(
+        let buffered_ip_rx = crate::tun::buffer::buffered_recv(
             MAX_PACKET_BUFS,
             pool.clone(),
-            Arc::clone(&device.tun_tx),
             Arc::clone(&device.tun_rx),
         )
         .await;
+        // The receive task writes decrypted packets itself; see `crate::tun::buffer`.
+        let direct_ip_tx = crate::tun::buffer::DirectIpSend::new(Arc::clone(&device.tun_tx)).await;
 
         let buffered_udp_tx = BufferedUdpSend::new(MAX_PACKET_BUFS, udp_tx.clone());
 
@@ -288,7 +289,7 @@ impl<T: DeviceTransports> Connection<T> {
             "handle_incoming",
             DeviceState::handle_incoming(
                 Arc::downgrade(&device_arc),
-                buffered_ip_tx.clone(),
+                direct_ip_tx,
                 buffered_udp_tx,
                 incoming_udp_rx,
                 pool.clone(),
@@ -890,8 +891,12 @@ impl<T: DeviceTransports> DeviceState<T> {
                             continue;
                         }
 
+                        // Write from this task, with no lock held, so the outgoing path is
+                        // never kept off the peer while the device takes the packet. Packets
+                        // are written one by one in decryption order (`DirectIpSend`).
+                        drop(peer);
+                        drop(device_guard);
                         if let Err(e) = tun_tx.send(packet).await {
-                            tracing::trace!("buffered_tun_send.send failed");
                             return Err(Error::IoError(e));
                         }
                     }

@@ -324,6 +324,31 @@ async fn reverse_path_rejects_source_owned_by_another_peer() {
     );
 }
 
+/// A burst far larger than one receive batch reaches the app complete and in send order. The
+/// decrypting task writes to the device itself (#260), so batching on the receive side must not
+/// reorder packets.
+#[tokio::test]
+#[test_log::test]
+async fn long_burst_is_delivered_in_order() {
+    const BURST: u32 = 2_000;
+    let (alice, mut bob, _eve) = mock::device_pair().await;
+
+    let send = async {
+        for seq in 0..BURST {
+            alice.app_tx.send(mock::packet(seq.to_be_bytes())).await;
+        }
+    };
+    let recv = async {
+        for seq in 0..BURST {
+            let got = bob.app_rx.recv().await;
+            assert_eq!(got.as_bytes(), mock::packet(seq.to_be_bytes()).as_bytes());
+        }
+    };
+    timeout(Duration::from_secs(10), async { join!(send, recv) })
+        .await
+        .expect("every packet of the burst must arrive");
+}
+
 /// Ensures setting a peer's preshared key via Device::modify_peer propagates into its noise state
 #[tokio::test]
 #[test_log::test]
