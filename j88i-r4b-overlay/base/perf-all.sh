@@ -11,6 +11,8 @@ label=""
 out=""
 rows=()
 declare -A binaries sources
+binary_count=0
+source_count=0
 
 usage() {
     cat <<'USAGE'
@@ -73,6 +75,7 @@ while (($#)); do
             }
             [[ $path != *$'\n'* && $path != *$'\t'* ]] || { echo 'binary paths cannot contain tabs or newlines' >&2; exit 2; }
             binaries[$tag]=$(readlink -f -- "$path")
+            binary_count=$((binary_count + 1))
             shift
             ;;
         --source)
@@ -82,6 +85,7 @@ while (($#)); do
                 echo "source for $tag must be a commit SHA" >&2; exit 2;
             }
             sources[$tag]=$source
+            source_count=$((source_count + 1))
             shift
             ;;
         --help|-h) usage; exit 0 ;;
@@ -92,7 +96,7 @@ done
 
 [[ -n $mode ]] || { usage >&2; exit 2; }
 if [[ $mode == validate ]]; then
-    ((${#rows[@]} == 0 && ${#binaries[@]} == 0 && ${#sources[@]} == 0)) || {
+    ((${#rows[@]} == 0 && binary_count == 0 && source_count == 0)) || {
         echo '--validate does not take row, binary, or source options' >&2; exit 2;
     }
 else
