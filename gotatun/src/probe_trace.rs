@@ -258,7 +258,10 @@ pub fn arm_wg(counter: u64, key: u64) {
 /// batch only when this is true.
 #[inline(always)]
 pub fn armed() -> bool {
-    enabled() && TRACER.get().is_some_and(|t| t.armed_count.load(Ordering::Acquire) != 0)
+    enabled()
+        && TRACER
+            .get()
+            .is_some_and(|t| t.armed_count.load(Ordering::Acquire) != 0)
 }
 
 /// The probe key of an encrypted message, if it was armed. With `take`, the slot is freed.

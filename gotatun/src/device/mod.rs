@@ -889,10 +889,11 @@ impl<T: DeviceTransports> DeviceState<T> {
                         // Only accept the incoming packet if an outgoing packet to the source IP address
                         // would be routed to the same peer. This is determined by the most specific
                         // matching allowed IP range on the device.
-                        let (source, packet): (IpAddr, crate::packet::Packet<crate::packet::Ip>) = packet.either(
-                            |ipv4| (ipv4.header.source().into(), ipv4.into()),
-                            |ipv6| (ipv6.header.source().into(), ipv6.into()),
-                        );
+                        let (source, packet): (IpAddr, crate::packet::Packet<crate::packet::Ip>) =
+                            packet.either(
+                                |ipv4| (ipv4.header.source().into(), ipv4.into()),
+                                |ipv6| (ipv6.header.source().into(), ipv6.into()),
+                            );
                         let routed_to_this_peer = device_guard
                             .peers_by_ip
                             .find(source)
@@ -1021,7 +1022,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                     None => packet.into(),
                 };
                 #[cfg(not(feature = "daita"))]
-                let packet = packet.into();
+                let packet: crate::packet::Packet = packet.into();
 
                 #[cfg(all(feature = "probe-trace", target_os = "linux"))]
                 let probe = crate::probe_trace::enabled()
@@ -1044,7 +1045,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                     },
                 };
                 #[cfg(not(feature = "daita"))]
-                let packet = packet.into();
+                let packet: crate::packet::Packet = packet.into();
 
                 drop(peer); // release lock
                 drop(device_guard);

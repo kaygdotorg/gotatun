@@ -168,7 +168,11 @@ impl<I: IpRecv> BufferedIpRecv<I> {
                             // written after it, so it includes any wait for channel space.
                             #[cfg(all(feature = "probe-trace", target_os = "linux"))]
                             let probe = crate::probe_trace::enabled()
-                                .then(|| crate::probe_trace::probe_key(zerocopy::IntoBytes::as_bytes(&*packet)))
+                                .then(|| {
+                                    crate::probe_trace::probe_key(zerocopy::IntoBytes::as_bytes(
+                                        &*packet,
+                                    ))
+                                })
                                 .flatten();
                             if tx.send(packet).await.is_err() {
                                 return;
