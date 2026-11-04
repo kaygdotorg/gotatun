@@ -698,7 +698,10 @@ mod tests {
                 for (_, packet) in receiver.batch.drain(..) {
                     let (_, port, seq) = port_and_seq(&packet);
                     let flow = usize::from(port - 30000);
-                    assert_eq!(seq, seen[flow], "flow {flow} reordered after {total} packets");
+                    assert_eq!(
+                        seq, seen[flow],
+                        "flow {flow} reordered after {total} packets"
+                    );
                     seen[flow] = seen[flow].wrapping_add(1);
                     total += 1;
                 }
