@@ -123,3 +123,6 @@ tun = ["dep:tun", "dep:wintun-bindings"]
 # UDP GRO appears to be broken on Windows.
 # In some cases it fails to return UDP_COALESCED_INFO
 windows-gro = []
+# Profiling only (#260 J88h): per-stage timestamps for ICMP echo probes, written when
+# GOTATUN_PROBE_TRACE names an output prefix. Never enabled by a shipping build.
+probe-trace = []

@@ -217,6 +217,9 @@ impl<T: DeviceTransports> Connection<T> {
 
         let pool = PacketBufPool::new_lazy(MAX_PACKET_BUFS);
 
+        #[cfg(all(feature = "probe-trace", target_os = "linux"))]
+        crate::probe_trace::init_from_env();
+
         // clean up existing connection
         if let Some(conn) = device.connection.take() {
             conn.stop().await;
@@ -769,7 +772,23 @@ impl<T: DeviceTransports> DeviceState<T> {
                 }
             }
 
+            #[cfg(all(feature = "probe-trace", target_os = "linux"))]
+            let probe_batch_len = received_packets.len();
+            // When this batch's receive returned; one clock read per batch, only while tracing.
+            #[cfg(all(feature = "probe-trace", target_os = "linux"))]
+            let probe_batch_ts = if crate::probe_trace::enabled() {
+                crate::probe_trace::now_ns()
+            } else {
+                0
+            };
+            #[cfg(all(feature = "probe-trace", target_os = "linux"))]
+            let mut probe_index = 0usize;
             for (src_buf, addr) in received_packets.drain(..) {
+                // Position of this datagram in its receive batch, for the probe record.
+                #[cfg(all(feature = "probe-trace", target_os = "linux"))]
+                {
+                    probe_index += 1;
+                }
                 let parsed_packet = match rate_limiter.verify_packet(addr, src_buf) {
                     Ok(packet) => packet,
                     Err(TunnResult::WriteToNetwork(WgKind::CookieReply(cookie))) => {
@@ -870,7 +889,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                         // Only accept the incoming packet if an outgoing packet to the source IP address
                         // would be routed to the same peer. This is determined by the most specific
                         // matching allowed IP range on the device.
-                        let (source, packet): (IpAddr, _) = packet.either(
+                        let (source, packet): (IpAddr, crate::packet::Packet<crate::packet::Ip>) = packet.either(
                             |ipv4| (ipv4.header.source().into(), ipv4.into()),
                             |ipv6| (ipv6.header.source().into(), ipv6.into()),
                         );
@@ -890,9 +909,43 @@ impl<T: DeviceTransports> DeviceState<T> {
                             continue;
                         }
 
+                        #[cfg(all(feature = "probe-trace", target_os = "linux"))]
+                        let probe = crate::probe_trace::enabled()
+                            .then(|| {
+                                crate::probe_trace::probe_key(zerocopy::IntoBytes::as_bytes(
+                                    &*packet,
+                                ))
+                            })
+                            .flatten();
+                        #[cfg(all(feature = "probe-trace", target_os = "linux"))]
+                        if let Some(key) = probe {
+                            crate::probe_trace::record(
+                                crate::probe_trace::Stage::UdpRecv,
+                                key,
+                                probe_batch_ts,
+                                crate::probe_trace::batch_pos(probe_batch_len, probe_index - 1),
+                            );
+                            crate::probe_trace::record(
+                                crate::probe_trace::Stage::DecDone,
+                                key,
+                                crate::probe_trace::now_ns(),
+                                0,
+                            );
+                        }
+
                         if let Err(e) = tun_tx.send(packet).await {
                             tracing::trace!("buffered_tun_send.send failed");
                             return Err(Error::IoError(e));
+                        }
+
+                        #[cfg(all(feature = "probe-trace", target_os = "linux"))]
+                        if let Some(key) = probe {
+                            crate::probe_trace::record(
+                                crate::probe_trace::Stage::TunQueueIn,
+                                key,
+                                crate::probe_trace::now_ns(),
+                                0,
+                            );
                         }
                     }
                 }
@@ -970,6 +1023,11 @@ impl<T: DeviceTransports> DeviceState<T> {
                 #[cfg(not(feature = "daita"))]
                 let packet = packet.into();
 
+                #[cfg(all(feature = "probe-trace", target_os = "linux"))]
+                let probe = crate::probe_trace::enabled()
+                    .then(|| crate::probe_trace::probe_key(&packet))
+                    .flatten();
+
                 let Some(packet) = tunnel.handle_outgoing_packet(packet, Some(&mut tun_mtu)) else {
                     continue;
                 };
@@ -991,8 +1049,31 @@ impl<T: DeviceTransports> DeviceState<T> {
                 drop(peer); // release lock
                 drop(device_guard);
 
+                // Armed before the send, so the UDP worker can never see the message first.
+                #[cfg(all(feature = "probe-trace", target_os = "linux"))]
+                if let Some(key) = probe {
+                    let counter = crate::probe_trace::wg_counter(&packet).unwrap_or(u64::MAX);
+                    crate::probe_trace::arm_wg(counter, key);
+                    crate::probe_trace::record(
+                        crate::probe_trace::Stage::EncDone,
+                        key,
+                        crate::probe_trace::now_ns(),
+                        counter,
+                    );
+                }
+
                 if udp.send_to(packet, peer_addr).await.is_err() {
                     break;
+                }
+
+                #[cfg(all(feature = "probe-trace", target_os = "linux"))]
+                if let Some(key) = probe {
+                    crate::probe_trace::record(
+                        crate::probe_trace::Stage::UdpQueueIn,
+                        key,
+                        crate::probe_trace::now_ns(),
+                        0,
+                    );
                 }
             }
         }

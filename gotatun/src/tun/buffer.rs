@@ -75,6 +75,13 @@ impl BufferedIpSend {
 
             let mut refused: u64 = 0;
             while let Some(packet) = rx.recv().await {
+                #[cfg(all(feature = "probe-trace", target_os = "linux"))]
+                crate::probe_trace::record_ip(
+                    crate::probe_trace::Stage::TunQueueOut,
+                    zerocopy::IntoBytes::as_bytes(&*packet),
+                    crate::probe_trace::now_ns(),
+                    0,
+                );
                 if let Err(e) = inner.send(packet).await {
                     if is_fatal_tun_error(&e) {
                         tracing::error!("TUN device was deleted: {e}");
@@ -157,8 +164,23 @@ impl<I: IpRecv> BufferedIpRecv<I> {
                 match inner.recv(&mut pool).await {
                     Ok(packets) => {
                         for packet in packets {
+                            // The key is taken before the send moves the packet; the record is
+                            // written after it, so it includes any wait for channel space.
+                            #[cfg(all(feature = "probe-trace", target_os = "linux"))]
+                            let probe = crate::probe_trace::enabled()
+                                .then(|| crate::probe_trace::probe_key(zerocopy::IntoBytes::as_bytes(&*packet)))
+                                .flatten();
                             if tx.send(packet).await.is_err() {
                                 return;
+                            }
+                            #[cfg(all(feature = "probe-trace", target_os = "linux"))]
+                            if let Some(key) = probe {
+                                crate::probe_trace::record(
+                                    crate::probe_trace::Stage::BufIn,
+                                    key,
+                                    crate::probe_trace::now_ns(),
+                                    0,
+                                );
                             }
                         }
                     }
@@ -200,6 +222,18 @@ impl<I: IpRecv> IpRecv for BufferedIpRecv<I> {
     ) -> io::Result<impl Iterator<Item = Packet<Ip>> + 'a> {
         let max_n = self.rx.max_capacity();
         let n = self.rx.recv_many(&mut self.rx_packet_buf, max_n).await;
+        #[cfg(all(feature = "probe-trace", target_os = "linux"))]
+        if crate::probe_trace::enabled() {
+            let ts = crate::probe_trace::now_ns();
+            for (index, packet) in self.rx_packet_buf.iter().enumerate() {
+                crate::probe_trace::record_ip(
+                    crate::probe_trace::Stage::BufOut,
+                    zerocopy::IntoBytes::as_bytes(&**packet),
+                    ts,
+                    crate::probe_trace::batch_pos(n, index),
+                );
+            }
+        }
         if n == 0 {
             // Channel is closed
             return Err(io::Error::new(

@@ -24,6 +24,9 @@ mod crypto;
 pub mod device;
 pub mod noise;
 pub mod packet;
+/// Per-stage timestamps for latency probe packets; profiling builds only (#260 J88h).
+#[cfg(all(feature = "probe-trace", target_os = "linux"))]
+pub mod probe_trace;
 pub mod tun;
 pub mod udp;
 

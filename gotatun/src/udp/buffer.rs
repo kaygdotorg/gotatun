@@ -59,6 +59,26 @@ impl BufferedUdpSend {
                     n = send_rx_v4.recv_many(&mut buf_v4, max_packet_count).fuse() => (n, &mut buf_v4),
                     n = send_rx_v6.recv_many(&mut buf_v6, max_packet_count).fuse() => (n, &mut buf_v6),
                 };
+                // Dequeue stamps for armed probes; the matching sent stamps follow the send.
+                #[cfg(all(feature = "probe-trace", target_os = "linux"))]
+                let probes: Vec<u64> = if crate::probe_trace::armed() {
+                    let ts = crate::probe_trace::now_ns();
+                    buf.iter()
+                        .enumerate()
+                        .filter_map(|(index, (packet, _))| {
+                            let key = crate::probe_trace::armed_key(packet, true)?;
+                            crate::probe_trace::record(
+                                crate::probe_trace::Stage::UdpDequeue,
+                                key,
+                                ts,
+                                crate::probe_trace::batch_pos(count, index),
+                            );
+                            Some(key)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 match count {
                     0 => break,
                     1 => {
@@ -81,6 +101,18 @@ impl BufferedUdpSend {
                                 buf.clear(); // give up, drop the packets we meant to send
                             }
                         }
+                    }
+                }
+                #[cfg(all(feature = "probe-trace", target_os = "linux"))]
+                if !probes.is_empty() {
+                    let ts = crate::probe_trace::now_ns();
+                    for key in probes {
+                        crate::probe_trace::record(
+                            crate::probe_trace::Stage::UdpSent,
+                            key,
+                            ts,
+                            count as u64,
+                        );
                     }
                 }
             }
