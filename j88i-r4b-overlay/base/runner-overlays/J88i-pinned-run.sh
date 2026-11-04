@@ -20,16 +20,20 @@ restored=0
 restore() {
     ((restored == 0)) || return 0
     systemctl revert perf.slice >/dev/null || return 1
-    local allowed effective paths
-    allowed=$(systemctl show perf.slice -p AllowedCPUs --value)
-    effective=$(cat /sys/fs/cgroup/perf.slice/cpuset.cpus.effective)
-    paths=$(systemctl show perf.slice -p DropInPaths --value)
-    if [[ $allowed != 1-3 || $effective != 1-3 || -n $paths ]]; then
-        echo "perf.slice restoration failed: AllowedCPUs=$allowed effective=$effective DropInPaths=$paths" >&2
-        return 1
-    fi
-    restored=1
-    echo "perf.slice restored: AllowedCPUs=$allowed effective=$effective DropInPaths=empty"
+    local allowed paths attempt
+    for attempt in {1..50}; do
+        allowed=$(systemctl show perf.slice -p AllowedCPUs --value)
+        paths=$(systemctl show perf.slice -p DropInPaths --value)
+        if [[ $allowed == 1-3 && -z $paths ]]; then
+            restored=1
+            echo "perf.slice restore requested: AllowedCPUs=$allowed DropInPaths=empty"
+            echo "effective cpuset is checked after the perf-run scope exits"
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "perf.slice restore request failed: AllowedCPUs=$allowed DropInPaths=$paths" >&2
+    return 1
 }
 finish() {
     local rc=$?

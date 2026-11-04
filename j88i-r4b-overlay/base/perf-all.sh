@@ -192,7 +192,28 @@ done
 runner=${PERF_RUN:-/usr/local/bin/perf-run}
 [[ -x $runner ]] || { echo "perf runner is not executable: $runner" >&2; exit 2; }
 echo "D348 pinned $mode: $label; results $out"
+run_status=0
+set +e
 "$runner" --root --out "$out/receipts" -- \
     env H2H_CPUSET_AUDIT=1 H2H_RESULTS="$out" \
     bash "$kit/runner-overlays/J88i-pinned-run.sh" "$kit" "$out" "$mode" "$label" "$plan"
+run_status=$?
+set -e
+
+# The active perf-run scope still has CPUs 0-3 when its inner command exits.
+# Take a second locked, read-only pass to verify the parent mask after teardown.
+mkdir -p "$out/restore-receipts"
+restore_status=0
+set +e
+"$runner" --root --out "$out/restore-receipts" -- \
+    bash "$kit/runner-overlays/J88i-verify-restored.sh" "$out/cpuset-restoration.txt"
+restore_status=$?
+set -e
+if ((restore_status != 0)); then
+    echo 'D348 perf.slice restoration was not verified after the measured scope exited' >&2
+    exit 2
+fi
+if ((run_status != 0)); then
+    exit "$run_status"
+fi
 echo "results: $out"
