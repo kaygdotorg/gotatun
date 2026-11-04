@@ -1037,7 +1037,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                 Self::register_handshake_idx(&device_guard.peers_by_idx, &packet, &peer_arc);
 
                 #[cfg(feature = "daita")]
-                let packet = match daita {
+                let packet: crate::packet::Packet = match daita {
                     None => packet.into(),
                     Some(daita) => match daita.on_tunnel_sent(packet) {
                         Some(packet) => packet.into(),
