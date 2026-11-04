@@ -147,22 +147,140 @@ type Queued = (u16, Packet<Ip>);
 /// bucket count is zero when it arrives goes to the sparse lane; every other packet goes to the
 /// bulk lane. [`IpRecv::recv`] serves the sparse lane first.
 ///
-/// **Per-flow order holds.** A count is raised before its packet is queued and lowered only when
-/// the consumer takes the packet, so a zero count means no earlier packet of that flow is queued
-/// in either lane. A sparse packet can therefore only overtake other flows' packets. Every later
+/// **Per-flow order holds.** A count is raised before its packet is queued, and lowered only once
+/// the consumer has taken the packet and everything it puts in the same batch. So a zero count
+/// means no earlier packet of that flow is queued in either lane or sits in the batch being
+/// assembled. A sparse packet can therefore only overtake other flows' packets. Every later
 /// packet of its flow sees a non-zero count and queues behind it in the bulk lane, or arrives
 /// after the consumer has taken it. The consumer handles each returned batch fully before it asks
 /// for the next, so a packet taken in an earlier batch is always handled first. Order across
 /// flows is not kept, as with any per-flow queueing. This happens before encryption, so the
 /// session counters still go out in sequence.
+///
+/// The two lanes are separate channels, so the consumer cannot check both at one instant. It can
+/// find the sparse lane empty, and then take a bulk batch that holds a packet the producer queued
+/// after a sparse packet of the same flow. So after every bulk batch, the consumer drains the
+/// sparse lane and puts those packets first ([`LaneReceiver::take`]). That is always safe: when a
+/// sparse packet was queued, its flow had nothing counted, and the bulk batch's counts are still
+/// held, so any packet of its flow in that batch was queued after it. #260's 1 h soak found the
+/// reordering without this step (90,299 out-of-order segments at the receiver).
 pub struct BufferedIpRecv<I> {
-    sparse_rx: mpsc::Receiver<Queued>,
-    rx: mpsc::Receiver<Queued>,
-    flows: Arc<FlowCounts>,
-    rx_packet_buf: Vec<Queued>,
+    lanes: LaneReceiver,
     _task: Arc<Task>,
     _phantom: std::marker::PhantomData<I>,
     mtu: MtuWatcher,
+}
+
+/// The producer side of [`BufferedIpRecv`]'s two lanes.
+struct Lanes {
+    sparse_tx: mpsc::Sender<Queued>,
+    tx: mpsc::Sender<Queued>,
+    flows: Arc<FlowCounts>,
+}
+
+/// The consumer side of [`BufferedIpRecv`]'s two lanes. `batch` holds the batch last taken.
+struct LaneReceiver {
+    sparse_rx: mpsc::Receiver<Queued>,
+    rx: mpsc::Receiver<Queued>,
+    flows: Arc<FlowCounts>,
+    batch: Vec<Queued>,
+    spill: Vec<Queued>,
+}
+
+/// Two lanes in front of one consumer; the bulk lane holds `capacity` packets.
+fn lanes(capacity: usize) -> (Lanes, LaneReceiver) {
+    let (tx, rx) = mpsc::channel::<Queued>(capacity);
+    let (sparse_tx, sparse_rx) = mpsc::channel::<Queued>(SPARSE_LANE);
+    let flows = Arc::new(FlowCounts::new());
+    let receiver = LaneReceiver {
+        sparse_rx,
+        rx,
+        flows: Arc::clone(&flows),
+        batch: vec![],
+        spill: vec![],
+    };
+    (
+        Lanes {
+            sparse_tx,
+            tx,
+            flows,
+        },
+        receiver,
+    )
+}
+
+impl Lanes {
+    /// Queue one packet in its lane. Returns `false` once the consumer is gone.
+    async fn queue(&self, packet: Packet<Ip>) -> bool {
+        let bucket = flow_bucket(packet.as_bytes());
+        let queued = if self.flows.enqueue(bucket) {
+            match self.sparse_tx.try_send((bucket, packet)) {
+                Ok(()) => return true,
+                // Nothing of this flow is queued, so the bulk lane is order-safe too.
+                Err(mpsc::error::TrySendError::Full(queued)) => queued,
+                Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            }
+        } else {
+            (bucket, packet)
+        };
+        self.tx.send(queued).await.is_ok()
+    }
+}
+
+impl LaneReceiver {
+    /// Take the next batch into `self.batch` and return its length; 0 once both lanes are closed
+    /// and empty. A batch is whatever the sparse lane holds, or a bulk batch as before, with any
+    /// sparse packets that arrived meanwhile in front (see [`BufferedIpRecv`]).
+    async fn take(&mut self) -> usize {
+        enum Lane {
+            Sparse(Option<Queued>),
+            Bulk(usize),
+        }
+        let max_n = self.rx.max_capacity();
+        self.batch.clear();
+        // Both receive futures are cancel-safe, so the losing branch loses nothing.
+        let lane = tokio::select! {
+            biased;
+            queued = self.sparse_rx.recv() => Lane::Sparse(queued),
+            n = self.rx.recv_many(&mut self.batch, max_n) => Lane::Bulk(n),
+        };
+        match lane {
+            Lane::Sparse(Some(queued)) => {
+                self.batch.push(queued);
+                self.drain_sparse_into_batch();
+            }
+            // The producer is gone; the bulk lane may still hold packets.
+            Lane::Sparse(None) => {
+                self.rx.recv_many(&mut self.batch, max_n).await;
+            }
+            Lane::Bulk(_) => {
+                // Sparse packets queued before this batch's packets of the same flow must go
+                // first. The batch's counts are still held, so nothing queued from here on can
+                // belong before it.
+                std::mem::swap(&mut self.batch, &mut self.spill);
+                self.drain_sparse_into_batch();
+                self.batch.append(&mut self.spill);
+            }
+        }
+        // Only now may later packets of these flows take the sparse lane.
+        for (bucket, _) in &self.batch {
+            self.flows.dequeue(*bucket);
+        }
+        self.batch.len()
+    }
+
+    /// Move up to [`SPARSE_LANE`] sparse packets to the end of `self.batch`. The lane holds at
+    /// most that many at once, and it is FIFO, so every packet already queued when a bulk batch
+    /// was taken is among them; the cap only stops a stream of new arrivals from holding up the
+    /// batch.
+    fn drain_sparse_into_batch(&mut self) {
+        for _ in 0..SPARSE_LANE {
+            let Ok(queued) = self.sparse_rx.try_recv() else {
+                break;
+            };
+            self.batch.push(queued);
+        }
+    }
 }
 
 /// Queued packets per flow bucket, shared by the producer task and the consumer.
@@ -235,10 +353,7 @@ impl<I: IpRecv> BufferedIpRecv<I> {
         inner: Arc<Mutex<I>>,
         token: CancellationToken,
     ) -> Self {
-        let (tx, rx) = mpsc::channel::<Queued>(capacity);
-        let (sparse_tx, sparse_rx) = mpsc::channel::<Queued>(SPARSE_LANE);
-        let flows = Arc::new(FlowCounts::new());
-        let counts = Arc::clone(&flows);
+        let (queue, lanes) = lanes(capacity);
 
         // We use a timeout instead of a try_lock().expect() because there may still be an old
         // BufferedIpRecv that is in the process of being dropped. Otherwise, there would be a
@@ -257,19 +372,7 @@ impl<I: IpRecv> BufferedIpRecv<I> {
                 match inner.recv(&mut pool).await {
                     Ok(packets) => {
                         for packet in packets {
-                            let bucket = flow_bucket(packet.as_bytes());
-                            let queued = if counts.enqueue(bucket) {
-                                match sparse_tx.try_send((bucket, packet)) {
-                                    Ok(()) => continue,
-                                    // Nothing of this flow is queued, so the bulk lane is
-                                    // order-safe too.
-                                    Err(mpsc::error::TrySendError::Full(queued)) => queued,
-                                    Err(mpsc::error::TrySendError::Closed(_)) => return,
-                                }
-                            } else {
-                                (bucket, packet)
-                            };
-                            if tx.send(queued).await.is_err() {
+                            if !queue.queue(packet).await {
                                 return;
                             }
                         }
@@ -296,10 +399,7 @@ impl<I: IpRecv> BufferedIpRecv<I> {
         });
 
         Self {
-            sparse_rx,
-            rx,
-            flows,
-            rx_packet_buf: vec![],
+            lanes,
             _task: Arc::new(task),
             _phantom: std::marker::PhantomData,
             mtu,
@@ -308,57 +408,20 @@ impl<I: IpRecv> BufferedIpRecv<I> {
 }
 
 impl<I: IpRecv> IpRecv for BufferedIpRecv<I> {
-    /// One batch from a single lane: whatever the sparse lane holds, else the bulk lane's queue
-    /// as before. The batch's flow counts drop as it is taken; that is safe because the caller
-    /// handles the whole batch before it calls again (see the type docs).
+    /// The next batch from [`LaneReceiver::take`]. Its flow counts are already released; that is
+    /// safe because the caller handles the whole batch before it calls again (see the type docs).
     async fn recv<'a>(
         &'a mut self,
         _pool: &mut PacketBufPool,
     ) -> io::Result<impl Iterator<Item = Packet<Ip>> + 'a> {
-        enum Lane {
-            Sparse(Option<Queued>),
-            Bulk(usize),
-        }
-        let Self {
-            sparse_rx,
-            rx,
-            flows,
-            rx_packet_buf: buf,
-            ..
-        } = self;
-        let max_n = rx.max_capacity();
-        // Both receive futures are cancel-safe, so the losing branch loses nothing.
-        let lane = tokio::select! {
-            biased;
-            queued = sparse_rx.recv() => Lane::Sparse(queued),
-            n = rx.recv_many(buf, max_n) => Lane::Bulk(n),
-        };
-        let n = match lane {
-            Lane::Sparse(Some(queued)) => {
-                buf.push(queued);
-                while buf.len() < SPARSE_LANE {
-                    let Ok(queued) = sparse_rx.try_recv() else {
-                        break;
-                    };
-                    buf.push(queued);
-                }
-                buf.len()
-            }
-            // The producer is gone; the bulk lane may still hold packets.
-            Lane::Sparse(None) => rx.recv_many(buf, max_n).await,
-            Lane::Bulk(n) => n,
-        };
-        if n == 0 {
+        if self.lanes.take().await == 0 {
             // Channel is closed
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "channel closed",
             ));
         }
-        for (bucket, _) in buf.iter() {
-            flows.dequeue(*bucket);
-        }
-        Ok(buf.drain(..n).map(|(_, packet)| packet))
+        Ok(self.lanes.batch.drain(..).map(|(_, packet)| packet))
     }
 
     fn mtu(&self) -> MtuWatcher {
@@ -584,6 +647,65 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         }
+    }
+
+    /// Per-flow order holds with the producer on another OS thread. Short bursts from few flows
+    /// make flows go idle and busy constantly, so a sparse packet and the next packet of its flow
+    /// often land in different lanes while the consumer is between its two lane checks: the
+    /// race the #260 soak found as TCP reordering.
+    #[test]
+    fn per_flow_order_holds_across_threads() {
+        const FLOWS: usize = 4;
+        const PACKETS: u32 = 200_000;
+        let (queue, mut receiver) = super::lanes(64);
+        let producer = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let mut next = [0u16; FLOWS];
+                let mut state = 0x9e37_79b9_u32;
+                let mut sent = 0;
+                while sent < PACKETS {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    let flow = state as usize % FLOWS;
+                    for _ in 0..1 + (state >> 8) % 6 {
+                        let packet = flow_packet(17, 30000 + flow as u16, next[flow]);
+                        assert!(queue.queue(packet).await, "the consumer is gone");
+                        next[flow] = next[flow].wrapping_add(1);
+                        sent += 1;
+                    }
+                }
+            });
+            // Dropping `queue` closes both lanes, which ends the consumer below.
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let total = runtime.block_on(async {
+            let mut seen = [0u16; FLOWS];
+            let mut total = 0u32;
+            loop {
+                let n = tokio::time::timeout(Duration::from_secs(10), receiver.take())
+                    .await
+                    .expect("the lanes must keep delivering");
+                if n == 0 {
+                    break total;
+                }
+                for (_, packet) in receiver.batch.drain(..) {
+                    let (_, port, seq) = port_and_seq(&packet);
+                    let flow = usize::from(port - 30000);
+                    assert_eq!(seq, seen[flow], "flow {flow} reordered after {total} packets");
+                    seen[flow] = seen[flow].wrapping_add(1);
+                    total += 1;
+                }
+            }
+        });
+        producer.join().unwrap();
+        assert!(total >= PACKETS);
     }
 
     /// Fragments of one IPv4 datagram share a bucket even though only the first carries ports.
