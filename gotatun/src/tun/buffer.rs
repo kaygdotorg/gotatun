@@ -234,7 +234,7 @@ impl LaneReceiver {
     async fn take(&mut self) -> usize {
         enum Lane {
             Sparse(Option<Queued>),
-            Bulk(usize),
+            Bulk,
         }
         let max_n = self.rx.max_capacity();
         self.batch.clear();
@@ -242,7 +242,7 @@ impl LaneReceiver {
         let lane = tokio::select! {
             biased;
             queued = self.sparse_rx.recv() => Lane::Sparse(queued),
-            n = self.rx.recv_many(&mut self.batch, max_n) => Lane::Bulk(n),
+            _ = self.rx.recv_many(&mut self.batch, max_n) => Lane::Bulk,
         };
         match lane {
             Lane::Sparse(Some(queued)) => {
@@ -253,7 +253,7 @@ impl LaneReceiver {
             Lane::Sparse(None) => {
                 self.rx.recv_many(&mut self.batch, max_n).await;
             }
-            Lane::Bulk(_) => {
+            Lane::Bulk => {
                 // Sparse packets queued before this batch's packets of the same flow must go
                 // first. The batch's counts are still held, so nothing queued from here on can
                 // belong before it.
