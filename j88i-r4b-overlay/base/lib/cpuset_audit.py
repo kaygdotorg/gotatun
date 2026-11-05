@@ -6,10 +6,11 @@ device IRQ of its own. This audit records IRQ affinity and per-CPU softirq
 counters beside each loaded phase, while checking that every process in a
 J88i scope has the scope's exact Cpus_allowed_list. Non-kernel runnable tasks
 on test CPUs reject the window. Root cgroup children of kthreadd that are
-bound to a matching test CPU are measured by role and summed against a 0.5%
-budget of total test-CPU time. Roles describe the workload but never exempt a
-worker from that budget. A ready-file keeps setup samples separate until the
-measured scopes are present and all process masks match.
+bound to a matching test CPU are measured by role. Only unrelated background
+runtime is compared with the 0.5% budget; kernel crypto and network softirq
+runtime belong to the measured workload and are reported without using that
+budget. A ready-file keeps setup samples separate until the measured scopes
+are present and all process masks match.
 """
 
 from __future__ import annotations
@@ -111,12 +112,12 @@ def bound_percpu_worker_role(comm: str, case: str) -> str:
 
 
 def kernel_worker_window_exceeds_limit(
-    runtime_delta_ns: int, test_cpu_time_ns: int
+    background_runtime_delta_ns: int, test_cpu_time_ns: int
 ) -> bool:
-    """Reject background bound-worker time only when strictly over 0.5%."""
+    """Reject unrelated bound-worker time only when strictly over 0.5%."""
     if test_cpu_time_ns <= 0:
-        return runtime_delta_ns > 0
-    return runtime_delta_ns * 200 > test_cpu_time_ns
+        return background_runtime_delta_ns > 0
+    return background_runtime_delta_ns * 200 > test_cpu_time_ns
 
 
 def cgroup_path(pid: int) -> str:
@@ -490,7 +491,7 @@ def main() -> int:
         window_duration_ns = max(0, int((window_end_unix - window_start_unix) * 1_000_000_000))
     test_cpu_time_ns = window_duration_ns * len(TEST_CPUS)
     kernel_bound_runtime_limit_exceeded = kernel_worker_window_exceeds_limit(
-        kernel_worker_runtime_delta_ns, test_cpu_time_ns
+        kernel_background_runtime_delta_ns, test_cpu_time_ns
     )
     clean = (
         not mismatch_samples
@@ -519,6 +520,7 @@ def main() -> int:
         "window_duration_ns": window_duration_ns,
         "test_cpu_time_ns": test_cpu_time_ns,
         "kernel_bound_percpu_runtime_limit_percent": BOUND_WORKER_RUNTIME_LIMIT_PERCENT,
+        "kernel_bound_runtime_budget_role": "background",
         "kernel_bound_percpu_runtime_percent_of_test_cpu_time": (
             kernel_worker_runtime_delta_ns * 100 / test_cpu_time_ns
             if test_cpu_time_ns > 0 else (float("inf") if kernel_worker_runtime_delta_ns else 0.0)
@@ -540,7 +542,7 @@ def main() -> int:
         "softirq_delta_per_cpu": softirq_delta,
         "veth_irq_note": "veth links have no device IRQ; interrupt affinity and per-CPU softirq deltas are retained for the measured path",
         "audit_case": os.environ.get("H2H_CPUSET_AUDIT_CASE", ""),
-        "interpretation": "bound kthreadd children in cgroup / named and pinned to one test CPU are measured by role and in total; the sum of all bound-worker runtime must stay at or below 0.5% of total test-CPU time; any non-kernel runnable task allowed on test CPUs rejects the window; other root kernel tasks are reported separately",
+        "interpretation": "bound kthreadd children in cgroup / named and pinned to one test CPU are measured by role and in total; only unrelated background-worker runtime is budgeted against 0.5% of test-CPU time; kernel crypto and network softirq are measured workload and are reported without using that budget; any non-kernel runnable task allowed on test CPUs rejects the window; other root kernel tasks are reported separately",
     }
     (OUTPUT / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return 0 if clean else 1
