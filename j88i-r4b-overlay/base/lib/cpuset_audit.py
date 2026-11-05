@@ -6,11 +6,10 @@ device IRQ of its own. This audit records IRQ affinity and per-CPU softirq
 counters beside each loaded phase, while checking that every process in a
 J88i scope has the scope's exact Cpus_allowed_list. Non-kernel runnable tasks
 on test CPUs reject the window. Root cgroup children of kthreadd that are
-bound to a matching test CPU are reported by role. Network softirq and kernel
-WireGuard crypto workers for the kernel-NetBird case are measured as workload;
-other matching workers are charged against a 0.5% budget of total test-CPU
-time. A ready-file keeps setup samples separate until the measured scopes are
-present and all process masks match.
+bound to a matching test CPU are measured by role and summed against a 0.5%
+budget of total test-CPU time. Roles describe the workload but never exempt a
+worker from that budget. A ready-file keeps setup samples separate until the
+measured scopes are present and all process masks match.
 """
 
 from __future__ import annotations
@@ -490,13 +489,13 @@ def main() -> int:
     if window_start_unix is not None and window_end_unix is not None:
         window_duration_ns = max(0, int((window_end_unix - window_start_unix) * 1_000_000_000))
     test_cpu_time_ns = window_duration_ns * len(TEST_CPUS)
-    kernel_worker_limit_exceeded = kernel_worker_window_exceeds_limit(
-        kernel_background_runtime_delta_ns, test_cpu_time_ns
+    kernel_bound_runtime_limit_exceeded = kernel_worker_window_exceeds_limit(
+        kernel_worker_runtime_delta_ns, test_cpu_time_ns
     )
     clean = (
         not mismatch_samples
         and not external_samples
-        and not kernel_worker_limit_exceeded
+        and not kernel_bound_runtime_limit_exceeded
         and max_scope_threads > 0
         and interrupt_data_available
         and softirq_data_available
@@ -528,7 +527,7 @@ def main() -> int:
             kernel_background_runtime_delta_ns * 100 / test_cpu_time_ns
             if test_cpu_time_ns > 0 else (float("inf") if kernel_background_runtime_delta_ns else 0.0)
         ),
-        "kernel_background_runtime_limit_exceeded": kernel_worker_limit_exceeded,
+        "kernel_bound_runtime_limit_exceeded": kernel_bound_runtime_limit_exceeded,
         "max_scope_threads": max_scope_threads,
         "scope_runtime_delta_ns": runtime_delta_ns,
         "scope_run_delay_delta_ns": run_delay_delta_ns,
@@ -541,7 +540,7 @@ def main() -> int:
         "softirq_delta_per_cpu": softirq_delta,
         "veth_irq_note": "veth links have no device IRQ; interrupt affinity and per-CPU softirq deltas are retained for the measured path",
         "audit_case": os.environ.get("H2H_CPUSET_AUDIT_CASE", ""),
-        "interpretation": "bound kthreadd children in cgroup / named and pinned to one test CPU are measured by role and in total; network softirq and kernel WireGuard crypto workers in mesh-netbird are workload, while other bound-worker runtime is limited to 0.5% of total test-CPU time; non-kernel runnable tasks allowed on test CPUs reject the window; other root kernel tasks are reported separately",
+        "interpretation": "bound kthreadd children in cgroup / named and pinned to one test CPU are measured by role and in total; the sum of all bound-worker runtime must stay at or below 0.5% of total test-CPU time; any non-kernel runnable task allowed on test CPUs rejects the window; other root kernel tasks are reported separately",
     }
     (OUTPUT / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return 0 if clean else 1

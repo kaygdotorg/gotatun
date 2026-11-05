@@ -375,10 +375,10 @@ NET_TX:              2          6
                 {"2": 20_000_000},
             )
             self.assertEqual(summary["test_cpu_time_ns"], 4_000_000_000)
-            self.assertFalse(summary["kernel_background_runtime_limit_exceeded"])
+            self.assertFalse(summary["kernel_bound_runtime_limit_exceeded"])
 
-    def test_sampler_reports_worker_runtime_by_role_and_limits_background_only(self) -> None:
-        """Expected network and WireGuard workers are measured apart from interference."""
+    def test_sampler_limits_the_sum_of_all_bound_worker_runtime(self) -> None:
+        """Every bound worker is measured and the total must stay within the budget."""
         script = Path(__file__).parent / "base/lib/cpuset_audit.py"
         with tempfile.TemporaryDirectory(prefix="j88i-worker-roles-") as temporary:
             output = Path(temporary)
@@ -439,7 +439,7 @@ NET_TX:              2          6
                  "network-softirq": 20_000_000},
             )
             self.assertEqual(summary["kernel_background_percpu_runtime_delta_ns"], 10_000_000)
-            self.assertFalse(summary["kernel_background_runtime_limit_exceeded"])
+            self.assertTrue(summary["kernel_bound_runtime_limit_exceeded"])
             self.assertGreater(
                 summary["kernel_bound_percpu_runtime_percent_of_test_cpu_time"], 0.5
             )
@@ -452,7 +452,7 @@ NET_TX:              2          6
                     "kworker/4:0-events": "background",
                 },
             )
-            self.assertTrue(summary["clean"], summary)
+            self.assertFalse(summary["clean"], summary)
 
 
 if __name__ == "__main__":
