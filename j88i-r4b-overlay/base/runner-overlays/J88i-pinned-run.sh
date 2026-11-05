@@ -317,7 +317,8 @@ case $mode in
     validate)
         smoke_dir="$out/cpuset-smoke"
         mkdir -p "$smoke_dir"
-        bash "$kit/cpuset-harness-smoke.sh" "$kit" "$smoke_dir"
+        # `kit` names `base/`; the smoke helper is shipped beside that directory.
+        bash "$kit/../cpuset-harness-smoke.sh" "$kit" "$smoke_dir"
         run_row validate-underlay underlay "" "" 1
         run_row validate-kernel kernel "" "" 1
         printf 'cpuset masks, runnable-task audit, veth/namespace counters, and kernel-WireGuard smoke completed\n' \
