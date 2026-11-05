@@ -187,6 +187,27 @@ impl<T> OrderedCompletions<T> {
         let state = self.state.lock();
         state.in_flight == 0 && state.pending.is_empty()
     }
+
+    /// Wait until this slot and every earlier slot have been delivered in order.
+    ///
+    /// Queue drains wait for their last reserved slot rather than lane idleness, because newer
+    /// peer traffic may reserve later slots before the drain returns.
+    pub(crate) async fn wait_delivered(&self, slot: u64) {
+        assert!(
+            slot < self.state.lock().next_slot,
+            "a completion slot must be reserved before it is awaited"
+        );
+
+        loop {
+            let notified = self.progress.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.state.lock().next_delivered > slot {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// Keeps ordered completion state only while a peer has outstanding work.
@@ -575,6 +596,29 @@ mod tests {
             assert_eq!(completions.reserve(), Some(expected as u64));
         }
         assert_eq!(completions.reserve(), None);
+    }
+
+    /// A queue drain can finish without waiting for newer peer traffic.
+    #[tokio::test]
+    async fn wait_for_slot_does_not_wait_for_later_peer_work() {
+        let completions = OrderedCompletions::<u8>::default();
+        let first_slot = completions.reserve().unwrap();
+        let later_slot = completions.reserve().unwrap();
+        let mut waiter = Box::pin(completions.wait_delivered(first_slot));
+        assert!(futures::poll!(&mut waiter).is_pending());
+
+        completions
+            .complete_with(first_slot, Some(1), |_| async { Ok::<_, ()>(()) })
+            .await
+            .unwrap();
+
+        assert!(futures::poll!(&mut waiter).is_ready());
+        assert!(!completions.is_idle());
+        completions
+            .complete_with(later_slot, Some(2), |_| async { Ok::<_, ()>(()) })
+            .await
+            .unwrap();
+        assert!(completions.is_idle());
     }
 
     /// Size the production pool from the CPU count visible to this process.
