@@ -4,7 +4,9 @@
 The R4b cases use veth links between namespaces, so the packet path has no
 device IRQ of its own. This audit records IRQ affinity and per-CPU softirq
 counters beside each loaded phase, while checking that every process in a
-J88i scope has the scope's exact Cpus_allowed_list.
+J88i scope has the scope's exact Cpus_allowed_list. When a ready-file is
+requested, setup samples stay separate until the measured scopes are present
+and no unrelated task is runnable on the test CPUs.
 """
 
 from __future__ import annotations
@@ -252,6 +254,15 @@ def sample() -> dict[str, object]:
     }
 
 
+def clean_startup_sample(current: dict[str, object]) -> bool:
+    """Release stopped workloads only after exact masks and a quiet run queue."""
+    return (
+        int(current.get("scope_threads", 0)) > 0
+        and not current.get("mask_mismatches")
+        and not current.get("external_runnable")
+    )
+
+
 def main() -> int:
     """Sample until the case asks us to stop, then write a compact summary."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -273,6 +284,18 @@ def main() -> int:
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     snapshot("before")
+    ready_file = os.environ.get("H2H_CPUSET_AUDIT_READY_FILE")
+    if ready_file:
+        ready_path = Path(ready_file)
+        with (OUTPUT / "preflight.jsonl").open("w") as preflight:
+            while not STOP:
+                current = sample()
+                preflight.write(json.dumps(current, separators=(",", ":")) + "\n")
+                preflight.flush()
+                if clean_startup_sample(current):
+                    ready_path.write_text("clean\n")
+                    break
+                time.sleep(0.1)
     samples = 0
     mismatch_samples = 0
     external_samples = 0

@@ -15,6 +15,7 @@ H2H_RUN=$(mktemp -d /dev/shm/j88i-cpuset-smoke.XXXXXX)
 export H2H_KIT H2H_RESULTS H2H_CASE H2H_CPUSET_PIN H2H_CPUSET_A H2H_CPUSET_B
 export H2H_CPUSET_AUDIT H2H_CPUSET_AUDIT_REQUIRE_CLEAN H2H_RUN
 mkdir -p "$H2H_RESULTS"
+mkdir -p "$H2H_RESULTS/$H2H_CASE"
 source "$H2H_KIT/lib/common.sh"
 
 finish() {
@@ -45,7 +46,26 @@ check_mask() {
 check_mask h2h-a 0-1
 check_mask h2h-b 2-3
 
-h2h_cpu_audit_start smoke
+# A paused scope lets the audit start after systemd has created every measured
+# cgroup, then releases the tools together so setup work is outside the hold.
+paused_marker="$H2H_RUN/paused-started"
+paused_done="$H2H_RUN/paused-done"
+paused_gate="$H2H_RUN/paused-gate"
+mkfifo "$paused_gate"
+H2H_SCOPE_PAUSE=1 H2H_SCOPE_LOG="$H2H_RUN/paused-scope.log" \
+    spawn_in_ns paused_pid h2h-a bash -c \
+    'printf started > "$1"; read -r _ < "$2"; printf done > "$3"' \
+    bash "$paused_marker" "$paused_gate" "$paused_done"
+paused_client=$H2H_SCOPE_CLIENT_PID
+paused_state=$(awk '/^State:/ {print $2}' "/proc/$paused_pid/status")
+[[ $paused_state == T ]] || die "measured scope was not stopped before release: state=$paused_state"
+[[ ! -e $paused_marker ]] || die "measured command ran before the audit started"
+kill -CONT "$paused_pid"
+wait_for 10 test -e "$paused_marker" || die "released measured command did not start"
+printf 'go\n' > "$paused_gate"
+wait "$paused_client" || die "released measured scope failed"
+[[ -e $paused_done ]] || die "released measured scope did not finish"
+
 spawn_in_ns probe_a_pid h2h-a sleep 30
 spawn_in_ns probe_b_pid h2h-b sleep 30
 for entry in "probe_a_pid:0-1" "probe_b_pid:2-3"; do
@@ -57,6 +77,7 @@ for entry in "probe_a_pid:0-1" "probe_b_pid:2-3"; do
     log "background namespace PID $pid masks: Cpus_allowed=$mask Cpus_allowed_list=$list, expected $want"
     [[ -n $mask && $list == "$want" ]] || die "background namespace process masks were $masks"
 done
+h2h_cpu_audit_start smoke
 sleep 2
 h2h_cpu_audit_stop
 python3 -I - "$H2H_RESULTS/$H2H_CASE/cpuset-smoke/summary.json" <<'PY'

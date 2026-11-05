@@ -20,6 +20,59 @@ from unittest.mock import patch
 class CpusetAuditCliTest(unittest.TestCase):
     """Keep the positional interface used by the R4b shell helper working."""
 
+    def test_sampler_signals_only_a_clean_startup_before_loaded_samples(self) -> None:
+        """The workload must stay stopped until the sampler sees a clean CPU set."""
+        script = Path(__file__).parent / "base/lib/cpuset_audit.py"
+        with tempfile.TemporaryDirectory(prefix="j88i-ready-") as temporary:
+            output = Path(temporary) / "audit"
+            ready = Path(temporary) / "ready"
+            output.mkdir()
+            with patch.dict(
+                os.environ,
+                {
+                    "H2H_CPUSET_AUDIT_READY_FILE": str(ready),
+                },
+            ):
+                spec = importlib.util.spec_from_file_location("cpuset_audit_ready", script)
+                self.assertIsNotNone(spec)
+                self.assertIsNotNone(spec.loader if spec is not None else None)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+
+            dirty = {
+                "scope_threads": 1,
+                "scope_processes": [],
+                "mask_mismatches": [],
+                "external_runnable": [{"pid": 1}],
+                "kernel_softirq_runnable": [],
+                "cpu_pressure": "",
+            }
+            clean = {**dirty, "external_runnable": []}
+            samples = iter([dirty, clean, clean])
+            sleep_calls = 0
+
+            def stop_after_loaded_sample(_seconds: float) -> None:
+                nonlocal sleep_calls
+                sleep_calls += 1
+                if ready.is_file() or sleep_calls >= 3:
+                    module.STOP = True
+
+            with (
+                patch.dict(os.environ, {"H2H_CPUSET_AUDIT_READY_FILE": str(ready)}),
+                patch.object(module, "sample", side_effect=lambda: next(samples)),
+                patch.object(module, "snapshot"),
+                patch.object(module.signal, "signal"),
+                patch.object(module.time, "sleep", side_effect=stop_after_loaded_sample),
+                patch("sys.argv", [str(script), str(output), str(os.getpid())]),
+                patch.object(module, "STOP", False),
+            ):
+                module.main()
+
+            self.assertTrue(ready.is_file(), "a clean preflight must release the stopped workload")
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertEqual(summary["samples"], 1, summary)
+            self.assertEqual(summary["external_runnable_samples"], 0, summary)
+
     def test_sampler_accepts_output_and_parent_pid_arguments(self) -> None:
         """The sampler must write its summary when called with both arguments."""
         script = Path(__file__).parent / "base/lib/cpuset_audit.py"
@@ -73,6 +126,7 @@ set -uo pipefail
 export H2H_KIT=$1 H2H_RESULTS=$2 H2H_CASE=stop-test H2H_CPUSET_AUDIT=1
 source "$H2H_KIT/lib/common.sh"
 python3() { return 23; }
+wait_for() { return 0; }
 h2h_cpu_audit_start failed
 if h2h_cpu_audit_stop; then
     exit 1

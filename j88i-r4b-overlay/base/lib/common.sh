@@ -100,17 +100,24 @@ h2h_scope_run() {
 }
 
 # Start a longer-lived namespace process in its side's cpuset and return the
-# actual command PID. The PID file is written before exec, so callers may use
-# the returned PID with nsenter without learning a systemd-run client PID.
+# actual command PID. A paused scope writes its PID before stopping, so all
+# measured scopes can exist before the clean audit and load start together.
 h2h_scope_spawn() {
     local outvar=$1 cpus=$2; shift 2
-    local slug unit pidfile scope_log client pid
+    local slug unit pidfile scope_log scope_stdout scope_stderr client pid pause
     slug=${H2H_CASE:-kit}
     slug=${slug//[^a-zA-Z0-9_.-]/-}
     unit="j88i-$slug-$$-$RANDOM.scope"
+    pause=${H2H_SCOPE_PAUSE:-0}
     if [[ ${H2H_CPUSET_PIN:-0} != 1 ]]; then
-        local scope_log=${H2H_SCOPE_LOG:-/dev/null}
-        "$@" > "$scope_log" 2>&1 &
+        scope_log=${H2H_SCOPE_LOG:-/dev/null}
+        scope_stdout=${H2H_SCOPE_STDOUT:-$scope_log}
+        scope_stderr=${H2H_SCOPE_STDERR:-$scope_log}
+        if [[ $scope_stderr == "$scope_stdout" ]]; then
+            "$@" > "$scope_stdout" 2>&1 &
+        else
+            "$@" > "$scope_stdout" 2>"$scope_stderr" &
+        fi
         pid=$!
         register_pid "$pid"
         H2H_SCOPE_CLIENT_PID=$pid
@@ -119,11 +126,13 @@ h2h_scope_spawn() {
     fi
     pidfile="$H2H_RUN/$unit.pid"
     scope_log=${H2H_SCOPE_LOG:-$H2H_RUN/$unit.log}
+    scope_stdout=${H2H_SCOPE_STDOUT:-$scope_log}
+    scope_stderr=${H2H_SCOPE_STDERR:-$scope_log}
     mkdir -p "$(dirname "$scope_log")"
     systemd-run --scope --quiet --collect --slice=perf.slice --unit="$unit" \
         --property="AllowedCPUs=$cpus" -- /bin/bash -c \
-        'pidfile=$1; shift; printf "%s\\n" "$$" > "$pidfile"; exec "$@"' \
-        j88i-scope "$pidfile" "$@" > "$scope_log" 2>&1 &
+        'pidfile=$1; pause=$2; stdout=$3; stderr=$4; shift 4; printf "%s\\n" "$$" > "$pidfile"; if [[ $pause == 1 ]]; then kill -STOP "$$"; fi; if [[ $stderr == "$stdout" ]]; then exec "$@" > "$stdout" 2>&1; else exec "$@" > "$stdout" 2>"$stderr"; fi' \
+        j88i-scope "$pidfile" "$pause" "$scope_stdout" "$scope_stderr" "$@" > "$scope_log" 2>&1 &
     client=$!
     register_pid "$client"
     wait_for 10 test -s "$pidfile" || die "cpuset scope $unit did not publish its command PID: $(tail -c 600 "$scope_log")"
@@ -134,16 +143,22 @@ h2h_scope_spawn() {
     printf -v "$outvar" '%s' "$pid"
 }
 
-# Start or stop low-rate /proc scheduler and placement evidence for one loaded phase.
+# Wait for a clean preflight, then sample process placement and scheduler delay
+# across the measured phase; setup activity is stored separately from load.
 h2h_cpu_audit_start() {
     [[ ${H2H_CPUSET_AUDIT:-0} == 1 ]] || return 0
     [[ -z ${H2H_CPUSET_AUDIT_PID:-} ]] || die "a cpuset audit is already running"
-    local tag=$1 dir="$H2H_RESULTS/$H2H_CASE/cpuset-$1"
+    local tag=$1 dir="$H2H_RESULTS/$H2H_CASE/cpuset-$1" ready_file
     mkdir -p "$dir"
+    ready_file="$dir/ready"
     H2H_CPUSET_AUDIT_SUMMARY="$dir/summary.json"
-    python3 -I "$H2H_KIT/lib/cpuset_audit.py" "$dir" "${BASHPID:-$$}" &
+    H2H_CPUSET_AUDIT_READY_FILE="$ready_file" \
+        python3 -I "$H2H_KIT/lib/cpuset_audit.py" "$dir" "${BASHPID:-$$}" &
     H2H_CPUSET_AUDIT_PID=$!
     log "cpuset audit started for $tag (PID $H2H_CPUSET_AUDIT_PID)"
+    wait_for 10 test -s "$ready_file" \
+        || die "D348 audit did not find a clean preflight for $tag"
+    log "cpuset audit preflight is clean for $tag; measured scopes may start"
 }
 
 h2h_cpu_audit_stop() {

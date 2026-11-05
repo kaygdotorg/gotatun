@@ -294,20 +294,50 @@ measure idle "$H" proc-idle --pids "$WATCH" --seconds "$IDLE_S"
 record_memcg one
 
 profile() { # profile <tag> <lat-count> <lat-interval-us> <tput-seconds>
-    local tag=$1 count=$2 interval=$3 secs=$4 size flows ping_pid
+    local tag=$1 count=$2 interval=$3 secs=$4 size flows ping_pid tput_pid
+    local ping_client tput_client ping_raw ping_status_file tput_file tput_tmp tput_err
+    local ping_status tput_status audit_status
     for size in 64 512 1400; do
         measure "lat-$tag-$size" in_ns h2h-a "$H" net-lat --to "$PEER:5201" --size "$size" --count "$count" --interval-us "$interval"
     done
     for flows in 1 8; do
+        ping_raw="$H2H_RESULTS/$H2H_CASE/icmp-$tag-$flows.raw"
+        ping_status_file="$H2H_RESULTS/$H2H_CASE/icmp-$tag-$flows.exit"
+        tput_file="$H2H_RESULTS/$H2H_CASE/tput-$tag-$flows.json"
+        tput_tmp="$tput_file.tmp"
+        tput_err="$tput_file.err"
+        H2H_SCOPE_PAUSE=1 \
+            H2H_SCOPE_LOG="$D/icmp-scope-$tag-$flows.log" \
+            H2H_SCOPE_STDOUT="$ping_raw" H2H_SCOPE_STDERR="$ping_raw" \
+            spawn_in_ns ping_pid h2h-a ping -D -O -n -i 0.005 -c "$count" \
+                -w "$((count / 100 + 5))" "$PEER"
+        ping_client=$H2H_SCOPE_CLIENT_PID
+        H2H_SCOPE_PAUSE=1 \
+            H2H_SCOPE_LOG="$D/tput-scope-$tag-$flows.log" \
+            H2H_SCOPE_STDOUT="$tput_tmp" H2H_SCOPE_STDERR="$tput_err" \
+            spawn_in_ns tput_pid h2h-a "$H" net-tput --to "$PEER:5201" \
+                --flows "$flows" --seconds "$secs" --pids "$WATCH"
+        tput_client=$H2H_SCOPE_CLIENT_PID
         h2h_cpu_audit_start "$tag-$flows"
-        raw_icmp "$tag" "$flows" "$count" 0.005 &
-        ping_pid=$!
-        measure "tput-$tag-$flows" in_ns h2h-a "$H" net-tput --to "$PEER:5201" --flows "$flows" --seconds "$secs" --pids "$WATCH"
-        if ! wait "$ping_pid"; then
-            h2h_cpu_audit_stop
-            die "raw ICMP probe failed for $tag/$flows flows"
+        kill -CONT "$ping_pid" "$tput_pid"
+
+        tput_status=0
+        if wait "$tput_client"; then
+            mv "$tput_tmp" "$tput_file"
+            rm -f "$tput_err"
+            log "tput-$tag-$flows: $(head -c 400 "$tput_file")"
+        else
+            tput_status=$?
+            log "tput-$tag-$flows failed: $(tail -c 400 "$tput_err")"
+            mv "$tput_tmp" "$tput_file.failed" 2>/dev/null || true
         fi
-        h2h_cpu_audit_stop
+        ping_status=0
+        if wait "$ping_client"; then :; else ping_status=$?; fi
+        printf '%s\n' "$ping_status" > "$ping_status_file"
+        audit_status=0
+        if h2h_cpu_audit_stop; then :; else audit_status=$?; fi
+        ((tput_status == 0)) || die "throughput probe failed for $tag/$flows flows"
+        ((audit_status == 0)) || die "D348 audit failed for $tag/$flows flows"
         summarize_icmp "$tag" "$flows" "$count"
     done
 }
@@ -360,18 +390,43 @@ capture_soak_counters() { # capture_soak_counters <before|after>
 }
 
 run_soak() {
-    local seconds=${H2H_SOAK_SECONDS:-0} ping_pid tput_pid rc=0 ping_rc audit_rc
+    local seconds=${H2H_SOAK_SECONDS:-0} ping_pid tput_pid ping_client tput_client
+    local ping_status_file ping_raw tput_file tput_tmp tput_err rc=0 ping_rc=0 audit_rc=0
     [[ $seconds == 3600 ]] || die "kept-cut soak must be exactly 3,600 seconds"
     capture_soak_counters before
+    ping_raw="$H2H_RESULTS/$H2H_CASE/icmp-soak-8.raw"
+    ping_status_file="$H2H_RESULTS/$H2H_CASE/icmp-soak-8.exit"
+    tput_file="$H2H_RESULTS/$H2H_CASE/tput-soak-8.json"
+    tput_tmp="$tput_file.tmp"
+    tput_err="$tput_file.err"
+    H2H_SCOPE_PAUSE=1 \
+        H2H_SCOPE_LOG="$D/icmp-scope-soak-8.log" \
+        H2H_SCOPE_STDOUT="$ping_raw" H2H_SCOPE_STDERR="$ping_raw" \
+        spawn_in_ns ping_pid h2h-a ping -D -O -n -i 1.0 -c "$seconds" \
+            -w "$((seconds + 10))" "$PEER"
+    ping_client=$H2H_SCOPE_CLIENT_PID
+    H2H_SCOPE_PAUSE=1 \
+        H2H_SCOPE_LOG="$D/tput-scope-soak-8.log" \
+        H2H_SCOPE_STDOUT="$tput_tmp" H2H_SCOPE_STDERR="$tput_err" \
+        spawn_in_ns tput_pid h2h-a "$H" net-tput --to "$PEER:5201" \
+            --flows 8 --seconds "$seconds" --pids "$WATCH"
+    tput_client=$H2H_SCOPE_CLIENT_PID
     h2h_cpu_audit_start soak
-    raw_icmp soak 8 "$seconds" 1.0 &
-    ping_pid=$!
-    measure tput-soak-8 in_ns h2h-a "$H" net-tput --to "$PEER:5201" --flows 8 --seconds "$seconds" --pids "$WATCH" &
-    tput_pid=$!
-    if wait "$tput_pid"; then :; else rc=$?; fi
-    if wait "$ping_pid"; then :; else ping_rc=$?; ((rc != 0)) || rc=$ping_rc; fi
+    kill -CONT "$ping_pid" "$tput_pid"
+    if wait "$tput_client"; then
+        mv "$tput_tmp" "$tput_file"
+        rm -f "$tput_err"
+        log "tput-soak-8: $(head -c 400 "$tput_file")"
+    else
+        rc=$?
+        log "tput-soak-8 failed: $(tail -c 400 "$tput_err")"
+        mv "$tput_tmp" "$tput_file.failed" 2>/dev/null || true
+    fi
+    if wait "$ping_client"; then :; else ping_rc=$?; ((rc != 0)) || rc=$ping_rc; fi
+    printf '%s\n' "$ping_rc" > "$ping_status_file"
     if h2h_cpu_audit_stop; then :; else audit_rc=$?; ((rc != 0)) || rc=$audit_rc; fi
-    ((rc == 0)) || die "one-hour soak workload or D348 audit failed with status $rc"
+    ((rc == 0 && audit_rc == 0)) \
+        || die "one-hour soak workload or D348 audit failed with status $rc/$audit_rc"
     summarize_icmp soak 8 "$seconds"
     sleep 2
     capture_soak_counters after
