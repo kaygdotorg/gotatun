@@ -730,7 +730,7 @@ mod tests {
 
     /// Measure serial AEAD and the ordered worker stage at one, two, and four workers.
     ///
-    /// Run with `cargo test -p gotatun --no-default-features --features device,ring --lib
+    /// Run with `cargo test -p gotatun --no-default-features --features device,ring,tun --lib
     /// crypto_stage_microbenchmark -- --ignored --nocapture` on a quiet compute host. Packet
     /// preparation is outside the timed interval. Worker measurements include queueing and
     /// in-order release, using the same bounded chunk size as the live device path.
