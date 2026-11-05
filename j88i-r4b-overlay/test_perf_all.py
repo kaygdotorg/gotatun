@@ -170,14 +170,14 @@ class PerfAllCliTest(unittest.TestCase):
             )
             self.assertIn("cpuset.cpus.effective=0-5", (output / "cpuset-restoration.txt").read_text())
 
-    def test_validation_resolves_smoke_helper_from_overlay_root(self) -> None:
-        """D348 validation must find the smoke helper shipped beside `base/`."""
+    def test_validation_resolves_smoke_helper_from_installed_kit_root(self) -> None:
+        """D348 validation must find the helper copied beside the installed harness kit."""
         overlay = Path(__file__).parent
         runner = overlay / "base/runner-overlays/J88i-pinned-run.sh"
         helper = overlay / "cpuset-harness-smoke.sh"
 
         self.assertTrue(helper.is_file())
-        self.assertIn('bash "$kit/../cpuset-harness-smoke.sh"', runner.read_text())
+        self.assertIn('bash "$kit/cpuset-harness-smoke.sh"', runner.read_text())
 
     def test_calibration_forwards_lan_probe_count_to_measured_scope(self) -> None:
         """The 3,600-probe override must cross perf-run's sudo boundary explicitly."""
