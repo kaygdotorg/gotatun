@@ -14,8 +14,8 @@ from pathlib import Path
 class PingStatsTest(unittest.TestCase):
     """Protect the loss-aware percentile rule used by the R4b keep table."""
 
-    def test_any_lost_probe_makes_the_keep_p99_infinite(self) -> None:
-        """J201's hold rule treats any lost probe as an infinite p99."""
+    def test_loss_above_one_percent_makes_p99_infinite(self) -> None:
+        """A loss rate above one percent pushes the p99 rank to infinity."""
         script = Path(__file__).parent / "base/lib/pingstat.py"
         spec = importlib.util.spec_from_file_location("pingstat", script)
         self.assertIsNotNone(spec)
@@ -27,18 +27,43 @@ class PingStatsTest(unittest.TestCase):
             sample = Path(temporary) / "ping.txt"
             replies = "".join(
                 f"[1.000000] 64 bytes from peer: icmp_seq={seq} ttl=64 time={seq / 1000:.3f} ms\n"
-                for seq in range(1, 100)
+                for seq in range(1, 98)
             )
-            sample.write_text(replies + "100 packets transmitted, 99 received\n")
+            sample.write_text(replies + "100 packets transmitted, 97 received\n")
 
             summary = module.stats([sample])
 
-        self.assertEqual((summary["sent"], summary["lost"]), (100, 1))
-        self.assertAlmostEqual(summary["p50_received_ms"], 0.050)
-        self.assertAlmostEqual(summary["p99_received_ms"], 0.099)
+        self.assertEqual((summary["sent"], summary["lost"]), (100, 3))
+        self.assertAlmostEqual(summary["p50_received_ms"], 0.049)
+        self.assertAlmostEqual(summary["p99_received_ms"], 0.097)
         self.assertTrue(math.isinf(summary["p99_loss_aware_ms"]))
         self.assertTrue(math.isinf(summary["p999_loss_aware_ms"]))
-        self.assertAlmostEqual(summary["max_received_ms"], 0.099)
+        self.assertAlmostEqual(summary["max_received_ms"], 0.097)
+
+    def test_loss_below_one_percent_keeps_exact_p99_finite(self) -> None:
+        """The p99 rank includes drops at infinity, while a sub-one-percent loss stays finite."""
+        script = Path(__file__).parent / "base/lib/pingstat.py"
+        spec = importlib.util.spec_from_file_location("pingstat_low_loss", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader if spec is not None else None)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with tempfile.TemporaryDirectory(prefix="j88i-pingstat-low-loss-") as temporary:
+            sample = Path(temporary) / "ping.txt"
+            replies = "".join(
+                f"[1.000000] 64 bytes from peer: icmp_seq={seq} ttl=64 time={seq / 1000:.3f} ms\n"
+                for seq in range(1, 996)
+            )
+            sample.write_text(replies + "1000 packets transmitted, 995 received\n")
+
+            summary = module.stats([sample])
+
+        self.assertEqual((summary["sent"], summary["lost"]), (1000, 5))
+        self.assertAlmostEqual(summary["p99_received_ms"], 0.986)
+        self.assertAlmostEqual(summary["p99_loss_aware_ms"], 0.990)
+        self.assertTrue(math.isinf(summary["p999_loss_aware_ms"]))
+        self.assertAlmostEqual(summary["max_received_ms"], 0.995)
 
     def test_no_loss_keeps_p99_equal_to_received_p99(self) -> None:
         """With no drops, the keep metric is the observed raw p99."""

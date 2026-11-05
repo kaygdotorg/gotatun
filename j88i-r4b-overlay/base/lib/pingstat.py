@@ -29,10 +29,9 @@ def stats(
 ) -> dict[str, int | float]:
     """Read ping output files and calculate received and loss-aware percentiles.
 
-    Each ICMP sequence contributes at most once per file. The keep-rule p99 is
-    deliberately infinite after any loss, even when the mathematical nearest
-    rank would still land on a received sample, so a dropped probe cannot look
-    like a latency improvement.
+    Each ICMP sequence contributes at most once per file. Each missing reply is
+    added as an infinite RTT before ranking, so p99 becomes infinite only when
+    losses occupy the p99 rank.
     """
     received: list[float] = []
     sent = 0
@@ -50,7 +49,7 @@ def stats(
     p50_received = percentile(received, 0.50)
     p99_received = percentile(received, 0.99)
     p999_loss_aware = percentile(received + [math.inf] * lost, 0.999)
-    p99_loss_aware = math.inf if lost else p99_received
+    p99_loss_aware = percentile(received + [math.inf] * lost, 0.99)
     return {
         "sent": sent,
         "lost": lost,
