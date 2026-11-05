@@ -312,6 +312,7 @@ impl CryptoHandle {
 pub(crate) struct CryptoWorkers {
     handle: CryptoHandle,
     threads: Vec<JoinHandle<()>>,
+    #[cfg(test)]
     worker_count: usize,
 }
 
@@ -378,6 +379,7 @@ impl CryptoWorkers {
         Ok(Self {
             handle: CryptoHandle { sender },
             threads,
+            #[cfg(test)]
             worker_count,
         })
     }
@@ -388,6 +390,7 @@ impl CryptoWorkers {
     }
 
     /// Worker count used for the pool.
+    #[cfg(test)]
     pub(crate) fn worker_count(&self) -> usize {
         self.worker_count
     }
@@ -395,9 +398,7 @@ impl CryptoWorkers {
     /// Close the job queue and join every worker.
     pub(crate) async fn stop(self) {
         let Self {
-            handle,
-            threads,
-            worker_count: _,
+            handle, threads, ..
         } = self;
         let CryptoHandle { sender } = handle;
         drop(sender);
