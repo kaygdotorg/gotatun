@@ -20,7 +20,7 @@ SYSTEM=$1
 H2H_CASE=mesh-$SYSTEM
 trap cleanup EXIT
 
-LAT_COUNT=$(dur 2000 300)
+LAT_COUNT=$(h2h_lan_latency_count)
 WAN_LAT_COUNT=$(dur 300 60)
 TPUT_S=$(dur 10 2)
 WAN_TPUT_S=$(dur 20 4)
