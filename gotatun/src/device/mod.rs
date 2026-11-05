@@ -18,6 +18,7 @@ pub mod configure;
 pub mod daita;
 #[cfg(test)]
 mod integration_tests;
+mod parallel_crypto;
 mod peer;
 mod peer_state;
 #[cfg(test)]
@@ -27,7 +28,7 @@ pub mod uapi;
 
 use crate::noise::index_table::IndexTable;
 use builder::Nul;
-use futures::TryFutureExt;
+use futures::{FutureExt, StreamExt, TryFutureExt, future::BoxFuture, stream::FuturesUnordered};
 use std::collections::HashMap;
 use std::io::{self};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
@@ -42,7 +43,7 @@ use tracing::{Level, instrument};
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
-use crate::noise::{Tunn, TunnResult};
+use crate::noise::{PreparedDecryption, PreparedOutgoing, Tunn, TunnResult};
 use crate::packet::{PacketBufPool, WgKind};
 use crate::task::Task;
 use crate::tun::{IpRecv, IpSend, MtuWatcher};
@@ -52,6 +53,10 @@ use crate::udp::buffer::BufferedUdpSend;
 use crate::udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams};
 use crate::x25519;
 use allowed_ips::AllowedIps;
+use parallel_crypto::{
+    CRYPTO_CHUNK_SIZE, CryptoHandle, CryptoWorkers, IncomingCompletion, OrderStore,
+    OrderedCompletions,
+};
 use peer_state::{PeerState, PendingHandshake};
 
 #[cfg(feature = "tun")]
@@ -132,6 +137,77 @@ pub enum Error {
     NotConnected,
 }
 
+/// Futures that finish one outgoing worker result and release it through the peer's order lane.
+type PendingOutgoing = FuturesUnordered<BoxFuture<'static, ()>>;
+
+/// Futures that finish one incoming worker result and release it toward the TUN in order.
+type PendingIncoming = FuturesUnordered<BoxFuture<'static, Result<(), Error>>>;
+
+/// Stable key for a peer while its reference-counted state remains alive.
+fn peer_order_key(peer: &Arc<Mutex<PeerState>>) -> usize {
+    Arc::as_ptr(peer) as usize
+}
+
+/// Apply one prepared outgoing packet and deliver newly ordered results to the peer's UDP path.
+async fn complete_outgoing_packet(
+    crypto: CryptoHandle,
+    ordered: Arc<OrderStore<WgKind>>,
+    peer_arc: Arc<Mutex<PeerState>>,
+    peer_key: usize,
+    lane: Arc<OrderedCompletions<WgKind>>,
+    slot: u64,
+    peer_addr: std::net::SocketAddr,
+    prepared: Option<PreparedOutgoing>,
+    udp: impl UdpSend,
+    apply_daita: bool,
+) {
+    #[cfg(not(feature = "daita"))]
+    let _ = apply_daita;
+    #[cfg(not(feature = "daita"))]
+    let _ = &peer_arc;
+
+    let packet = match prepared {
+        Some(PreparedOutgoing::Encrypt(packet)) => match crypto.submit_encryption(packet).await {
+            Some(result) => result.await.ok(),
+            None => None,
+        },
+        Some(PreparedOutgoing::Ready(packet)) => Some(packet),
+        None => None,
+    };
+
+    let _ = lane
+        .complete_with(slot, packet, |packet| {
+            #[cfg(feature = "daita")]
+            let peer_arc = Arc::clone(&peer_arc);
+            let udp = udp.clone();
+            async move {
+                #[cfg(feature = "daita")]
+                let packet = {
+                    if apply_daita {
+                        let mut peer = peer_arc.lock().await;
+                        match peer.daita.as_mut() {
+                            Some(daita) => daita.on_tunnel_sent(packet),
+                            None => Some(packet),
+                        }
+                    } else {
+                        Some(packet)
+                    }
+                };
+                #[cfg(not(feature = "daita"))]
+                let packet = Some(packet);
+
+                if let Some(packet) = packet
+                    && udp.send_to(packet.into(), peer_addr).await.is_err()
+                {
+                    tracing::trace!("udp.send_to failed");
+                }
+                Ok::<(), ()>(())
+            }
+        })
+        .await;
+    ordered.release_if_idle(peer_key, &lane);
+}
+
 /// A reference-counted handle to a WireGuard device.
 pub struct Device<T: DeviceTransports> {
     inner: Arc<RwLock<DeviceState<T>>>,
@@ -190,6 +266,9 @@ pub(crate) struct DeviceState<T: DeviceTransports> {
 
 pub(crate) struct Connection<T: DeviceTransports> {
     udp: <T::UdpTransportFactory as UdpTransportFactory>::Send,
+
+    /// Bounded workers shared by both packet directions for this connection.
+    crypto_workers: CryptoWorkers,
 
     /// The task that reads IPv4 traffic from the UDP socket.
     incoming: Task,
@@ -258,6 +337,11 @@ impl<T: DeviceTransports> Connection<T> {
             .await?;
         }
 
+        let crypto_workers = CryptoWorkers::new()?;
+        let crypto = crypto_workers.handle();
+        let outgoing_order = Arc::new(OrderStore::default());
+        let incoming_order = Arc::new(OrderStore::default());
+
         let fatal_error = device.fatal_error.clone();
         let register_fatal_error = move |e| {
             fatal_error.send_if_modified(|option| {
@@ -277,12 +361,19 @@ impl<T: DeviceTransports> Connection<T> {
                 buffered_ip_rx,
                 buffered_udp_tx.clone(),
                 pool.clone(),
+                crypto.clone(),
+                Arc::clone(&outgoing_order),
             )
             .map_err(register_fatal_error.clone()),
         );
         let timers = Task::spawn(
             "handle_timers",
-            DeviceState::handle_timers(Arc::downgrade(&device_arc), buffered_udp_tx.clone()),
+            DeviceState::handle_timers(
+                Arc::downgrade(&device_arc),
+                buffered_udp_tx.clone(),
+                crypto.clone(),
+                Arc::clone(&outgoing_order),
+            ),
         );
         let incoming = Task::spawn(
             "handle_incoming",
@@ -292,6 +383,9 @@ impl<T: DeviceTransports> Connection<T> {
                 buffered_udp_tx,
                 incoming_udp_rx,
                 pool.clone(),
+                crypto,
+                incoming_order,
+                Arc::clone(&outgoing_order),
             )
             .map_err(register_fatal_error.clone()),
         );
@@ -299,6 +393,7 @@ impl<T: DeviceTransports> Connection<T> {
         debug_assert!(device.connection.is_none());
         device.connection = Some(Connection {
             udp: udp_tx,
+            crypto_workers,
             incoming,
             timers,
             outgoing,
@@ -640,8 +735,245 @@ impl<T: DeviceTransports> DeviceState<T> {
         peers_by_idx.lock().insert(sender_idx, Arc::clone(peer));
     }
 
+    /// Finish one authenticated data packet at its peer's ordered receive position.
+    async fn deliver_incoming_data(
+        device: Weak<RwLock<Self>>,
+        peer_arc: Arc<Mutex<PeerState>>,
+        completion: IncomingCompletion,
+        mut tun_tx: impl IpSend,
+    ) -> Result<(), Error> {
+        let Some(device_arc) = device.upgrade() else {
+            return Ok(());
+        };
+        let device_guard = device_arc.read().await;
+        let mut peer = peer_arc.lock().await;
+        let result = peer.complete_incoming_data(completion.result, completion.addr);
+        #[cfg_attr(not(feature = "daita"), expect(unused_mut))]
+        let TunnResult::WriteToTunnel(mut packet) = result else {
+            return Ok(());
+        };
+
+        #[cfg(feature = "daita")]
+        if let Some(daita) = peer.daita.as_mut() {
+            match daita.on_data_recv(packet) {
+                Some(new) => packet = new,
+                None => return Ok(()),
+            }
+        }
+
+        if packet.is_empty() {
+            return Ok(());
+        }
+        let Ok(packet) = packet.try_into_ipvx() else {
+            return Ok(());
+        };
+
+        let (source, packet): (IpAddr, _) = packet.either(
+            |ipv4| (ipv4.header.source().into(), ipv4.into()),
+            |ipv6| (ipv6.header.source().into(), ipv6.into()),
+        );
+        let routed_to_this_peer = device_guard
+            .peers_by_ip
+            .find(source)
+            .is_some_and(|owner| Arc::ptr_eq(owner, &peer_arc));
+        if !routed_to_this_peer {
+            if cfg!(debug_assertions) {
+                let unspecified = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into();
+                tracing::warn!(
+                    "peer at {} is not allowed to send us packets from: {source}",
+                    peer.endpoint().addr.unwrap_or(unspecified)
+                );
+            }
+            return Ok(());
+        }
+
+        drop(peer);
+        drop(device_guard);
+        tun_tx.send(packet).await.map_err(Error::IoError)
+    }
+
+    /// Queue one received data packet on a worker and release it through its peer's receive lane.
+    fn enqueue_incoming_packet(
+        pending: &mut PendingIncoming,
+        crypto: CryptoHandle,
+        ordered: Arc<OrderStore<IncomingCompletion>>,
+        peer_key: usize,
+        lane: Arc<OrderedCompletions<IncomingCompletion>>,
+        slot: u64,
+        peer_arc: Arc<Mutex<PeerState>>,
+        device: Weak<RwLock<Self>>,
+        tun_tx: impl IpSend + Clone,
+        addr: std::net::SocketAddr,
+        packet: PreparedDecryption,
+    ) {
+        pending.push(
+            async move {
+                let completion = match crypto.submit_decryption(packet).await {
+                    Some(result) => result
+                        .await
+                        .ok()
+                        .map(|result| IncomingCompletion { result, addr }),
+                    None => None,
+                };
+
+                let result = lane
+                    .complete_with(slot, completion, |completion| {
+                        let device = device.clone();
+                        let peer_arc = Arc::clone(&peer_arc);
+                        let tun_tx = tun_tx.clone();
+                        async move {
+                            Self::deliver_incoming_data(device, peer_arc, completion, tun_tx).await
+                        }
+                    })
+                    .await;
+                ordered.release_if_idle(peer_key, &lane);
+                result
+            }
+            .boxed(),
+        );
+    }
+
+    /// Encrypt and send a bounded chunk of handshake-queued packets before newer TUN traffic.
+    async fn flush_handshake_queue(
+        device: Weak<RwLock<Self>>,
+        peer_arc: Arc<Mutex<PeerState>>,
+        peer_key: usize,
+        first_lane: Arc<OrderedCompletions<WgKind>>,
+        peer_addr: std::net::SocketAddr,
+        udp: impl UdpSend + 'static,
+        crypto: CryptoHandle,
+        ordered: Arc<OrderStore<WgKind>>,
+        pending: &mut PendingOutgoing,
+        flush_guard: parallel_crypto::FlushGuard<WgKind>,
+    ) -> Result<(), Error> {
+        let mut flush_guard = Some(flush_guard);
+
+        while !first_lane.is_idle() {
+            pending
+                .next()
+                .await
+                .expect("the handshake output has an ordered completion future");
+        }
+
+        loop {
+            let Some(device_arc) = device.upgrade() else {
+                return Ok(());
+            };
+            let device_guard = device_arc.read().await;
+            let mut peer = peer_arc.lock().await;
+            if !peer.tunnel.has_queued_packets() {
+                drop(flush_guard.take());
+                return Ok(());
+            }
+
+            let mut jobs = Vec::with_capacity(CRYPTO_CHUNK_SIZE);
+            let mut stop_after_chunk = false;
+            for _ in 0..CRYPTO_CHUNK_SIZE {
+                let Some(packet) = peer.tunnel.take_queued_packet() else {
+                    break;
+                };
+                let (lane, slot) = ordered
+                    .reserve(peer_key)
+                    .expect("the bounded packet windows fit within the peer order window");
+                let prepared = peer.tunnel.prepare_queued_packet(packet);
+                if let Some(PreparedOutgoing::Ready(packet)) = prepared.as_ref() {
+                    Self::register_handshake_idx(&device_guard.peers_by_idx, packet, &peer_arc);
+                    stop_after_chunk = true;
+                }
+                if prepared.is_none() {
+                    stop_after_chunk = true;
+                }
+                jobs.push((lane, slot, prepared));
+                if stop_after_chunk {
+                    break;
+                }
+            }
+
+            if stop_after_chunk || !peer.tunnel.has_queued_packets() {
+                // The queue's remaining packets already have a later handshake or lane ordering
+                // point, so newer TUN packets may return to the regular path now.
+                drop(flush_guard.take());
+            }
+            drop(peer);
+            drop(device_guard);
+
+            if jobs.is_empty() {
+                return Ok(());
+            }
+            let chunk_lane = Arc::clone(&jobs[0].0);
+            for (lane, slot, prepared) in jobs {
+                while pending.len() >= CRYPTO_CHUNK_SIZE {
+                    pending
+                        .next()
+                        .await
+                        .expect("a full crypto chunk has a completion future");
+                }
+                Self::enqueue_outgoing_packet(
+                    pending,
+                    crypto.clone(),
+                    Arc::clone(&ordered),
+                    Arc::clone(&peer_arc),
+                    peer_key,
+                    lane,
+                    slot,
+                    peer_addr,
+                    prepared,
+                    udp.clone(),
+                    true,
+                );
+            }
+
+            while !chunk_lane.is_idle() {
+                pending
+                    .next()
+                    .await
+                    .expect("a queued packet has an ordered completion future");
+            }
+            if flush_guard.is_none() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Add one outgoing packet to a bounded future set without waiting for a larger batch.
+    fn enqueue_outgoing_packet(
+        pending: &mut PendingOutgoing,
+        crypto: CryptoHandle,
+        ordered: Arc<OrderStore<WgKind>>,
+        peer_arc: Arc<Mutex<PeerState>>,
+        peer_key: usize,
+        lane: Arc<OrderedCompletions<WgKind>>,
+        slot: u64,
+        peer_addr: std::net::SocketAddr,
+        prepared: Option<PreparedOutgoing>,
+        udp: impl UdpSend + 'static,
+        apply_daita: bool,
+    ) {
+        pending.push(
+            complete_outgoing_packet(
+                crypto,
+                ordered,
+                peer_arc,
+                peer_key,
+                lane,
+                slot,
+                peer_addr,
+                prepared,
+                udp,
+                apply_daita,
+            )
+            .boxed(),
+        );
+    }
+
+    /// Run periodic tunnel maintenance and send each peer's timer output in sequence.
     #[instrument(level = Level::TRACE, skip_all)]
-    async fn handle_timers(device: Weak<RwLock<Self>>, udp: impl UdpSend) {
+    async fn handle_timers(
+        device: Weak<RwLock<Self>>,
+        udp: impl UdpSend,
+        crypto: CryptoHandle,
+        outgoing_order: Arc<OrderStore<WgKind>>,
+    ) {
         loop {
             let Some(device) = device.upgrade() else {
                 break;
@@ -670,6 +1002,10 @@ impl<T: DeviceTransports> DeviceState<T> {
             // Go over each peer and invoke the timer function
             for peer in peer_map.values() {
                 let mut p = peer.lock().await;
+                let peer_key = peer_order_key(peer);
+                if outgoing_order.is_flushing(peer_key) {
+                    continue;
+                }
                 let endpoint_addr = match p.endpoint().addr {
                     Some(addr) => addr,
                     None => continue,
@@ -680,11 +1016,26 @@ impl<T: DeviceTransports> DeviceState<T> {
                         // Register sender_idx from outgoing handshake packets
                         Self::register_handshake_idx(&device.peers_by_idx, &packet, peer);
 
+                        let (lane, slot) = outgoing_order
+                            .reserve(peer_key)
+                            .expect("timer output fits within the peer order window");
+
                         drop(p);
 
                         // NOTE: we don't bother with triggering TunnelRecv DAITA events here.
-
-                        let _ = udp.send_to(packet.into(), endpoint_addr).await;
+                        complete_outgoing_packet(
+                            crypto.clone(),
+                            Arc::clone(&outgoing_order),
+                            Arc::clone(peer),
+                            peer_key,
+                            lane,
+                            slot,
+                            endpoint_addr,
+                            Some(PreparedOutgoing::Ready(packet)),
+                            udp.clone(),
+                            false,
+                        )
+                        .await;
                     }
                     Ok(None) => {}
                     Err(WireGuardError::ConnectionExpired) => {}
@@ -701,12 +1052,15 @@ impl<T: DeviceTransports> DeviceState<T> {
     #[instrument(level = Level::TRACE, skip_all)]
     async fn handle_incoming(
         device: Weak<RwLock<Self>>,
-        mut tun_tx: impl IpSend,
-        udp_tx: impl UdpSend,
+        mut tun_tx: impl IpSend + Clone,
+        udp_tx: impl UdpSend + 'static,
         mut udp_rx: impl UdpRecv,
         mut packet_pool: PacketBufPool,
+        crypto: CryptoHandle,
+        incoming_order: Arc<OrderStore<IncomingCompletion>>,
+        outgoing_order: Arc<OrderStore<WgKind>>,
     ) -> Result<(), Error> {
-        let (private_key, public_key, rate_limiter, mut tun_mtu) = {
+        let (private_key, public_key, rate_limiter) = {
             let Some(device) = device.upgrade() else {
                 return Ok(());
             };
@@ -714,17 +1068,19 @@ impl<T: DeviceTransports> DeviceState<T> {
 
             let (private_key, public_key) = device.key_pair.clone().expect("Key not set");
             let rate_limiter = device.rate_limiter.clone().unwrap();
-            let tun_mtu = device.tun_rx_mtu.clone();
-            (private_key, public_key, rate_limiter, tun_mtu)
+            (private_key, public_key, rate_limiter)
         };
 
         let mut udp_recv_buf = Default::default();
         let mut received_packets = Vec::new();
+        let mut incoming_pending = PendingIncoming::new();
+        let mut outgoing_pending = PendingOutgoing::new();
 
         // Idle memory release. One timer for the task's lifetime, re-armed once per period,
         // and polled only when the socket has nothing to read (`biased` polls the receive
         // first), so a busy link pays nothing per packet. Every receive is cancel-safe while
-        // pending: nothing is consumed before its single await completes.
+        // pending: nothing is consumed before its single await completes. Completion futures are
+        // polled ahead of the socket when ready so a quiet peer does not wait for another datagram.
         let idle_check = tokio::time::sleep(IDLE_RELEASE_PERIOD);
         tokio::pin!(idle_check);
         let mut busy = false;
@@ -734,6 +1090,14 @@ impl<T: DeviceTransports> DeviceState<T> {
             received_packets.clear();
             tokio::select! {
                 biased;
+                completed = incoming_pending.next(), if !incoming_pending.is_empty() => {
+                    if let Some(result) = completed {
+                        result?;
+                    }
+                }
+                completed = outgoing_pending.next(), if !outgoing_pending.is_empty() => {
+                    let _ = completed;
+                }
                 received = udp_rx.recv_many_from(
                     &mut udp_recv_buf,
                     &mut packet_pool,
@@ -783,11 +1147,11 @@ impl<T: DeviceTransports> DeviceState<T> {
                     Err(_) => continue,
                 };
 
-                let Some(device) = device.upgrade() else {
+                let Some(device_arc) = device.upgrade() else {
                     return Ok(());
                 };
 
-                let device_guard = device.read().await;
+                let device_guard = device_arc.read().await;
                 let peers = &device_guard.peers;
                 let peer = match &parsed_packet {
                     WgKind::HandshakeInit(p) => parse_handshake_anon(&private_key, &public_key, p)
@@ -811,88 +1175,147 @@ impl<T: DeviceTransports> DeviceState<T> {
                         .cloned(),
                 };
                 let Some(peer_arc) = peer else { continue };
-                let mut peer = peer_arc.lock().await;
+                let peer_key = peer_order_key(&peer_arc);
 
-                let result = peer.handle_incoming_packet(parsed_packet, addr);
+                match parsed_packet {
+                    WgKind::Data(packet) => {
+                        let mut peer = peer_arc.lock().await;
+                        match peer.prepare_incoming_data(packet) {
+                            crate::noise::PreparedIncoming::Immediate(result) => {
+                                // The serial data path also discarded packets without a session.
+                                drop(result);
+                            }
+                            crate::noise::PreparedIncoming::Decrypt { packet } => {
+                                let (lane, slot) = incoming_order
+                                    .reserve(peer_key)
+                                    .expect("the receive chunk fits within the peer order window");
+                                drop(peer);
+                                drop(device_guard);
 
-                #[cfg(feature = "daita")]
-                let PeerState { tunnel, daita, .. } = &mut *peer;
-                #[cfg(not(feature = "daita"))]
-                let PeerState { tunnel, .. } = &mut *peer;
-
-                match result {
-                    TunnResult::Done => {}
-                    TunnResult::Err(_) => continue,
-                    // Flush pending queue
-                    TunnResult::WriteToNetwork(packet) => {
-                        // Register sender_idx from outgoing handshake packets
-                        Self::register_handshake_idx(
-                            &device_guard.peers_by_idx,
-                            &packet,
-                            &peer_arc,
-                        );
-
-                        // TODO: does this end up with the packets being out-of-order?
-                        let packets =
-                            std::iter::once(packet).chain(tunnel.get_queued_packets(&mut tun_mtu));
-
-                        #[cfg(feature = "daita")]
-                        let packets = packets.filter_map(|p| match daita {
-                            Some(daita) => daita.on_tunnel_sent(p),
-                            None => Some(p),
-                        });
-
-                        for packet in packets {
-                            if let Err(_err) = udp_tx.send_to(packet.into(), addr).await {
-                                tracing::trace!("udp.send_to failed");
-                                break;
+                                while incoming_pending.len() >= CRYPTO_CHUNK_SIZE {
+                                    incoming_pending
+                                        .next()
+                                        .await
+                                        .expect("a full receive chunk has a completion future")?;
+                                }
+                                Self::enqueue_incoming_packet(
+                                    &mut incoming_pending,
+                                    crypto.clone(),
+                                    Arc::clone(&incoming_order),
+                                    peer_key,
+                                    lane,
+                                    slot,
+                                    Arc::clone(&peer_arc),
+                                    device.clone(),
+                                    tun_tx.clone(),
+                                    addr,
+                                    packet,
+                                );
                             }
                         }
                     }
-                    #[cfg_attr(not(feature = "daita"), expect(unused_mut))]
-                    TunnResult::WriteToTunnel(mut packet) => {
-                        #[cfg(feature = "daita")]
-                        if let Some(daita) = daita {
-                            match daita.on_data_recv(packet) {
-                                Some(new) => packet = new,
-                                None => continue,
+                    packet => {
+                        if let Some(lane) = incoming_order.lane(peer_key) {
+                            while !lane.is_idle() {
+                                incoming_pending
+                                    .next()
+                                    .await
+                                    .expect("an incoming data slot has a completion future")?;
                             }
                         }
 
-                        // keepalive
-                        if packet.is_empty() {
-                            continue;
-                        }
-                        let Ok(packet) = packet.try_into_ipvx() else {
-                            continue;
-                        };
-
-                        // Only accept the incoming packet if an outgoing packet to the source IP address
-                        // would be routed to the same peer. This is determined by the most specific
-                        // matching allowed IP range on the device.
-                        let (source, packet): (IpAddr, _) = packet.either(
-                            |ipv4| (ipv4.header.source().into(), ipv4.into()),
-                            |ipv6| (ipv6.header.source().into(), ipv6.into()),
-                        );
-                        let routed_to_this_peer = device_guard
-                            .peers_by_ip
-                            .find(source)
-                            .is_some_and(|owner| Arc::ptr_eq(owner, &peer_arc));
-                        if !routed_to_this_peer {
-                            if cfg!(debug_assertions) {
-                                let unspecified =
-                                    SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into();
-                                tracing::warn!(
-                                    "peer at {} is not allowed to send us packets from: {source}",
-                                    peer.endpoint().addr.unwrap_or(unspecified)
+                        let mut peer = peer_arc.lock().await;
+                        let result = peer.handle_incoming_packet(packet, addr);
+                        match result {
+                            TunnResult::Done | TunnResult::Err(_) => {}
+                            TunnResult::WriteToNetwork(packet) => {
+                                Self::register_handshake_idx(
+                                    &device_guard.peers_by_idx,
+                                    &packet,
+                                    &peer_arc,
                                 );
-                            }
-                            continue;
-                        }
+                                let (lane, slot) = outgoing_order
+                                    .reserve(peer_key)
+                                    .expect("the peer's outgoing producers fit its order window");
+                                let flush_guard = outgoing_order.begin_flush(peer_key);
+                                let first_lane = Arc::clone(&lane);
+                                drop(peer);
+                                drop(device_guard);
 
-                        if let Err(e) = tun_tx.send(packet).await {
-                            tracing::trace!("buffered_tun_send.send failed");
-                            return Err(Error::IoError(e));
+                                while outgoing_pending.len() >= CRYPTO_CHUNK_SIZE {
+                                    outgoing_pending
+                                        .next()
+                                        .await
+                                        .expect("a full outgoing chunk has a completion future");
+                                }
+                                Self::enqueue_outgoing_packet(
+                                    &mut outgoing_pending,
+                                    crypto.clone(),
+                                    Arc::clone(&outgoing_order),
+                                    Arc::clone(&peer_arc),
+                                    peer_key,
+                                    lane,
+                                    slot,
+                                    addr,
+                                    Some(PreparedOutgoing::Ready(packet)),
+                                    udp_tx.clone(),
+                                    true,
+                                );
+                                Self::flush_handshake_queue(
+                                    device.clone(),
+                                    Arc::clone(&peer_arc),
+                                    peer_key,
+                                    first_lane,
+                                    addr,
+                                    udp_tx.clone(),
+                                    crypto.clone(),
+                                    Arc::clone(&outgoing_order),
+                                    &mut outgoing_pending,
+                                    flush_guard,
+                                )
+                                .await?;
+                            }
+                            #[cfg_attr(not(feature = "daita"), expect(unused_mut))]
+                            TunnResult::WriteToTunnel(mut packet) => {
+                                #[cfg(feature = "daita")]
+                                if let Some(daita) = peer.daita.as_mut() {
+                                    match daita.on_data_recv(packet) {
+                                        Some(new) => packet = new,
+                                        None => continue,
+                                    }
+                                }
+
+                                if packet.is_empty() {
+                                    continue;
+                                }
+                                let Ok(packet) = packet.try_into_ipvx() else {
+                                    continue;
+                                };
+                                let (source, packet): (IpAddr, _) = packet.either(
+                                    |ipv4| (ipv4.header.source().into(), ipv4.into()),
+                                    |ipv6| (ipv6.header.source().into(), ipv6.into()),
+                                );
+                                let routed_to_this_peer = device_guard
+                                    .peers_by_ip
+                                    .find(source)
+                                    .is_some_and(|owner| Arc::ptr_eq(owner, &peer_arc));
+                                if !routed_to_this_peer {
+                                    if cfg!(debug_assertions) {
+                                        let unspecified =
+                                            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into();
+                                        tracing::warn!(
+                                            "peer at {} is not allowed to send us packets from: {source}",
+                                            peer.endpoint().addr.unwrap_or(unspecified)
+                                        );
+                                    }
+                                    continue;
+                                }
+
+                                if let Err(e) = tun_tx.send(packet).await {
+                                    tracing::trace!("buffered_tun_send.send failed");
+                                    return Err(Error::IoError(e));
+                                }
+                            }
                         }
                     }
                 }
@@ -905,8 +1328,10 @@ impl<T: DeviceTransports> DeviceState<T> {
     async fn handle_outgoing(
         device: Weak<RwLock<Self>>,
         mut tun_rx: impl IpRecv,
-        udp: impl UdpSend,
+        udp: impl UdpSend + 'static,
         mut packet_pool: PacketBufPool,
+        crypto: CryptoHandle,
+        outgoing_order: Arc<OrderStore<WgKind>>,
     ) -> Result<(), Error> {
         let mut tun_mtu = {
             let Some(device) = device.upgrade() else {
@@ -916,83 +1341,94 @@ impl<T: DeviceTransports> DeviceState<T> {
             device.tun_rx_mtu.clone()
         };
 
+        let mut pending = PendingOutgoing::new();
         loop {
-            let packets = match tun_rx.recv(&mut packet_pool).await {
-                Ok(packets) => packets,
-                Err(e) => {
-                    tracing::error!("Unexpected error on tun interface: {e:?}");
-                    return Err(Error::IoError(e));
+            tokio::select! {
+                completed = pending.next(), if !pending.is_empty() => {
+                    let _ = completed;
                 }
-            };
+                packets = tun_rx.recv(&mut packet_pool) => {
+                    let packets = match packets {
+                        Ok(packets) => packets,
+                        Err(e) => {
+                            tracing::error!("Unexpected error on tun interface: {e:?}");
+                            return Err(Error::IoError(e));
+                        }
+                    };
 
-            for packet in packets {
-                // Determine peer to use from the destination address
-                let Some(dst_addr) = packet.destination() else {
-                    continue;
-                };
+                    for packet in packets {
+                        let Some(dst_addr) = packet.destination() else {
+                            continue;
+                        };
 
-                let Some(device_arc) = device.upgrade() else {
-                    return Ok(());
-                };
+                        let Some(device_arc) = device.upgrade() else {
+                            return Ok(());
+                        };
+                        let device_guard = device_arc.read().await;
+                        let Some(peer_arc) = device_guard.peers_by_ip.find(dst_addr).cloned() else {
+                            if cfg!(debug_assertions) {
+                                tracing::trace!("Dropping packet with no routable peer");
+                            }
+                            continue;
+                        };
 
-                let device_guard = device_arc.read().await;
+                        let peer_key = peer_order_key(&peer_arc);
+                        let mut peer = peer_arc.lock().await;
+                        let Some(peer_addr) = peer.endpoint().addr else {
+                            tracing::error!("No endpoint");
+                            continue;
+                        };
 
-                let Some(peer_arc) = device_guard.peers_by_ip.find(dst_addr).cloned() else {
-                    if cfg!(debug_assertions) {
-                        tracing::trace!("Dropping packet with no routable peer");
+                        #[cfg(feature = "daita")]
+                        let packet = match peer.daita.as_mut() {
+                            Some(daita) => daita.on_normal_sent(packet),
+                            None => packet.into(),
+                        };
+                        #[cfg(not(feature = "daita"))]
+                        let packet = packet.into();
+
+                        if outgoing_order.is_flushing(peer_key) {
+                            peer.tunnel
+                                .queue_outgoing_packet(packet, Some(&mut tun_mtu));
+                            continue;
+                        }
+
+                        let (lane, slot) = outgoing_order
+                            .reserve(peer_key)
+                            .expect("the producer chunks fit within the peer order window");
+                        let prepared = peer
+                            .tunnel
+                            .prepare_outgoing_packet(packet, Some(&mut tun_mtu));
+                        if let Some(PreparedOutgoing::Ready(packet)) = prepared.as_ref() {
+                            Self::register_handshake_idx(
+                                &device_guard.peers_by_idx,
+                                packet,
+                                &peer_arc,
+                            );
+                        }
+
+                        drop(peer);
+                        drop(device_guard);
+                        while pending.len() >= CRYPTO_CHUNK_SIZE {
+                            pending
+                                .next()
+                                .await
+                                .expect("a full crypto chunk has a completion future");
+                        }
+                        Self::enqueue_outgoing_packet(
+                            &mut pending,
+                            crypto.clone(),
+                            Arc::clone(&outgoing_order),
+                            Arc::clone(&peer_arc),
+                            peer_key,
+                            lane,
+                            slot,
+                            peer_addr,
+                            prepared,
+                            udp.clone(),
+                            true,
+                        );
                     }
-
-                    // Drop packet if no peer has allowed IPs for destination
-                    drop(packet);
-                    continue;
-                };
-
-                let mut peer = peer_arc.lock().await;
-                let Some(peer_addr) = peer.endpoint().addr else {
-                    // TODO: Implement the following error handling from section 3 of the
-                    // whitepaper: If [peer_addr] matches no peer, it is dropped, and the sender is
-                    // informed by a standard ICMP “no route to host” packet, as well as returning
-                    // -ENOKEY to user space.
-                    tracing::error!("No endpoint");
-                    continue;
-                };
-
-                #[cfg(feature = "daita")]
-                let PeerState { tunnel, daita, .. } = &mut *peer;
-                #[cfg(not(feature = "daita"))]
-                let PeerState { tunnel, .. } = &mut *peer;
-
-                #[cfg(feature = "daita")]
-                let packet = match daita {
-                    Some(daita) => daita.on_normal_sent(packet),
-                    None => packet.into(),
-                };
-                #[cfg(not(feature = "daita"))]
-                let packet = packet.into();
-
-                let Some(packet) = tunnel.handle_outgoing_packet(packet, Some(&mut tun_mtu)) else {
-                    continue;
-                };
-
-                // Register sender_idx from outgoing handshake packets
-                Self::register_handshake_idx(&device_guard.peers_by_idx, &packet, &peer_arc);
-
-                #[cfg(feature = "daita")]
-                let packet = match daita {
-                    None => packet.into(),
-                    Some(daita) => match daita.on_tunnel_sent(packet) {
-                        Some(packet) => packet.into(),
-                        None => continue,
-                    },
-                };
-                #[cfg(not(feature = "daita"))]
-                let packet = packet.into();
-
-                drop(peer); // release lock
-                drop(device_guard);
-
-                if udp.send_to(packet, peer_addr).await.is_err() {
-                    break;
                 }
             }
         }
@@ -1000,9 +1436,11 @@ impl<T: DeviceTransports> DeviceState<T> {
 }
 
 impl<T: DeviceTransports> Connection<T> {
+    /// Stop connection tasks before closing and joining the shared crypto workers.
     async fn stop(self) {
         let Self {
             udp,
+            crypto_workers,
             incoming,
             timers,
             outgoing,
@@ -1010,6 +1448,7 @@ impl<T: DeviceTransports> Connection<T> {
         drop(udp);
 
         join!(incoming.stop(), timers.stop(), outgoing.stop(),);
+        crypto_workers.stop().await;
     }
 }
 

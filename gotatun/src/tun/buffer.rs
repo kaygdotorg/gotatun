@@ -24,6 +24,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// Maximum number of TUN packets returned to the encryption path by one receive call.
+const MAX_RECV_BATCH_SIZE: usize = 64;
+
 /// Create a pair of [`BufferedIpSend`] and [`BufferedIpRecv`] with `capacity`.
 ///
 /// This takes an `Arc<Mutex<S>>` and `Arc<Mutex<R>>` because the inner `S` and `R` will be re-used
@@ -198,7 +201,7 @@ impl<I: IpRecv> IpRecv for BufferedIpRecv<I> {
         &'a mut self,
         _pool: &mut PacketBufPool,
     ) -> io::Result<impl Iterator<Item = Packet<Ip>> + 'a> {
-        let max_n = self.rx.max_capacity();
+        let max_n = self.rx.max_capacity().min(MAX_RECV_BATCH_SIZE);
         let n = self.rx.recv_many(&mut self.rx_packet_buf, max_n).await;
         if n == 0 {
             // Channel is closed
