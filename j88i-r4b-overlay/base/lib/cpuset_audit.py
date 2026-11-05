@@ -404,6 +404,7 @@ def main() -> int:
     external_samples = 0
     kernel_wireguard_samples = 0
     kernel_wireguard_workers: dict[str, dict[str, object]] = {}
+    bound_percpu_worker_records: dict[str, dict[str, object]] = {}
     kernel_worker_runtime_delta_by_cpu_ns: dict[int, int] = {}
     kernel_worker_runtime_delta_by_role_ns: dict[str, int] = {}
     kernel_other_workers: dict[str, dict[str, object]] = {}
@@ -438,6 +439,7 @@ def main() -> int:
                 role = str(worker.get("role") or bound_percpu_worker_role(
                     str(worker["comm"]), str(current.get("audit_case", ""))
                 ))
+                bound_percpu_worker_records[key] = {**worker, "role": role}
                 previous = previous_kernel_worker_stats.get(key)
                 if previous is not None:
                     runtime_delta = max(0, runtime - previous[1])
@@ -505,6 +507,7 @@ def main() -> int:
         "external_runnable_samples": external_samples,
         "kernel_wireguard_crypto_runnable_samples": kernel_wireguard_samples,
         "kernel_wireguard_crypto_workers": list(kernel_wireguard_workers.values()),
+        "kernel_bound_percpu_workers": list(bound_percpu_worker_records.values()),
         "kernel_other_runnable": list(kernel_other_workers.values()),
         "kernel_bound_percpu_runtime_delta_ns": kernel_worker_runtime_delta_ns,
         "kernel_bound_percpu_runtime_delta_by_cpu_ns": {

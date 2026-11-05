@@ -443,6 +443,15 @@ NET_TX:              2          6
             self.assertGreater(
                 summary["kernel_bound_percpu_runtime_percent_of_test_cpu_time"], 0.5
             )
+            self.assertEqual(
+                {worker["comm"]: worker["role"]
+                 for worker in summary["kernel_bound_percpu_workers"]},
+                {
+                    "ksoftirqd/2": "network-softirq",
+                    "kworker/3:0-wg-crypt-wt0": "kernel-wireguard-crypto",
+                    "kworker/4:0-events": "background",
+                },
+            )
             self.assertTrue(summary["clean"], summary)
 
 
