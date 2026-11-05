@@ -291,6 +291,24 @@ NET_TX:              2          6
         self.assertIsNone(classifier("kworker/2:0-events", 99, "/", {2}))
         self.assertIsNone(classifier("kworker/u8:0-events", 2, "/", {1, 2, 3, 4}))
 
+    def test_kernel_network_and_crypto_workers_are_reported_as_workload(self) -> None:
+        """Network softirq and kernel-WireGuard crypto runtime is workload, not background interference."""
+        script = Path(__file__).parent / "base/lib/cpuset_audit.py"
+        spec = importlib.util.spec_from_file_location("cpuset_audit_worker_role", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader if spec is not None else None)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        role = getattr(module, "bound_percpu_worker_role", lambda *_args: None)
+
+        self.assertEqual(role("ksoftirqd/2", "mesh-gotatun"), "network-softirq")
+        self.assertEqual(
+            role("kworker/2:0-wg-crypt-wt0", "mesh-netbird"),
+            "kernel-wireguard-crypto",
+        )
+        self.assertEqual(role("kworker/2:0-wg-crypt-wt0", "mesh-gotatun"), "background")
+        self.assertEqual(role("kworker/2:0-events", "mesh-netbird"), "background")
+
     def test_bound_worker_runtime_limit_is_strictly_point_five_percent_of_test_cpu_time(self) -> None:
         """Exactly 0.5% is allowed; only a larger measured runtime rejects the window."""
         script = Path(__file__).parent / "base/lib/cpuset_audit.py"
@@ -357,7 +375,75 @@ NET_TX:              2          6
                 {"2": 20_000_000},
             )
             self.assertEqual(summary["test_cpu_time_ns"], 4_000_000_000)
-            self.assertFalse(summary["kernel_bound_percpu_runtime_limit_exceeded"])
+            self.assertFalse(summary["kernel_background_runtime_limit_exceeded"])
+
+    def test_sampler_reports_worker_runtime_by_role_and_limits_background_only(self) -> None:
+        """Expected network and WireGuard workers are measured apart from interference."""
+        script = Path(__file__).parent / "base/lib/cpuset_audit.py"
+        with tempfile.TemporaryDirectory(prefix="j88i-worker-roles-") as temporary:
+            output = Path(temporary)
+            spec = importlib.util.spec_from_file_location("cpuset_audit_worker_roles", script)
+            self.assertIsNotNone(spec)
+            self.assertIsNotNone(spec.loader if spec is not None else None)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            workers = [
+                {"pid": 123, "tid": 123, "comm": "ksoftirqd/2", "worker_cpu": 2},
+                {"pid": 124, "tid": 124, "comm": "kworker/3:0-wg-crypt-wt0", "worker_cpu": 3},
+                {"pid": 125, "tid": 125, "comm": "kworker/4:0-events", "worker_cpu": 4},
+            ]
+            first = {
+                "time_unix": 100.0, "audit_case": "mesh-netbird",
+                "scope_threads": 1, "scope_processes": [],
+                "mask_mismatches": [], "external_runnable": [],
+                "kernel_bound_percpu_workers": [
+                    {**worker, "runtime_ns": runtime}
+                    for worker, runtime in zip(workers, (100_000_000, 200_000_000, 300_000_000))
+                ],
+                "kernel_wireguard_crypto_runnable": [], "kernel_other_runnable": [],
+            }
+            second = {
+                **first,
+                "time_unix": 101.0,
+                "kernel_bound_percpu_workers": [
+                    {**worker, "runtime_ns": runtime}
+                    for worker, runtime in zip(workers, (120_000_000, 230_000_000, 310_000_000))
+                ],
+            }
+            samples = iter([first, second])
+            sleep_calls = 0
+
+            def stop_after_two_samples(_seconds: float) -> None:
+                nonlocal sleep_calls
+                sleep_calls += 1
+                if sleep_calls >= 2:
+                    module.STOP = True
+
+            with (
+                patch.dict(os.environ, {"H2H_CPUSET_AUDIT_CASE": "mesh-netbird"}, clear=True),
+                patch.object(module, "sample", side_effect=lambda: next(samples)),
+                patch.object(module, "snapshot"),
+                patch.object(module, "parse_per_cpu_counters", return_value={"NET_RX": {}}),
+                patch.object(module.signal, "signal"),
+                patch.object(module.time, "sleep", side_effect=stop_after_two_samples),
+                patch("sys.argv", [str(script), str(output), str(os.getpid())]),
+                patch.object(module, "STOP", False),
+            ):
+                module.main()
+
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertEqual(summary["kernel_bound_percpu_runtime_delta_ns"], 60_000_000)
+            self.assertEqual(
+                summary["kernel_bound_percpu_runtime_delta_by_role_ns"],
+                {"background": 10_000_000, "kernel-wireguard-crypto": 30_000_000,
+                 "network-softirq": 20_000_000},
+            )
+            self.assertEqual(summary["kernel_background_percpu_runtime_delta_ns"], 10_000_000)
+            self.assertFalse(summary["kernel_background_runtime_limit_exceeded"])
+            self.assertGreater(
+                summary["kernel_bound_percpu_runtime_percent_of_test_cpu_time"], 0.5
+            )
+            self.assertTrue(summary["clean"], summary)
 
 
 if __name__ == "__main__":

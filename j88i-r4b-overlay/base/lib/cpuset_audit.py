@@ -6,9 +6,11 @@ device IRQ of its own. This audit records IRQ affinity and per-CPU softirq
 counters beside each loaded phase, while checking that every process in a
 J88i scope has the scope's exact Cpus_allowed_list. Non-kernel runnable tasks
 on test CPUs reject the window. Root cgroup children of kthreadd that are
-bound to a matching test CPU are reported and charged against a 0.5% budget
-of total test-CPU time. A ready-file keeps setup samples separate until the
-measured scopes are present and all process masks match.
+bound to a matching test CPU are reported by role. Network softirq and kernel
+WireGuard crypto workers for the kernel-NetBird case are measured as workload;
+other matching workers are charged against a 0.5% budget of total test-CPU
+time. A ready-file keeps setup samples separate until the measured scopes are
+present and all process masks match.
 """
 
 from __future__ import annotations
@@ -96,10 +98,23 @@ def bound_percpu_worker_cpu(
     return None
 
 
+def bound_percpu_worker_role(comm: str, case: str) -> str:
+    """Name expected kernel workload separately from unrelated bound workers."""
+    if comm.startswith("ksoftirqd/"):
+        return "network-softirq"
+    if (
+        case == "mesh-netbird"
+        and comm.startswith("kworker/")
+        and comm.endswith("wg-crypt-wt0")
+    ):
+        return "kernel-wireguard-crypto"
+    return "background"
+
+
 def kernel_worker_window_exceeds_limit(
     runtime_delta_ns: int, test_cpu_time_ns: int
 ) -> bool:
-    """Reject bound-worker time only when it is strictly over 0.5% of CPU time."""
+    """Reject background bound-worker time only when strictly over 0.5%."""
     if test_cpu_time_ns <= 0:
         return runtime_delta_ns > 0
     return runtime_delta_ns * 200 > test_cpu_time_ns
@@ -272,6 +287,7 @@ def sample() -> dict[str, object]:
             if bound_cpu in TEST_CPUS:
                 bound_percpu_workers.append({
                     "pid": pid, "tid": tid, "comm": comm,
+                    "role": bound_percpu_worker_role(comm, audit_case),
                     "worker_cpu": bound_cpu,
                     "state": values["state"],
                     "processor": values["processor"],
@@ -389,6 +405,7 @@ def main() -> int:
     kernel_wireguard_samples = 0
     kernel_wireguard_workers: dict[str, dict[str, object]] = {}
     kernel_worker_runtime_delta_by_cpu_ns: dict[int, int] = {}
+    kernel_worker_runtime_delta_by_role_ns: dict[str, int] = {}
     kernel_other_workers: dict[str, dict[str, object]] = {}
     max_scope_threads = 0
     runtime_delta_ns = 0
@@ -418,11 +435,17 @@ def main() -> int:
                 key = f"{worker['pid']}:{worker['tid']}"
                 cpu = int(worker["worker_cpu"])
                 runtime = int(worker["runtime_ns"])
+                role = str(worker.get("role") or bound_percpu_worker_role(
+                    str(worker["comm"]), str(current.get("audit_case", ""))
+                ))
                 previous = previous_kernel_worker_stats.get(key)
                 if previous is not None:
                     runtime_delta = max(0, runtime - previous[1])
                     kernel_worker_runtime_delta_by_cpu_ns[cpu] = (
                         kernel_worker_runtime_delta_by_cpu_ns.get(cpu, 0) + runtime_delta
+                    )
+                    kernel_worker_runtime_delta_by_role_ns[role] = (
+                        kernel_worker_runtime_delta_by_role_ns.get(role, 0) + runtime_delta
                     )
                 current_kernel_worker_stats[key] = (cpu, runtime)
             previous_kernel_worker_stats = current_kernel_worker_stats
@@ -458,12 +481,15 @@ def main() -> int:
         read_text(OUTPUT / "softirqs.before.txt")
     )) and bool(parse_per_cpu_counters(read_text(OUTPUT / "softirqs.after.txt")))
     kernel_worker_runtime_delta_ns = sum(kernel_worker_runtime_delta_by_cpu_ns.values())
+    kernel_background_runtime_delta_ns = kernel_worker_runtime_delta_by_role_ns.get(
+        "background", 0
+    )
     window_duration_ns = 0
     if window_start_unix is not None and window_end_unix is not None:
         window_duration_ns = max(0, int((window_end_unix - window_start_unix) * 1_000_000_000))
     test_cpu_time_ns = window_duration_ns * len(TEST_CPUS)
     kernel_worker_limit_exceeded = kernel_worker_window_exceeds_limit(
-        kernel_worker_runtime_delta_ns, test_cpu_time_ns
+        kernel_background_runtime_delta_ns, test_cpu_time_ns
     )
     clean = (
         not mismatch_samples
@@ -484,6 +510,10 @@ def main() -> int:
         "kernel_bound_percpu_runtime_delta_by_cpu_ns": {
             str(cpu): runtime for cpu, runtime in sorted(kernel_worker_runtime_delta_by_cpu_ns.items())
         },
+        "kernel_bound_percpu_runtime_delta_by_role_ns": {
+            role: runtime for role, runtime in sorted(kernel_worker_runtime_delta_by_role_ns.items())
+        },
+        "kernel_background_percpu_runtime_delta_ns": kernel_background_runtime_delta_ns,
         "window_duration_ns": window_duration_ns,
         "test_cpu_time_ns": test_cpu_time_ns,
         "kernel_bound_percpu_runtime_limit_percent": BOUND_WORKER_RUNTIME_LIMIT_PERCENT,
@@ -491,7 +521,11 @@ def main() -> int:
             kernel_worker_runtime_delta_ns * 100 / test_cpu_time_ns
             if test_cpu_time_ns > 0 else (float("inf") if kernel_worker_runtime_delta_ns else 0.0)
         ),
-        "kernel_bound_percpu_runtime_limit_exceeded": kernel_worker_limit_exceeded,
+        "kernel_background_percpu_runtime_percent_of_test_cpu_time": (
+            kernel_background_runtime_delta_ns * 100 / test_cpu_time_ns
+            if test_cpu_time_ns > 0 else (float("inf") if kernel_background_runtime_delta_ns else 0.0)
+        ),
+        "kernel_background_runtime_limit_exceeded": kernel_worker_limit_exceeded,
         "max_scope_threads": max_scope_threads,
         "scope_runtime_delta_ns": runtime_delta_ns,
         "scope_run_delay_delta_ns": run_delay_delta_ns,
@@ -504,7 +538,7 @@ def main() -> int:
         "softirq_delta_per_cpu": softirq_delta,
         "veth_irq_note": "veth links have no device IRQ; interrupt affinity and per-CPU softirq deltas are retained for the measured path",
         "audit_case": os.environ.get("H2H_CPUSET_AUDIT_CASE", ""),
-        "interpretation": "bound kthreadd children in cgroup / named and pinned to one test CPU are measured against 0.5% of total test-CPU time; non-kernel runnable tasks allowed on test CPUs reject the window; other root kernel tasks are reported separately; kernel WireGuard crypto workers remain identified for mesh-netbird",
+        "interpretation": "bound kthreadd children in cgroup / named and pinned to one test CPU are measured by role and in total; network softirq and kernel WireGuard crypto workers in mesh-netbird are workload, while other bound-worker runtime is limited to 0.5% of total test-CPU time; non-kernel runnable tasks allowed on test CPUs reject the window; other root kernel tasks are reported separately",
     }
     (OUTPUT / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return 0 if clean else 1
