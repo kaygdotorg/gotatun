@@ -152,6 +152,7 @@ h2h_cpu_audit_start() {
     mkdir -p "$dir"
     ready_file="$dir/ready"
     H2H_CPUSET_AUDIT_SUMMARY="$dir/summary.json"
+    H2H_CPUSET_AUDIT_CASE="$H2H_CASE" \
     H2H_CPUSET_AUDIT_READY_FILE="$ready_file" \
         python3 -I "$H2H_KIT/lib/cpuset_audit.py" "$dir" "${BASHPID:-$$}" &
     H2H_CPUSET_AUDIT_PID=$!

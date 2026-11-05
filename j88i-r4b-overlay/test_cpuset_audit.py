@@ -183,6 +183,81 @@ NET_TX:              2          6
             {"NET_RX": {"CPU0": 3, "CPU1": 5}, "NET_TX": {"CPU1": 2}},
         )
 
+    def test_kernel_wireguard_crypto_worker_is_workload_only_for_kernel_netbird(self) -> None:
+        """Only kernel NetBird crypto workers are reported as measured workload."""
+        script = Path(__file__).parent / "base/lib/cpuset_audit.py"
+        spec = importlib.util.spec_from_file_location("cpuset_audit_classification", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader if spec is not None else None)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        classifier = getattr(module, "classify_runnable_task", None)
+        self.assertTrue(callable(classifier), "the audit must classify runnable task roles")
+
+        self.assertEqual(
+            classifier("kworker/2:1-wg-crypt-wt0", "mesh-netbird"),
+            "kernel-wireguard-crypto",
+        )
+        self.assertEqual(
+            classifier("kworker/2:1+wg-crypt-wt0", "mesh-underlay"),
+            "external",
+        )
+        self.assertEqual(
+            classifier("kworker/2:1-events", "mesh-netbird"),
+            "external",
+        )
+        self.assertEqual(
+            classifier("systemd", "mesh-netbird"),
+            "external",
+        )
+
+    def test_summary_preserves_kernel_wireguard_worker_cpu_masks(self) -> None:
+        """The audit summary must retain CPU placement for kernel crypto workers."""
+        script = Path(__file__).parent / "base/lib/cpuset_audit.py"
+        with tempfile.TemporaryDirectory(prefix="j88i-wg-worker-") as temporary:
+            output = Path(temporary)
+            spec = importlib.util.spec_from_file_location("cpuset_audit_workers", script)
+            self.assertIsNotNone(spec)
+            self.assertIsNotNone(spec.loader if spec is not None else None)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            worker = {
+                "pid": 123,
+                "tid": 123,
+                "comm": "kworker/2:1-wg-crypt-wt0",
+                "processor": 2,
+                "cpus_allowed": "4",
+                "cpus_allowed_list": "2",
+                "cgroup": "/",
+            }
+            sample = {
+                "scope_threads": 1,
+                "scope_processes": [],
+                "mask_mismatches": [],
+                "external_runnable": [],
+                "kernel_softirq_runnable": [],
+                "kernel_wireguard_crypto_runnable": [worker],
+                "cpu_pressure": "",
+            }
+
+            def stop_after_one_sample(_seconds: float) -> None:
+                module.STOP = True
+
+            with (
+                patch.dict(os.environ, {"H2H_CPUSET_AUDIT_CASE": "mesh-netbird"}, clear=True),
+                patch.object(module, "sample", return_value=sample),
+                patch.object(module, "snapshot"),
+                patch.object(module.signal, "signal"),
+                patch.object(module.time, "sleep", side_effect=stop_after_one_sample),
+                patch("sys.argv", [str(script), str(output), str(os.getpid())]),
+                patch.object(module, "STOP", False),
+            ):
+                module.main()
+
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertEqual(summary.get("kernel_wireguard_crypto_runnable_samples"), 1)
+            self.assertEqual(summary.get("kernel_wireguard_crypto_workers"), [worker])
+
 
 if __name__ == "__main__":
     unittest.main()

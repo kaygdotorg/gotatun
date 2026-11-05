@@ -6,7 +6,8 @@ device IRQ of its own. This audit records IRQ affinity and per-CPU softirq
 counters beside each loaded phase, while checking that every process in a
 J88i scope has the scope's exact Cpus_allowed_list. When a ready-file is
 requested, setup samples stay separate until the measured scopes are present
-and no unrelated task is runnable on the test CPUs.
+and no unrelated task is runnable on the test CPUs. Kernel WireGuard crypto
+workers are reported as workload only for the kernel NetBird case.
 """
 
 from __future__ import annotations
@@ -54,6 +55,19 @@ def parse_cpulist(value: str) -> set[int]:
         high = int(bounds[1]) if len(bounds) == 2 else low
         cpus.update(range(low, high + 1))
     return cpus
+
+
+def classify_runnable_task(comm: str, case: str) -> str:
+    """Separate measured kernel networking work from unrelated runnable tasks."""
+    if comm.startswith("ksoftirqd/"):
+        return "kernel-softirq"
+    if (
+        case == "mesh-netbird"
+        and comm.startswith("kworker/")
+        and comm.endswith("wg-crypt-wt0")
+    ):
+        return "kernel-wireguard-crypto"
+    return "external"
 
 
 def cgroup_path(pid: int) -> str:
@@ -167,11 +181,13 @@ def snapshot(name: str) -> None:
 
 
 def sample() -> dict[str, object]:
-    """Check active J88i scopes and sample runnable work outside those scopes."""
+    """Sample J88i scopes and classify other runnable tasks by workload role."""
+    audit_case = os.environ.get("H2H_CPUSET_AUDIT_CASE", "")
     scope_threads = 0
     mask_mismatches = []
     external_runnable = []
     kernel_runnable = []
+    kernel_wireguard_runnable = []
     scope_processes = []
     run_delay_ns = 0
     runtime_ns = 0
@@ -236,18 +252,23 @@ def sample() -> dict[str, object]:
                 "cpus_allowed": values["cpus_allowed"],
                 "cpus_allowed_list": values["allowed"], "cgroup": group,
             }
-            if comm.startswith("ksoftirqd/"):
+            task_class = classify_runnable_task(comm, audit_case)
+            if task_class == "kernel-softirq":
                 kernel_runnable.append(task)
+            elif task_class == "kernel-wireguard-crypto":
+                kernel_wireguard_runnable.append(task)
             else:
                 external_runnable.append(task)
 
     return {
         "time_unix": time.time(),
+        "audit_case": audit_case,
         "scope_threads": scope_threads,
         "scope_processes": scope_processes,
         "mask_mismatches": mask_mismatches,
         "external_runnable": external_runnable,
         "kernel_softirq_runnable": kernel_runnable,
+        "kernel_wireguard_crypto_runnable": kernel_wireguard_runnable,
         "scope_runtime_ns": runtime_ns,
         "scope_run_delay_ns": run_delay_ns,
         "cpu_pressure": read_text(Path("/proc/pressure/cpu")).strip(),
@@ -299,6 +320,8 @@ def main() -> int:
     samples = 0
     mismatch_samples = 0
     external_samples = 0
+    kernel_wireguard_samples = 0
+    kernel_wireguard_workers: dict[str, dict[str, object]] = {}
     max_scope_threads = 0
     runtime_delta_ns = 0
     run_delay_delta_ns = 0
@@ -310,6 +333,11 @@ def main() -> int:
             max_scope_threads = max(max_scope_threads, int(current["scope_threads"]))
             mismatch_samples += bool(current["mask_mismatches"])
             external_samples += bool(current["external_runnable"])
+            wireguard_workers = current.get("kernel_wireguard_crypto_runnable", [])
+            kernel_wireguard_samples += bool(wireguard_workers)
+            for worker in wireguard_workers:
+                key = f"{worker['pid']}:{worker['tid']}"
+                kernel_wireguard_workers[key] = worker
             current_stats: dict[str, tuple[int, int]] = {}
             for task in current["scope_processes"]:
                 key = f"{task['pid']}:{task['tid']}"
@@ -349,6 +377,8 @@ def main() -> int:
         "samples": samples,
         "mask_mismatch_samples": mismatch_samples,
         "external_runnable_samples": external_samples,
+        "kernel_wireguard_crypto_runnable_samples": kernel_wireguard_samples,
+        "kernel_wireguard_crypto_workers": list(kernel_wireguard_workers.values()),
         "max_scope_threads": max_scope_threads,
         "scope_runtime_delta_ns": runtime_delta_ns,
         "scope_run_delay_delta_ns": run_delay_delta_ns,
@@ -360,7 +390,8 @@ def main() -> int:
         "interrupt_delta_per_cpu": interrupt_delta,
         "softirq_delta_per_cpu": softirq_delta,
         "veth_irq_note": "veth links have no device IRQ; interrupt affinity and per-CPU softirq deltas are retained for the measured path",
-        "interpretation": "ksoftirqd is reported separately; all other runnable tasks allowed on test CPUs count as interference",
+        "audit_case": os.environ.get("H2H_CPUSET_AUDIT_CASE", ""),
+        "interpretation": "ksoftirqd is reported separately; wg-crypt-wt0 workers are reported as workload only for mesh-netbird; all other runnable tasks allowed on test CPUs count as interference",
     }
     (OUTPUT / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return 0 if clean else 1
