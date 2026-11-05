@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Sample D348 process placement, runnable tasks, scheduler delay and network counters.
+"""Sample D348 placement, runnable work, kernel-worker time, and network counters.
 
 The R4b cases use veth links between namespaces, so the packet path has no
 device IRQ of its own. This audit records IRQ affinity and per-CPU softirq
 counters beside each loaded phase, while checking that every process in a
-J88i scope has the scope's exact Cpus_allowed_list. When a ready-file is
-requested, setup samples stay separate until the measured scopes are present
-and no unrelated task is runnable on the test CPUs. Kernel WireGuard crypto
-workers are reported as workload only for the kernel NetBird case.
+J88i scope has the scope's exact Cpus_allowed_list. Non-kernel runnable tasks
+on test CPUs reject the window. Root cgroup children of kthreadd that are
+bound to a matching test CPU are reported and charged against a 0.5% budget
+of total test-CPU time. A ready-file keeps setup samples separate until the
+measured scopes are present and all process masks match.
 """
 
 from __future__ import annotations
@@ -24,9 +25,13 @@ from pathlib import Path
 
 OUTPUT = Path(os.environ.get("H2H_CPUSET_AUDIT_DIR", "."))
 PARENT_PID = int(os.environ.get("H2H_CPUSET_AUDIT_PARENT", "-1"))
-SELF_PID = os.getpid()
 TEST_CPUS = {1, 2, 3, 4}
 EXPECTED_MASKS = {frozenset({1, 2}), frozenset({3, 4})}
+BOUND_WORKER_PATTERNS = (
+    re.compile(r"^kworker/(\d+):"),
+    re.compile(r"^ksoftirqd/(\d+)$"),
+)
+BOUND_WORKER_RUNTIME_LIMIT_PERCENT = 0.5
 STOP = False
 
 
@@ -70,6 +75,36 @@ def classify_runnable_task(comm: str, case: str) -> str:
     return "external"
 
 
+def bound_percpu_worker_cpu(
+    comm: str, parent_pid: int, cgroup: str, allowed: set[int]
+) -> int | None:
+    """Return the CPU for a root kthreadd worker pinned to its named CPU.
+
+    A matching name alone is not enough: a user process can choose that name,
+    and an unbound worker can have a similarly shaped suffix. The kernel parent,
+    root cgroup, and exact one-CPU affinity together identify a bound worker.
+    """
+    if parent_pid != 2 or cgroup != "/":
+        return None
+    for pattern in BOUND_WORKER_PATTERNS:
+        match = pattern.match(comm)
+        if match is None:
+            continue
+        cpu = int(match.group(1))
+        if allowed == {cpu}:
+            return cpu
+    return None
+
+
+def kernel_worker_window_exceeds_limit(
+    runtime_delta_ns: int, test_cpu_time_ns: int
+) -> bool:
+    """Reject bound-worker time only when it is strictly over 0.5% of CPU time."""
+    if test_cpu_time_ns <= 0:
+        return runtime_delta_ns > 0
+    return runtime_delta_ns * 200 > test_cpu_time_ns
+
+
 def cgroup_path(pid: int) -> str:
     """Return the unified cgroup path for one process."""
     for line in read_text(Path(f"/proc/{pid}/cgroup")).splitlines():
@@ -90,6 +125,8 @@ def task_values(pid: int, tid: int) -> dict[str, object] | None:
                     if line.startswith("Cpus_allowed_list:")), "")
     allowed_mask = next((line.split(":", 1)[1].strip() for line in status.splitlines()
                          if line.startswith("Cpus_allowed:")), "")
+    parent_pid = next((line.split(":", 1)[1].strip() for line in status.splitlines()
+                       if line.startswith("PPid:")), "")
     right = stat.rfind(")")
     fields = stat[right + 2:].split() if right >= 0 else []
     if not fields:
@@ -103,9 +140,14 @@ def task_values(pid: int, tid: int) -> dict[str, object] | None:
         runtime_ns = int(schedstat[0])
     except (IndexError, ValueError):
         run_delay_ns = runtime_ns = 0
+    try:
+        parsed_parent_pid = int(parent_pid)
+    except ValueError:
+        parsed_parent_pid = -1
     return {
         "state": fields[0],
         "processor": processor,
+        "parent_pid": parsed_parent_pid,
         "allowed": allowed,
         "cpus_allowed": allowed_mask,
         "runtime_ns": runtime_ns,
@@ -186,8 +228,11 @@ def sample() -> dict[str, object]:
     scope_threads = 0
     mask_mismatches = []
     external_runnable = []
-    kernel_runnable = []
+    kernel_bound_runnable = []
+    kernel_softirq_runnable = []
     kernel_wireguard_runnable = []
+    kernel_other_runnable = []
+    bound_percpu_workers = []
     scope_processes = []
     run_delay_ns = 0
     runtime_ns = 0
@@ -222,6 +267,20 @@ def sample() -> dict[str, object]:
                 allowed = parse_cpulist(str(values["allowed"]))
             except ValueError:
                 allowed = set()
+            parent_pid = int(values["parent_pid"])
+            bound_cpu = bound_percpu_worker_cpu(comm, parent_pid, group, allowed)
+            if bound_cpu in TEST_CPUS:
+                bound_percpu_workers.append({
+                    "pid": pid, "tid": tid, "comm": comm,
+                    "worker_cpu": bound_cpu,
+                    "state": values["state"],
+                    "processor": values["processor"],
+                    "cpus_allowed": values["cpus_allowed"],
+                    "cpus_allowed_list": values["allowed"], "cgroup": group,
+                    "parent_pid": parent_pid,
+                    "runtime_ns": values["runtime_ns"],
+                    "run_delay_ns": values["run_delay_ns"],
+                })
             if in_scope:
                 scope_threads += 1
                 runtime_ns += int(values["runtime_ns"])
@@ -244,19 +303,22 @@ def sample() -> dict[str, object]:
                 continue
             if values["state"] != "R" or not allowed.intersection(TEST_CPUS):
                 continue
-            if pid == SELF_PID or pid == PARENT_PID:
-                continue
             task = {
                 "pid": pid, "tid": tid, "comm": comm,
                 "processor": values["processor"],
+                "parent_pid": parent_pid,
                 "cpus_allowed": values["cpus_allowed"],
                 "cpus_allowed_list": values["allowed"], "cgroup": group,
             }
             task_class = classify_runnable_task(comm, audit_case)
-            if task_class == "kernel-softirq":
-                kernel_runnable.append(task)
-            elif task_class == "kernel-wireguard-crypto":
+            if bound_cpu is not None:
+                kernel_bound_runnable.append(task)
+                if comm.startswith("ksoftirqd/"):
+                    kernel_softirq_runnable.append(task)
+            elif task_class == "kernel-wireguard-crypto" and parent_pid == 2 and group == "/":
                 kernel_wireguard_runnable.append(task)
+            elif parent_pid == 2 and group == "/":
+                kernel_other_runnable.append(task)
             else:
                 external_runnable.append(task)
 
@@ -267,8 +329,12 @@ def sample() -> dict[str, object]:
         "scope_processes": scope_processes,
         "mask_mismatches": mask_mismatches,
         "external_runnable": external_runnable,
-        "kernel_softirq_runnable": kernel_runnable,
+        "kernel_bound_percpu_runnable": kernel_bound_runnable,
+        "kernel_softirq_runnable": kernel_softirq_runnable,
         "kernel_wireguard_crypto_runnable": kernel_wireguard_runnable,
+        "kernel_other_runnable": kernel_other_runnable,
+        "kernel_bound_percpu_workers": bound_percpu_workers,
+        "audit_parent_pid": PARENT_PID,
         "scope_runtime_ns": runtime_ns,
         "scope_run_delay_ns": run_delay_ns,
         "cpu_pressure": read_text(Path("/proc/pressure/cpu")).strip(),
@@ -289,7 +355,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output_dir", nargs="?", help="directory for the audit evidence")
     parser.add_argument("parent_pid", nargs="?", type=int,
-                        help="case shell PID to exclude from interference samples")
+                        help="case shell PID, retained for audit evidence and not exempt from checks")
     arguments = parser.parse_args()
     output_dir = arguments.output_dir or os.environ.get("H2H_CPUSET_AUDIT_DIR")
     parent_pid = arguments.parent_pid
@@ -322,14 +388,23 @@ def main() -> int:
     external_samples = 0
     kernel_wireguard_samples = 0
     kernel_wireguard_workers: dict[str, dict[str, object]] = {}
+    kernel_worker_runtime_delta_by_cpu_ns: dict[int, int] = {}
+    kernel_other_workers: dict[str, dict[str, object]] = {}
     max_scope_threads = 0
     runtime_delta_ns = 0
     run_delay_delta_ns = 0
     previous_stats: dict[str, tuple[int, int]] = {}
+    previous_kernel_worker_stats: dict[str, tuple[int, int]] = {}
+    window_start_unix: float | None = None
+    window_end_unix: float | None = None
     with (OUTPUT / "samples.jsonl").open("w") as output:
         while not STOP:
             current = sample()
             samples += 1
+            sample_time = float(current.get("time_unix", time.time()))
+            if window_start_unix is None:
+                window_start_unix = sample_time
+            window_end_unix = sample_time
             max_scope_threads = max(max_scope_threads, int(current["scope_threads"]))
             mismatch_samples += bool(current["mask_mismatches"])
             external_samples += bool(current["external_runnable"])
@@ -338,6 +413,22 @@ def main() -> int:
             for worker in wireguard_workers:
                 key = f"{worker['pid']}:{worker['tid']}"
                 kernel_wireguard_workers[key] = worker
+            current_kernel_worker_stats: dict[str, tuple[int, int]] = {}
+            for worker in current.get("kernel_bound_percpu_workers", []):
+                key = f"{worker['pid']}:{worker['tid']}"
+                cpu = int(worker["worker_cpu"])
+                runtime = int(worker["runtime_ns"])
+                previous = previous_kernel_worker_stats.get(key)
+                if previous is not None:
+                    runtime_delta = max(0, runtime - previous[1])
+                    kernel_worker_runtime_delta_by_cpu_ns[cpu] = (
+                        kernel_worker_runtime_delta_by_cpu_ns.get(cpu, 0) + runtime_delta
+                    )
+                current_kernel_worker_stats[key] = (cpu, runtime)
+            previous_kernel_worker_stats = current_kernel_worker_stats
+            for worker in current.get("kernel_other_runnable", []):
+                key = f"{worker['pid']}:{worker['tid']}"
+                kernel_other_workers[key] = worker
             current_stats: dict[str, tuple[int, int]] = {}
             for task in current["scope_processes"]:
                 key = f"{task['pid']}:{task['tid']}"
@@ -366,9 +457,18 @@ def main() -> int:
     softirq_data_available = bool(parse_per_cpu_counters(
         read_text(OUTPUT / "softirqs.before.txt")
     )) and bool(parse_per_cpu_counters(read_text(OUTPUT / "softirqs.after.txt")))
+    kernel_worker_runtime_delta_ns = sum(kernel_worker_runtime_delta_by_cpu_ns.values())
+    window_duration_ns = 0
+    if window_start_unix is not None and window_end_unix is not None:
+        window_duration_ns = max(0, int((window_end_unix - window_start_unix) * 1_000_000_000))
+    test_cpu_time_ns = window_duration_ns * len(TEST_CPUS)
+    kernel_worker_limit_exceeded = kernel_worker_window_exceeds_limit(
+        kernel_worker_runtime_delta_ns, test_cpu_time_ns
+    )
     clean = (
         not mismatch_samples
         and not external_samples
+        and not kernel_worker_limit_exceeded
         and max_scope_threads > 0
         and interrupt_data_available
         and softirq_data_available
@@ -379,6 +479,19 @@ def main() -> int:
         "external_runnable_samples": external_samples,
         "kernel_wireguard_crypto_runnable_samples": kernel_wireguard_samples,
         "kernel_wireguard_crypto_workers": list(kernel_wireguard_workers.values()),
+        "kernel_other_runnable": list(kernel_other_workers.values()),
+        "kernel_bound_percpu_runtime_delta_ns": kernel_worker_runtime_delta_ns,
+        "kernel_bound_percpu_runtime_delta_by_cpu_ns": {
+            str(cpu): runtime for cpu, runtime in sorted(kernel_worker_runtime_delta_by_cpu_ns.items())
+        },
+        "window_duration_ns": window_duration_ns,
+        "test_cpu_time_ns": test_cpu_time_ns,
+        "kernel_bound_percpu_runtime_limit_percent": BOUND_WORKER_RUNTIME_LIMIT_PERCENT,
+        "kernel_bound_percpu_runtime_percent_of_test_cpu_time": (
+            kernel_worker_runtime_delta_ns * 100 / test_cpu_time_ns
+            if test_cpu_time_ns > 0 else (float("inf") if kernel_worker_runtime_delta_ns else 0.0)
+        ),
+        "kernel_bound_percpu_runtime_limit_exceeded": kernel_worker_limit_exceeded,
         "max_scope_threads": max_scope_threads,
         "scope_runtime_delta_ns": runtime_delta_ns,
         "scope_run_delay_delta_ns": run_delay_delta_ns,
@@ -391,7 +504,7 @@ def main() -> int:
         "softirq_delta_per_cpu": softirq_delta,
         "veth_irq_note": "veth links have no device IRQ; interrupt affinity and per-CPU softirq deltas are retained for the measured path",
         "audit_case": os.environ.get("H2H_CPUSET_AUDIT_CASE", ""),
-        "interpretation": "ksoftirqd is reported separately; wg-crypt-wt0 workers are reported as workload only for mesh-netbird; all other runnable tasks allowed on test CPUs count as interference",
+        "interpretation": "bound kthreadd children in cgroup / named and pinned to one test CPU are measured against 0.5% of total test-CPU time; non-kernel runnable tasks allowed on test CPUs reject the window; other root kernel tasks are reported separately; kernel WireGuard crypto workers remain identified for mesh-netbird",
     }
     (OUTPUT / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     return 0 if clean else 1

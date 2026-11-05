@@ -40,17 +40,18 @@ if [[ ${H2H_LOCK:-} == external ]]; then
     grep -q 'perf.slice' /proc/self/cgroup || { echo 'external lock mode requires perf.slice' >&2; exit 2; }
 fi
 if [[ ${H2H_CPUSET_PIN:-0} == 1 ]]; then
+    perf_cpus=${H2H_CPUSET_PERF:-0-5}
     [[ ${H2H_CPUSET_A:-} == 1-2 && ${H2H_CPUSET_B:-} == 3-4 ]] || {
         echo 'D348 requires side A CPUs 1-2 and side B CPUs 3-4' >&2
         exit 2
     }
-    [[ $(cat /sys/fs/cgroup/perf.slice/cpuset.cpus) == 1-4 && \
-       $(cat /sys/fs/cgroup/perf.slice/cpuset.cpus.effective) == 1-4 ]] || {
-        echo 'D348 runtime perf.slice cgroup masks are not 1-4' >&2
+    [[ $(cat /sys/fs/cgroup/perf.slice/cpuset.cpus) == "$perf_cpus" && \
+       $(cat /sys/fs/cgroup/perf.slice/cpuset.cpus.effective) == "$perf_cpus" ]] || {
+        echo "D348 runtime perf.slice cgroup masks are not $perf_cpus" >&2
         exit 2
     }
-    [[ $(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status) == 1-4 ]] || {
-        echo 'D348 case runner did not inherit CPUs 1-4' >&2
+    [[ $(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status) == 0,5 ]] || {
+        echo 'D348 case runner is not pinned to housekeeping CPUs 0,5' >&2
         exit 2
     }
     {

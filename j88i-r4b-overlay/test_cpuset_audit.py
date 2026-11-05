@@ -274,5 +274,91 @@ NET_TX:              2          6
             self.assertEqual(summary.get("kernel_wireguard_crypto_workers"), [worker])
 
 
+    def test_only_matching_root_kthreads_are_classified_as_bound_per_cpu_workers(self) -> None:
+        """A per-CPU kernel worker must be a kthreadd child pinned to its named CPU."""
+        script = Path(__file__).parent / "base/lib/cpuset_audit.py"
+        spec = importlib.util.spec_from_file_location("cpuset_audit_worker_class", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader if spec is not None else None)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        classifier = getattr(module, "bound_percpu_worker_cpu", lambda *_args: None)
+
+        self.assertEqual(classifier("kworker/2:0-events", 2, "/", {2}), 2)
+        self.assertEqual(classifier("ksoftirqd/3", 2, "/", {3}), 3)
+        self.assertIsNone(classifier("kworker/2:0-events", 2, "/", {1, 2}))
+        self.assertIsNone(classifier("kworker/2:0-events", 2, "/system.slice", {2}))
+        self.assertIsNone(classifier("kworker/2:0-events", 99, "/", {2}))
+        self.assertIsNone(classifier("kworker/u8:0-events", 2, "/", {1, 2, 3, 4}))
+
+    def test_bound_worker_runtime_limit_is_strictly_point_five_percent_of_test_cpu_time(self) -> None:
+        """Exactly 0.5% is allowed; only a larger measured runtime rejects the window."""
+        script = Path(__file__).parent / "base/lib/cpuset_audit.py"
+        spec = importlib.util.spec_from_file_location("cpuset_audit_worker_threshold", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader if spec is not None else None)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        exceeds = getattr(module, "kernel_worker_window_exceeds_limit", lambda *_args: True)
+
+        self.assertFalse(exceeds(20_000_000, 4_000_000_000))
+        self.assertTrue(exceeds(20_000_001, 4_000_000_000))
+        self.assertTrue(exceeds(1, 0))
+
+    def test_sampler_sums_bound_worker_schedstat_deltas_by_cpu(self) -> None:
+        """Loaded-window runtime comes from successive schedstat values, not uptime totals."""
+        script = Path(__file__).parent / "base/lib/cpuset_audit.py"
+        with tempfile.TemporaryDirectory(prefix="j88i-worker-delta-") as temporary:
+            output = Path(temporary)
+            spec = importlib.util.spec_from_file_location("cpuset_audit_worker_delta", script)
+            self.assertIsNotNone(spec)
+            self.assertIsNotNone(spec.loader if spec is not None else None)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            worker = {
+                "pid": 123, "tid": 123, "comm": "kworker/2:0-events",
+                "worker_cpu": 2, "runtime_ns": 10_000_000,
+            }
+            first = {
+                "time_unix": 100.0, "scope_threads": 1, "scope_processes": [],
+                "mask_mismatches": [], "external_runnable": [],
+                "kernel_bound_percpu_workers": [worker],
+                "kernel_wireguard_crypto_runnable": [], "kernel_other_runnable": [],
+            }
+            second = {
+                **first,
+                "time_unix": 101.0,
+                "kernel_bound_percpu_workers": [{**worker, "runtime_ns": 30_000_000}],
+            }
+            samples = iter([first, second])
+            sleep_calls = 0
+
+            def stop_after_two_samples(_seconds: float) -> None:
+                nonlocal sleep_calls
+                sleep_calls += 1
+                if sleep_calls >= 2:
+                    module.STOP = True
+
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch.object(module, "sample", side_effect=lambda: next(samples)),
+                patch.object(module, "snapshot"),
+                patch.object(module.signal, "signal"),
+                patch.object(module.time, "sleep", side_effect=stop_after_two_samples),
+                patch("sys.argv", [str(script), str(output), str(os.getpid())]),
+                patch.object(module, "STOP", False),
+            ):
+                module.main()
+
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertEqual(summary["kernel_bound_percpu_runtime_delta_ns"], 20_000_000)
+            self.assertEqual(
+                summary["kernel_bound_percpu_runtime_delta_by_cpu_ns"],
+                {"2": 20_000_000},
+            )
+            self.assertEqual(summary["test_cpu_time_ns"], 4_000_000_000)
+            self.assertFalse(summary["kernel_bound_percpu_runtime_limit_exceeded"])
+
+
 if __name__ == "__main__":
     unittest.main()

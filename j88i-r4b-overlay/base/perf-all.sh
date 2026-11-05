@@ -5,6 +5,12 @@ set -euo pipefail
 
 kit=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 [[ $(id -un) == claude ]] || { echo 'run as claude on the perf VM' >&2; exit 2; }
+housekeeping=${H2H_CPUSET_HOUSEKEEPING:-0,5}
+taskset -pc "$housekeeping" "$$" >/dev/null
+[[ $(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status) == "$housekeeping" ]] || {
+    echo "D348 perf-all coordinator is not pinned to housekeeping CPUs $housekeeping" >&2
+    exit 2
+}
 
 mode=""
 label=""
@@ -18,16 +24,17 @@ usage() {
     cat <<'USAGE'
 usage:
   perf-all.sh --validate [--out DIR]
-  perf-all.sh --smoke --row TAG=gotatun|kernel [--binary TAG=PATH] [--source TAG=SHA] [--out DIR]
-  perf-all.sh --calibration --row control-a=gotatun --row control-b=gotatun [--binary TAG=PATH] [--out DIR]
-  perf-all.sh --hold --label CUT --row kernel-before=kernel --row control-a=gotatun \
-    --row candidate-a=gotatun --row candidate-b=gotatun --row control-b=gotatun \
-    --row kernel-after=kernel --binary TAG=PATH [--source TAG=SHA] [--out DIR]
+  perf-all.sh --smoke --row TAG=gotatun|kernel|wireguard-go [--binary TAG=PATH] [--source TAG=SHA] [--out DIR]
+  perf-all.sh --calibration --row control-a=gotatun --row control-b=gotatun --row control-c=gotatun [--binary TAG=PATH] [--out DIR]
+  perf-all.sh --hold --label CUT --row kernel-before=kernel --row wireguard-go-before=wireguard-go \
+    --row control-a=gotatun --row candidate-a=gotatun --row candidate-b=gotatun \
+    --row control-b=gotatun --row wireguard-go-after=wireguard-go --row kernel-after=kernel \
+    --binary TAG=PATH [--source TAG=SHA] [--out DIR]
   perf-all.sh --soak --label CUT --row control=gotatun --row candidate=gotatun \
     --binary TAG=PATH [--source TAG=SHA] [--out DIR]
 
-The full hold order is fixed: kernel, current control, candidate twice,
-control, kernel. All rows share one perf-run lock and distinct result dirs.
+The full hold order is fixed: kernel, wireguard-go, current control,
+candidate twice, control, wireguard-go, kernel. All rows share one perf-run lock and distinct result dirs.
 Unpinned results are historical data and must be reported separately.
 USAGE
 }
@@ -58,7 +65,7 @@ while (($#)); do
             (($# >= 2)) || { echo '--row needs a value' >&2; exit 2; }
             parse_pair "$2" tag engine
             [[ $tag =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid row tag: $tag" >&2; exit 2; }
-            [[ $engine == gotatun || $engine == kernel || $engine == underlay ]] || {
+            [[ $engine == gotatun || $engine == kernel || $engine == wireguard-go || $engine == underlay ]] || {
                 echo "invalid engine for row $tag: $engine" >&2; exit 2;
             }
             for existing in "${rows[@]}"; do
@@ -120,24 +127,29 @@ case $mode in
         ((${#rows[@]} == 1)) || { echo '--smoke takes exactly one row' >&2; exit 2; }
         ;;
     calibration)
-        ((${#rows[@]} == 2)) || { echo '--calibration takes exactly two rows' >&2; exit 2; }
+        ((${#rows[@]} == 3)) || { echo '--calibration takes exactly three rows' >&2; exit 2; }
         check_row 0 control-a gotatun
         check_row 1 control-b gotatun
-        [[ ${binaries[control-a]:-} == "${binaries[control-b]:-}" ]] || {
-            echo 'control-a and control-b must use the same binary' >&2; exit 2;
+        check_row 2 control-c gotatun
+        [[ ${binaries[control-a]:-} == "${binaries[control-b]:-}" && \
+           ${binaries[control-a]:-} == "${binaries[control-c]:-}" ]] || {
+            echo 'all control rows must use the same binary' >&2; exit 2;
         }
-        [[ -n ${sources[control-a]:-} && ${sources[control-a]} == "${sources[control-b]:-}" ]] || {
-            echo 'control calibration rows need the same source SHA' >&2; exit 2;
+        [[ -n ${sources[control-a]:-} && ${sources[control-a]} == "${sources[control-b]:-}" && \
+           ${sources[control-a]} == "${sources[control-c]:-}" ]] || {
+            echo 'all control rows need the same source SHA' >&2; exit 2;
         }
         ;;
     hold)
-        ((${#rows[@]} == 6)) || { echo '--hold takes exactly six rows' >&2; exit 2; }
+        ((${#rows[@]} == 8)) || { echo '--hold takes exactly eight rows' >&2; exit 2; }
         check_row 0 kernel-before kernel
-        check_row 1 control-a gotatun
-        check_row 2 candidate-a gotatun
-        check_row 3 candidate-b gotatun
-        check_row 4 control-b gotatun
-        check_row 5 kernel-after kernel
+        check_row 1 wireguard-go-before wireguard-go
+        check_row 2 control-a gotatun
+        check_row 3 candidate-a gotatun
+        check_row 4 candidate-b gotatun
+        check_row 5 control-b gotatun
+        check_row 6 wireguard-go-after wireguard-go
+        check_row 7 kernel-after kernel
         [[ -n $label ]] || { echo '--hold requires --label CUT' >&2; exit 2; }
         [[ ${binaries[control-a]:-} == "${binaries[control-b]:-}" ]] || {
             echo 'control-a and control-b must use the same binary' >&2; exit 2;
@@ -192,27 +204,39 @@ done
 runner=${PERF_RUN:-/usr/local/bin/perf-run}
 [[ -x $runner ]] || { echo "perf runner is not executable: $runner" >&2; exit 2; }
 echo "D348 pinned $mode: $label; results $out"
-run_env=(H2H_CPUSET_AUDIT=1 H2H_RESULTS="$out")
+run_env=(H2H_CPUSET_AUDIT=1 H2H_RESULTS="$out" "H2H_CPUSET_HOUSEKEEPING=$housekeeping")
+if [[ $mode == calibration && -z ${H2H_LAN_PING_COUNT:-} ]]; then
+    H2H_LAN_PING_COUNT=3600
+fi
 if [[ -n ${H2H_LAN_PING_COUNT:-} ]]; then
     # perf-run enters a sudo scope, so measured overrides must be command env assignments.
     run_env+=("H2H_LAN_PING_COUNT=$H2H_LAN_PING_COUNT")
 fi
 run_status=0
 set +e
-"$runner" --root --out "$out/receipts" -- \
+taskset -c "$housekeeping" "$runner" --root --out "$out/receipts" -- \
     env "${run_env[@]}" \
     bash "$kit/runner-overlays/J88i-pinned-run.sh" "$kit" "$out" "$mode" "$label" "$plan"
 run_status=$?
 set -e
 
-# The active perf-run scope still has CPUs 0-3 when its inner command exits.
-# Take a second locked, read-only pass to verify the parent mask after teardown.
+# Take a second locked, read-only pass after the measured scope exits. Baseline
+# manifests verify the real cgroup masks, workqueues, and IRQ affinities.
 mkdir -p "$out/restore-receipts"
 restore_status=0
 set +e
-"$runner" --root --out "$out/restore-receipts" -- \
-    bash "$kit/runner-overlays/J88i-verify-restored.sh" "$out/cpuset-restoration.txt"
-restore_status=$?
+restore_args=("$out/cpuset-restoration.txt")
+[[ -s $out/cgroup-masks-before.tsv ]] && restore_args+=("$out/cgroup-masks-before.tsv") || restore_args+=("")
+[[ -s $out/workqueue-masks-before.tsv ]] && restore_args+=("$out/workqueue-masks-before.tsv") || restore_args+=("")
+[[ -s $out/irq-affinity-before.tsv ]] && restore_args+=("$out/irq-affinity-before.tsv") || restore_args+=("")
+if ((run_status == 0)) && [[ ! -s $out/cgroup-masks-before.tsv || ! -s $out/workqueue-masks-before.tsv || ! -s $out/irq-affinity-before.tsv ]]; then
+    echo 'D348 baseline manifests are missing after a successful measured scope' >&2
+    restore_status=2
+else
+    taskset -c "$housekeeping" "$runner" --root --out "$out/restore-receipts" -- \
+        bash "$kit/runner-overlays/J88i-verify-restored.sh" "${restore_args[@]}"
+    restore_status=$?
+fi
 set -e
 if ((restore_status != 0)); then
     echo 'D348 perf.slice restoration was not verified after the measured scope exited' >&2
@@ -222,3 +246,15 @@ if ((run_status != 0)); then
     exit "$run_status"
 fi
 echo "results: $out"
+if [[ $mode == calibration ]]; then
+    spread_report="$out/calibration-spread.json"
+    spread_status=0
+    set +e
+    python3 -I "$kit/lib/calibration_spread.py" "$out" --expected-probes 3600 --output "$spread_report"
+    spread_status=$?
+    set -e
+    if ((spread_status != 0)); then
+        echo "D348 control calibration failed the unpinned max/min spread gate; candidate holds are not enabled ($spread_report)" >&2
+        exit "$spread_status"
+    fi
+fi

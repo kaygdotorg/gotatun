@@ -18,7 +18,7 @@ class PerfAllCliTest(unittest.TestCase):
         self,
         root: Path,
         effective: str,
-        cpuset: str = "1-3",
+        cpuset: str = "0-5",
     ) -> dict[str, str]:
         """Provide a controlled systemd and cgroup view for restoration tests."""
         bin_dir = root / "bin"
@@ -31,6 +31,7 @@ class PerfAllCliTest(unittest.TestCase):
         systemctl.write_text(
             "#!/usr/bin/env bash\n"
             "case \" $* \" in\n"
+            "  *ControlGroup*) printf '/perf.slice\\n' ;;\n"
             "  *AllowedCPUs*) cat \"$J88I_TEST_SYSTEMD_STATE/allowed\" ;;\n"
             "  *EffectiveCPUs*) cat \"$J88I_TEST_SYSTEMD_STATE/effective\" ;;\n"
             "  *DropInPaths*) cat \"$J88I_TEST_SYSTEMD_STATE/dropins\" ;;\n"
@@ -38,7 +39,7 @@ class PerfAllCliTest(unittest.TestCase):
             "esac\n"
         )
         systemctl.chmod(0o755)
-        (state_dir / "allowed").write_text("1-3\n")
+        (state_dir / "allowed").write_text("0-5\n")
         (state_dir / "effective").write_text(f"{effective}\n")
         (state_dir / "dropins").write_text("")
         (cgroup / "cpuset.cpus").write_text(f"{cpuset}\n")
@@ -46,6 +47,7 @@ class PerfAllCliTest(unittest.TestCase):
         environment = os.environ.copy()
         environment["PATH"] = f"{bin_dir}{os.pathsep}{environment['PATH']}"
         environment["J88I_PERF_SLICE_CGROUP"] = str(cgroup)
+        environment["J88I_EXPECTED_PERF_CPUS"] = "0-5"
         environment["J88I_TEST_SYSTEMD_STATE"] = str(state_dir)
         return environment
 
@@ -54,9 +56,10 @@ class PerfAllCliTest(unittest.TestCase):
         root: Path,
         effective: str,
         *,
-        cpuset: str = "1-3",
-        allowed: str = "1-3",
+        cpuset: str = "0-5",
+        allowed: str = "0-5",
         systemd_effective: str | None = None,
+        workqueue_manifest: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Run the post-scope verifier against a temporary cgroup and systemd view."""
         script = Path(__file__).parent / "base/runner-overlays/J88i-verify-restored.sh"
@@ -67,8 +70,14 @@ class PerfAllCliTest(unittest.TestCase):
         (state_dir / "effective").write_text(
             f"{effective if systemd_effective is None else systemd_effective}\n"
         )
+        cgroup_manifest = root / "cgroup-masks-before.tsv"
+        cgroup_manifest.write_text("perf.slice\t/perf.slice\t0-5\t0-5\t\n")
+        environment["J88I_CGROUP_ROOT"] = str(root)
+        command = ["bash", str(script), str(output), str(cgroup_manifest)]
+        if workqueue_manifest is not None:
+            command.append(str(workqueue_manifest))
         return subprocess.run(
-            ["bash", str(script), str(output)],
+            command,
             capture_output=True,
             text=True,
             env=environment,
@@ -76,15 +85,15 @@ class PerfAllCliTest(unittest.TestCase):
         )
 
     def test_restore_check_accepts_baseline_cgroup_after_scope_exit(self) -> None:
-        """The second locked run must see the restored 1-3 effective set."""
+        """The second locked run must see every captured cgroup mask restored."""
         with tempfile.TemporaryDirectory(prefix="j88i-restore-ok-") as temporary:
             root = Path(temporary)
-            result = self.run_restore_check(root, "1-3")
+            result = self.run_restore_check(root, "0-5")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("cpuset.cpus.effective=1-3", (root / "restoration.txt").read_text())
+            self.assertIn("cpuset.cpus.effective=0-5", (root / "restoration.txt").read_text())
 
     def test_restore_check_rejects_a_still_widened_cgroup(self) -> None:
-        """The post-scope check must reject an effective 0-3 cgroup."""
+        """The post-scope check must reject an effective mask that differs from its baseline."""
         with tempfile.TemporaryDirectory(prefix="j88i-restore-widened-") as temporary:
             result = self.run_restore_check(Path(temporary), "0-3")
             self.assertEqual(result.returncode, 2, result.stderr)
@@ -96,12 +105,12 @@ class PerfAllCliTest(unittest.TestCase):
             root = Path(temporary)
             result = self.run_restore_check(
                 root,
-                "1-3",
+                "0-5",
                 allowed="",
-                systemd_effective="0 5",
+                systemd_effective="1-3",
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("cpuset.cpus.effective=1-3", (root / "restoration.txt").read_text())
+            self.assertIn("cpuset.cpus.effective=0-5", (root / "restoration.txt").read_text())
 
     def test_restore_check_rejects_wrong_cgroup_even_when_systemd_claims_baseline(self) -> None:
         """A correct property string cannot hide a cgroup that still has extra CPUs."""
@@ -109,12 +118,12 @@ class PerfAllCliTest(unittest.TestCase):
             result = self.run_restore_check(
                 Path(temporary),
                 "0-5",
-                cpuset="0-5",
-                allowed="1-3",
-                systemd_effective="1-3",
+                cpuset="0-4",
+                allowed="0-5",
+                systemd_effective="0-5",
             )
             self.assertEqual(result.returncode, 2, result.stderr)
-            self.assertIn("cpuset.cpus=0-5", result.stderr)
+            self.assertIn("cpuset.cpus=0-4", result.stderr)
 
     def test_validate_reaches_perf_runner_without_rows(self) -> None:
         """Empty validation options must not trip nounset before perf-run."""
@@ -138,7 +147,7 @@ class PerfAllCliTest(unittest.TestCase):
                 "\"$@\"\n"
             )
             runner.chmod(0o755)
-            environment = self.fake_restore_environment(root, "1-3")
+            environment = self.fake_restore_environment(root, "0-5")
             environment["PERF_RUN"] = str(runner)
             environment["PERF_RUN_CAPTURE"] = str(capture)
             environment["PERF_RUN_COUNT_FILE"] = str(count_file)
@@ -159,7 +168,7 @@ class PerfAllCliTest(unittest.TestCase):
                 capture.read_text().splitlines()[:3],
                 ["--root", "--out", str(output / "receipts")],
             )
-            self.assertIn("cpuset.cpus.effective=1-3", (output / "cpuset-restoration.txt").read_text())
+            self.assertIn("cpuset.cpus.effective=0-5", (output / "cpuset-restoration.txt").read_text())
 
     def test_calibration_forwards_lan_probe_count_to_measured_scope(self) -> None:
         """The 3,600-probe override must cross perf-run's sudo boundary explicitly."""
@@ -185,7 +194,7 @@ class PerfAllCliTest(unittest.TestCase):
                 "\"$@\"\n"
             )
             runner.chmod(0o755)
-            environment = self.fake_restore_environment(root, "1-3")
+            environment = self.fake_restore_environment(root, "0-5")
             environment["PERF_RUN"] = str(runner)
             environment["PERF_RUN_CAPTURE"] = str(capture)
             environment["PERF_RUN_COUNT_FILE"] = str(count_file)
@@ -200,14 +209,20 @@ class PerfAllCliTest(unittest.TestCase):
                     "control-a=gotatun",
                     "--row",
                     "control-b=gotatun",
+                    "--row",
+                    "control-c=gotatun",
                     "--binary",
                     f"control-a={binary}",
                     "--binary",
                     f"control-b={binary}",
+                    "--binary",
+                    f"control-c={binary}",
                     "--source",
                     "control-a=84b7bb28e385d57dfb80493e78202898fad24d1e",
                     "--source",
                     "control-b=84b7bb28e385d57dfb80493e78202898fad24d1e",
+                    "--source",
+                    "control-c=84b7bb28e385d57dfb80493e78202898fad24d1e",
                     "--out",
                     str(output),
                 ],
@@ -219,6 +234,69 @@ class PerfAllCliTest(unittest.TestCase):
 
             self.assertEqual(result.returncode, 23, result.stderr)
             self.assertIn("H2H_LAN_PING_COUNT=3600", capture.read_text().splitlines())
+
+    def test_restore_check_rejects_a_changed_workqueue_cpumask(self) -> None:
+        """A mask left on housekeeping CPUs must fail the second locked restore check."""
+        with tempfile.TemporaryDirectory(prefix="j88i-restore-workqueue-") as temporary:
+            root = Path(temporary)
+            mask = root / "workqueue" / "writeback" / "cpumask"
+            mask.parent.mkdir(parents=True)
+            mask.write_text("21\n")
+            manifest = root / "workqueue-masks-before.tsv"
+            manifest.write_text(f"{mask}\t3f\n")
+            result = self.run_restore_check(
+                root,
+                "0-5",
+                workqueue_manifest=manifest,
+            )
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("workqueue cpumask restore failed", result.stderr)
+
+    def test_smoke_plan_accepts_wireguard_go_reference_engine(self) -> None:
+        """The baseline comparison can schedule the existing wireguard-go harness case."""
+        script = Path(__file__).parent / "base/perf-all.sh"
+        with tempfile.TemporaryDirectory(prefix="j88i-wireguard-go-row-") as temporary:
+            root = Path(temporary)
+            runner = root / "perf-run"
+            capture = root / "runner-args.txt"
+            count_file = root / "runner-count.txt"
+            output = root / "wireguard-go"
+            runner.write_text(
+                "#!/usr/bin/env bash\n"
+                "count=0\n"
+                "[[ ! -f $PERF_RUN_COUNT_FILE ]] || count=$(cat \"$PERF_RUN_COUNT_FILE\")\n"
+                "count=$((count + 1))\n"
+                "printf '%s\\n' \"$count\" > \"$PERF_RUN_COUNT_FILE\"\n"
+                "if ((count == 1)); then printf '%s\\n' \"$@\" > \"$PERF_RUN_CAPTURE\"; exit 23; fi\n"
+                "while (($#)) && [[ $1 != -- ]]; do shift; done\n"
+                "[[ ${1:-} == -- ]] && shift\n"
+                "\"$@\"\n"
+            )
+            runner.chmod(0o755)
+            environment = self.fake_restore_environment(root, "0-5")
+            environment["PERF_RUN"] = str(runner)
+            environment["PERF_RUN_CAPTURE"] = str(capture)
+            environment["PERF_RUN_COUNT_FILE"] = str(count_file)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(script),
+                    "--smoke",
+                    "--row",
+                    "wireguard-go=wireguard-go",
+                    "--out",
+                    str(output),
+                ],
+                capture_output=True,
+                text=True,
+                env=environment,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 23, result.stderr)
+            self.assertIn("wireguard-go\twireguard-go", (output / "rows.tsv").read_text())
 
 
 if __name__ == "__main__":

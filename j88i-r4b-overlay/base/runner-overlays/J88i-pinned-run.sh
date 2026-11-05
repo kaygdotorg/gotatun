@@ -12,7 +12,7 @@ mkdir -p "$out"
 side_a=${H2H_CPUSET_A:-1-2}
 side_b=${H2H_CPUSET_B:-3-4}
 housekeeping=${H2H_CPUSET_HOUSEKEEPING:-0,5}
-perf_cpus=${H2H_CPUSET_PERF:-1-4}
+perf_cpus=${H2H_CPUSET_PERF:-0-5}
 [[ $(id -u) == 0 ]] || { echo 'D348 host placement must run as root' >&2; exit 2; }
 
 topology=$(lscpu --parse=CPU,CORE,SOCKET | awk -F, '!/^#/ {print}')
@@ -22,7 +22,7 @@ core_count=$(printf '%s\n' "$topology" | awk -F, '{print $2 "/" $3}' | sort -u |
     echo "unexpected post-resize topology: nproc=$(nproc --all) CPUs=$cpu_list cores=$core_count" >&2
     exit 2
 }
-[[ $side_a == 1-2 && $side_b == 3-4 && $housekeeping == 0,5 && $perf_cpus == 1-4 ]] || {
+[[ $side_a == 1-2 && $side_b == 3-4 && $housekeeping == 0,5 && $perf_cpus == 0-5 ]] || {
     echo "unexpected D348 masks: A=$side_a B=$side_b housekeeping=$housekeeping perf=$perf_cpus" >&2
     exit 2
 }
@@ -62,6 +62,37 @@ old_perf_effective=${old_effective[perf.slice]}
     exit 2
 }
 
+for unit in init.scope system.slice user.slice; do
+    [[ ${old_cpuset[$unit]} == 0-5 && ${old_effective[$unit]} == 0-5 ]] || {
+        echo "$unit must be unpinned at 0-5 before D348, got cpuset.cpus=${old_cpuset[$unit]} effective=${old_effective[$unit]}" >&2
+        exit 2
+    }
+done
+
+# Keep a machine-readable baseline so the second perf-run scope can verify
+# real cgroup files after this scope has gone away.
+: > "$out/cgroup-masks-before.tsv"
+for unit in "${units[@]}"; do
+    group=$(unit_cgroup "$unit")
+    printf '%s\t%s\t%s\t%s\t%s\n' "$unit" "${group#/sys/fs/cgroup}" \
+        "${old_cpuset[$unit]}" "${old_effective[$unit]}" "${old_dropins[$unit]}" \
+        >> "$out/cgroup-masks-before.tsv"
+done
+
+# The global and per-workqueue cpumasks all start from their own exact values.
+# Pinning them together keeps unbound kernel work off the measured CPUs.
+workqueue_mask_files=(/sys/devices/virtual/workqueue/cpumask)
+for path in /sys/devices/virtual/workqueue/*/cpumask; do
+    [[ -f $path ]] && workqueue_mask_files+=("$path")
+done
+declare -A old_workqueue_mask
+: > "$out/workqueue-masks-before.tsv"
+for path in "${workqueue_mask_files[@]}"; do
+    [[ -r $path && -w $path ]] || { echo "cannot read and set workqueue cpumask $path" >&2; exit 2; }
+    old_workqueue_mask[$path]=$(cat "$path")
+    printf '%s\t%s\n' "$path" "${old_workqueue_mask[$path]}" >> "$out/workqueue-masks-before.tsv"
+done
+
 host_net_irqs=()
 declare -A irq_seen
 for netdev in /sys/class/net/*; do
@@ -82,11 +113,19 @@ for netdev in /sys/class/net/*; do
     done < <(awk -v prefix="$device-" '$1 ~ /^[0-9]+:/ && index($0, prefix) {gsub(":", "", $1); print $1}' /proc/interrupts)
 done
 
+: > "$out/irq-affinity-before.tsv"
+for irq in "${host_net_irqs[@]}"; do
+    printf '%s\t%s\n' "$irq" "${old_irq_affinity[$irq]}" >> "$out/irq-affinity-before.tsv"
+done
+
 restored=0
 # Restore saved cgroup masks and IRQ affinities, then verify the real state.
 restore() {
     ((restored == 0)) || return 0
-    local rc=0 command_rc=0 cpus effective paths attempt irq unit
+    local rc=0 command_rc=0 cpus effective paths attempt irq unit path
+    for path in "${workqueue_mask_files[@]}"; do
+        printf '%s\n' "${old_workqueue_mask[$path]}" > "$path" || command_rc=1
+    done
     for irq in "${host_net_irqs[@]}"; do
         printf '%s\n' "${old_irq_affinity[$irq]}" > "/proc/irq/$irq/smp_affinity_list" || command_rc=1
     done
@@ -110,6 +149,9 @@ restore() {
         for irq in "${host_net_irqs[@]}"; do
             [[ $(cat "/proc/irq/$irq/smp_affinity_list") == "${old_irq_affinity[$irq]}" ]] || rc=1
         done
+        for path in "${workqueue_mask_files[@]}"; do
+            [[ $(cat "$path") == "${old_workqueue_mask[$path]}" ]] || rc=1
+        done
         cpus=$(unit_cpus perf.slice cpuset.cpus) || rc=1
         effective=$(unit_cpus perf.slice cpuset.cpus.effective) || rc=1
         [[ $cpus == "$old_cpus" && $effective == "$old_perf_effective" ]] || rc=1
@@ -126,8 +168,11 @@ restore() {
                 for irq in "${host_net_irqs[@]}"; do
                     printf 'host_network_irq_%s_affinity=%s\n' "$irq" "$(cat "/proc/irq/$irq/smp_affinity_list")"
                 done
+                for path in "${workqueue_mask_files[@]}"; do
+                    printf 'workqueue_cpumask_%s=%s\n' "${path##*/}" "$(cat "$path")"
+                done
             } > "$out/host-layout-restored.txt"
-            echo "host service slices and IRQ affinities restored; perf.slice cpuset.cpus=$cpus cpuset.cpus.effective=$effective"
+            echo "host service slices, IRQ affinities, and workqueue masks restored; perf.slice cpuset.cpus=$cpus cpuset.cpus.effective=$effective"
             return 0
         fi
         sleep 0.1
@@ -146,6 +191,14 @@ finish() {
 trap finish EXIT
 trap 'exit 143' TERM INT
 
+for path in "${workqueue_mask_files[@]}"; do
+    printf '21\n' > "$path"
+    [[ $(cat "$path") == 21 ]] || {
+        echo "workqueue cpumask did not pin to housekeeping CPUs $housekeeping: $path=$(cat "$path")" >&2
+        exit 2
+    }
+done
+
 for unit in init.scope system.slice user.slice; do
     systemctl set-property --runtime "$unit" "AllowedCPUs=$housekeeping" >/dev/null
 done
@@ -162,6 +215,11 @@ done
     echo "perf.slice did not accept test CPUs $perf_cpus" >&2
     exit 2
 }
+taskset -pc "$housekeeping" "$$" >/dev/null
+[[ $(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status) == "$housekeeping" ]] || {
+    echo "D348 coordinator was not pinned to housekeeping CPUs $housekeeping" >&2
+    exit 2
+}
 for irq in "${host_net_irqs[@]}"; do
     printf '%s\n' "$housekeeping" > "/proc/irq/$irq/smp_affinity_list"
     [[ $(cat "/proc/irq/$irq/smp_affinity_list") == "$housekeeping" ]] || {
@@ -169,8 +227,8 @@ for irq in "${host_net_irqs[@]}"; do
         exit 2
     }
 done
-[[ $(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status) == "$perf_cpus" ]] || {
-    echo "perf-run scope did not inherit CPUs $perf_cpus after widening" >&2
+[[ $(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status) == "$housekeeping" ]] || {
+    echo "D348 coordinator affinity is not restricted to housekeeping CPUs $housekeeping" >&2
     exit 2
 }
 runner_cpus_allowed=$(awk '/^Cpus_allowed:/ {print $2}' /proc/self/status)
@@ -205,6 +263,9 @@ runner_allowed=$(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status)
     for irq in "${host_net_irqs[@]}"; do
         printf 'host_network_irq_%s_affinity=%s\n' "$irq" "$(cat "/proc/irq/$irq/smp_affinity_list")"
     done
+    for path in "${workqueue_mask_files[@]}"; do
+        printf 'workqueue_cpumask_%s=%s\n' "${path##*/}" "$(cat "$path")"
+    done
 } > "$out/cpuset-preflight.txt"
 cp "$out/cpuset-preflight.txt" "$out/host-layout-pinned.txt"
 
@@ -212,6 +273,7 @@ export H2H_CPUSET_PIN=1
 export H2H_CPUSET_A="$side_a"
 export H2H_CPUSET_B="$side_b"
 export H2H_CPUSET_HOUSEKEEPING="$housekeeping"
+export H2H_CPUSET_PERF="$perf_cpus"
 export H2H_LOCK=external
 export H2H_USER=claude
 export H2H_CPUSET_AUDIT=1
@@ -223,6 +285,7 @@ run_row() {
     case $engine in
         gotatun) case_name=mesh-gotatun ;;
         kernel) case_name=mesh-netbird ;;
+        wireguard-go) case_name=mesh-wireguard-go ;;
         underlay) case_name=mesh-underlay ;;
         *) echo "unknown engine $engine for $tag" >&2; return 2 ;;
     esac
@@ -232,10 +295,10 @@ run_row() {
     local -a args=(--only "$case_name" --label "$row_label")
     [[ $smoke == 1 ]] && args+=(--smoke)
     if [[ $mode == soak ]]; then
-        env H2H_RESULTS="$row_dir" H2H_GOTATUN_BIN="$binary" H2H_GOTATUN_SOURCE="$source_sha" \
+        taskset -c "$housekeeping" env H2H_RESULTS="$row_dir" H2H_GOTATUN_BIN="$binary" H2H_GOTATUN_SOURCE="$source_sha" \
             H2H_SOAK_SECONDS=3600 bash "$kit/run.sh" "${args[@]}"
     else
-        env H2H_RESULTS="$row_dir" H2H_GOTATUN_BIN="$binary" H2H_GOTATUN_SOURCE="$source_sha" \
+        taskset -c "$housekeeping" env H2H_RESULTS="$row_dir" H2H_GOTATUN_BIN="$binary" H2H_GOTATUN_SOURCE="$source_sha" \
             bash "$kit/run.sh" "${args[@]}"
     fi
 }
