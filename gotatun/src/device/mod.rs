@@ -148,6 +148,20 @@ fn peer_order_key(peer: &Arc<Mutex<PeerState>>) -> usize {
     Arc::as_ptr(peer) as usize
 }
 
+/// Drive local completions until this outgoing slot is delivered, even if later peer work remains.
+async fn wait_for_outgoing_slot(
+    lane: &OrderedCompletions<WgKind>,
+    slot: u64,
+    pending: &mut PendingOutgoing,
+) {
+    loop {
+        tokio::select! {
+            _ = lane.wait_delivered(slot) => return,
+            _ = pending.next(), if !pending.is_empty() => {}
+        }
+    }
+}
+
 /// Apply one prepared outgoing packet and deliver newly ordered results to the peer's UDP path.
 async fn complete_outgoing_packet(
     crypto: CryptoHandle,
@@ -839,6 +853,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         peer_arc: Arc<Mutex<PeerState>>,
         peer_key: usize,
         first_lane: Arc<OrderedCompletions<WgKind>>,
+        first_slot: u64,
         peer_addr: std::net::SocketAddr,
         udp: impl UdpSend + 'static,
         crypto: CryptoHandle,
@@ -848,12 +863,7 @@ impl<T: DeviceTransports> DeviceState<T> {
     ) -> Result<(), Error> {
         let mut flush_guard = Some(flush_guard);
 
-        while !first_lane.is_idle() {
-            pending
-                .next()
-                .await
-                .expect("the handshake output has an ordered completion future");
-        }
+        wait_for_outgoing_slot(&first_lane, first_slot, pending).await;
 
         loop {
             let Some(device_arc) = device.upgrade() else {
@@ -901,6 +911,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                 return Ok(());
             }
             let chunk_lane = Arc::clone(&jobs[0].0);
+            let chunk_last_slot = jobs[jobs.len() - 1].1;
             for (lane, slot, prepared) in jobs {
                 while pending.len() >= CRYPTO_CHUNK_SIZE {
                     pending
@@ -923,12 +934,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                 );
             }
 
-            while !chunk_lane.is_idle() {
-                pending
-                    .next()
-                    .await
-                    .expect("a queued packet has an ordered completion future");
-            }
+            wait_for_outgoing_slot(&chunk_lane, chunk_last_slot, pending).await;
             if flush_guard.is_none() {
                 return Ok(());
             }
@@ -1266,6 +1272,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                     Arc::clone(&peer_arc),
                                     peer_key,
                                     first_lane,
+                                    slot,
                                     addr,
                                     udp_tx.clone(),
                                     crypto.clone(),
