@@ -40,24 +40,25 @@ if [[ ${H2H_LOCK:-} == external ]]; then
     grep -q 'perf.slice' /proc/self/cgroup || { echo 'external lock mode requires perf.slice' >&2; exit 2; }
 fi
 if [[ ${H2H_CPUSET_PIN:-0} == 1 ]]; then
-    [[ ${H2H_CPUSET_A:-} == 0-1 && ${H2H_CPUSET_B:-} == 2-3 ]] || {
-        echo 'D348 requires side A CPUs 0-1 and side B CPUs 2-3' >&2
+    [[ ${H2H_CPUSET_A:-} == 1-2 && ${H2H_CPUSET_B:-} == 3-4 ]] || {
+        echo 'D348 requires side A CPUs 1-2 and side B CPUs 3-4' >&2
         exit 2
     }
-    [[ $(systemctl show perf.slice -p AllowedCPUs --value) == 0-3 ]] || {
-        echo 'D348 runtime perf.slice must allow CPUs 0-3' >&2
+    [[ $(systemctl show perf.slice -p AllowedCPUs --value) == 1-4 ]] || {
+        echo 'D348 runtime perf.slice must allow CPUs 1-4' >&2
         exit 2
     }
-    [[ $(cat /sys/fs/cgroup/perf.slice/cpuset.cpus.effective) == 0-3 ]] || {
-        echo 'D348 runtime perf.slice effective CPUs are not 0-3' >&2
+    [[ $(cat /sys/fs/cgroup/perf.slice/cpuset.cpus.effective) == 1-4 ]] || {
+        echo 'D348 runtime perf.slice effective CPUs are not 1-4' >&2
         exit 2
     }
-    [[ $(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status) == 0-3 ]] || {
-        echo 'D348 case runner did not inherit CPUs 0-3' >&2
+    [[ $(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status) == 1-4 ]] || {
+        echo 'D348 case runner did not inherit CPUs 1-4' >&2
         exit 2
     }
     {
         printf 'side_a=%s\nside_b=%s\n' "$H2H_CPUSET_A" "$H2H_CPUSET_B"
+        printf 'housekeeping=%s\n' "${H2H_CPUSET_HOUSEKEEPING:-0,5}"
         printf 'perf_slice_allowed=%s\n' "$(systemctl show perf.slice -p AllowedCPUs --value)"
         printf 'perf_slice_effective=%s\n' "$(cat /sys/fs/cgroup/perf.slice/cpuset.cpus.effective)"
         printf 'runner_cpus_allowed=%s\n' "$(awk '/^Cpus_allowed:/ {print $2}' /proc/self/status)"

@@ -25,8 +25,8 @@ from pathlib import Path
 OUTPUT = Path(os.environ.get("H2H_CPUSET_AUDIT_DIR", "."))
 PARENT_PID = int(os.environ.get("H2H_CPUSET_AUDIT_PARENT", "-1"))
 SELF_PID = os.getpid()
-TEST_CPUS = {0, 1, 2, 3}
-EXPECTED_MASKS = {frozenset({0, 1}), frozenset({2, 3})}
+TEST_CPUS = {1, 2, 3, 4}
+EXPECTED_MASKS = {frozenset({1, 2}), frozenset({3, 4})}
 STOP = False
 
 
@@ -384,7 +384,7 @@ def main() -> int:
         "scope_run_delay_delta_ns": run_delay_delta_ns,
         "clean": clean,
         "test_cpu_list": sorted(TEST_CPUS),
-        "expected_side_cpu_lists": [[0, 1], [2, 3]],
+        "expected_side_cpu_lists": [[1, 2], [3, 4]],
         "interrupt_data_available": interrupt_data_available,
         "softirq_data_available": softirq_data_available,
         "interrupt_delta_per_cpu": interrupt_delta,

@@ -64,8 +64,8 @@ cleanup() {
 # Return the fixed D348 CPU pair for a namespace's test side.
 h2h_cpu_mask_for_ns() {
     case $1 in
-        h2h-a | h2h-ts | h2h-c | h2h-u) printf '%s' "${H2H_CPUSET_A:-0-1}" ;;
-        h2h-b | h2h-tc) printf '%s' "${H2H_CPUSET_B:-2-3}" ;;
+        h2h-a | h2h-ts | h2h-c | h2h-u) printf '%s' "${H2H_CPUSET_A:-1-2}" ;;
+        h2h-b | h2h-tc) printf '%s' "${H2H_CPUSET_B:-3-4}" ;;
         *) die "no D348 CPU pair is defined for namespace $1" ;;
     esac
 }

@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
-# Prove R4b namespace helpers create separate 0-1 and 2-3 process cpusets.
+# Prove R4b namespace helpers create separate 1-2 and 3-4 process cpusets.
 set -euo pipefail
 
 H2H_KIT=$1
 H2H_RESULTS=$2
 H2H_CASE=j88i-cpuset-smoke
 H2H_CPUSET_PIN=1
-H2H_CPUSET_A=0-1
-H2H_CPUSET_B=2-3
+H2H_CPUSET_A=1-2
+H2H_CPUSET_B=3-4
+H2H_CPUSET_HOUSEKEEPING=0,5
 H2H_CPUSET_AUDIT=1
 H2H_CPUSET_AUDIT_REQUIRE_CLEAN=1
 H2H_RUN=$(mktemp -d /dev/shm/j88i-cpuset-smoke.XXXXXX)
-export H2H_KIT H2H_RESULTS H2H_CASE H2H_CPUSET_PIN H2H_CPUSET_A H2H_CPUSET_B
+export H2H_KIT H2H_RESULTS H2H_CASE H2H_CPUSET_PIN H2H_CPUSET_A H2H_CPUSET_B H2H_CPUSET_HOUSEKEEPING
 export H2H_CPUSET_AUDIT H2H_CPUSET_AUDIT_REQUIRE_CLEAN H2H_RUN
 mkdir -p "$H2H_RESULTS"
 mkdir -p "$H2H_RESULTS/$H2H_CASE"
@@ -43,8 +44,8 @@ check_mask() {
     [[ -n $mask && $list == "$want" ]] || die "$ns process masks were $got, expected list $want"
 }
 
-check_mask h2h-a 0-1
-check_mask h2h-b 2-3
+check_mask h2h-a 1-2
+check_mask h2h-b 3-4
 
 # A paused scope lets the audit start after systemd has created every measured
 # cgroup, then releases the tools together so setup work is outside the hold.
@@ -68,7 +69,7 @@ wait "$paused_client" || die "released measured scope failed"
 
 spawn_in_ns probe_a_pid h2h-a sleep 30
 spawn_in_ns probe_b_pid h2h-b sleep 30
-for entry in "probe_a_pid:0-1" "probe_b_pid:2-3"; do
+for entry in "probe_a_pid:1-2" "probe_b_pid:3-4"; do
     name=${entry%%:*}
     want=${entry#*:}
     pid=${!name}

@@ -20,6 +20,21 @@ from unittest.mock import patch
 class CpusetAuditCliTest(unittest.TestCase):
     """Keep the positional interface used by the R4b shell helper working."""
 
+    def test_d348_audit_uses_two_test_pairs_and_housekeeping_cpus(self) -> None:
+        """Reserve CPUs 0 and 5 for host work and give each side two cores."""
+        script = Path(__file__).parent / "base/lib/cpuset_audit.py"
+        spec = importlib.util.spec_from_file_location("cpuset_audit_topology", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader if spec is not None else None)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        self.assertEqual(module.TEST_CPUS, {1, 2, 3, 4})
+        self.assertEqual(
+            module.EXPECTED_MASKS,
+            {frozenset({1, 2}), frozenset({3, 4})},
+        )
+
     def test_scope_spawn_sets_a_pid_output_name_that_matches_its_local_name(self) -> None:
         """The spawn helper must assign output variables even when callers name one `pid`."""
         common = Path(__file__).parent / "base/lib/common.sh"
