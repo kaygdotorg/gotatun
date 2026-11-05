@@ -20,6 +20,25 @@ from unittest.mock import patch
 class CpusetAuditCliTest(unittest.TestCase):
     """Keep the positional interface used by the R4b shell helper working."""
 
+    def test_scope_spawn_sets_a_pid_output_name_that_matches_its_local_name(self) -> None:
+        """The spawn helper must assign output variables even when callers name one `pid`."""
+        common = Path(__file__).parent / "base/lib/common.sh"
+        code = r"""
+set -euo pipefail
+export H2H_KIT=$1 H2H_CASE=scope-output H2H_CPUSET_PIN=0
+source "$H2H_KIT/lib/common.sh"
+h2h_scope_spawn pid 0-1 sleep 0.1
+[[ ${pid:-} =~ ^[0-9]+$ ]] || { echo "scope pid output was not set" >&2; exit 1; }
+wait "$H2H_SCOPE_CLIENT_PID"
+"""
+        result = subprocess.run(
+            ["bash", "-c", code, "bash", str(common.parent.parent)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_sampler_signals_only_a_clean_startup_before_loaded_samples(self) -> None:
         """The workload must stay stopped until the sampler sees a clean CPU set."""
         script = Path(__file__).parent / "base/lib/cpuset_audit.py"

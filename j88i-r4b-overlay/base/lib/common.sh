@@ -104,7 +104,7 @@ h2h_scope_run() {
 # measured scopes can exist before the clean audit and load start together.
 h2h_scope_spawn() {
     local outvar=$1 cpus=$2; shift 2
-    local slug unit pidfile scope_log scope_stdout scope_stderr client pid pause
+    local slug unit pidfile scope_log scope_stdout scope_stderr client scope_pid pause
     slug=${H2H_CASE:-kit}
     slug=${slug//[^a-zA-Z0-9_.-]/-}
     unit="j88i-$slug-$$-$RANDOM.scope"
@@ -118,10 +118,10 @@ h2h_scope_spawn() {
         else
             "$@" > "$scope_stdout" 2>"$scope_stderr" &
         fi
-        pid=$!
-        register_pid "$pid"
-        H2H_SCOPE_CLIENT_PID=$pid
-        printf -v "$outvar" '%s' "$pid"
+        scope_pid=$!
+        register_pid "$scope_pid"
+        H2H_SCOPE_CLIENT_PID=$scope_pid
+        printf -v "$outvar" '%s' "$scope_pid"
         return
     fi
     pidfile="$H2H_RUN/$unit.pid"
@@ -136,11 +136,11 @@ h2h_scope_spawn() {
     client=$!
     register_pid "$client"
     wait_for 10 test -s "$pidfile" || die "cpuset scope $unit did not publish its command PID: $(tail -c 600 "$scope_log")"
-    read -r pid < "$pidfile"
-    register_pid "$pid"
+    read -r scope_pid < "$pidfile"
+    register_pid "$scope_pid"
     H2H_SCOPE_CLIENT_PID=$client
-    printf '%s\t%s\t%s\n' "$pid" "$cpus" "$unit" >> "$H2H_RESULTS/$H2H_CASE/cpuset-pids.tsv"
-    printf -v "$outvar" '%s' "$pid"
+    printf '%s\t%s\t%s\n' "$scope_pid" "$cpus" "$unit" >> "$H2H_RESULTS/$H2H_CASE/cpuset-pids.tsv"
+    printf -v "$outvar" '%s' "$scope_pid"
 }
 
 # Wait for a clean preflight, then sample process placement and scheduler delay
