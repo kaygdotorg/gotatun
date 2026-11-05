@@ -192,10 +192,15 @@ done
 runner=${PERF_RUN:-/usr/local/bin/perf-run}
 [[ -x $runner ]] || { echo "perf runner is not executable: $runner" >&2; exit 2; }
 echo "D348 pinned $mode: $label; results $out"
+run_env=(H2H_CPUSET_AUDIT=1 H2H_RESULTS="$out")
+if [[ -n ${H2H_LAN_PING_COUNT:-} ]]; then
+    # perf-run enters a sudo scope, so measured overrides must be command env assignments.
+    run_env+=("H2H_LAN_PING_COUNT=$H2H_LAN_PING_COUNT")
+fi
 run_status=0
 set +e
 "$runner" --root --out "$out/receipts" -- \
-    env H2H_CPUSET_AUDIT=1 H2H_RESULTS="$out" \
+    env "${run_env[@]}" \
     bash "$kit/runner-overlays/J88i-pinned-run.sh" "$kit" "$out" "$mode" "$label" "$plan"
 run_status=$?
 set -e

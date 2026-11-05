@@ -161,6 +161,65 @@ class PerfAllCliTest(unittest.TestCase):
             )
             self.assertIn("cpuset.cpus.effective=1-3", (output / "cpuset-restoration.txt").read_text())
 
+    def test_calibration_forwards_lan_probe_count_to_measured_scope(self) -> None:
+        """The 3,600-probe override must cross perf-run's sudo boundary explicitly."""
+        script = Path(__file__).parent / "base/perf-all.sh"
+        with tempfile.TemporaryDirectory(prefix="j88i-calibration-count-") as temporary:
+            root = Path(temporary)
+            runner = root / "perf-run"
+            capture = root / "runner-args.txt"
+            count_file = root / "runner-count.txt"
+            output = root / "calibration"
+            binary = root / "gotatun"
+            binary.write_text("#!/usr/bin/env bash\nexit 0\n")
+            binary.chmod(0o755)
+            runner.write_text(
+                "#!/usr/bin/env bash\n"
+                "count=0\n"
+                "[[ ! -f $PERF_RUN_COUNT_FILE ]] || count=$(cat \"$PERF_RUN_COUNT_FILE\")\n"
+                "count=$((count + 1))\n"
+                "printf '%s\\n' \"$count\" > \"$PERF_RUN_COUNT_FILE\"\n"
+                "if ((count == 1)); then printf '%s\\n' \"$@\" > \"$PERF_RUN_CAPTURE\"; exit 23; fi\n"
+                "while (($#)) && [[ $1 != -- ]]; do shift; done\n"
+                "[[ ${1:-} == -- ]] && shift\n"
+                "\"$@\"\n"
+            )
+            runner.chmod(0o755)
+            environment = self.fake_restore_environment(root, "1-3")
+            environment["PERF_RUN"] = str(runner)
+            environment["PERF_RUN_CAPTURE"] = str(capture)
+            environment["PERF_RUN_COUNT_FILE"] = str(count_file)
+            environment["H2H_LAN_PING_COUNT"] = "3600"
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(script),
+                    "--calibration",
+                    "--row",
+                    "control-a=gotatun",
+                    "--row",
+                    "control-b=gotatun",
+                    "--binary",
+                    f"control-a={binary}",
+                    "--binary",
+                    f"control-b={binary}",
+                    "--source",
+                    "control-a=84b7bb28e385d57dfb80493e78202898fad24d1e",
+                    "--source",
+                    "control-b=84b7bb28e385d57dfb80493e78202898fad24d1e",
+                    "--out",
+                    str(output),
+                ],
+                capture_output=True,
+                text=True,
+                env=environment,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 23, result.stderr)
+            self.assertIn("H2H_LAN_PING_COUNT=3600", capture.read_text().splitlines())
+
 
 if __name__ == "__main__":
     unittest.main()
