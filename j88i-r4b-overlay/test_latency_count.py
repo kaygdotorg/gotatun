@@ -38,6 +38,17 @@ class LatencyCountTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "3600")
 
+    def test_loaded_ping_count_is_not_extended_until_all_replies_arrive(self) -> None:
+        """A lost echo reply must not make a fixed-count ping send extra probes."""
+        mesh = Path(__file__).parent / "base/cases/mesh.sh"
+        source = mesh.read_text()
+        start = source.index("spawn_in_ns ping_pid h2h-a ping -D -O -n -i 0.005")
+        end = source.index('"$PEER"', start)
+        ping_command = source[start:end]
+
+        self.assertIn('-c "$count"', ping_command)
+        self.assertNotIn("-w", ping_command)
+
     def test_full_run_probe_count_keeps_the_existing_default(self) -> None:
         """Full measurements keep the existing 2,000-probe default."""
         result = self.run_count()

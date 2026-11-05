@@ -306,11 +306,12 @@ profile() { # profile <tag> <lat-count> <lat-interval-us> <tput-seconds>
         tput_file="$H2H_RESULTS/$H2H_CASE/tput-$tag-$flows.json"
         tput_tmp="$tput_file.tmp"
         tput_err="$tput_file.err"
+        # `ping -w` can send beyond -c while waiting for that many replies.
+        # Keep this sample's -c value as the exact transmitted-probe count.
         H2H_SCOPE_PAUSE=1 \
             H2H_SCOPE_LOG="$D/icmp-scope-$tag-$flows.log" \
             H2H_SCOPE_STDOUT="$ping_raw" H2H_SCOPE_STDERR="$ping_raw" \
-            spawn_in_ns ping_pid h2h-a ping -D -O -n -i 0.005 -c "$count" \
-                -w "$((count / 100 + 5))" "$PEER"
+            spawn_in_ns ping_pid h2h-a ping -D -O -n -i 0.005 -c "$count" "$PEER"
         ping_client=$H2H_SCOPE_CLIENT_PID
         H2H_SCOPE_PAUSE=1 \
             H2H_SCOPE_LOG="$D/tput-scope-$tag-$flows.log" \
