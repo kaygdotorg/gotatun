@@ -11,12 +11,12 @@ dropins=$(systemctl show perf.slice -p DropInPaths --value)
 cpus=$(cat "$slice_cgroup/cpuset.cpus")
 cpus_effective=$(cat "$slice_cgroup/cpuset.cpus.effective")
 
-if [[ $allowed != 1-3 || $effective != 1-3 || $cpus != 1-3 || $cpus_effective != 1-3 || -n $dropins ]]; then
+if [[ $cpus != 1-3 || $cpus_effective != 1-3 || -n $dropins ]]; then
     printf 'perf.slice restoration failed: AllowedCPUs=%s EffectiveCPUs=%s cpuset.cpus=%s cpuset.cpus.effective=%s DropInPaths=%s\n' \
         "$allowed" "$effective" "$cpus" "$cpus_effective" "$dropins" >&2
     exit 2
 fi
 
-printf 'perf.slice restored after scope exit: AllowedCPUs=%s EffectiveCPUs=%s cpuset.cpus=%s cpuset.cpus.effective=%s DropInPaths=empty\n' \
-    "$allowed" "$effective" "$cpus" "$cpus_effective" > "$output"
+printf 'perf.slice restored after scope exit: cpuset.cpus=%s cpuset.cpus.effective=%s DropInPaths=empty (AllowedCPUs=%s EffectiveCPUs=%s are informational)\n' \
+    "$cpus" "$cpus_effective" "$allowed" "$effective" > "$output"
 cat "$output"

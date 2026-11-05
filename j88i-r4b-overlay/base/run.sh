@@ -44,12 +44,9 @@ if [[ ${H2H_CPUSET_PIN:-0} == 1 ]]; then
         echo 'D348 requires side A CPUs 1-2 and side B CPUs 3-4' >&2
         exit 2
     }
-    [[ $(systemctl show perf.slice -p AllowedCPUs --value) == 1-4 ]] || {
-        echo 'D348 runtime perf.slice must allow CPUs 1-4' >&2
-        exit 2
-    }
-    [[ $(cat /sys/fs/cgroup/perf.slice/cpuset.cpus.effective) == 1-4 ]] || {
-        echo 'D348 runtime perf.slice effective CPUs are not 1-4' >&2
+    [[ $(cat /sys/fs/cgroup/perf.slice/cpuset.cpus) == 1-4 && \
+       $(cat /sys/fs/cgroup/perf.slice/cpuset.cpus.effective) == 1-4 ]] || {
+        echo 'D348 runtime perf.slice cgroup masks are not 1-4' >&2
         exit 2
     }
     [[ $(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status) == 1-4 ]] || {
@@ -59,7 +56,7 @@ if [[ ${H2H_CPUSET_PIN:-0} == 1 ]]; then
     {
         printf 'side_a=%s\nside_b=%s\n' "$H2H_CPUSET_A" "$H2H_CPUSET_B"
         printf 'housekeeping=%s\n' "${H2H_CPUSET_HOUSEKEEPING:-0,5}"
-        printf 'perf_slice_allowed=%s\n' "$(systemctl show perf.slice -p AllowedCPUs --value)"
+        printf 'perf_slice_cpuset=%s\n' "$(cat /sys/fs/cgroup/perf.slice/cpuset.cpus)"
         printf 'perf_slice_effective=%s\n' "$(cat /sys/fs/cgroup/perf.slice/cpuset.cpus.effective)"
         printf 'runner_cpus_allowed=%s\n' "$(awk '/^Cpus_allowed:/ {print $2}' /proc/self/status)"
         printf 'runner_allowed=%s\n' "$(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status)"

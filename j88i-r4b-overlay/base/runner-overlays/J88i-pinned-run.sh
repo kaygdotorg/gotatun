@@ -27,31 +27,38 @@ core_count=$(printf '%s\n' "$topology" | awk -F, '{print $2 "/" $3}' | sort -u |
     exit 2
 }
 
-effective_cpus() {
+# Resolve a systemd unit to its cgroup v2 directory so CPU masks come from
+# the kernel's live state rather than systemd's presentation format.
+unit_cgroup() {
     local unit=$1 group
     group=$(systemctl show "$unit" -p ControlGroup --value)
-    if [[ -n $group && -r "/sys/fs/cgroup$group/cpuset.cpus.effective" ]]; then
-        cat "/sys/fs/cgroup$group/cpuset.cpus.effective"
-    else
-        systemctl show "$unit" -p EffectiveCPUs --value
-    fi
+    [[ $group == /* ]] || { echo "$unit has no cgroup path" >&2; return 2; }
+    printf '/sys/fs/cgroup%s\n' "$group"
+}
+
+# Read one live cpuset file; missing cgroup state is an error, never a fallback.
+unit_cpus() {
+    local unit=$1 file=$2 group
+    group=$(unit_cgroup "$unit") || return
+    [[ -r "$group/$file" ]] || { echo "$unit cgroup lacks $file" >&2; return 2; }
+    cat "$group/$file"
 }
 
 units=(init.scope system.slice user.slice perf.slice)
-declare -A old_allowed old_effective old_dropins old_irq_affinity
+declare -A old_cpuset old_effective old_dropins old_irq_affinity
 for unit in "${units[@]}"; do
-    old_allowed[$unit]=$(systemctl show "$unit" -p AllowedCPUs --value)
-    old_effective[$unit]=$(effective_cpus "$unit")
+    old_cpuset[$unit]=$(unit_cpus "$unit" cpuset.cpus)
+    old_effective[$unit]=$(unit_cpus "$unit" cpuset.cpus.effective)
     old_dropins[$unit]=$(systemctl show "$unit" -p DropInPaths --value)
     [[ -z ${old_dropins[$unit]} ]] || {
         echo "refusing to alter $unit with existing drop-ins: ${old_dropins[$unit]}" >&2
         exit 2
     }
 done
-old_cpus=$(systemctl show perf.slice -p AllowedCPUs --value)
-old_perf_effective=$(cat /sys/fs/cgroup/perf.slice/cpuset.cpus.effective)
+old_cpus=${old_cpuset[perf.slice]}
+old_perf_effective=${old_effective[perf.slice]}
 [[ $old_cpus == 1-3 && $old_perf_effective == 1-3 ]] || {
-    echo "unexpected perf.slice baseline: AllowedCPUs=$old_cpus effective=$old_perf_effective" >&2
+    echo "unexpected perf.slice baseline: cpuset.cpus=$old_cpus cpuset.cpus.effective=$old_perf_effective" >&2
     exit 2
 }
 
@@ -76,49 +83,56 @@ for netdev in /sys/class/net/*; do
 done
 
 restored=0
+# Restore saved cgroup masks and IRQ affinities, then verify the real state.
 restore() {
     ((restored == 0)) || return 0
-    local rc=0 allowed effective paths attempt irq unit
+    local rc=0 command_rc=0 cpus effective paths attempt irq unit
     for irq in "${host_net_irqs[@]}"; do
-        printf '%s\n' "${old_irq_affinity[$irq]}" > "/proc/irq/$irq/smp_affinity_list" || rc=1
+        printf '%s\n' "${old_irq_affinity[$irq]}" > "/proc/irq/$irq/smp_affinity_list" || command_rc=1
+    done
+    # Put every unit back on its captured effective mask before removing the
+    # temporary AllowedCPUs properties that created the test placement.
+    for unit in "${units[@]}"; do
+        systemctl set-property --runtime "$unit" "AllowedCPUs=${old_effective[$unit]}" >/dev/null || command_rc=1
     done
     for unit in "${units[@]}"; do
-        systemctl revert "$unit" >/dev/null || rc=1
+        systemctl revert "$unit" >/dev/null || command_rc=1
     done
     for attempt in {1..50}; do
         rc=0
         for unit in "${units[@]}"; do
-            allowed=$(systemctl show "$unit" -p AllowedCPUs --value)
-            effective=$(effective_cpus "$unit")
+            cpus=$(unit_cpus "$unit" cpuset.cpus) || rc=1
+            effective=$(unit_cpus "$unit" cpuset.cpus.effective) || rc=1
             paths=$(systemctl show "$unit" -p DropInPaths --value)
-            [[ $allowed == "${old_allowed[$unit]}" && $effective == "${old_effective[$unit]}" && \
+            [[ $cpus == "${old_cpuset[$unit]}" && $effective == "${old_effective[$unit]}" && \
                $paths == "${old_dropins[$unit]}" ]] || rc=1
         done
         for irq in "${host_net_irqs[@]}"; do
             [[ $(cat "/proc/irq/$irq/smp_affinity_list") == "${old_irq_affinity[$irq]}" ]] || rc=1
         done
-        effective=$(cat /sys/fs/cgroup/perf.slice/cpuset.cpus.effective)
-        [[ $effective == 1-3 ]] || rc=1
-        if ((rc == 0)); then
+        cpus=$(unit_cpus perf.slice cpuset.cpus) || rc=1
+        effective=$(unit_cpus perf.slice cpuset.cpus.effective) || rc=1
+        [[ $cpus == "$old_cpus" && $effective == "$old_perf_effective" ]] || rc=1
+        if ((rc == 0 && command_rc == 0)); then
             restored=1
             {
                 echo "restored at $(date -Is)"
                 for unit in "${units[@]}"; do
-                    printf '%s allowed=%s effective=%s dropins=%s\n' "$unit" \
-                        "$(systemctl show "$unit" -p AllowedCPUs --value)" \
-                        "$(effective_cpus "$unit")" \
+                    printf '%s cpuset.cpus=%s cpuset.cpus.effective=%s dropins=%s\n' "$unit" \
+                        "$(unit_cpus "$unit" cpuset.cpus)" \
+                        "$(unit_cpus "$unit" cpuset.cpus.effective)" \
                         "$(systemctl show "$unit" -p DropInPaths --value)"
                 done
                 for irq in "${host_net_irqs[@]}"; do
                     printf 'host_network_irq_%s_affinity=%s\n' "$irq" "$(cat "/proc/irq/$irq/smp_affinity_list")"
                 done
             } > "$out/host-layout-restored.txt"
-            echo "host service slices and IRQ affinities restored; perf.slice AllowedCPUs=$old_cpus effective=$effective"
+            echo "host service slices and IRQ affinities restored; perf.slice cpuset.cpus=$cpus cpuset.cpus.effective=$effective"
             return 0
         fi
         sleep 0.1
     done
-    echo "host placement restore failed: AllowedCPUs=$allowed DropInPaths=$paths perf.slice effective=$effective" >&2
+    echo "host placement restore failed: command_status=$command_rc cpuset.cpus=$cpus DropInPaths=$paths perf.slice cpuset.cpus.effective=$effective" >&2
     return 1
 }
 finish() {
@@ -137,14 +151,14 @@ for unit in init.scope system.slice user.slice; do
 done
 systemctl set-property --runtime perf.slice "AllowedCPUs=$perf_cpus" >/dev/null
 for unit in init.scope system.slice user.slice; do
-    [[ $(systemctl show "$unit" -p AllowedCPUs --value) == "$housekeeping" && \
-       $(effective_cpus "$unit") == "$housekeeping" ]] || {
+    [[ $(unit_cpus "$unit" cpuset.cpus) == "$housekeeping" && \
+       $(unit_cpus "$unit" cpuset.cpus.effective) == "$housekeeping" ]] || {
         echo "$unit did not inherit housekeeping CPUs $housekeeping" >&2
         exit 2
     }
 done
-[[ $(systemctl show perf.slice -p AllowedCPUs --value) == "$perf_cpus" && \
-   $(cat /sys/fs/cgroup/perf.slice/cpuset.cpus.effective) == "$perf_cpus" ]] || {
+[[ $(unit_cpus perf.slice cpuset.cpus) == "$perf_cpus" && \
+   $(unit_cpus perf.slice cpuset.cpus.effective) == "$perf_cpus" ]] || {
     echo "perf.slice did not accept test CPUs $perf_cpus" >&2
     exit 2
 }
@@ -165,16 +179,23 @@ runner_allowed=$(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status)
     echo "topology: nproc_all=$(nproc --all)"
     printf 'CPU,CORE,SOCKET\n%s\n' "$topology"
     printf 'side_a=%s\nside_b=%s\nhousekeeping=%s\n' "$side_a" "$side_b" "$housekeeping"
-    printf 'perf_slice_allowed=%s\nperf_slice_effective=%s\n' \
-        "$(systemctl show perf.slice -p AllowedCPUs --value)" \
-        "$(cat /sys/fs/cgroup/perf.slice/cpuset.cpus.effective)"
+    printf 'perf_slice_cpuset=%s\nperf_slice_effective=%s\n' \
+        "$(unit_cpus perf.slice cpuset.cpus)" \
+        "$(unit_cpus perf.slice cpuset.cpus.effective)"
     printf 'runner_cpus_allowed=%s\nrunner_allowed=%s\n' "$runner_cpus_allowed" "$runner_allowed"
     for unit in init.scope system.slice user.slice netbird.service tailscaled.service containerd.service docker.service systemd-journald.service; do
         state=$(systemctl show "$unit" -p ActiveState --value)
-        allowed=$(systemctl show "$unit" -p AllowedCPUs --value)
-        effective=$(effective_cpus "$unit")
-        printf 'unit=%s state=%s allowed=%s effective=%s\n' "$unit" "$state" "$allowed" "$effective"
+        property=$(systemctl show "$unit" -p AllowedCPUs --value)
+        cpus=""
+        effective=""
+        if [[ $state == active ]]; then
+            cpus=$(unit_cpus "$unit" cpuset.cpus)
+            effective=$(unit_cpus "$unit" cpuset.cpus.effective)
+        fi
+        printf 'unit=%s state=%s AllowedCPUs_property=%s cpuset.cpus=%s cpuset.cpus.effective=%s\n' \
+            "$unit" "$state" "$property" "$cpus" "$effective"
         if [[ $unit == *.service && $state == active ]]; then
+            # Service cpuset.cpus may be empty because it inherits system.slice.
             [[ $effective == "$housekeeping" ]] || {
                 echo "$unit is not confined to housekeeping CPUs $housekeeping" >&2
                 exit 2

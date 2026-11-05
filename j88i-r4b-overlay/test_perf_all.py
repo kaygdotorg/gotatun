@@ -14,7 +14,12 @@ from pathlib import Path
 class PerfAllCliTest(unittest.TestCase):
     """Keep validation mode reachable when optional row maps are empty."""
 
-    def fake_restore_environment(self, root: Path, effective: str) -> dict[str, str]:
+    def fake_restore_environment(
+        self,
+        root: Path,
+        effective: str,
+        cpuset: str = "1-3",
+    ) -> dict[str, str]:
         """Provide a controlled systemd and cgroup view for restoration tests."""
         bin_dir = root / "bin"
         state_dir = root / "systemd-state"
@@ -36,7 +41,7 @@ class PerfAllCliTest(unittest.TestCase):
         (state_dir / "allowed").write_text("1-3\n")
         (state_dir / "effective").write_text(f"{effective}\n")
         (state_dir / "dropins").write_text("")
-        (cgroup / "cpuset.cpus").write_text("1-3\n")
+        (cgroup / "cpuset.cpus").write_text(f"{cpuset}\n")
         (cgroup / "cpuset.cpus.effective").write_text(f"{effective}\n")
         environment = os.environ.copy()
         environment["PATH"] = f"{bin_dir}{os.pathsep}{environment['PATH']}"
@@ -44,11 +49,24 @@ class PerfAllCliTest(unittest.TestCase):
         environment["J88I_TEST_SYSTEMD_STATE"] = str(state_dir)
         return environment
 
-    def run_restore_check(self, root: Path, effective: str) -> subprocess.CompletedProcess[str]:
+    def run_restore_check(
+        self,
+        root: Path,
+        effective: str,
+        *,
+        cpuset: str = "1-3",
+        allowed: str = "1-3",
+        systemd_effective: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         """Run the post-scope verifier against a temporary cgroup and systemd view."""
         script = Path(__file__).parent / "base/runner-overlays/J88i-verify-restored.sh"
         output = root / "restoration.txt"
-        environment = self.fake_restore_environment(root, effective)
+        environment = self.fake_restore_environment(root, effective, cpuset)
+        state_dir = root / "systemd-state"
+        (state_dir / "allowed").write_text(f"{allowed}\n")
+        (state_dir / "effective").write_text(
+            f"{effective if systemd_effective is None else systemd_effective}\n"
+        )
         return subprocess.run(
             ["bash", str(script), str(output)],
             capture_output=True,
@@ -71,6 +89,32 @@ class PerfAllCliTest(unittest.TestCase):
             result = self.run_restore_check(Path(temporary), "0-3")
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("cpuset.cpus.effective=0-3", result.stderr)
+
+    def test_restore_check_uses_cgroup_masks_when_systemd_lists_differ(self) -> None:
+        """The final CPU mask comes from cgroups, even when systemd prints a different form."""
+        with tempfile.TemporaryDirectory(prefix="j88i-restore-cgroup-authority-") as temporary:
+            root = Path(temporary)
+            result = self.run_restore_check(
+                root,
+                "1-3",
+                allowed="",
+                systemd_effective="0 5",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("cpuset.cpus.effective=1-3", (root / "restoration.txt").read_text())
+
+    def test_restore_check_rejects_wrong_cgroup_even_when_systemd_claims_baseline(self) -> None:
+        """A correct property string cannot hide a cgroup that still has extra CPUs."""
+        with tempfile.TemporaryDirectory(prefix="j88i-restore-cgroup-widened-") as temporary:
+            result = self.run_restore_check(
+                Path(temporary),
+                "0-5",
+                cpuset="0-5",
+                allowed="1-3",
+                systemd_effective="1-3",
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("cpuset.cpus=0-5", result.stderr)
 
     def test_validate_reaches_perf_runner_without_rows(self) -> None:
         """Empty validation options must not trip nounset before perf-run."""
