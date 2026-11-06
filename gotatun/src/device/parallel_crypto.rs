@@ -751,7 +751,7 @@ mod tests {
 
     use super::{
         CRYPTO_BATCH_SIZE, CRYPTO_CHUNK_SIZE, CRYPTO_WORKER_BATCH_SIZE, CryptoWorkers,
-        IncomingCompletion, MIN_PARALLEL_RUN_SIZE, OrderedCompletions,
+        IncomingCompletion, MAX_PEER_CRYPTO_IN_FLIGHT, MIN_PARALLEL_RUN_SIZE, OrderedCompletions,
     };
     use crate::noise::index_table::IndexTable;
     use crate::noise::rate_limiter::RateLimiter;
