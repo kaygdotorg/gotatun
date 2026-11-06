@@ -202,3 +202,19 @@ remain alongside the raw rows. `kernel-slab-overlay.patch` adds the snapshot
 to the scale overlay; it does not change the traffic or placement protocol.
 The separate inventory log `kernel-inventory.log` records module and slab
 identity, also under `perf-run` (exit 0).
+
+## Disk inventory checkpoint
+
+The matching baseline executable occupies 2,769,040 logical file bytes. Its
+four resolved shared runtime files add 3,885,024 bytes, for 6,654,064 bytes
+before the tiny launcher. The wireguard-go executable used in the same harness
+is 3,408,137 bytes; no full Go runtime/dependency-closure claim is made from
+that file alone. The kernel module plus recursive module dependency files
+occupy 149,452 compressed bytes (excluding the OS, module metadata and control
+tools). These are explicit accounting units, not equal deployment closures,
+and establish no disk superiority over either competitor.
+
+Artifacts on perf: `/home/claude/j324/evidence/disk-inventory.json`,
+`disk-inventory.log`, `disk-closure.log`; source `/home/claude/j324/disk-inventory.py`.
+Both inventory scopes exited zero under `perf-run`. Candidate stripped and
+unstripped executable deltas remain pending the matching x86 build.
