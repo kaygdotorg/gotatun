@@ -1241,7 +1241,7 @@ mod tests {
 
     /// Prepare one bounded packet stream for each peer in the stage profile.
     fn prepared_encryption_peers() -> Vec<Vec<PreparedEncryption>> {
-        assert_eq!(PROFILE_PACKET_COUNT % PROFILE_PEER_COUNT, 0);
+        assert!(PROFILE_PACKET_COUNT.is_multiple_of(PROFILE_PEER_COUNT));
         (0..PROFILE_PEER_COUNT)
             .map(|_| {
                 let (mut sender, _) = established_tunnels();
@@ -1274,7 +1274,7 @@ mod tests {
 
     /// Prepare valid incoming packets for each peer in the stage profile.
     fn prepared_decryption_peers() -> Vec<Vec<PreparedDecryption>> {
-        assert_eq!(PROFILE_PACKET_COUNT % PROFILE_PEER_COUNT, 0);
+        assert!(PROFILE_PACKET_COUNT.is_multiple_of(PROFILE_PEER_COUNT));
         (0..PROFILE_PEER_COUNT)
             .map(|_| {
                 let (mut sender, mut receiver) = established_tunnels();
