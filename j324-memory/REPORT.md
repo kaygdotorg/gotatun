@@ -304,3 +304,115 @@ throwaway source mirror), `heap-overlay.patch` (apply after the scale overlay),
 and `heap-summary.py` (summarize final snapshots in cumulative phase logs).
 The summary retains bins and large extents; its resident estimate must be read
 with the direct page-discard caveat above. None is part of a shipping binary.
+
+## Final candidate diagnostics (performance acceptance blocked)
+
+The production source remains `77fcd66`; later commits document evidence only.
+Shipping system-allocator candidate SHA-256:
+`0c8224ed8854566634ad4a0b5171aacedd45236c0c99d7b7b0c4191af590332c`.
+Both endpoint processes combined, under the scale method above:
+
+| Peers/endpoint | Base idle MiB | Candidate idle MiB | Base loaded MiB | Candidate loaded MiB | Base recovered MiB | Candidate recovered MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 9.125 | 9.094 | 30.043 | 25.957 | 11.242 | 11.113 |
+| 100 | 11.641 | 11.520 | 31.871 | 25.578 | 11.805 | 11.754 |
+| 1,000 | 15.914 | 15.621 | 35.156 | 31.754 | 15.688 | 15.770 |
+
+Loaded RSS falls 3.402 MiB (9.7%) at 1,000 peers. Recovered RSS increases
+0.082 MiB there; no recovered-memory or fixed-peer-state win is established.
+Candidate sampled peaks are 27.477 / 27.492 / 32.230 MiB at the three scales,
+versus 33.086 / 32.105 / 36.477 MiB for the matched base. Process idle CPU
+reads 0.0% at all candidate scales; the five-second resolution does not
+establish a CPU or wakeup reduction. Forwarding write-byte deltas remain zero.
+
+Artifacts: perf `/home/claude/j324/evidence/candidate/candidate/mesh-gotatun/`,
+`candidate-console.log`, `candidate-restore-console.log`, `memory-summary.md`.
+The case and independent restoration scope both exit zero. Raw competitor
+rows and kernel accounting limitations remain as documented above and on #260.
+
+Candidate optional-jemalloc diagnostic SHA-256:
+`76ed782fbbe0a1a1e7cfc5c59ffabf79d5e2c41c8dce0f60eab1f5adba3dc685`.
+Allocator-reported bytes, both endpoints combined:
+
+| Peers/endpoint | Base loaded allocated MiB | Candidate loaded allocated MiB | Base loaded 2+4 KiB bins MiB | Candidate loaded 2+4 KiB bins MiB | Base recovered allocated MiB | Candidate recovered allocated MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 72.309 | 66.521 | 13.230 | 6.148 | 58.655 | 58.664 |
+| 100 | 72.428 | 67.252 | 12.969 | 7.227 | 59.072 | 59.119 |
+| 1,000 | 77.405 | 71.477 | 13.461 | 6.270 | 63.125 | 63.089 |
+
+At 1,000 peers the small/full packet bins fall 7.191 MiB while total allocated
+memory falls 5.928 MiB. Other allocations and occupancy vary between samples;
+this is a bin/source attribution, not a precise causal stack profile.
+Raw snapshots: perf `heap-candidate/heap-candidate/mesh-gotatun/`; summary
+`heap-comparison-table.md` and `heap-summary.json`. The 143-second case and
+independent restoration scopes both exit zero. Jemalloc still is diagnostic
+only; the original decay/arena configuration and scratch-accounting caveats
+apply to both sides.
+
+Three short control/candidate/control LAN diagnostic windows retain all raw
+probes. These do not repair the failed calibration or satisfy D348:
+
+| Row | Flows | Gbit/s | Loss-aware p99 ms | Lost/sent | Process CPU s/Gbit | Whole-machine CPU s/Gbit |
+|---|---:|---:|---:|---:|---:|---:|
+| Control before | 1 | 3.037 | 8.410 | 0/3600 | 0.897 | 1.060 |
+| Candidate | 1 | 3.101 | 8.210 | 0/3600 | 0.877 | 1.039 |
+| Control after | 1 | 3.026 | 9.340 | 0/3600 | 0.892 | 1.063 |
+| Control before | 8 | 2.175 | 13.600 | 0/3600 | 1.226 | 1.440 |
+| Candidate | 8 | 2.185 | 13.000 | 0/3600 | 1.245 | 1.483 |
+| Control after | 8 | 2.175 | 12.900 | 0/3600 | 1.225 | 1.443 |
+
+The eight-flow candidate's CPU cost is higher in these diagnostics and its p99
+lies between the controls. No throughput, latency or CPU improvement or
+non-regression is established. At scale, measured whole-machine CPU s/Gbit
+for base/candidate is 1.485/1.492, 1.431/1.499 and 1.453/1.524. Kernel and Go
+rows are retained in `scale-cpu-summary.md`; they are unqualified timing rows,
+not a ranked engine comparison. A fresh passing calibration and qualified
+paired measurements remain required before integration.
+
+Timing artifacts: perf `candidate-timing-summary.{json,md}` and
+`timing-{control-before,candidate,control-after}/`. Each approximately
+62-second case and each separate restoration check exits zero. No perf job
+remains active after these completed windows.
+
+Matched stripped executables: base 2,307,080 bytes, candidate 2,313,456 bytes
+(+6,376). Unstripped: 2,769,040 / 2,776,264 (+7,224). The resolved runtime files
+are identical at 3,885,024 bytes. This change establishes no disk win.
+Artifact: perf `disk-final.log` (exit zero) and compute01
+`/home/claude/j324-evidence/x86-post-restart.log`.
+
+## Restart and x86 control correction
+
+The queued follow-up was cut by the announced compute01 restart at 02:43 IST,
+not by a test failure. After #402 comment 83012 announced five slots, the
+preserved batch was submitted exactly once in the foreground. Candidate
+shipping-ring tests reported 142 passed, zero failed, seven ignored; its UDP
+integration test, CLI test, doctests and all-feature clippy passed. Candidate
+serial all-feature tests passed, while default-concurrency all-feature tests
+retained existing one-second eavesdrop timeouts. Verbatim batch markers:
+
+```text
+J324_CANDIDATE_PARALLEL_EXIT=101
+J324_CANDIDATE_ALL_FEATURES_SERIAL_EXIT=0
+J324_CANDIDATE_FOCUSED_EXIT=0
+J324_X86_RING_EXIT=0
+J324_X86_CLI_EXIT=0
+J324_X86_CLIPPY_EXIT=0
+scripts/verify fast: unavailable (fork has no scripts/verify; infraternal is unchanged)
+J324_X86_BATCH_EXIT=101
+```
+
+Artifact: compute01 `/home/claude/j324-evidence/x86-post-restart.log`, copied to
+control `/home/kayg/.cache/codex-scratch/j324/evidence/x86-post-restart.log`.
+The logs named `x86-baseline-{parallel,serial,focused}.log` from that batch
+are **invalid baseline controls**: archive extraction restored old timestamps,
+and Cargo reused the candidate binary (J324-only test names expose this).
+They must not be used to attribute the candidate timeouts to the baseline.
+
+The archive files themselves match `ebeb8f0`. A separately queued explicit
+source-refresh comparison touches extracted Rust files, records source hashes,
+and runs full baseline/candidate suites at parallel and serial concurrency.
+Artifact: compute01 `/home/claude/j324-evidence/x86-source-refresh.log` and
+`x86-fresh-{base,candidate}-{parallel,serial}.log`. Its result is still pending.
+This correction changes evidence handling only, with no assertion/deadline or
+production-source change. No infraternal files changed, and the fork has no
+`scripts/verify`; the fork suites above are the applicable executable checks.
