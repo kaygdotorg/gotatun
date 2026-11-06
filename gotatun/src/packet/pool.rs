@@ -9,6 +9,8 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+//! Shared packet storage with small and full-size buffers under one retention limit.
+
 use bytes::BytesMut;
 use std::{
     collections::VecDeque,
@@ -29,8 +31,11 @@ pub struct PacketBufPool<const N: usize = 4096> {
 /// All of it sits behind the mutex that every `get` and every returned buffer already take,
 /// so counting use adds no extra synchronisation to the packet path.
 struct PoolQueue {
+    /// Full-size buffers, also usable by small packets when already available.
     buffers: VecDeque<BytesMut>,
-    /// Most buffers this queue retains. Stored, not read from `buffers.capacity()`, because
+    /// Half-size buffers for known packet lengths that fit below the full receive size.
+    small_buffers: VecDeque<BytesMut>,
+    /// Most buffers both queues retain in total. Stored, not read from deque capacity, because
     /// an idle release frees the deque's storage too.
     capacity: usize,
     /// Buffers taken since the last [`PacketBufPool::take_count`]. Read only by `device`.
@@ -62,6 +67,7 @@ impl<const N: usize> PacketBufPool<N> {
         PacketBufPool {
             queue: Arc::new(Mutex::new(PoolQueue {
                 buffers,
+                small_buffers: VecDeque::new(),
                 capacity,
                 taken: 0,
             })),
@@ -86,40 +92,58 @@ impl<const N: usize> PacketBufPool<N> {
     /// working and refills on demand.
     #[cfg(feature = "device")]
     pub(crate) fn release(&self) {
-        let released = std::mem::take(&mut self.queue.lock().unwrap().buffers);
+        let released = {
+            let mut queue = self.queue.lock().unwrap();
+            (
+                std::mem::take(&mut queue.buffers),
+                std::mem::take(&mut queue.small_buffers),
+            )
+        };
         // Free outside the lock; a packet arriving now must not wait on thousands of frees.
         drop(released);
     }
 
     #[cfg(all(test, feature = "device"))]
     fn retained(&self) -> usize {
-        self.queue.lock().unwrap().buffers.len()
+        let queue = self.queue.lock().unwrap();
+        queue.buffers.len() + queue.small_buffers.len()
     }
 
-    /// Try to re-use a [`Packet`] from the pool.
-    fn re_use(&self) -> Option<Packet<[u8]>> {
-        while let Some(mut pointer_to_start_of_allocation) = {
+    /// Reuse a buffer in the requested class, falling back to existing full-size storage.
+    fn re_use(&self, prefer_small: bool) -> Option<Packet<[u8]>> {
+        while let Some((mut pointer_to_start_of_allocation, small)) = {
             let mut queue = self.queue.lock().unwrap();
             queue.taken = queue.taken.saturating_add(1);
-            queue.buffers.pop_front()
+            if prefer_small {
+                queue
+                    .small_buffers
+                    .pop_front()
+                    .map(|buffer| (buffer, true))
+                    .or_else(|| queue.buffers.pop_front().map(|buffer| (buffer, false)))
+            } else {
+                queue.buffers.pop_front().map(|buffer| (buffer, false))
+            }
         } {
+            let buffer_len = if small { N / 2 } else { N };
             debug_assert_eq!(pointer_to_start_of_allocation.len(), 0);
-            if pointer_to_start_of_allocation.try_reclaim(N) {
+            if pointer_to_start_of_allocation.try_reclaim(buffer_len) {
                 let mut buf = pointer_to_start_of_allocation.split_off(0);
 
-                debug_assert!(buf.capacity() >= N);
+                debug_assert!(buf.capacity() >= buffer_len);
 
                 // SAFETY:
                 // - buf was split from the BytesMut allocated below.
                 // - buf has not been mutated, and still points to the original allocation.
-                // - try_reclaim succeeded, so the capacity is at least `N`.
+                // - try_reclaim succeeded, so capacity covers this buffer's original size.
                 // - the allocation was created using `BytesMut::zeroed`, so the bytes are
-                //   initialized.
-                unsafe { buf.set_len(N) };
+                //   initialized. The immutable size-class tag stays with its start pointer,
+                //   even if the packet grows and moves its payload to another allocation.
+                unsafe { buf.set_len(buffer_len) };
 
                 let return_to_pool = ReturnToPool {
                     pointer_to_start_of_allocation: Some(pointer_to_start_of_allocation),
                     queue: self.queue.clone(),
+                    small,
                 };
 
                 return Some(Packet::new_from_pool(return_to_pool, buf));
@@ -136,19 +160,39 @@ impl<const N: usize> PacketBufPool<N> {
     ///
     /// This will try to re-use an already allocated packet if possible, or allocate one otherwise.
     pub fn get(&self) -> Packet<[u8]> {
-        if let Some(packet) = self.re_use() {
+        self.get_sized(false)
+    }
+
+    /// Copy a packet into reusable storage sized for its known length.
+    ///
+    /// With the default pool, packets up to 2 KiB use a 2 KiB backing allocation. Existing
+    /// full-size buffers remain reusable, and oversized packets grow as needed. Both classes
+    /// share the same retained-buffer limit. Unlike this copying path, [`Self::get`] always
+    /// returns a full `N` bytes so callers reading directly into it keep their receive limit.
+    pub fn copy_from(&self, data: &[u8]) -> Packet<[u8]> {
+        let mut packet = self.get_sized(N > 1 && data.len() <= N / 2);
+        packet.buf_mut().clear();
+        packet.buf_mut().extend_from_slice(data);
+        packet
+    }
+
+    /// Reuse or allocate one buffer, preserving its initialized size class for recycling.
+    fn get_sized(&self, small: bool) -> Packet<[u8]> {
+        if let Some(packet) = self.re_use(small) {
             return packet;
         }
 
-        let mut buf = BytesMut::zeroed(N);
+        let buffer_len = if small { N / 2 } else { N };
+        let mut buf = BytesMut::zeroed(buffer_len);
         let pointer_to_start_of_allocation = buf.split_to(0);
 
         debug_assert_eq!(pointer_to_start_of_allocation.len(), 0);
-        debug_assert_eq!(buf.len(), N);
+        debug_assert_eq!(buf.len(), buffer_len);
 
         let return_to_pool = ReturnToPool {
             pointer_to_start_of_allocation: Some(pointer_to_start_of_allocation),
             queue: self.queue.clone(),
+            small,
         };
 
         Packet::new_from_pool(return_to_pool, buf)
@@ -162,19 +206,25 @@ pub struct ReturnToPool {
     /// this allocation later.
     ///
     /// INVARIANT:
-    /// - Points to the start of an `N`-sized allocation.
+    /// - Points to the start of an allocation initialized for its immutable size class.
     // Note: Option is faster than mem::take
     pointer_to_start_of_allocation: Option<BytesMut>,
     queue: Arc<Mutex<PoolQueue>>,
+    /// The original allocation is half-size; growing the packet must never change this tag.
+    small: bool,
 }
 
 impl Drop for ReturnToPool {
     fn drop(&mut self) {
         let p = self.pointer_to_start_of_allocation.take().unwrap();
         let mut queue_g = self.queue.lock().unwrap();
-        if queue_g.buffers.len() < queue_g.capacity {
-            // Add the packet back to the pool unless we're at capacity
-            queue_g.buffers.push_back(p);
+        if queue_g.buffers.len() + queue_g.small_buffers.len() < queue_g.capacity {
+            // The classes share one bound, so adding small packets cannot double retention.
+            if self.small {
+                queue_g.small_buffers.push_back(p);
+            } else {
+                queue_g.buffers.push_back(p);
+            }
         }
     }
 }
@@ -249,13 +299,13 @@ mod tests {
         let mut packets = vec![];
 
         for _ in 0..buffer_count {
-            let packet = pool.re_use().expect("10 buffers was pre-allocated");
+            let packet = pool.re_use(false).expect("10 buffers was pre-allocated");
             assert_eq!(packet.buf().len(), N);
             packets.push(packet); // save packets so they don't get re-used
         }
 
         assert!(
-            pool.re_use().is_none(),
+            pool.re_use(false).is_none(),
             "pool is empty and a new packet must be allocated"
         );
     }
@@ -267,7 +317,7 @@ mod tests {
         const N: usize = 1024;
         let pool = PacketBufPool::<N>::new_lazy(1);
 
-        assert!(pool.re_use().is_none(), "lazy pool must start empty");
+        assert!(pool.re_use(false).is_none(), "lazy pool must start empty");
 
         let packet = pool.get();
         let buffer_ptr = packet.as_ptr();
@@ -275,7 +325,9 @@ mod tests {
         assert!(packet.iter().all(|byte| *byte == 0));
         drop(packet);
 
-        let recycled = pool.re_use().expect("returned buffer must be retained");
+        let recycled = pool
+            .re_use(false)
+            .expect("returned buffer must be retained");
         assert_eq!(recycled.as_ptr(), buffer_ptr);
     }
 
@@ -302,6 +354,69 @@ mod tests {
         });
 
         assert_eq!(pool.retained(), CAPACITY);
+    }
+
+    /// Both size classes must share a bound even when buffers return from concurrent workers.
+    #[cfg(feature = "device")]
+    #[test]
+    fn mixed_size_pool_retention_is_bounded() {
+        let pool = PacketBufPool::<4096>::new_lazy(4);
+        let barrier = Arc::new(Barrier::new(8));
+        thread::scope(|scope| {
+            for index in 0..8 {
+                let pool = pool.clone();
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    let packet = if index % 2 == 0 {
+                        pool.get()
+                    } else {
+                        pool.copy_from(b"small")
+                    };
+                    barrier.wait();
+                    drop(packet);
+                });
+            }
+        });
+        assert_eq!(pool.retained(), 4);
+        assert_eq!(pool.take_count(), 8);
+        pool.release();
+        assert_eq!(pool.retained(), 0);
+    }
+
+    /// Reusing a small buffer must not shorten full receives or lose its original allocation.
+    #[cfg(feature = "device")]
+    #[test]
+    fn small_buffers_recycle_after_growth_and_keep_full_receive_capacity() {
+        let pool = PacketBufPool::<4096>::new_lazy(4);
+        let packet = pool.copy_from(b"first");
+        let small_address = packet.as_ptr();
+        drop(packet);
+        let full = pool.get();
+        assert_eq!(full.len(), 4096);
+        assert_ne!(full.as_ptr(), small_address);
+        drop(full);
+        let mut packet = pool.copy_from(b"second");
+        assert_eq!(packet.as_ptr(), small_address);
+        packet.buf_mut().resize(16_384, 0xAA);
+        drop(packet);
+        let recycled = pool.copy_from(b"third");
+        assert_eq!(recycled.as_ptr(), small_address);
+        assert_eq!(recycled.as_ref(), b"third");
+    }
+
+    /// A split packet can outlive its pool lease without its bytes being overwritten on reuse.
+    #[cfg(feature = "device")]
+    #[test]
+    fn small_buffer_split_remains_valid_across_reuse_and_release() {
+        let pool = PacketBufPool::<4096>::new_lazy(1);
+        let mut packet = pool.copy_from(b"abcdef");
+        let prefix = packet.buf_mut().split_to(3);
+        drop(packet);
+        let next = pool.copy_from(b"next");
+        assert_eq!(prefix.as_ref(), b"abc");
+        assert_eq!(next.as_ref(), b"next");
+        pool.release();
+        assert_eq!(prefix.as_ref(), b"abc");
     }
 
     /// The pool counts every buffer taken, and after a release it keeps recycling, bounded by

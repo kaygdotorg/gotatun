@@ -276,9 +276,7 @@ impl IpRecv for TunDevice {
 
         // Keep one oversized scratch allocation per TUN device. The packet pool still owns the
         // returned packet, so its lifetime is independent of the next read into this buffer.
-        let mut packet = pool.get();
-        packet.buf_mut().clear();
-        packet.buf_mut().extend_from_slice(&read_buf[..n]);
+        let packet = pool.copy_from(&read_buf[..n]);
         drop(read_buf);
 
         if self.state.vnet_header {

@@ -9,6 +9,8 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+//! Linux UDP offloads and batched I/O, with packet storage shared by the device's peers.
+
 //! Linux UDP send and receive batching, including optional GSO and GRO offloads.
 
 #[cfg(target_os = "linux")]
@@ -853,6 +855,7 @@ mod gro {
     use std::os::fd::AsRawFd;
     use tokio::io::Interest;
 
+    /// Copy only received bytes into size-appropriate pooled packets, preserving GRO boundaries.
     fn append_received_packets(
         buffer: &[u8],
         received_len: usize,
@@ -879,15 +882,11 @@ mod gro {
             }
 
             for segment in received.chunks(gro_size) {
-                let mut packet = pool.get();
-                packet.buf_mut().clear();
-                packet.buf_mut().extend_from_slice(segment);
+                let packet = pool.copy_from(segment);
                 packets.push((packet, source_addr));
             }
         } else {
-            let mut packet = pool.get();
-            packet.buf_mut().clear();
-            packet.buf_mut().extend_from_slice(received);
+            let packet = pool.copy_from(received);
             packets.push((packet, source_addr));
         }
 
@@ -1079,6 +1078,37 @@ mod gro {
         use crate::udp::{UdpRecv, UdpSend};
         use std::net::{Ipv6Addr, SocketAddr};
         use std::time::Duration;
+
+        /// MTU-sized datagrams must not retain a full 4 KiB buffer per queued packet.
+        #[test]
+        fn mtu_datagrams_use_small_pool_buffers_without_truncating_large_packets() {
+            let mut pool = PacketBufPool::<4096>::new(0);
+            let source: SocketAddr = (Ipv6Addr::LOCALHOST, 51820).into();
+            let mut packets = Vec::new();
+            let payload = vec![0xAB; 1452];
+            append_received_packets(&payload, 1452, None, source, &mut pool, &mut packets).unwrap();
+            assert_eq!(packets[0].0.as_ref(), payload.as_slice());
+            assert!(packets[0].0.buf_mut().capacity() <= 2048);
+            // A large ordinary datagram and large GRO segments must retain all their bytes.
+            for gro_size in [None, Some(5000)] {
+                let payload = vec![0xCD; 10_000];
+                packets.clear();
+                append_received_packets(
+                    &payload,
+                    10_000,
+                    gro_size,
+                    source,
+                    &mut pool,
+                    &mut packets,
+                )
+                .unwrap();
+                let actual: Vec<u8> = packets
+                    .iter()
+                    .flat_map(|(p, _)| p.iter().copied())
+                    .collect();
+                assert_eq!(actual, payload);
+            }
+        }
 
         #[test]
         fn gro_receive_splits_only_the_bytes_reported_by_recvmmsg() {
