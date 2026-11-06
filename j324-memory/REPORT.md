@@ -1,7 +1,7 @@
 <!-- J324 memory experiment: method, provenance and limits for issue #407 / #260. -->
 # J324: memory pools
 
-Work in progress on `j324-mem-pools`, based on `ebeb8f0071c4103168b570407f9dc555562f4b79`.
+Experimental candidate on `j324-mem-pools`, based on `ebeb8f0071c4103168b570407f9dc555562f4b79`.
 Tracked in https://git.kayg.org/kayg/infraternal/issues/407, coordinated on #260.
 No infraternal dependency pin changes. No allocator or crypto library replacement.
 
@@ -144,3 +144,35 @@ the existing 1.6%/0.8% throughput and 3.2%/5.9% p99 spread limits.
 
 This report/evidence slice changes no shipping code; the infraternal gate does
 not apply to it. Fork correctness checks will precede production pool changes.
+
+## Candidate correctness checkpoint
+
+The production changes are split into two atomic commits: `96239d4` releases
+blocked-packet deque storage after drain/reset; `77fcd66` introduces the smaller
+class in the existing shared pool and uses it in the UDP and Linux TUN copying
+paths. Both are pushed to both fork remotes. They are experimental and have no
+D348 performance acceptance yet.
+
+The baseline regression run compiled successfully, then failed the two queue
+capacity assertions (256 versus zero) and the ordinary-datagram backing-size
+assertion (above 2048 bytes). Artifacts on compute01:
+`/home/claude/j324-evidence/valid-red-handshake_queue.log` and
+`valid-red-mtu_datagrams_use_small_pool.log`. Earlier compile-failing attempts
+are preserved separately and are not counted as failing-test evidence.
+
+The single aarch64 batch used `CARGO_INCREMENTAL=0`, three build jobs and the
+`env` runner. The queue-only library suite reported 138 passed, zero failed,
+seven ignored; the complete candidate reported 142 passed, zero failed,
+seven ignored. Integration, CLI and documentation tests passed; all-target
+ring clippy completed successfully. Verbatim batch markers:
+
+```text
+J324_ARM_QUEUE_CHECKS_EXIT=0
+J324_ARM_CHECKS_EXIT=0
+J324_ARM_EXIT=0
+```
+
+Artifact: dev-02 `/home/claude/j324-evidence/arm-checks.log`, copied to control
+`/home/kayg/.cache/codex-scratch/j324/evidence/arm-checks.log`. The batch trap
+removed its own target directory. x86 checks, same-build disk comparison,
+candidate RSS and allocator-bin diagnostics remain pending.
