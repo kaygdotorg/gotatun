@@ -110,9 +110,20 @@ impl TunDevice {
         {
             let (tun, vnet_header) =
                 linux::create_tun_with_vnet_fallback(&mut tun_config).map_err(Error::OpenTun)?;
-            if vnet_header {
-                linux::enable_tso_with_fallback(tun.deref());
-            }
+            let offloads = if vnet_header {
+                linux::enable_tun_offloads_with_fallback(tun.deref())
+            } else {
+                tracing::debug!(
+                    "TUN virtio network header unavailable; using software packet handling"
+                );
+                linux::TunOffloadState::default()
+            };
+            tracing::info!(
+                vnet_header,
+                tcp_tso = offloads.tcp_tso,
+                udp_uso = offloads.udp_uso,
+                "Linux TUN offload setup"
+            );
             // Only a device we created here: one handed to us via `from_tun_device` keeps
             // whatever its owner configured.
             if let Ok(name) = tun.tun_name() {
