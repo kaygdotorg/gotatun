@@ -418,7 +418,65 @@ The archive files themselves match `ebeb8f0`. A separately queued explicit
 source-refresh comparison touches extracted Rust files, records source hashes,
 and runs full baseline/candidate suites at parallel and serial concurrency.
 Artifact: compute01 `/home/claude/j324-evidence/x86-source-refresh.log` and
-`x86-fresh-{base,candidate}-{parallel,serial}.log`. Its result is still pending.
+`x86-fresh-{base,candidate}-{parallel,serial}.log`. The completed results are recorded below.
 This correction changes evidence handling only, with no assertion/deadline or
 production-source change. No infraternal files changed, and the fork has no
 `scripts/verify`; the fork suites above are the applicable executable checks.
+
+
+## Completed source-verified x86 comparison
+
+The corrected comparison acquired a slot after about 70 minutes and finished.
+All five production-file hashes from each extracted variant match its Git
+blobs (`ebeb8f0` base and `77fcd66` candidate). Baseline binaries contain none
+of the six J324 test names; candidate binaries contain and pass all six.
+Source freshness is therefore independently checked in addition to touching
+files before Cargo runs. Control receipt:
+`/home/kayg/.cache/codex-scratch/j324/evidence/source-hash-proof.txt`.
+
+| Source | Test concurrency | Passed | Failed | Ignored | Failing test |
+|---|---|---:|---:|---:|---|
+| Base | Default | 148 | 1 | 7 | device::tests::test_indices |
+| Base | Serial | 148 | 1 | 7 | device::tests::test_indices |
+| Candidate | Default | 154 | 1 | 7 | device::tests::test_indices |
+| Candidate | Serial | 154 | 1 | 7 | device::tests::test_indices |
+
+The unchanged base's parallel run reports `timeout` at `device/tests.rs:715`;
+its serial run and both candidate runs report `eavesdrop timeout` at line 686.
+All are existing timeout assertions in the same test. This directly reproduces
+that test's failure on the frozen base; it does not identify the timeout's
+underlying cause or retroactively attribute the earlier three-test failure.
+The earlier candidate serial pass remains a separate observed result. No
+test assertion or deadline has been changed, no failed result is discarded,
+and the complete all-feature x86 suite is **not green**.
+
+Verbatim corrected batch markers:
+
+```text
+J324_FRESH_base_PARALLEL_EXIT=101
+J324_FRESH_base_SERIAL_EXIT=101
+J324_FRESH_candidate_PARALLEL_EXIT=101
+J324_FRESH_candidate_SERIAL_EXIT=101
+J324_SOURCE_REFRESH_FINISHED=1
+```
+
+The final marker means the comparison finished; it does not mean tests passed.
+Raw logs: compute01 `/home/claude/j324-evidence/x86-source-refresh.log` and
+`x86-fresh-{base,candidate}-{parallel,serial}.log`. All five logs are copied to
+control `/home/kayg/.cache/codex-scratch/j324/evidence/`. The identical tests
+continue to use their original all-feature configuration and environment.
+
+The passing shipping-ring x86 suite, CLI, doctests and all-feature clippy are
+retained in `x86-post-restart.log`; the passing single aarch64 batch remains
+in `arm-checks.log`. They do not erase the full-suite failure. The six added
+queue/pool/datagram tests also pass in both corrected all-feature candidate
+runs. No production change followed those checks. Fork `scripts/verify fast`
+is unavailable; there are no infraternal changes to gate or pin.
+
+This remains an **experimental memory candidate**. Lower loaded RSS and heap
+allocation are established under the documented diagnostic protocol. Qualified
+throughput/p99 non-regression, CPU superiority, total kernel-memory superiority
+and a disk win are not established. Failed D348 calibration prevents accepting
+the candidate for integration. All perf windows have finished and their host
+placement restoration checks passed; the aarch64 target was removed after
+its one batch. The x86 target is removed after preserving these final logs.
