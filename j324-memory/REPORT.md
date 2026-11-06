@@ -218,3 +218,89 @@ Artifacts on perf: `/home/claude/j324/evidence/disk-inventory.json`,
 `disk-inventory.log`, `disk-closure.log`; source `/home/claude/j324/disk-inventory.py`.
 Both inventory scopes exited zero under `perf-run`. Candidate stripped and
 unstripped executable deltas remain pending the matching x86 build.
+
+## Baseline heap attribution
+
+Temporary ring+jemalloc+stats binary SHA-256:
+`a6766176787971fc35a9816d6da362db5ca62fd89ba4aa4c772e5e382b54dbd3`.
+This is an allocation diagnostic, not the shipping allocator or timing binary.
+Both endpoints combined:
+
+| phase | allocated MiB | active MiB | metadata MiB | allocator resident estimate MiB | retained virtual MiB |
+|---|---:|---:|---:|---:|---:|
+| idle-1 | 59.550 | 60.180 | 5.882 | 65.797 | 15.820 |
+| loaded-scale-1 | 72.309 | 73.609 | 6.315 | 83.629 | 17.922 |
+| recovered-1 | 58.655 | 59.863 | 6.316 | 80.453 | 21.098 |
+| idle-100 | 59.402 | 60.738 | 6.317 | 78.777 | 22.777 |
+| loaded-scale-100 | 72.428 | 73.617 | 6.476 | 85.133 | 23.086 |
+| recovered-100 | 59.072 | 60.430 | 6.506 | 82.824 | 25.422 |
+| idle-1000 | 63.182 | 64.684 | 6.513 | 84.406 | 23.848 |
+| loaded-scale-1000 | 77.405 | 78.727 | 6.537 | 88.219 | 23.059 |
+| recovered-1000 | 63.125 | 64.480 | 6.551 | 86.254 | 25.035 |
+
+The reporter confirms stats enabled, eight arenas, `dirty_decay_ms=10000`,
+`muzzy_decay_ms=0`, `background_thread=false`, `retain=true`, `tcache=true`.
+Retained virtual bytes are not resident bytes. The allocator resident estimate
+also differs from actual OS RSS: the existing scratch-buffer code discards
+unused pages directly, without updating jemalloc's accounting. One 28 MiB size
+class extent per endpoint backs the 25 MiB UDP GRO scratch reservation; it is
+not 28 MiB of physically resident packet data. Initial combined instrumented
+OS RSS was 22.707 MiB; recovered after first load was 39.809 MiB. Optional
+jemalloc therefore retains materially more OS RSS here than the shipping
+system-allocator control (11.242 MiB after first load); no allocator switch or
+new decay policy is made in this job.
+
+At 1,000-peer load the 4 KiB bin alone held 14,069,760 bytes across endpoints;
+after recovery it held 167,936 bytes. The 1,792-byte bin held 3,584,000 bytes,
+consistent with the 2,000 mutex-wrapped peer objects and their ownership
+headers. These are size-bin/source attributions, not allocation stack traces;
+other objects can share bins. Small-bin and large-extent details are retained
+in `/home/claude/j324/evidence/heap-summary.json` and raw phase logs.
+
+Measured fixed sizes on x86, ring diagnostic build:
+
+| Per-peer component | Bytes | Allocation behavior |
+|---|---:|---|
+| Tunnel state | 1,552 | Embedded in peer state; includes handshake and timers below |
+| Handshake state | 576 | Embedded, with current/previous handshake state and cookies |
+| Timers | 568 | Embedded deadlines; device-wide task scans peers |
+| Peer state | 1,616 | Includes tunnel and compact routing/notification metadata |
+| Mutex-wrapped peer state | 1,664 | Ownership header and allocator rounding are extra |
+| Session | 2,176 | Only present after handshake |
+| Eight-slot session ring | 17,408 | Lazy boxed allocation; absent for inert peers |
+| Packet deque descriptor | 32 | Empty queues allocate no descriptor backing |
+| Packet descriptor, baseline | 72 | At 256 entries, queue storage is 18 KiB before payloads |
+| Allowed-IP value | 18 | Routing containers/ownership are extra |
+
+Packet payloads, UDP/TUN scratch, and device buffering are shared per endpoint,
+not per peer. The new queue release is relevant after a peer has queued a
+burst; the inert peers in the scale run never fill those queues. The new pool
+class targets loaded payload allocation rather than reducing fixed peer state.
+
+Artifacts: perf `/home/claude/j324/evidence/heap-base/heap-base/mesh-gotatun`,
+`heap-base-console.log` (exit 0; 143.226 seconds; host placement restored),
+`heap-base-table.md`, `heap-summary.json`, and `heap-summary.txt`.
+
+## x86 all-feature test investigation
+
+Queue-only tests passed on x86 (`J324_QUEUE_CHECKS_EXIT=0`). The first complete
+candidate workspace all-feature run reported 152 passed, three failed, seven
+ignored: `number_of_packets`, `one_handshake`, and `one_keepalive` hit the
+existing one-second eavesdrop deadline. Artifact: compute01
+`/home/claude/j324-evidence/queue-green.log`, copied to control
+`/home/kayg/.cache/codex-scratch/j324/evidence/x86-first-checks.log`.
+
+J225 independently reproduced these existing test-helper timeouts on its
+pre-change branch and two on plain main (#260 comments 82848/82860; fork issue
+https://git.kayg.org/kayg/gotatun-fork/issues/1). J324's own frozen-base comparison
+remains pending, so this report does not yet attribute the J324 failures.
+The queued follow-up preserves the full default-concurrency baseline result,
+serial full suites, and standalone assertions with all deadlines unchanged.
+It then runs shipping ring tests, clippy and artifact builds. No second arm
+batch or production-code change is needed for this investigation.
+
+The diagnostic source is preserved as `heap-instrument.py` (apply only to a
+throwaway source mirror), `heap-overlay.patch` (apply after the scale overlay),
+and `heap-summary.py` (summarize final snapshots in cumulative phase logs).
+The summary retains bins and large extents; its resident estimate must be read
+with the direct page-discard caveat above. None is part of a shipping binary.

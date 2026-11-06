@@ -1,0 +1,16 @@
+--- a/cases/mesh.sh
++++ b/cases/mesh.sh
+@@ -514,6 +514,13 @@
+         done
+     done
+     record_memcg "$phase"
++    if [[ ${H2H_J324_HEAP:-0} == 1 ]]; then
++        kill -USR1 "${WATCH%%,*}" "${WATCH##*,}"
++        # sleep: allow the temporary SIGUSR1 reporter to finish its allocator JSON dump.
++        sleep 1
++        cp "$D/a/daemon.log" "$H2H_RESULTS/$H2H_CASE/heap-$phase-a.log"
++        cp "$D/b/daemon.log" "$H2H_RESULTS/$H2H_CASE/heap-$phase-b.log"
++    fi
+ }
+ # J324: configure inert peers without replacing the one active traffic peer.
+ # Each scale has one established peer; the remainder are configured, unhandshaken peers.
