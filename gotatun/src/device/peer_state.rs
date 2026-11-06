@@ -21,10 +21,10 @@ use tokio::sync::watch;
 #[cfg(feature = "daita")]
 use crate::device::daita::{DaitaHooks, DaitaSettings};
 use crate::noise::errors::WireGuardError;
-use crate::noise::{Tunn, TunnResult};
+use crate::noise::{Tunn, TunnResult, VerifiedDecryption};
 #[cfg(feature = "daita")]
 use crate::packet;
-use crate::packet::{Packet, WgHandshakeInit, WgKind};
+use crate::packet::{Packet, WgData, WgHandshakeInit, WgKind};
 #[cfg(feature = "daita")]
 use crate::tun::MtuWatcher;
 #[cfg(feature = "daita")]
@@ -111,6 +111,27 @@ impl PeerState {
             TunnResult::Done | TunnResult::Err(_) => {}
         }
         result
+    }
+
+    /// Apply the tunnel bookkeeping after a worker decrypts an incoming data packet.
+    pub(crate) fn complete_incoming_data(
+        &mut self,
+        result: Result<VerifiedDecryption, WireGuardError>,
+        addr: SocketAddr,
+    ) -> TunnResult {
+        let result = self.tunnel.complete_incoming_packet(result);
+        if matches!(result, TunnResult::WriteToTunnel(_)) {
+            self.endpoint.addr = Some(addr);
+        }
+        result
+    }
+
+    /// Prepare a data packet for parallel decryption under its selected session.
+    pub(crate) fn prepare_incoming_data(
+        &mut self,
+        packet: Packet<WgData>,
+    ) -> crate::noise::PreparedIncoming {
+        self.tunnel.prepare_incoming_packet(WgKind::Data(packet))
     }
 
     /// Subscribe to completions of handshakes that we initiated.
