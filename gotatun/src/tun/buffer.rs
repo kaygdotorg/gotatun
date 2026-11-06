@@ -16,7 +16,7 @@ use std::{io, sync::Arc, time::Duration};
 use crate::{
     packet::{Ip, Packet, PacketBufPool},
     task::Task,
-    tun::{IpRecv, IpSend, MtuWatcher},
+    tun::{IpRecv, IpSend, MtuWatcher, is_fatal_tun_error},
 };
 use tokio::{
     sync::{Mutex, mpsc},
@@ -213,49 +213,6 @@ impl<I: IpRecv> IpRecv for BufferedIpRecv<I> {
     fn mtu(&self) -> MtuWatcher {
         self.mtu.clone()
     }
-}
-
-/// Checks if an I/O error indicates the TUN device has been deleted or is unusable.
-///
-/// Only a gone device counts. `InvalidData` and `InvalidInput` describe one frame (a malformed
-/// header we refuse to decode, a packet the device refuses to take) and are not fatal: anything
-/// on the host able to send a raw packet could otherwise stop a whole direction of traffic
-/// with one bad frame (#260).
-fn is_fatal_tun_error(err: &io::Error) -> bool {
-    #[cfg(target_os = "linux")]
-    if matches!(
-        err.raw_os_error(),
-        Some(libc::EBADF) | Some(libc::EBADFD) | Some(libc::ENODEV)
-    ) {
-        return true;
-    }
-
-    #[cfg(windows)]
-    {
-        const ERROR_HANDLE_EOF: i32 = windows_sys::Win32::Foundation::ERROR_HANDLE_EOF as i32;
-
-        if err.raw_os_error() == Some(ERROR_HANDLE_EOF) {
-            return true;
-        }
-
-        // TODO: Propagate the underlying error from tun/wintun-bindings and remove this
-        #[cfg(feature = "tun")]
-        if let Some(ERROR_HANDLE_EOF) = err
-            .get_ref()
-            .and_then(|e| e.downcast_ref::<wintun_bindings::Error>())
-            .and_then(|e| match e {
-                wintun_bindings::Error::Io(io_err) => io_err.raw_os_error(),
-                _ => None,
-            })
-        {
-            return true;
-        }
-    }
-
-    matches!(
-        err.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe
-    )
 }
 
 #[cfg(test)]
