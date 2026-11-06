@@ -800,25 +800,23 @@ mod tests {
         }
     }
 
-    /// Lazily split peers into ordered runs and interleave peers without buffering the profile.
-    fn profile_peer_batches<T>(peers: Vec<Vec<T>>) -> impl Iterator<Item = (usize, Vec<T>)> {
-        let mut peers = peers
+    /// One peer's ready packet run and its arrival time at the crypto stage.
+    struct ProfilePeerRead<T> {
+        /// The peer whose sequence lane owns this run.
+        peer_index: usize,
+        /// When the complete read run became available to the stage.
+        ready_at: Instant,
+        /// The contiguous packets from this read.
+        packets: Vec<T>,
+    }
+
+    /// Keep one lazy packet stream per peer for fair ready-read scheduling.
+    fn profile_peer_streams<T>(peers: Vec<Vec<T>>) -> VecDeque<(usize, std::vec::IntoIter<T>)> {
+        peers
             .into_iter()
             .enumerate()
             .map(|(peer_index, packets)| (peer_index, packets.into_iter()))
-            .collect::<VecDeque<_>>();
-
-        std::iter::from_fn(move || {
-            let (peer_index, mut packets) = peers.pop_front()?;
-            let batch = packets
-                .by_ref()
-                .take(PROFILE_READ_PACKETS_PER_PEER)
-                .collect::<Vec<_>>();
-            if !packets.as_slice().is_empty() {
-                peers.push_back((peer_index, packets));
-            }
-            (!batch.is_empty()).then_some((peer_index, batch))
-        })
+            .collect::<VecDeque<_>>()
     }
 
     /// Keep a bounded set of ready reads active, replacing each completed run immediately.
@@ -849,6 +847,94 @@ mod tests {
             if let Some(read) = reads.next() {
                 pending.push(process(read));
             }
+        }
+
+        completed
+    }
+
+    /// Take one fitting run without materializing batches for peers whose slot windows are full.
+    fn next_profile_peer_read<T>(
+        streams: &mut VecDeque<(usize, std::vec::IntoIter<T>)>,
+        peer_in_flight: &[usize],
+        peer_capacity: usize,
+    ) -> Option<ProfilePeerRead<T>> {
+        let peers_to_check = streams.len();
+        for _ in 0..peers_to_check {
+            let (peer_index, mut packets) =
+                streams.pop_front().expect("the peer stream remains queued");
+            let Some(run_len) = (!packets.as_slice().is_empty())
+                .then_some(packets.as_slice().len().min(PROFILE_READ_PACKETS_PER_PEER))
+            else {
+                continue;
+            };
+            let in_flight = peer_in_flight[peer_index];
+            assert!(
+                in_flight <= peer_capacity,
+                "a peer stays within its slot bound"
+            );
+            if run_len > peer_capacity - in_flight {
+                streams.push_back((peer_index, packets));
+                continue;
+            }
+
+            let batch = packets.by_ref().take(run_len).collect();
+            if !packets.as_slice().is_empty() {
+                streams.push_back((peer_index, packets));
+            }
+            return Some(ProfilePeerRead {
+                peer_index,
+                ready_at: Instant::now(),
+                packets: batch,
+            });
+        }
+        None
+    }
+
+    /// Keep a global worker window while respecting each peer's ordered slot capacity.
+    async fn run_profile_peer_window<T, R, F, Fut>(
+        peers: Vec<Vec<T>>,
+        max_in_flight: usize,
+        mut process: F,
+    ) -> Vec<R>
+    where
+        F: FnMut(ProfilePeerRead<T>) -> Fut,
+        Fut: Future<Output = R> + 'static,
+    {
+        assert!(max_in_flight > 0, "the profile window must be non-empty");
+        let peer_count = peers.len();
+        assert!(peer_count > 0, "the profile must contain at least one peer");
+
+        let mut streams = profile_peer_streams(peers);
+        let mut peer_in_flight = vec![0usize; peer_count];
+        let mut pending = FuturesUnordered::new();
+        let mut completed = Vec::new();
+
+        loop {
+            while pending.len() < max_in_flight {
+                let Some(read) = next_profile_peer_read(
+                    &mut streams,
+                    &peer_in_flight,
+                    MAX_PEER_CRYPTO_IN_FLIGHT,
+                ) else {
+                    break;
+                };
+                let peer_index = read.peer_index;
+                assert!(
+                    peer_index < peer_count,
+                    "each profile read belongs to a configured peer"
+                );
+                let run_len = read.packets.len();
+                peer_in_flight[peer_index] += run_len;
+                let run = process(read);
+                pending.push(async move { (peer_index, run_len, run.await) });
+            }
+
+            let Some((peer_index, run_len, result)) = pending.next().await else {
+                assert!(streams.is_empty(), "all profile peer streams are drained");
+                break;
+            };
+            peer_in_flight[peer_index] -= run_len;
+            completed.push(result);
         }
 
         completed
@@ -915,22 +1001,21 @@ mod tests {
             .map(|_| Arc::new(OrderedCompletions::<()>::default()))
             .collect::<Vec<_>>();
 
-        let completed =
-            run_profile_window(profile_peer_batches(peers), 4, |(peer_index, batch)| {
-                let lane = Arc::clone(&lanes[peer_index]);
-                let run_len = batch.len();
-                let first_slot = lane
-                    .reserve_run(run_len)
-                    .expect("the ready profile window fits each peer's slot bound");
-                async move {
-                    lane.complete_run(first_slot, vec![Some(()); run_len], |_| async {
-                        Ok::<_, ()>(())
-                    })
-                    .await
-                    .expect("the profile run completes in order");
-                }
-            })
-            .await;
+        let completed = run_profile_peer_window(peers, 4, |read| {
+            let lane = Arc::clone(&lanes[read.peer_index]);
+            let run_len = read.packets.len();
+            let first_slot = lane
+                .reserve_run(run_len)
+                .expect("the ready profile window fits each peer's slot bound");
+            async move {
+                lane.complete_run(first_slot, vec![Some(()); run_len], |_| async {
+                    Ok::<_, ()>(())
+                })
+                .await
+                .expect("the profile run completes in order");
+            }
+        })
+        .await;
 
         assert_eq!(completed.len(), 8);
     }
@@ -949,36 +1034,35 @@ mod tests {
         let mut slow_peer_gate = Some(release_slow_peer_rx);
         let (fast_peer_done_tx, mut fast_peer_done_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let mut task = tokio::spawn(run_profile_window(
-            profile_peer_batches(peers),
-            4,
-            move |(peer_index, batch)| {
-                let lane = Arc::clone(&lanes[peer_index]);
-                let run_len = batch.len();
-                let first_slot = lane
-                    .reserve_run(run_len)
-                    .expect("the profile scheduler stays within each peer's slot window");
-                let gate = (peer_index == 0 && first_slot == 0)
-                    .then(|| slow_peer_gate.take().expect("the first slow run has a gate"));
-                let fast_peer_done = fast_peer_done_tx.clone();
+        let mut task = tokio::spawn(run_profile_peer_window(peers, 4, move |read| {
+            let lane = Arc::clone(&lanes[read.peer_index]);
+            let run_len = read.packets.len();
+            let first_slot = lane
+                .reserve_run(run_len)
+                .expect("the profile scheduler stays within each peer's slot window");
+            let gate = (read.peer_index == 0 && first_slot == 0).then(|| {
+                slow_peer_gate
+                    .take()
+                    .expect("the first slow run has a gate")
+            });
+            let fast_peer_done = fast_peer_done_tx.clone();
 
-                async move {
-                    if let Some(gate) = gate {
-                        gate.await.expect("the slow peer is eventually released");
-                    }
-                    lane.complete_run(first_slot, vec![Some(()); run_len], |_| async {
-                        Ok::<_, ()>(())
-                    })
-                    .await
-                    .expect("the profile run completes in order");
-                    if peer_index == 1 {
-                        fast_peer_done
-                            .send(())
-                            .expect("the test is listening for the fast peer");
-                    }
+            async move {
+                if let Some(gate) = gate {
+                    gate.await.expect("the slow peer is eventually released");
                 }
-            },
-        ));
+                lane.complete_run(first_slot, vec![Some(()); run_len], |_| async {
+                    Ok::<_, ()>(())
+                })
+                .await
+                .expect("the profile run completes in order");
+                if read.peer_index == 1 {
+                    fast_peer_done
+                        .send(())
+                        .expect("the test is listening for the fast peer");
+                }
+            }
+        }));
 
         for _ in 0..4 {
             tokio::select! {
@@ -1530,10 +1614,11 @@ mod tests {
     /// host with the shared benchmark lock and `taskset`. Set `GOTATUN_PROFILE_WORKERS` to run one
     /// worker count at a time so its affinity can match the pool size. Packet preparation is outside
     /// the timed interval. The ordered-stage profile places eight inner IP flows on each of two
-    /// peers, and interleaves their contiguous 64-packet reads so four workers fit inside the peer
-    /// slot bounds. Its latency runs from read readiness through in-order release, including
-    /// queueing and the bounded worker batch. Compare ordered worker counts with the one-worker
-    /// stage row, not the raw per-packet AEAD row, because those rows time different work units.
+    /// peers, and schedules their contiguous reads only when each run fits in that peer's 128-slot
+    /// window. A full peer stream does not occupy the shared worker window. Its latency runs from
+    /// read readiness through in-order release, including worker queueing and the bounded batch.
+    /// Compare ordered worker counts with the one-worker stage row, not the raw per-packet AEAD
+    /// row, because those rows time different work units.
     #[test]
     #[ignore = "manual crypto-stage measurement on the pinned performance VM"]
     fn crypto_stage_microbenchmark() {
@@ -1728,23 +1813,21 @@ mod tests {
             .expect("the requested worker pool starts");
         assert_eq!(workers.worker_count(), worker_count);
         let crypto = workers.handle();
-        let lanes = (0..peers.len())
+        let peer_count = peers.len();
+        let lanes = (0..peer_count)
             .map(|_| Arc::new(OrderedCompletions::<WgKind>::default()))
             .collect::<Vec<_>>();
         let mut latencies = Vec::with_capacity(PROFILE_PACKET_COUNT);
         let started = Instant::now();
-        let encryption_runs = profile_peer_batches(peers).map(|(peer_index, packets)| {
-            (
-                peer_index,
-                packets
-                    .into_iter()
-                    .map(|packet| Some(PreparedOutgoing::Encrypt(packet)))
-                    .collect::<Vec<_>>(),
-            )
-        });
-        let completed = run_profile_window(encryption_runs, worker_count, |(peer_index, batch)| {
-            let read_started = Instant::now();
-            let batch_len = batch.len();
+        let completed = run_profile_peer_window(peers, worker_count, |read| {
+            let read_started = read.ready_at;
+            let peer_index = read.peer_index;
+            let batch_len = read.packets.len();
+            let batch = read
+                .packets
+                .into_iter()
+                .map(|packet| Some(PreparedOutgoing::Encrypt(packet)))
+                .collect::<Vec<_>>();
             let lane = Arc::clone(&lanes[peer_index]);
             let first_slot = lane
                 .reserve_run(batch_len)
@@ -1786,7 +1869,8 @@ mod tests {
             .expect("the requested worker pool starts");
         assert_eq!(workers.worker_count(), worker_count);
         let crypto = workers.handle();
-        let lanes = (0..peers.len())
+        let peer_count = peers.len();
+        let lanes = (0..peer_count)
             .map(|_| Arc::new(OrderedCompletions::<IncomingCompletion>::default()))
             .collect::<Vec<_>>();
         let mut latencies = Vec::with_capacity(PROFILE_PACKET_COUNT);
@@ -1794,18 +1878,15 @@ mod tests {
         let addr = "127.0.0.1:51820"
             .parse()
             .expect("the profile peer address is valid");
-        let decryption_runs = profile_peer_batches(peers).map(|(peer_index, packets)| {
-            (
-                peer_index,
-                packets
-                    .into_iter()
-                    .map(|packet| (packet, addr))
-                    .collect::<Vec<_>>(),
-            )
-        });
-        let completed = run_profile_window(decryption_runs, worker_count, |(peer_index, batch)| {
-            let read_started = Instant::now();
-            let batch_len = batch.len();
+        let completed = run_profile_peer_window(peers, worker_count, |read| {
+            let read_started = read.ready_at;
+            let peer_index = read.peer_index;
+            let batch_len = read.packets.len();
+            let batch = read
+                .packets
+                .into_iter()
+                .map(|packet| (packet, addr))
+                .collect::<Vec<_>>();
             let lane = Arc::clone(&lanes[peer_index]);
             let first_slot = lane
                 .reserve_run(batch_len)
