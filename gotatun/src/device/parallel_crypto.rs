@@ -15,6 +15,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::io;
+use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::{
@@ -82,14 +83,17 @@ pub(crate) struct IncomingCompletion {
 }
 
 /// Tracks reserved sequence positions and completed packets for one peer direction.
-struct CompletionState<T> {
+struct CompletionState {
     next_slot: u64,
+    /// First slot that has not yet claimed the ordered delivery turn.
     next_release: u64,
+    /// First slot whose delivery callback has not finished.
     next_delivered: u64,
     in_flight: usize,
     /// Reserved packets whose AEAD work has not completed; ordered delivery is tracked separately.
     crypto_pending: usize,
-    pending: BTreeMap<u64, Vec<Option<T>>>,
+    /// AEAD-complete runs waiting for their turn; each future retains its results and callback.
+    completed: BTreeMap<u64, usize>,
     /// Adaptive dispatch exists only while this ordered lane has in-flight slots.
     dispatch: AdaptiveDispatch,
 }
@@ -120,13 +124,14 @@ impl AdaptiveDispatch {
 
 /// Assigns peer-local slots and releases completed results only in slot order.
 ///
-/// Producers reserve while holding their peer's state lock. Workers may finish in any order.
-/// `complete_run` serializes delivery as well as extraction, so an async send for an earlier run
-/// cannot be overtaken by a later completion.
+/// Producers reserve while holding their peer's state lock. Workers may finish in any order, but
+/// each completion keeps its own result and delivery callback while waiting for its sequence turn.
+/// Completed crypto leaves the dispatch backlog before the serialized delivery lock is acquired.
 pub(crate) struct OrderedCompletions<T> {
-    state: Mutex<CompletionState<T>>,
+    state: Mutex<CompletionState>,
     delivery: AsyncMutex<()>,
     progress: Notify,
+    _result_type: PhantomData<fn() -> T>,
 }
 
 impl<T> Default for OrderedCompletions<T> {
@@ -139,11 +144,12 @@ impl<T> Default for OrderedCompletions<T> {
                 next_delivered: 0,
                 in_flight: 0,
                 crypto_pending: 0,
-                pending: BTreeMap::new(),
+                completed: BTreeMap::new(),
                 dispatch: AdaptiveDispatch::default(),
             }),
             delivery: AsyncMutex::new(()),
             progress: Notify::new(),
+            _result_type: PhantomData,
         }
     }
 }
@@ -193,7 +199,7 @@ impl<T> OrderedCompletions<T> {
             .should_force_worker(packet_count, peer_backlog_packets)
     }
 
-    /// Store a completed run and deliver newly contiguous runs in slot order.
+    /// Record AEAD completion and deliver this run when its slot range reaches the front.
     ///
     /// `None` marks a slot that completed without a packet, such as an invalid receive packet.
     pub(crate) async fn complete_run<F, Fut, E>(
@@ -211,8 +217,7 @@ impl<T> OrderedCompletions<T> {
         let end_slot = first_slot
             .checked_add(run_len as u64)
             .expect("a peer crypto sequence cannot wrap");
-        let delivery = self.delivery.lock().await;
-        let ready = {
+        {
             let mut state = self.state.lock();
             assert!(
                 first_slot >= state.next_release && end_slot <= state.next_slot,
@@ -223,70 +228,64 @@ impl<T> OrderedCompletions<T> {
                 "completion run {first_slot}..{end_slot} finished more crypto slots than remain"
             );
             assert!(
-                state.pending.insert(first_slot, results).is_none(),
+                state.completed.insert(first_slot, run_len).is_none(),
                 "completion run beginning at slot {first_slot} was completed twice"
             );
             state.crypto_pending -= run_len;
+        }
 
-            let mut ready = Vec::new();
-            loop {
-                let first_slot = state.next_release;
-                let Some(results) = state.pending.remove(&first_slot) else {
-                    break;
-                };
-                let run_len = results.len();
-                ready.push((first_slot, run_len, results));
-                state.next_release = state
-                    .next_release
-                    .checked_add(run_len as u64)
-                    .expect("a peer crypto sequence cannot wrap");
-            }
-            ready
-        };
+        loop {
+            let notified = self.progress.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
 
-        let mut first_error = None;
-        for (first_slot, run_len, results) in ready {
-            if first_error.is_none()
-                && let Err(error) = deliver(results).await
-            {
-                first_error = Some(error);
+            let delivery = self.delivery.lock().await;
+            let is_next_run = {
+                let mut state = self.state.lock();
+                assert!(
+                    first_slot >= state.next_release && end_slot <= state.next_slot,
+                    "completion run {first_slot}..{end_slot} was not outstanding"
+                );
+                if first_slot == state.next_release {
+                    assert_eq!(
+                        state.completed.remove(&first_slot),
+                        Some(run_len),
+                        "the next ordered run must have completed crypto"
+                    );
+                    // Claim the ordered turn before awaiting I/O; `next_delivered` advances later.
+                    state.next_release = end_slot;
+                    true
+                } else {
+                    false
+                }
+            };
+
+            if !is_next_run {
+                drop(delivery);
+                notified.await;
+                continue;
             }
+
+            let result = deliver(results).await;
             {
                 let mut state = self.state.lock();
                 assert_eq!(
                     state.next_delivered, first_slot,
                     "ordered completion delivery advanced out of sequence"
                 );
-                state.next_delivered += run_len as u64;
+                state.next_delivered = end_slot;
                 state.in_flight -= run_len;
             }
             self.progress.notify_waiters();
-        }
-        drop(delivery);
-
-        // Keep this completion in its producer's bounded window until it is actually released.
-        // Otherwise later slots could finish quickly, leave the window, and let an arbitrarily
-        // large backlog accumulate behind one slow earlier packet.
-        loop {
-            let notified = self.progress.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.state.lock().next_delivered >= end_slot {
-                break;
-            }
-            notified.await;
-        }
-
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
+            drop(delivery);
+            return result;
         }
     }
 
     /// Whether every reserved slot has been delivered.
     pub(crate) fn is_idle(&self) -> bool {
         let state = self.state.lock();
-        state.in_flight == 0 && state.crypto_pending == 0 && state.pending.is_empty()
+        state.in_flight == 0 && state.crypto_pending == 0 && state.completed.is_empty()
     }
 
     /// Remaining sequence slots before this peer reaches its in-flight bound.
@@ -1230,6 +1229,88 @@ mod tests {
         assert!(completions.is_idle());
     }
 
+    /// A later batch must run its own delivery callback after an earlier packet closes the gap.
+    #[test]
+    fn concurrent_producers_keep_each_runs_delivery_callback() {
+        let completions = Arc::new(OrderedCompletions::<u64>::default());
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let (first_slot_tx, first_slot_rx) = mpsc::sync_channel(1);
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+
+        let first_completions = Arc::clone(&completions);
+        let first_delivered = Arc::clone(&delivered);
+        let first = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let slot = first_completions.reserve_run(1).unwrap();
+                first_slot_tx.send(slot).unwrap();
+                release_first_rx.await.unwrap();
+                first_completions
+                    .complete_run(slot, vec![Some(0)], |values| {
+                        let delivered = Arc::clone(&first_delivered);
+                        async move {
+                            delivered
+                                .lock()
+                                .unwrap()
+                                .push((slot, values.into_iter().flatten().collect::<Vec<_>>()));
+                            Ok::<_, ()>(())
+                        }
+                    })
+                    .await
+                    .unwrap();
+            });
+        });
+
+        assert_eq!(first_slot_rx.recv().unwrap(), 0);
+
+        let (later_ready_tx, later_ready_rx) = mpsc::sync_channel(1);
+        let (later_waiting_tx, later_waiting_rx) = mpsc::sync_channel(1);
+        let later_completions = Arc::clone(&completions);
+        let later_delivered = Arc::clone(&delivered);
+        let later = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let slot = later_completions.reserve_run(2).unwrap();
+                later_ready_tx.send(slot).unwrap();
+                let mut completion = Box::pin(later_completions.complete_run(
+                    slot,
+                    vec![Some(1), Some(2)],
+                    |values| {
+                        let delivered = Arc::clone(&later_delivered);
+                        async move {
+                            delivered
+                                .lock()
+                                .unwrap()
+                                .push((slot, values.into_iter().flatten().collect::<Vec<_>>()));
+                            Ok::<_, ()>(())
+                        }
+                    },
+                ));
+                assert!(futures::poll!(&mut completion).is_pending());
+                later_waiting_tx.send(()).unwrap();
+                completion.await.unwrap();
+            });
+        });
+
+        assert_eq!(later_ready_rx.recv().unwrap(), 1);
+        later_waiting_rx.recv().unwrap();
+        assert!(delivered.lock().unwrap().is_empty());
+
+        release_first_tx.send(()).unwrap();
+        first.join().unwrap();
+        later.join().unwrap();
+
+        assert_eq!(
+            *delivered.lock().unwrap(),
+            vec![(0, vec![0]), (1, vec![1, 2])]
+        );
+        assert!(completions.is_idle());
+    }
+
     /// A test-first control confirms why an append-on-completion stage is unsafe.
     #[test]
     fn naive_parallel_completion_reorders_a_peers_packets() {
@@ -1402,6 +1483,100 @@ mod tests {
         )
         .await
         .expect("the next delivery succeeds");
+        assert!(lane.is_idle());
+    }
+
+    /// A completed run waiting for the delivery lock must not count as unfinished AEAD work.
+    #[tokio::test]
+    async fn adaptive_dispatch_ignores_completed_crypto_waiting_for_delivery_lock() {
+        let lane = Arc::new(OrderedCompletions::<()>::default());
+        let first_slot = lane
+            .reserve_run(super::PARALLEL_DISPATCH_HIGH_WATER)
+            .expect("the first run fits the peer's window");
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let (delivering_tx, mut delivering_rx) = tokio::sync::mpsc::unbounded_channel();
+        let first_lane = Arc::clone(&lane);
+        let first_release_rx = Arc::clone(&release_rx);
+        let first_completion = tokio::spawn(async move {
+            first_lane
+                .complete_run(
+                    first_slot,
+                    vec![Some(()); super::PARALLEL_DISPATCH_HIGH_WATER],
+                    move |_| {
+                        let release_rx = Arc::clone(&first_release_rx);
+                        let delivering_tx = delivering_tx.clone();
+                        async move {
+                            delivering_tx
+                                .send(())
+                                .expect("the test is waiting for ordered delivery");
+                            let release_rx = release_rx
+                                .lock()
+                                .await
+                                .take()
+                                .expect("the earlier ordered send waits once");
+                            release_rx
+                                .await
+                                .expect("the test releases the earlier ordered send");
+                            Ok::<_, ()>(())
+                        }
+                    },
+                )
+                .await
+        });
+        delivering_rx
+            .recv()
+            .await
+            .expect("the earlier run reached ordered output");
+
+        let completed_slot = lane
+            .reserve_run(super::PARALLEL_DISPATCH_HIGH_WATER)
+            .expect("the next run fits behind the earlier ordered send");
+        let (waiting_tx, mut waiting_rx) = tokio::sync::mpsc::unbounded_channel();
+        let completed_lane = Arc::clone(&lane);
+        let completed_run = tokio::spawn(async move {
+            let mut completion = Box::pin(completed_lane.complete_run(
+                completed_slot,
+                vec![Some(()); super::PARALLEL_DISPATCH_HIGH_WATER],
+                |_| async { Ok::<_, ()>(()) },
+            ));
+            assert!(futures::poll!(&mut completion).is_pending());
+            waiting_tx
+                .send(())
+                .expect("the test is waiting for the blocked completion");
+            completion.await
+        });
+        waiting_rx
+            .recv()
+            .await
+            .expect("the completed run is waiting for ordered delivery");
+
+        let next_slot = lane
+            .reserve_run(MIN_PARALLEL_RUN_SIZE)
+            .expect("the next dispatch decision fits the peer's window");
+        assert!(
+            !lane.should_force_worker(MIN_PARALLEL_RUN_SIZE),
+            "delivery-lock wait must not look like outstanding AEAD work"
+        );
+
+        release_tx
+            .send(())
+            .expect("the earlier ordered send is still waiting");
+        first_completion
+            .await
+            .expect("the earlier completion task succeeds")
+            .expect("the earlier delivery succeeds");
+        completed_run
+            .await
+            .expect("the later completion task succeeds")
+            .expect("the later delivery succeeds");
+        lane.complete_run(
+            next_slot,
+            vec![Some(()); MIN_PARALLEL_RUN_SIZE],
+            |_| async { Ok::<_, ()>(()) },
+        )
+        .await
+        .expect("the next ordered delivery succeeds");
         assert!(lane.is_idle());
     }
 
