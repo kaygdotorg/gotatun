@@ -55,7 +55,7 @@ use allowed_ips::AllowedIps;
 use gotatun_crypto::x25519;
 use parallel_crypto::{
     CRYPTO_BATCH_SIZE, CRYPTO_CHUNK_SIZE, CryptoHandle, CryptoWorkers, IncomingCompletion,
-    OrderStore, OrderedCompletions, should_force_worker,
+    OrderStore, OrderedCompletions,
 };
 use peer_state::{PeerState, PendingHandshake};
 
@@ -1039,12 +1039,14 @@ impl<T: DeviceTransports> DeviceState<T> {
     }
 
     /// Queue each bounded receive run once and release it through its peer's ordered lane.
+    ///
+    /// The lane selects worker dispatch from its own outstanding-slot backlog, so unrelated peers
+    /// do not move a shallow queue off the inline path.
     fn enqueue_incoming_run<TunTx: IpSend + Clone>(
         pending: &mut PendingIncoming,
         context: IncomingRunContext<Self, TunTx>,
         first_slot: u64,
         packets: Vec<(PreparedDecryption, std::net::SocketAddr)>,
-        force_worker: bool,
     ) {
         let IncomingRunContext {
             crypto,
@@ -1056,8 +1058,6 @@ impl<T: DeviceTransports> DeviceState<T> {
             tun_tx,
         } = context;
         assert!(!packets.is_empty());
-        let other_peer_runs =
-            force_worker || packets.len() > CRYPTO_BATCH_SIZE || !pending.is_empty();
         let mut packets = packets.into_iter();
         let mut remaining = packets.len();
         let mut offset = 0_u64;
@@ -1065,7 +1065,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         while remaining > 0 {
             let batch = packets.by_ref().take(CRYPTO_BATCH_SIZE).collect::<Vec<_>>();
             let batch_len = batch.len();
-            let force_worker = should_force_worker(batch_len, other_peer_runs);
+            let force_worker = lane.should_force_worker(batch_len);
             let crypto = crypto.clone();
             let ordered = Arc::clone(&ordered);
             let lane = Arc::clone(&lane);
@@ -1105,8 +1105,7 @@ impl<T: DeviceTransports> DeviceState<T> {
 
     /// Reserve one contiguous receive range and add its batches to the bounded completion set.
     ///
-    /// A singleton run does not force worker use; when the pool is otherwise idle, it stays on the
-    /// caller and avoids a worker wake for a sparse flowlet.
+    /// A shallow peer lane stays inline and avoids a worker wake for low-rate traffic.
     async fn flush_incoming_run(
         pending: &mut PendingIncoming,
         crypto: CryptoHandle,
@@ -1114,7 +1113,6 @@ impl<T: DeviceTransports> DeviceState<T> {
         device: Weak<RwLock<Self>>,
         tun_tx: impl IpSend + Clone,
         run: PreparedIncomingRun,
-        force_worker: bool,
     ) -> Result<(), Error> {
         if run.packets.is_empty() {
             return Ok(());
@@ -1149,7 +1147,6 @@ impl<T: DeviceTransports> DeviceState<T> {
             },
             first_slot,
             run.packets,
-            force_worker,
         );
         Ok(())
     }
@@ -1249,7 +1246,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                 first_slot,
                 jobs,
                 true,
-                false,
             );
 
             wait_for_outgoing_slot(&chunk_lane, chunk_last_slot, pending).await;
@@ -1273,8 +1269,8 @@ impl<T: DeviceTransports> DeviceState<T> {
 
     /// Split a peer's reserved range into bounded runs without creating per-packet futures.
     ///
-    /// A run spanning multiple worker batches is dispatched even when it is the only active peer;
-    /// one small run stays inline unless other substantial peer work is ready.
+    /// Each run consults its own lane's backlog, so shallow traffic stays inline while sustained
+    /// queued work can use the bounded worker pool.
     fn enqueue_outgoing_run<U: UdpSend + 'static>(
         pending: &mut PendingOutgoing,
         context: OutgoingBatchContext<U>,
@@ -1282,11 +1278,8 @@ impl<T: DeviceTransports> DeviceState<T> {
         first_slot: u64,
         prepared: Vec<Option<PreparedOutgoing>>,
         apply_daita: bool,
-        force_worker: bool,
     ) {
         assert!(!prepared.is_empty());
-        let other_peer_runs =
-            force_worker || prepared.len() > CRYPTO_BATCH_SIZE || !pending.is_empty();
         let mut prepared = prepared.into_iter();
         let mut remaining = prepared.len();
         let mut offset = 0_u64;
@@ -1297,7 +1290,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                 .take(CRYPTO_BATCH_SIZE)
                 .collect::<Vec<_>>();
             let batch_len = batch.len();
-            let force_worker = should_force_worker(batch_len, other_peer_runs);
+            let force_worker = lane.should_force_worker(batch_len);
             pending.push(
                 complete_outgoing_batch(
                     context.clone(),
@@ -1492,9 +1485,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                 let parsed_packet = match rate_limiter.verify_packet(addr, src_buf) {
                     Ok(packet) => packet,
                     Err(TunnResult::WriteToNetwork(WgKind::CookieReply(cookie))) => {
-                        let multiple_peer_runs = incoming_runs.len() > 1;
                         for run in std::mem::take(&mut incoming_runs).into_values() {
-                            let force_worker = multiple_peer_runs && run.packets.len() > 1;
                             Self::flush_incoming_run(
                                 &mut incoming_pending,
                                 crypto.clone(),
@@ -1502,7 +1493,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 device.clone(),
                                 tun_tx.clone(),
                                 run,
-                                force_worker,
                             )
                             .await?;
                         }
@@ -1517,9 +1507,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                 };
 
                 if !matches!(&parsed_packet, WgKind::Data(_)) && !incoming_runs.is_empty() {
-                    let multiple_peer_runs = incoming_runs.len() > 1;
                     for run in std::mem::take(&mut incoming_runs).into_values() {
-                        let force_worker = multiple_peer_runs && run.packets.len() > 1;
                         Self::flush_incoming_run(
                             &mut incoming_pending,
                             crypto.clone(),
@@ -1527,7 +1515,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                             device.clone(),
                             tun_tx.clone(),
                             run,
-                            force_worker,
                         )
                         .await?;
                     }
@@ -1586,7 +1573,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                                     run.packets.len() == CRYPTO_CHUNK_SIZE
                                 };
                                 if reached_limit {
-                                    let force_worker = incoming_runs.len() > 1;
                                     Self::flush_incoming_run(
                                         &mut incoming_pending,
                                         crypto.clone(),
@@ -1596,7 +1582,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                                         incoming_runs
                                             .remove(&peer_key)
                                             .expect("the receive run reached its bound"),
-                                        force_worker,
                                     )
                                     .await?;
                                 }
@@ -1711,9 +1696,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                     }
                 }
             }
-            let multiple_peer_runs = incoming_runs.len() > 1;
             for run in std::mem::take(&mut incoming_runs).into_values() {
-                let force_worker = multiple_peer_runs && run.packets.len() > 1;
                 Self::flush_incoming_run(
                     &mut incoming_pending,
                     crypto.clone(),
@@ -1721,7 +1704,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                     device.clone(),
                     tun_tx.clone(),
                     run,
-                    force_worker,
                 )
                 .await?;
             }
@@ -1780,7 +1762,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                     }));
                     drop(device_guard);
 
-                    let multiple_peer_runs = runs.len() > 1;
                     for (peer_key, peer_arc, packets) in runs {
                         let mut packets = packets.into_iter().peekable();
                         while packets.peek().is_some() {
@@ -1873,7 +1854,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                                     .await
                                     .expect("a full outgoing run has a completion future");
                             }
-                            let force_worker = multiple_peer_runs && prepared.len() > 1;
                             let batch_context = OutgoingBatchContext {
                                 peer: OutgoingPeerContext {
                                     crypto: crypto.clone(),
@@ -1892,7 +1872,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 first_slot,
                                 prepared,
                                 true,
-                                force_worker,
                             );
 
                             if let (Some(offset), Some(flush_guard)) =
