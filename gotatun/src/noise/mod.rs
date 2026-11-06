@@ -459,8 +459,16 @@ impl<R: RngCore + Send> Tunn<R> {
         }
     }
 
+    /// Remove the oldest blocked packet and release descriptor storage when the queue drains.
+    ///
+    /// This queue is used only while waiting for a handshake. Retaining a burst's capacity
+    /// after the last packet leaves would charge idle peers for a queue they no longer use.
     fn dequeue_packet(&mut self) -> Option<Packet> {
-        self.packet_queue.pop_front()
+        let packet = self.packet_queue.pop_front();
+        if self.packet_queue.is_empty() {
+            self.packet_queue.shrink_to_fit();
+        }
+        packet
     }
 
     fn estimate_loss(&self) -> f32 {
@@ -548,6 +556,44 @@ fn pad_to_x16(mut packet: Packet, tun_mtu: &mut MtuWatcher) -> Packet {
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
+
+    /// A completed handshake must release blocked-packet descriptors without changing FIFO.
+    #[test]
+    fn drained_handshake_queue_releases_storage_and_preserves_fifo() {
+        let (mut tunnel, _) = create_two_tuns();
+        for value in 0..=255u8 {
+            tunnel.queue_packet(Packet::copy_from(&[value]));
+        }
+        // An overflowing packet must still be dropped, rather than displacing the oldest.
+        tunnel.queue_packet(Packet::copy_from(&[99]));
+        for value in 0..=255u8 {
+            assert_eq!(tunnel.dequeue_packet().unwrap().as_ref(), &[value]);
+        }
+        assert!(tunnel.dequeue_packet().is_none());
+        assert_eq!(
+            tunnel.packet_queue.capacity(),
+            0,
+            "idle peers retain no queue storage"
+        );
+        tunnel.queue_packet(Packet::copy_from(b"next burst"));
+        assert_eq!(tunnel.dequeue_packet().unwrap().as_ref(), b"next burst");
+    }
+
+    /// Resetting a peer must free blocked packets and their queue, including after a full burst.
+    #[test]
+    fn reset_handshake_queue_releases_storage() {
+        let (mut tunnel, _) = create_two_tuns();
+        for _ in 0..256 {
+            tunnel.queue_packet(Packet::copy_from(b"blocked"));
+        }
+        tunnel.reset();
+        assert_eq!(
+            tunnel.packet_queue.capacity(),
+            0,
+            "reset peers retain no queue storage"
+        );
+        assert!(tunnel.dequeue_packet().is_none());
+    }
 
     #[test]
     fn tunnel_does_not_embed_the_session_ring() {

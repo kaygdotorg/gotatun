@@ -276,12 +276,12 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         self.timers.rekey_after_time = self.sample_timer(|p| &p.rekey_after_time);
     }
 
-    // We don't really clear the timers, but we set them to the current time to
-    // so the reference time frame is the same
+    /// Forget sessions and blocked packets, release the queue, and reset timer reference times.
     pub(super) fn clear_all(&mut self) {
         self.sessions = None;
 
         self.packet_queue.clear();
+        self.packet_queue.shrink_to_fit();
 
         self.timers.clear();
     }
