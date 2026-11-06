@@ -48,6 +48,12 @@ pub(crate) const CRYPTO_WORKER_BATCH_SIZE: usize = CRYPTO_CHUNK_SIZE;
 /// Smallest ready peer run worth offloading when another run can execute concurrently.
 pub(crate) const MIN_PARALLEL_RUN_SIZE: usize = 8;
 
+/// Start parallel dispatch after half a worker chunk of older packets is queued for this peer.
+pub(crate) const PARALLEL_DISPATCH_HIGH_WATER: usize = CRYPTO_CHUNK_SIZE / 2;
+
+/// Return to inline dispatch after this peer's older backlog drains below one minimum run.
+pub(crate) const PARALLEL_DISPATCH_LOW_WATER: usize = MIN_PARALLEL_RUN_SIZE;
+
 /// Maximum outstanding completion slots for one peer and one direction.
 pub(crate) const MAX_PEER_CRYPTO_IN_FLIGHT: usize = 128;
 
@@ -58,12 +64,13 @@ pub(crate) const MAX_QUEUED_CRYPTO_JOBS: usize = 128;
 /// Number of lock-free checks a worker makes for newly queued chunks before it parks.
 const WORKER_SPIN_COUNT: usize = 128;
 
-/// Whether a ready run has enough concurrent work to justify a worker handoff.
+/// Whether a ready run has enough queued work behind it to justify entering parallel dispatch.
 ///
-/// A lone run stays inline even when large because one worker cannot make it parallel. Small runs
-/// stay inline even when another peer is ready because their crypto work does not repay a wake.
-pub(crate) const fn should_force_worker(packet_count: usize, other_peer_runs: bool) -> bool {
-    other_peer_runs && packet_count >= MIN_PARALLEL_RUN_SIZE
+/// The backlog is measured in older reserved packet slots for this peer. A large lone run cannot
+/// benefit from a worker handoff, and another peer's activity must not make this peer leave its
+/// shallow-queue fast path.
+pub(crate) const fn should_force_worker(packet_count: usize, peer_backlog_packets: usize) -> bool {
+    packet_count >= MIN_PARALLEL_RUN_SIZE && peer_backlog_packets >= PARALLEL_DISPATCH_HIGH_WATER
 }
 
 /// A decrypted packet and the session metadata applied at its ordered release point.
@@ -80,7 +87,35 @@ struct CompletionState<T> {
     next_release: u64,
     next_delivered: u64,
     in_flight: usize,
+    /// Reserved packets whose AEAD work has not completed; ordered delivery is tracked separately.
+    crypto_pending: usize,
     pending: BTreeMap<u64, Vec<Option<T>>>,
+    /// Adaptive dispatch exists only while this ordered lane has in-flight slots.
+    dispatch: AdaptiveDispatch,
+}
+
+/// Per-peer high and low water marks for handing bounded runs to crypto workers.
+///
+/// This latch lives inside the ordered lane, which is removed as soon as its peer drains. No idle
+/// peer keeps a timer or adaptive-dispatch state alive.
+#[derive(Default)]
+struct AdaptiveDispatch {
+    parallel: bool,
+}
+
+impl AdaptiveDispatch {
+    /// Update this peer's hysteresis latch and select a worker only for useful batch sizes.
+    fn should_force_worker(&mut self, packet_count: usize, peer_backlog_packets: usize) -> bool {
+        if self.parallel {
+            if peer_backlog_packets <= PARALLEL_DISPATCH_LOW_WATER {
+                self.parallel = false;
+            }
+        } else if should_force_worker(packet_count, peer_backlog_packets) {
+            self.parallel = true;
+        }
+
+        self.parallel && packet_count >= MIN_PARALLEL_RUN_SIZE
+    }
 }
 
 /// Assigns peer-local slots and releases completed results only in slot order.
@@ -103,7 +138,9 @@ impl<T> Default for OrderedCompletions<T> {
                 next_release: 0,
                 next_delivered: 0,
                 in_flight: 0,
+                crypto_pending: 0,
                 pending: BTreeMap::new(),
+                dispatch: AdaptiveDispatch::default(),
             }),
             delivery: AsyncMutex::new(()),
             progress: Notify::new(),
@@ -134,7 +171,26 @@ impl<T> OrderedCompletions<T> {
             .checked_add(count as u64)
             .expect("a peer crypto sequence cannot wrap");
         state.in_flight += count;
+        state.crypto_pending += count;
         Some(first_slot)
+    }
+
+    /// Decide whether this bounded run should join the peer's active parallel phase.
+    ///
+    /// Call after reserving the run so `crypto_pending` includes it. The backlog counts older
+    /// packets that have not finished AEAD, excluding completed work waiting for ordered I/O. The
+    /// lane's separate high and low water marks prevent mode flapping.
+    pub(crate) fn should_force_worker(&self, packet_count: usize) -> bool {
+        assert!(packet_count > 0, "a crypto dispatch run cannot be empty");
+        let mut state = self.state.lock();
+        assert!(
+            packet_count <= state.crypto_pending,
+            "dispatch can only inspect slots already reserved by this peer"
+        );
+        let peer_backlog_packets = state.crypto_pending - packet_count;
+        state
+            .dispatch
+            .should_force_worker(packet_count, peer_backlog_packets)
     }
 
     /// Store a completed run and deliver newly contiguous runs in slot order.
@@ -163,9 +219,14 @@ impl<T> OrderedCompletions<T> {
                 "completion run {first_slot}..{end_slot} was not outstanding"
             );
             assert!(
+                run_len <= state.crypto_pending,
+                "completion run {first_slot}..{end_slot} finished more crypto slots than remain"
+            );
+            assert!(
                 state.pending.insert(first_slot, results).is_none(),
                 "completion run beginning at slot {first_slot} was completed twice"
             );
+            state.crypto_pending -= run_len;
 
             let mut ready = Vec::new();
             loop {
@@ -225,7 +286,7 @@ impl<T> OrderedCompletions<T> {
     /// Whether every reserved slot has been delivered.
     pub(crate) fn is_idle(&self) -> bool {
         let state = self.state.lock();
-        state.in_flight == 0 && state.pending.is_empty()
+        state.in_flight == 0 && state.crypto_pending == 0 && state.pending.is_empty()
     }
 
     /// Remaining sequence slots before this peer reaches its in-flight bound.
@@ -777,6 +838,9 @@ mod tests {
     /// Two peers let four workers run without exceeding either peer's slot window.
     const PROFILE_PEER_COUNT: usize = 2;
 
+    /// Keep one extra ready run per worker so the loaded profile crosses the peer backlog mark.
+    const PROFILE_READY_RUNS_PER_WORKER: usize = 2;
+
     /// Packets per peer in one ready read from the profile.
     const PROFILE_READ_PACKETS_PER_PEER: usize = CRYPTO_CHUNK_SIZE;
 
@@ -1213,20 +1277,132 @@ mod tests {
 
     /// Keep a lone ready run inline and dispatch substantial work only when another run exists.
     #[test]
-    fn worker_dispatch_preserves_single_run_fast_path_and_parallelizes_ready_runs() {
-        assert!(!super::should_force_worker(1, false));
+    fn worker_dispatch_requires_a_useful_run_and_peer_backlog() {
+        assert!(!super::should_force_worker(
+            1,
+            super::PARALLEL_DISPATCH_HIGH_WATER
+        ));
         assert!(!super::should_force_worker(
             MIN_PARALLEL_RUN_SIZE - 1,
-            false
+            super::PARALLEL_DISPATCH_HIGH_WATER
         ));
-        assert!(!super::should_force_worker(MIN_PARALLEL_RUN_SIZE, false));
         assert!(!super::should_force_worker(
-            super::CRYPTO_WORKER_BATCH_SIZE,
-            false
+            MIN_PARALLEL_RUN_SIZE,
+            super::PARALLEL_DISPATCH_HIGH_WATER - 1
         ));
-        assert!(!super::should_force_worker(1, true));
-        assert!(!super::should_force_worker(MIN_PARALLEL_RUN_SIZE - 1, true));
-        assert!(super::should_force_worker(MIN_PARALLEL_RUN_SIZE, true));
+        assert!(super::should_force_worker(
+            MIN_PARALLEL_RUN_SIZE,
+            super::PARALLEL_DISPATCH_HIGH_WATER
+        ));
+    }
+
+    /// Keep parallel dispatch active in the hysteresis band, then collapse near an empty queue.
+    #[test]
+    fn adaptive_dispatch_uses_distinct_high_and_low_watermarks() {
+        let mut dispatch = super::AdaptiveDispatch::default();
+        assert!(!dispatch.should_force_worker(CRYPTO_CHUNK_SIZE, 0));
+        assert!(!dispatch.should_force_worker(
+            MIN_PARALLEL_RUN_SIZE,
+            super::PARALLEL_DISPATCH_HIGH_WATER - 1
+        ));
+        assert!(
+            dispatch
+                .should_force_worker(MIN_PARALLEL_RUN_SIZE, super::PARALLEL_DISPATCH_HIGH_WATER)
+        );
+        assert!(dispatch.should_force_worker(
+            MIN_PARALLEL_RUN_SIZE,
+            super::PARALLEL_DISPATCH_LOW_WATER + 1
+        ));
+        assert!(
+            !dispatch
+                .should_force_worker(MIN_PARALLEL_RUN_SIZE, super::PARALLEL_DISPATCH_LOW_WATER)
+        );
+        assert!(!dispatch.should_force_worker(
+            MIN_PARALLEL_RUN_SIZE,
+            super::PARALLEL_DISPATCH_HIGH_WATER - 1
+        ));
+    }
+
+    /// Backlog on one peer must not force a shallow peer out of its inline fast path.
+    #[test]
+    fn adaptive_dispatch_uses_each_peers_own_ordered_backlog() {
+        let bulk_peer = OrderedCompletions::<()>::default();
+        let interactive_peer = OrderedCompletions::<()>::default();
+        bulk_peer
+            .reserve_run(super::PARALLEL_DISPATCH_HIGH_WATER)
+            .expect("the bulk peer has bounded backlog capacity");
+        bulk_peer
+            .reserve_run(MIN_PARALLEL_RUN_SIZE)
+            .expect("the current bulk run fits in its lane");
+        interactive_peer
+            .reserve_run(MIN_PARALLEL_RUN_SIZE)
+            .expect("the interactive run fits in its lane");
+
+        assert!(bulk_peer.should_force_worker(MIN_PARALLEL_RUN_SIZE));
+        assert!(!interactive_peer.should_force_worker(MIN_PARALLEL_RUN_SIZE));
+    }
+
+    /// Completed crypto waiting for ordered output must not keep another run on a worker.
+    #[tokio::test]
+    async fn adaptive_dispatch_ignores_backlog_after_crypto_completes() {
+        let lane = Arc::new(OrderedCompletions::<()>::default());
+        let first_slot = lane
+            .reserve_run(super::PARALLEL_DISPATCH_HIGH_WATER)
+            .expect("the first run fits the peer's window");
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let first_lane = Arc::clone(&lane);
+        let first_release_rx = Arc::clone(&release_rx);
+        let first_completion = tokio::spawn(async move {
+            first_lane
+                .complete_run(
+                    first_slot,
+                    vec![Some(()); super::PARALLEL_DISPATCH_HIGH_WATER],
+                    move |_| {
+                        let release_rx = Arc::clone(&first_release_rx);
+                        let started_tx = started_tx.clone();
+                        async move {
+                            started_tx
+                                .send(())
+                                .expect("the test is waiting for ordered delivery");
+                            let release_rx = release_rx
+                                .lock()
+                                .await
+                                .take()
+                                .expect("the ordered release receiver is taken once");
+                            release_rx.await.expect("the test releases ordered output");
+                            Ok::<_, ()>(())
+                        }
+                    },
+                )
+                .await
+        });
+        started_rx
+            .recv()
+            .await
+            .expect("the first result reached ordered output");
+
+        let next_slot = lane
+            .reserve_run(MIN_PARALLEL_RUN_SIZE)
+            .expect("the next run fits behind completed output");
+        assert!(!lane.should_force_worker(MIN_PARALLEL_RUN_SIZE));
+
+        release_tx
+            .send(())
+            .expect("ordered output is still waiting");
+        first_completion
+            .await
+            .expect("the first completion task succeeds")
+            .expect("the first delivery succeeds");
+        lane.complete_run(
+            next_slot,
+            vec![Some(()); MIN_PARALLEL_RUN_SIZE],
+            |_| async { Ok::<_, ()>(()) },
+        )
+        .await
+        .expect("the next delivery succeeds");
+        assert!(lane.is_idle());
     }
 
     /// Keep a ready read run contiguous through one worker handoff and ordered release.
@@ -1407,20 +1583,29 @@ mod tests {
         let packets = prepared_encryptions(&mut sender, packet_count);
         let workers = CryptoWorkers::with_worker_count(2).expect("the worker pool starts");
         let crypto = workers.handle();
+        let lane = OrderedCompletions::<WgKind>::default();
+        let first_slot = lane
+            .reserve_run(packet_count)
+            .expect("the lone run fits the peer's ordered window");
         let run = packets
             .into_iter()
             .map(|packet| Some(PreparedOutgoing::Encrypt(packet)))
             .collect();
-        let force_worker = super::should_force_worker(packet_count, false);
+        let force_worker = lane.should_force_worker(packet_count);
 
-        black_box(
-            crypto
-                .encrypt_run(run, force_worker)
-                .await
-                .expect("the serial fast path returns the packet"),
-        );
+        let results = crypto
+            .encrypt_run(run, force_worker)
+            .await
+            .expect("the serial fast path returns the packet");
+        lane.complete_run(first_slot, results, |results| async move {
+            black_box(results);
+            Ok::<_, ()>(())
+        })
+        .await
+        .expect("the ordered lane releases the lone run");
 
         assert_eq!(crypto.handoff_count(), 0);
+        assert!(lane.is_idle());
         workers.stop().await;
     }
 
@@ -1617,8 +1802,9 @@ mod tests {
     /// peers, and schedules their contiguous reads only when each run fits in that peer's 128-slot
     /// window. A full peer stream does not occupy the shared worker window. Its latency runs from
     /// read readiness through in-order release, including worker queueing and the bounded batch.
-    /// Compare ordered worker counts with the one-worker stage row, not the raw per-packet AEAD
-    /// row, because those rows time different work units.
+    /// The loaded stage keeps twice as many bounded reads ready as workers so dispatch observes
+    /// real per-peer backlog; compare worker counts with the one-worker stage row, not the raw
+    /// per-packet AEAD row, because those rows time different work units.
     #[test]
     #[ignore = "manual crypto-stage measurement on the pinned performance VM"]
     fn crypto_stage_microbenchmark() {
@@ -1819,35 +2005,40 @@ mod tests {
             .collect::<Vec<_>>();
         let mut latencies = Vec::with_capacity(PROFILE_PACKET_COUNT);
         let started = Instant::now();
-        let completed = run_profile_peer_window(peers, worker_count, |read| {
-            let read_started = read.ready_at;
-            let peer_index = read.peer_index;
-            let batch_len = read.packets.len();
-            let batch = read
-                .packets
-                .into_iter()
-                .map(|packet| Some(PreparedOutgoing::Encrypt(packet)))
-                .collect::<Vec<_>>();
-            let lane = Arc::clone(&lanes[peer_index]);
-            let first_slot = lane
-                .reserve_run(batch_len)
-                .expect("ready peer runs fit the in-flight window");
-            let crypto = crypto.clone();
-            async move {
-                let results = crypto
-                    .encrypt_run(batch, worker_count > 1 && batch_len > 1)
+        let completed = run_profile_peer_window(
+            peers,
+            worker_count.saturating_mul(PROFILE_READY_RUNS_PER_WORKER),
+            |read| {
+                let read_started = read.ready_at;
+                let peer_index = read.peer_index;
+                let batch_len = read.packets.len();
+                let batch = read
+                    .packets
+                    .into_iter()
+                    .map(|packet| Some(PreparedOutgoing::Encrypt(packet)))
+                    .collect::<Vec<_>>();
+                let lane = Arc::clone(&lanes[peer_index]);
+                let first_slot = lane
+                    .reserve_run(batch_len)
+                    .expect("ready peer runs fit the in-flight window");
+                let force_worker = lane.should_force_worker(batch_len);
+                let crypto = crypto.clone();
+                async move {
+                    let results = crypto
+                        .encrypt_run(batch, force_worker)
+                        .await
+                        .expect("the worker queue remains open");
+                    lane.complete_run(first_slot, results, |results| async move {
+                        black_box(results);
+                        Ok::<_, ()>(())
+                    })
                     .await
-                    .expect("the worker queue remains open");
-                lane.complete_run(first_slot, results, |results| async move {
-                    black_box(results);
-                    Ok::<_, ()>(())
-                })
-                .await
-                .expect("ordered delivery succeeds");
-                lane.wait_delivered(first_slot + batch_len as u64 - 1).await;
-                (batch_len, read_started.elapsed())
-            }
-        })
+                    .expect("ordered delivery succeeds");
+                    lane.wait_delivered(first_slot + batch_len as u64 - 1).await;
+                    (batch_len, read_started.elapsed())
+                }
+            },
+        )
         .await;
         for (batch_len, latency) in completed {
             latencies.resize(latencies.len() + batch_len, latency);
@@ -1878,44 +2069,49 @@ mod tests {
         let addr = "127.0.0.1:51820"
             .parse()
             .expect("the profile peer address is valid");
-        let completed = run_profile_peer_window(peers, worker_count, |read| {
-            let read_started = read.ready_at;
-            let peer_index = read.peer_index;
-            let batch_len = read.packets.len();
-            let batch = read
-                .packets
-                .into_iter()
-                .map(|packet| (packet, addr))
-                .collect::<Vec<_>>();
-            let lane = Arc::clone(&lanes[peer_index]);
-            let first_slot = lane
-                .reserve_run(batch_len)
-                .expect("ready peer runs fit the in-flight window");
-            let crypto = crypto.clone();
-            async move {
-                let completions = crypto
-                    .decrypt_run(batch, worker_count > 1 && batch_len > 1)
+        let completed = run_profile_peer_window(
+            peers,
+            worker_count.saturating_mul(PROFILE_READY_RUNS_PER_WORKER),
+            |read| {
+                let read_started = read.ready_at;
+                let peer_index = read.peer_index;
+                let batch_len = read.packets.len();
+                let batch = read
+                    .packets
+                    .into_iter()
+                    .map(|packet| (packet, addr))
+                    .collect::<Vec<_>>();
+                let lane = Arc::clone(&lanes[peer_index]);
+                let first_slot = lane
+                    .reserve_run(batch_len)
+                    .expect("ready peer runs fit the in-flight window");
+                let force_worker = lane.should_force_worker(batch_len);
+                let crypto = crypto.clone();
+                async move {
+                    let completions = crypto
+                        .decrypt_run(batch, force_worker)
+                        .await
+                        .expect("the worker queue remains open");
+                    let results = completions.into_iter().map(Some).collect();
+                    lane.complete_run(first_slot, results, |completions| async move {
+                        for completion in completions.into_iter().flatten() {
+                            black_box(
+                                completion
+                                    .result
+                                    .expect("the profile packet authenticates")
+                                    .complete()
+                                    .expect("the ordered profile counter is accepted"),
+                            );
+                        }
+                        Ok::<_, ()>(())
+                    })
                     .await
-                    .expect("the worker queue remains open");
-                let results = completions.into_iter().map(Some).collect();
-                lane.complete_run(first_slot, results, |completions| async move {
-                    for completion in completions.into_iter().flatten() {
-                        black_box(
-                            completion
-                                .result
-                                .expect("the profile packet authenticates")
-                                .complete()
-                                .expect("the ordered profile counter is accepted"),
-                        );
-                    }
-                    Ok::<_, ()>(())
-                })
-                .await
-                .expect("ordered replay marking succeeds");
-                lane.wait_delivered(first_slot + batch_len as u64 - 1).await;
-                (batch_len, read_started.elapsed())
-            }
-        })
+                    .expect("ordered replay marking succeeds");
+                    lane.wait_delivered(first_slot + batch_len as u64 - 1).await;
+                    (batch_len, read_started.elapsed())
+                }
+            },
+        )
         .await;
         for (batch_len, latency) in completed {
             latencies.resize(latencies.len() + batch_len, latency);
