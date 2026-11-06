@@ -24,6 +24,8 @@ pub mod rate_limiter;
 mod session;
 mod timers;
 
+pub(crate) use session::{PreparedDecryption, PreparedEncryption, VerifiedDecryption};
+
 use rand::{RngCore, SeedableRng, rngs::StdRng};
 use zerocopy::IntoBytes;
 
@@ -59,6 +61,32 @@ pub enum TunnResult {
     WriteToTunnel(Packet),
 }
 
+/// Packet work split between serial tunnel state and worker AEAD operations.
+pub(crate) enum PreparedOutgoing {
+    /// A packet with its sequence counter reserved for worker encryption.
+    Encrypt(PreparedEncryption),
+    /// A control packet that does not use the transport AEAD.
+    Ready(WgKind),
+}
+
+impl PreparedOutgoing {
+    /// Apply encryption when preserving the synchronous public tunnel API.
+    fn encrypt(self) -> WgKind {
+        match self {
+            Self::Encrypt(packet) => packet.encrypt(),
+            Self::Ready(packet) => packet,
+        }
+    }
+}
+
+/// Packet work split between serial tunnel state and worker AEAD operations.
+pub(crate) enum PreparedIncoming {
+    /// A non-data packet, or a data packet that could not select a session.
+    Immediate(TunnResult),
+    /// A data packet with the receiving session and replay counter work retained.
+    Decrypt { packet: PreparedDecryption },
+}
+
 impl From<WireGuardError> for TunnResult {
     fn from(err: WireGuardError) -> TunnResult {
         TunnResult::Err(err)
@@ -70,7 +98,7 @@ pub struct Tunn<R: RngCore + Send = StdRng> {
     /// The handshake currently in progress.
     handshake: handshake::Handshake,
     /// The [`N_SESSIONS`] most recent sessions, allocated after the first handshake.
-    sessions: Option<Box<[Option<session::Session>; N_SESSIONS]>>,
+    sessions: Option<Box<[Option<Arc<session::Session>>; N_SESSIONS]>>,
     /// Index of the most recently used session.
     current: usize,
     /// Counter for slot selection when inserting new sessions.
@@ -199,22 +227,179 @@ impl<R: RngCore + Send> Tunn<R> {
     /// clamped to not exceed MTU.
     pub fn handle_outgoing_packet(
         &mut self,
-        mut packet: Packet,
+        packet: Packet,
         tun_mtu: Option<&mut MtuWatcher>,
     ) -> Option<WgKind> {
+        self.prepare_outgoing_packet(packet, tun_mtu)
+            .map(PreparedOutgoing::encrypt)
+    }
+
+    /// Reserve the packet counter and prepare one outgoing packet without running AEAD.
+    ///
+    /// The caller serializes this method per peer, then gives any `Encrypt` result to the bounded
+    /// worker pool. Packets waiting for a handshake remain in the existing bounded queue.
+    pub(crate) fn prepare_outgoing_packet(
+        &mut self,
+        mut packet: Packet,
+        tun_mtu: Option<&mut MtuWatcher>,
+    ) -> Option<PreparedOutgoing> {
         if let Some(tun_mtu) = tun_mtu {
             packet = pad_to_x16(packet, tun_mtu);
         }
 
-        match self.encapsulate_with_session(packet) {
-            Ok(encapsulated_packet) => Some(encapsulated_packet.into()),
-            Err(packet) => {
-                // If there is no session, queue the packet for future retry
-                self.queue_packet(packet);
-                // Initiate a new handshake if none is in progress
-                self.format_handshake_initiation(false).map(Into::into)
-            }
+        self.prepare_outgoing_packet_inner(packet)
+    }
+
+    /// Prepare a packet removed from the already-padded handshake queue.
+    ///
+    /// Queued packets passed through `prepare_outgoing_packet` before they were stored, so this
+    /// path must not apply MTU padding a second time.
+    pub(crate) fn prepare_queued_packet(&mut self, packet: Packet) -> Option<PreparedOutgoing> {
+        let session = self
+            .sessions
+            .as_ref()
+            .and_then(|sessions| sessions[self.current % N_SESSIONS].as_ref())
+            .cloned();
+        match session {
+            Some(session) => match session.prepare_packet_data(packet) {
+                Ok(prepared) => {
+                    let packet_len = prepared.packet_len();
+                    let keepalive = prepared.is_keepalive();
+                    self.record_outgoing_packet(packet_len, keepalive);
+                    Some(PreparedOutgoing::Encrypt(prepared))
+                }
+                Err(packet) => self.queue_packet_front_and_start_handshake(packet),
+            },
+            None => self.queue_packet_front_and_start_handshake(packet),
         }
+    }
+
+    /// Pad and retain a packet while a completed handshake queue is being drained.
+    pub(crate) fn queue_outgoing_packet(
+        &mut self,
+        mut packet: Packet,
+        tun_mtu: Option<&mut MtuWatcher>,
+    ) {
+        if let Some(tun_mtu) = tun_mtu {
+            packet = pad_to_x16(packet, tun_mtu);
+        }
+        self.queue_packet(packet);
+    }
+
+    /// Reserve the session counter for one prepared packet or queue it until a session is ready.
+    fn prepare_outgoing_packet_inner(&mut self, packet: Packet) -> Option<PreparedOutgoing> {
+        let session = self
+            .sessions
+            .as_ref()
+            .and_then(|sessions| sessions[self.current % N_SESSIONS].as_ref())
+            .cloned();
+        match session {
+            Some(session) => match session.prepare_packet_data(packet) {
+                Ok(prepared) => {
+                    let packet_len = prepared.packet_len();
+                    let keepalive = prepared.is_keepalive();
+                    self.timer_tick(TimerName::TimeLastPacketSent);
+                    if !keepalive {
+                        self.timer_tick(TimerName::TimeLastDataPacketSent);
+                    }
+                    self.tx_bytes += packet_len;
+                    Some(PreparedOutgoing::Encrypt(prepared))
+                }
+                Err(packet) => self.queue_packet_and_start_handshake(packet),
+            },
+            None => self.queue_packet_and_start_handshake(packet),
+        }
+    }
+
+    fn queue_packet_and_start_handshake(&mut self, packet: Packet) -> Option<PreparedOutgoing> {
+        // If there is no session, queue the packet for future retry.
+        self.queue_packet(packet);
+        // Initiate a new handshake if none is in progress.
+        self.format_handshake_initiation(false)
+            .map(|packet| PreparedOutgoing::Ready(packet.into()))
+    }
+
+    /// Return a removed queued packet to the front if its session is no longer usable.
+    fn queue_packet_front_and_start_handshake(
+        &mut self,
+        packet: Packet,
+    ) -> Option<PreparedOutgoing> {
+        self.packet_queue.push_front(packet);
+        self.format_handshake_initiation(false)
+            .map(|packet| PreparedOutgoing::Ready(packet.into()))
+    }
+
+    fn record_outgoing_packet(&mut self, packet_len: usize, keepalive: bool) {
+        self.timer_tick(TimerName::TimeLastPacketSent);
+        if !keepalive {
+            self.timer_tick(TimerName::TimeLastDataPacketSent);
+        }
+        self.tx_bytes += packet_len;
+    }
+
+    /// Remove the oldest packet waiting for a completed handshake.
+    pub(crate) fn take_queued_packet(&mut self) -> Option<Packet> {
+        self.dequeue_packet()
+    }
+
+    /// Whether packets remain queued after the most recent bounded flush chunk.
+    pub(crate) fn has_queued_packets(&self) -> bool {
+        !self.packet_queue.is_empty()
+    }
+
+    /// Select a receive session without running AEAD or mutating replay state.
+    ///
+    /// The caller sends `Decrypt` work to a worker and commits its replay counter only when its
+    /// peer-local ordered completion slot is released.
+    pub(crate) fn prepare_incoming_packet(&mut self, packet: WgKind) -> PreparedIncoming {
+        let WgKind::Data(packet) = packet else {
+            return PreparedIncoming::Immediate(self.handle_incoming_packet(packet));
+        };
+
+        let receiver_idx = packet.header.receiver_idx.get();
+        let Some(sessions) = self.sessions.as_ref() else {
+            return PreparedIncoming::Immediate(WireGuardError::NoCurrentSession.into());
+        };
+        let Some((session_slot, session)) = sessions
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, session)| session.as_ref().map(|session| (slot, session)))
+            .find(|(_, session)| session.receiving_index.value() == receiver_idx)
+        else {
+            return PreparedIncoming::Immediate(WireGuardError::NoCurrentSession.into());
+        };
+
+        PreparedIncoming::Decrypt {
+            packet: session.prepare_receive_packet(packet, session_slot),
+        }
+    }
+
+    /// Commit replay state and tunnel receive counters after an ordered worker completion.
+    pub(crate) fn complete_incoming_packet(
+        &mut self,
+        result: Result<VerifiedDecryption, WireGuardError>,
+    ) -> TunnResult {
+        let completed = match result.and_then(VerifiedDecryption::complete) {
+            Ok(packet) => packet,
+            Err(error) => return TunnResult::Err(error),
+        };
+        let session_slot = completed.session_slot();
+        let session_is_current = self
+            .sessions
+            .as_ref()
+            .and_then(|sessions| sessions[session_slot].as_ref())
+            .is_some_and(|session| completed.belongs_to(session));
+        if session_is_current {
+            self.set_current_session(session_slot);
+        }
+        let decapsulated_packet = completed.into_packet();
+
+        if !decapsulated_packet.is_empty() {
+            self.timer_tick(TimerName::TimeLastDataPacketReceived);
+        }
+        self.timer_tick(TimerName::TimeLastPacketReceived);
+        self.rx_bytes += decapsulated_packet.as_bytes().len();
+        TunnResult::WriteToTunnel(decapsulated_packet)
     }
 
     /// Encapsulate a single packet into a [`WgData`].
@@ -230,12 +415,9 @@ impl<R: RngCore + Send> Tunn<R> {
         {
             // Send the packet using an established session
             let packet = session.format_packet_data(packet)?;
-            self.timer_tick(TimerName::TimeLastPacketSent);
-            // Exclude Keepalive packets from timer update.
-            if !packet.is_keepalive() {
-                self.timer_tick(TimerName::TimeLastDataPacketSent);
-            }
-            self.tx_bytes += packet.as_bytes().len();
+            let packet_len = packet.as_bytes().len();
+            let keepalive = packet.is_keepalive();
+            self.record_outgoing_packet(packet_len, keepalive);
             Ok(packet)
         } else {
             Err(packet)
@@ -354,7 +536,7 @@ impl<R: RngCore + Send> Tunn<R> {
         let sessions = self
             .sessions
             .get_or_insert_with(|| Box::new(std::array::from_fn(|_| None)));
-        sessions[slot % N_SESSIONS] = Some(session);
+        sessions[slot % N_SESSIONS] = Some(Arc::new(session));
     }
 
     /// Decrypt a data packet, and return a [`TunnResult::WriteToTunnel`] (`Ipv4` or `Ipv6`) if
@@ -452,6 +634,7 @@ impl<R: RngCore + Send> Tunn<R> {
     }
 
     /// Push packet to the back of the queue.
+    /// Push a packet to the back of the bounded queue, dropping it if the queue is full.
     fn queue_packet(&mut self, packet: Packet) {
         if self.packet_queue.len() < MAX_QUEUE_DEPTH {
             // Drop if too many are already in queue
