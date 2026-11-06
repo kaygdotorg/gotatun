@@ -30,6 +30,7 @@ class CpusetAuditCliTest(unittest.TestCase):
         spec.loader.exec_module(module)
 
         self.assertEqual(module.TEST_CPUS, {1, 2, 3, 4})
+        self.assertEqual(module.HOUSEKEEPING_CPUS, {0, 5})
         self.assertEqual(
             module.EXPECTED_MASKS,
             {frozenset({1, 2}), frozenset({3, 4})},
@@ -198,6 +199,52 @@ NET_TX:              2          6
             {"NET_RX": {"CPU0": 3, "CPU1": 5}, "NET_TX": {"CPU1": 2}},
         )
 
+    def test_proc_stat_steal_delta_is_recorded_by_cpu_and_window(self) -> None:
+        """Each loaded window reports steal time for test and housekeeping CPUs."""
+        script = Path(__file__).parent / "base/lib/cpuset_audit.py"
+        spec = importlib.util.spec_from_file_location("cpuset_audit_steal", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader if spec is not None else None)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        before = """cpu 0 0 0 0 0 0 0 0 0 0
+cpu0 0 0 0 0 0 0 0 10 0 0
+cpu1 0 0 0 0 0 0 0 20 0 0
+cpu2 0 0 0 0 0 0 0 30 0 0
+cpu3 0 0 0 0 0 0 0 40 0 0
+cpu4 0 0 0 0 0 0 0 50 0 0
+cpu5 0 0 0 0 0 0 0 60 0 0
+"""
+        after = """cpu 0 0 0 0 0 0 0 0 0 0
+cpu0 0 0 0 0 0 0 0 12 0 0
+cpu1 0 0 0 0 0 0 0 21 0 0
+cpu2 0 0 0 0 0 0 0 32 0 0
+cpu3 0 0 0 0 0 0 0 43 0 0
+cpu4 0 0 0 0 0 0 0 54 0 0
+cpu5 0 0 0 0 0 0 0 66 0 0
+"""
+        before_ticks = module.parse_proc_stat_steal_ticks(before)
+        after_ticks = module.parse_proc_stat_steal_ticks(after)
+        summary = module.summarize_cpu_steal(
+            before_ticks,
+            after_ticks,
+            test_cpus={1, 2, 3, 4},
+            housekeeping_cpus={0, 5},
+            ticks_per_second=100,
+            window_duration_ns=2_000_000_000,
+        )
+
+        self.assertTrue(summary["cpu_steal_data_available"])
+        self.assertEqual(
+            summary["cpu_steal_delta_ticks_by_cpu"],
+            {"0": 2, "1": 1, "2": 2, "3": 3, "4": 4, "5": 6},
+        )
+        self.assertAlmostEqual(summary["cpu_steal_test_cpu_seconds"], 0.1)
+        self.assertAlmostEqual(summary["cpu_steal_housekeeping_cpu_seconds"], 0.08)
+        self.assertAlmostEqual(summary["cpu_steal_all_cpu_seconds"], 0.18)
+        self.assertAlmostEqual(summary["cpu_steal_test_cpu_percent"], 1.25)
+
     def test_kernel_wireguard_crypto_worker_is_workload_only_for_kernel_netbird(self) -> None:
         """Only kernel NetBird crypto workers are reported as measured workload."""
         script = Path(__file__).parent / "base/lib/cpuset_audit.py"
@@ -211,6 +258,14 @@ NET_TX:              2          6
 
         self.assertEqual(
             classifier("kworker/2:1-wg-crypt-wt0", "mesh-netbird"),
+            "kernel-wireguard-crypto",
+        )
+        self.assertEqual(
+            classifier("kworker/3:1-wg-crypt-wgA", "mesh-kernel-plain"),
+            "kernel-wireguard-crypto",
+        )
+        self.assertEqual(
+            classifier("kworker/4:1-wg-crypt-wgB", "mesh-kernel-plain"),
             "kernel-wireguard-crypto",
         )
         self.assertEqual(
@@ -306,6 +361,14 @@ NET_TX:              2          6
             role("kworker/2:0-wg-crypt-wt0", "mesh-netbird"),
             "kernel-wireguard-crypto",
         )
+        self.assertEqual(
+            role("kworker/3:1-wg-crypt-wgA", "mesh-kernel-wireguard"),
+            "kernel-wireguard-crypto",
+        )
+        self.assertEqual(
+            role("kworker/4:1-wg-crypt-wgB", "mesh-kernel-wireguard"),
+            "kernel-wireguard-crypto",
+        )
         self.assertEqual(role("kworker/2:0-wg-crypt-wt0", "mesh-gotatun"), "background")
         self.assertEqual(role("kworker/2:0-events", "mesh-netbird"), "background")
 
@@ -340,6 +403,7 @@ NET_TX:              2          6
             first = {
                 "time_unix": 100.0, "scope_threads": 1, "scope_processes": [],
                 "mask_mismatches": [], "external_runnable": [],
+                "proc_stat_steal_ticks_by_cpu": {str(cpu): 100 for cpu in range(6)},
                 "kernel_bound_percpu_workers": [worker],
                 "kernel_wireguard_crypto_runnable": [], "kernel_other_runnable": [],
             }
@@ -376,6 +440,12 @@ NET_TX:              2          6
             )
             self.assertEqual(summary["test_cpu_time_ns"], 4_000_000_000)
             self.assertFalse(summary["kernel_bound_runtime_limit_exceeded"])
+            self.assertTrue(summary["cpu_steal_data_available"])
+            self.assertEqual(
+                summary["cpu_steal_delta_ticks_by_cpu"],
+                {str(cpu): 0 for cpu in range(6)},
+            )
+            self.assertEqual(summary["cpu_steal_test_cpu_percent"], 0.0)
 
     def _run_worker_window(self, module, output: Path, runtime_deltas: dict[str, int]) -> dict[str, object]:
         """Summarize two sampler snapshots with known per-role runtime deltas."""
@@ -389,6 +459,7 @@ NET_TX:              2          6
             "time_unix": 100.0, "audit_case": "mesh-netbird",
             "scope_threads": 1, "scope_processes": [],
             "mask_mismatches": [], "external_runnable": [],
+            "proc_stat_steal_ticks_by_cpu": {str(cpu): 100 for cpu in range(6)},
             "kernel_bound_percpu_workers": [
                 {**worker, "runtime_ns": 0} for worker in workers
             ],
