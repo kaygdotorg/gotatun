@@ -16,6 +16,7 @@ mod builder;
 pub mod configure;
 #[cfg(feature = "daita")]
 pub mod daita;
+mod fair_queue;
 #[cfg(test)]
 mod integration_tests;
 mod peer;
@@ -52,6 +53,7 @@ use crate::udp::buffer::BufferedUdpSend;
 use crate::udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams};
 use crate::x25519;
 use allowed_ips::AllowedIps;
+use fair_queue::fair_schedule_routed_batch;
 use peer_state::{PeerState, PendingHandshake};
 
 #[cfg(feature = "tun")]
@@ -925,7 +927,22 @@ impl<T: DeviceTransports> DeviceState<T> {
                 }
             };
 
-            for packet in packets {
+            let packets = {
+                let Some(device_arc) = device.upgrade() else {
+                    return Ok(());
+                };
+                let device_guard = device_arc.read().await;
+                let routed_batch = packets.into_iter().filter_map(|packet| {
+                    let destination = packet.destination()?;
+                    let peer_key = device_guard.peers_by_ip.find(destination).map(Arc::as_ptr);
+                    Some((peer_key, packet, ()))
+                });
+                fair_schedule_routed_batch(routed_batch)
+            };
+
+            // Re-resolve each packet below so a route change during batch preparation takes
+            // effect.
+            for (packet, ()) in packets {
                 // Determine peer to use from the destination address
                 let Some(dst_addr) = packet.destination() else {
                     continue;
