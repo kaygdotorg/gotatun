@@ -1,0 +1,78 @@
+--- a/cases/mesh.sh
++++ b/cases/mesh.sh
+@@ -504,73 +504,5 @@
+     measure mem-after-soak "$H" proc-mem --pids "$WATCH"
+ }
+ 
+-if [[ ${H2H_SOAK_SECONDS:-0} == 3600 ]]; then
+-    run_soak
+-else
+-    profile lan "$LAT_COUNT" 1000 "$TPUT_S"
+-    measure mem-after-load "$H" proc-mem --pids "$WATCH"
+-
+-    netem_set h2h-a a0 delay 99ms
+-    netem_set h2h-b b0 delay 99ms
+-    sleep 2
+-    profile de-in "$WAN_LAT_COUNT" 10000 "$WAN_TPUT_S"
+-    # Loss is at the packet layer on both egress interfaces. Two independent 2%
+-    # drops imply 3.96% round-trip exposure, not a single 2% end-to-end profile.
+-    netem_set h2h-a a0 delay 99ms loss 2%
+-    netem_set h2h-b b0 delay 99ms loss 2%
+-    sleep 2
+-    profile de-in-loss "$WAN_LAT_COUNT" 10000 "$WAN_TPUT_S"
+-    netem_clear h2h-a a0
+-    netem_clear h2h-b b0
+-
+-    if [[ ${H2H_REORDER_CHECK:-0} == 1 ]]; then
+-        netem_set h2h-a a0 delay 99ms reorder 25% 50%
+-        netem_set h2h-b b0 delay 99ms reorder 25% 50%
+-        sleep 2
+-        profile de-in-reorder "$WAN_LAT_COUNT" 10000 "$WAN_TPUT_S"
+-        netem_clear h2h-a a0
+-        netem_clear h2h-b b0
+-    fi
+-fi
+-
+-if [[ $SYSTEM == tailscale ]]; then
+-    note peer-scale '{"configured_peers_per_endpoint":1,"at_1000":"not supported by the two-node testcontrol fixture"}'
+-elif [[ $SYSTEM == infraternal ]]; then
+-    for x in a b; do
+-        nspid=$A_PID
+-        [[ $x == b ]] && nspid=$B_PID
+-        python3 -I "$H2H_KIT/lib/peer_scale.py" kernel-config --count 1000 --start 0 --output "$D/peers-$x.conf"
+-        nsenter -t "$nspid" -n -- "$H2H_BIN/wg" setconf infraternal0 "$D/peers-$x.conf"
+-        test "$(nsenter -t "$nspid" -n -- "$H2H_BIN/wg" show infraternal0 peers | wc -l)" -eq 1000 \
+-            || die "kernel WireGuard peer count is not 1,000 on $x"
+-    done
+-    sleep 2
+-    measure idle-1000 "$H" proc-idle --pids "$WATCH" --seconds "$IDLE_S"
+-    measure mem-1000 "$H" proc-mem --pids "$WATCH"
+-    record_memcg 1000
+-    note peer-scale '{"configured_peers_per_endpoint":1000,"method":"wg setconf"}'
+-elif [[ $SYSTEM == gotatun || $SYSTEM == boringtun || $SYSTEM == wireguard-go ]]; then
+-    case $SYSTEM in
+-        gotatun) peer_a=$GOTA_A_PID; peer_b=$GOTA_B_PID; iface_a=wgA; iface_b=wgB ;;
+-        boringtun) peer_a=$BORING_A_PID; peer_b=$BORING_B_PID; iface_a=wgA; iface_b=wgB ;;
+-        wireguard-go) peer_a=$WG_A_PID; peer_b=$WG_B_PID; iface_a=wgA; iface_b=wgB ;;
+-    esac
+-    nsenter -t "$peer_a" -n -m -- python3 -I "$H2H_KIT/lib/peer_scale.py" add-uapi --interface "$iface_a" --count 999 --start 1 > "$D/peers-a.json"
+-    nsenter -t "$peer_b" -n -m -- python3 -I "$H2H_KIT/lib/peer_scale.py" add-uapi --interface "$iface_b" --count 999 --start 1 > "$D/peers-b.json"
+-    sleep 2
+-    measure idle-1000 "$H" proc-idle --pids "$WATCH" --seconds "$IDLE_S"
+-    measure mem-1000 "$H" proc-mem --pids "$WATCH"
+-    record_memcg 1000
+-    note peer-scale '{"configured_peers_per_endpoint":1000,"method":"WireGuard UAPI, 999 additional non-traffic peers per endpoint"}'
+-fi
+-
+-if [[ $SYSTEM == tailscale ]]; then
+-    sandboxed "$A_PID" "$H2H_BIN/tailscale" --socket="$D/a/sock" status --json \
+-        | python3 -c 'import json,sys; s=json.load(sys.stdin); print(json.dumps([{"cur_addr":p.get("CurAddr"),"relay":p.get("Relay")} for p in (s.get("Peer") or {}).values()]))' \
+-        > "$H2H_RESULTS/$H2H_CASE/path.json" || true
+-fi
+-if [[ $SYSTEM == netbird* ]]; then
+-    # NetBird logs whether each peer connection is peer-to-peer or relayed.
+-    grep -ihE 'p2p|relay' "$D/a/client.log" | tail -n 20 > "$H2H_RESULTS/$H2H_CASE/path.txt" || true
+-fi
+-log done
++profile lan 3600 1000 10
++exit 0
