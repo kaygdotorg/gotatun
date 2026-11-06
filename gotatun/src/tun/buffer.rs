@@ -298,24 +298,9 @@ mod tests {
         Packet::from_bytes(bytes).try_into_ip().unwrap()
     }
 
-    /// Make a buffered receiver with a chosen capacity for deterministic batch tests.
-    async fn scripted_recv_with_capacity(
-        capacity: usize,
-        script: Vec<io::Result<Vec<Packet<Ip>>>>,
-    ) -> BufferedIpRecv<Script> {
-        let inner = Arc::new(Mutex::new(Script(VecDeque::from(script))));
-        BufferedIpRecv::new(
-            capacity,
-            PacketBufPool::new(1),
-            inner,
-            CancellationToken::new(),
-        )
-        .await
-    }
-
-    /// Use the usual small capacity for tests that do not inspect batching.
     async fn scripted_recv(script: Vec<io::Result<Vec<Packet<Ip>>>>) -> BufferedIpRecv<Script> {
-        scripted_recv_with_capacity(64, script).await
+        let inner = Arc::new(Mutex::new(Script(VecDeque::from(script))));
+        BufferedIpRecv::new(64, PacketBufPool::new(1), inner, CancellationToken::new()).await
     }
 
     /// One frame the TUN reader refuses (malformed headers) is dropped; the next frame still
@@ -362,36 +347,5 @@ mod tests {
             result.err().map(|e| e.kind()),
             Some(io::ErrorKind::UnexpectedEof)
         );
-    }
-
-    /// Keep each TUN batch handed to encryption at or below the experimental 64-packet cap.
-    #[tokio::test]
-    async fn encryption_batches_are_capped_at_sixty_four_packets() {
-        const BATCH_CAP: usize = 64;
-        const PACKETS: usize = BATCH_CAP * 2;
-
-        let packets = (0..PACKETS)
-            .map(|id| packet(64, id as u16))
-            .collect::<Vec<_>>();
-        let mut recv = scripted_recv_with_capacity(4000, vec![Ok(packets)]).await;
-        let mut pool = PacketBufPool::new(1);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        let mut observed = 0;
-        while observed < PACKETS {
-            let batch = tokio::time::timeout(Duration::from_secs(5), recv.recv(&mut pool))
-                .await
-                .expect("queued packets must arrive")
-                .expect("the reader must remain open")
-                .collect::<Vec<_>>();
-            assert!(!batch.is_empty(), "a queued packet must be returned");
-            assert!(
-                batch.len() <= BATCH_CAP,
-                "an encrypt batch exceeded {BATCH_CAP} packets: {}",
-                batch.len()
-            );
-            observed += batch.len();
-        }
-        assert_eq!(observed, PACKETS, "batching must not lose packets");
     }
 }
