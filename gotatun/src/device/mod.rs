@@ -54,8 +54,8 @@ use crate::udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParam
 use crate::x25519;
 use allowed_ips::AllowedIps;
 use parallel_crypto::{
-    CRYPTO_CHUNK_SIZE, CryptoHandle, CryptoWorkers, IncomingCompletion, OrderStore,
-    OrderedCompletions,
+    CRYPTO_BATCH_SIZE, CRYPTO_CHUNK_SIZE, CryptoHandle, CryptoWorkers, IncomingCompletion,
+    OrderStore, OrderedCompletions, should_force_worker,
 };
 use peer_state::{PeerState, PendingHandshake};
 
@@ -143,9 +143,39 @@ type PendingOutgoing = FuturesUnordered<BoxFuture<'static, ()>>;
 /// Futures that finish one incoming worker result and release it toward the TUN in order.
 type PendingIncoming = FuturesUnordered<BoxFuture<'static, Result<(), Error>>>;
 
+/// Prepared authenticated work gathered from one peer in a receive batch.
+struct PreparedIncomingRun {
+    peer_key: usize,
+    peer_arc: Arc<Mutex<PeerState>>,
+    packets: Vec<(PreparedDecryption, std::net::SocketAddr)>,
+}
+
 /// Stable key for a peer while its reference-counted state remains alive.
 fn peer_order_key(peer: &Arc<Mutex<PeerState>>) -> usize {
     Arc::as_ptr(peer) as usize
+}
+
+/// Group interleaved items by key while keeping each group's input order.
+fn group_by_key<K, Metadata, Item>(
+    items: impl IntoIterator<Item = (K, Metadata, Item)>,
+) -> Vec<(K, Metadata, Vec<Item>)>
+where
+    K: Copy + Eq + std::hash::Hash,
+{
+    let mut indices = HashMap::new();
+    let mut groups = Vec::new();
+    for (key, metadata, item) in items {
+        let index = if let Some(index) = indices.get(&key).copied() {
+            index
+        } else {
+            let index = groups.len();
+            groups.push((key, metadata, Vec::new()));
+            indices.insert(key, index);
+            index
+        };
+        groups[index].2.push(item);
+    }
+    groups
 }
 
 /// Drive local completions until this outgoing slot is delivered, even if later peer work remains.
@@ -180,21 +210,20 @@ async fn complete_outgoing_packet(
     #[cfg(not(feature = "daita"))]
     let _ = &peer_arc;
 
-    let packet = match prepared {
-        Some(PreparedOutgoing::Encrypt(packet)) => match crypto.submit_encryption(packet).await {
-            Some(result) => result.await.ok(),
-            None => None,
-        },
-        Some(PreparedOutgoing::Ready(packet)) => Some(packet),
-        None => None,
-    };
+    let packets = crypto
+        .encrypt_run(vec![prepared], false)
+        .await
+        .unwrap_or_else(|| vec![None]);
 
     let _ = lane
-        .complete_with(slot, packet, |packet| {
+        .complete_run(slot, packets, |mut packets| {
             #[cfg(feature = "daita")]
             let peer_arc = Arc::clone(&peer_arc);
             let udp = udp.clone();
             async move {
+                let Some(packet) = packets.pop().flatten() else {
+                    return Ok::<(), ()>(());
+                };
                 #[cfg(feature = "daita")]
                 let packet = {
                     if apply_daita {
@@ -214,6 +243,90 @@ async fn complete_outgoing_packet(
                     && udp.send_to(packet.into(), peer_addr).await.is_err()
                 {
                     tracing::trace!("udp.send_to failed");
+                }
+                Ok::<(), ()>(())
+            }
+        })
+        .await;
+    ordered.release_if_idle(peer_key, &lane);
+}
+
+/// Encrypt and release one peer's contiguous run through one worker handoff and UDP batch send.
+async fn complete_outgoing_batch<U: UdpSend + 'static>(
+    crypto: CryptoHandle,
+    ordered: Arc<OrderStore<WgKind>>,
+    peer_arc: Arc<Mutex<PeerState>>,
+    peer_key: usize,
+    lane: Arc<OrderedCompletions<WgKind>>,
+    first_slot: u64,
+    peer_addr: std::net::SocketAddr,
+    prepared: Vec<Option<PreparedOutgoing>>,
+    udp: U,
+    send_many_buf: Arc<Mutex<U::SendManyBuf>>,
+    apply_daita: bool,
+    force_worker: bool,
+) {
+    let count = prepared.len();
+    let packets = crypto
+        .encrypt_run(prepared, force_worker)
+        .await
+        .unwrap_or_else(|| std::iter::repeat_with(|| None).take(count).collect());
+
+    let _ = lane
+        .complete_run(first_slot, packets, |packets| {
+            let peer_arc = Arc::clone(&peer_arc);
+            let udp = udp.clone();
+            let send_many_buf = Arc::clone(&send_many_buf);
+            async move {
+                let mut output = Vec::with_capacity(packets.len());
+                #[cfg(feature = "daita")]
+                let mut peer = if apply_daita {
+                    Some(peer_arc.lock().await)
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "daita"))]
+                let _ = (apply_daita, peer_arc);
+
+                for packet in packets.into_iter().flatten() {
+                    #[cfg(feature = "daita")]
+                    let packet = if let Some(peer) = peer.as_mut() {
+                        match peer.daita.as_mut() {
+                            Some(daita) => daita.on_tunnel_sent(packet),
+                            None => Some(packet),
+                        }
+                    } else {
+                        Some(packet)
+                    };
+                    #[cfg(not(feature = "daita"))]
+                    let packet = Some(packet);
+
+                    if let Some(packet) = packet {
+                        output.push((packet.into(), peer_addr));
+                    }
+                }
+
+                #[cfg(feature = "daita")]
+                drop(peer);
+
+                match output.len() {
+                    0 => {}
+                    1 => {
+                        let (packet, addr) = output.pop().expect("one packet was counted");
+                        if udp.send_to(packet, addr).await.is_err() {
+                            tracing::trace!("udp.send_to failed");
+                        }
+                    }
+                    _ => {
+                        let mut send_many_buf = send_many_buf.lock().await;
+                        if udp
+                            .send_many_to(&mut send_many_buf, &mut output)
+                            .await
+                            .is_err()
+                        {
+                            tracing::trace!("udp.send_many_to failed");
+                        }
+                    }
                 }
                 Ok::<(), ()>(())
             }
@@ -749,11 +862,11 @@ impl<T: DeviceTransports> DeviceState<T> {
         peers_by_idx.lock().insert(sender_idx, Arc::clone(peer));
     }
 
-    /// Finish one authenticated data packet at its peer's ordered receive position.
-    async fn deliver_incoming_data(
+    /// Finish a contiguous receive run while holding peer state only once.
+    async fn deliver_incoming_run(
         device: Weak<RwLock<Self>>,
         peer_arc: Arc<Mutex<PeerState>>,
-        completion: IncomingCompletion,
+        completions: Vec<Option<IncomingCompletion>>,
         mut tun_tx: impl IpSend,
     ) -> Result<(), Error> {
         let Some(device_arc) = device.upgrade() else {
@@ -761,101 +874,187 @@ impl<T: DeviceTransports> DeviceState<T> {
         };
         let device_guard = device_arc.read().await;
         let mut peer = peer_arc.lock().await;
-        let result = peer.complete_incoming_data(completion.result, completion.addr);
-        #[cfg_attr(not(feature = "daita"), expect(unused_mut))]
-        let TunnResult::WriteToTunnel(mut packet) = result else {
-            return Ok(());
-        };
+        let mut tun_packets = Vec::with_capacity(completions.len());
 
-        #[cfg(feature = "daita")]
-        if let Some(daita) = peer.daita.as_mut() {
-            match daita.on_data_recv(packet) {
-                Some(new) => packet = new,
-                None => return Ok(()),
+        for completion in completions.into_iter().flatten() {
+            let result = peer.complete_incoming_data(completion.result, completion.addr);
+            #[cfg_attr(not(feature = "daita"), expect(unused_mut))]
+            let TunnResult::WriteToTunnel(mut packet) = result else {
+                continue;
+            };
+
+            #[cfg(feature = "daita")]
+            if let Some(daita) = peer.daita.as_mut() {
+                match daita.on_data_recv(packet) {
+                    Some(new) => packet = new,
+                    None => continue,
+                }
             }
-        }
 
-        if packet.is_empty() {
-            return Ok(());
-        }
-        let Ok(packet) = packet.try_into_ipvx() else {
-            return Ok(());
-        };
-
-        let (source, packet): (IpAddr, _) = packet.either(
-            |ipv4| (ipv4.header.source().into(), ipv4.into()),
-            |ipv6| (ipv6.header.source().into(), ipv6.into()),
-        );
-        let routed_to_this_peer = device_guard
-            .peers_by_ip
-            .find(source)
-            .is_some_and(|owner| Arc::ptr_eq(owner, &peer_arc));
-        if !routed_to_this_peer {
-            if cfg!(debug_assertions) {
-                let unspecified = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into();
-                tracing::warn!(
-                    "peer at {} is not allowed to send us packets from: {source}",
-                    peer.endpoint().addr.unwrap_or(unspecified)
-                );
+            if packet.is_empty() {
+                continue;
             }
-            return Ok(());
+            let Ok(packet) = packet.try_into_ipvx() else {
+                continue;
+            };
+
+            let (source, packet): (IpAddr, _) = packet.either(
+                |ipv4| (ipv4.header.source().into(), ipv4.into()),
+                |ipv6| (ipv6.header.source().into(), ipv6.into()),
+            );
+            let routed_to_this_peer = device_guard
+                .peers_by_ip
+                .find(source)
+                .is_some_and(|owner| Arc::ptr_eq(owner, &peer_arc));
+            if !routed_to_this_peer {
+                if cfg!(debug_assertions) {
+                    let unspecified = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into();
+                    tracing::warn!(
+                        "peer at {} is not allowed to send us packets from: {source}",
+                        peer.endpoint().addr.unwrap_or(unspecified)
+                    );
+                }
+                continue;
+            }
+            tun_packets.push(packet);
         }
 
         drop(peer);
         drop(device_guard);
-        tun_tx.send(packet).await.map_err(Error::IoError)
+        match tun_packets.len() {
+            0 => Ok(()),
+            1 => tun_tx
+                .send(tun_packets.pop().expect("one packet was counted"))
+                .await
+                .map_err(Error::IoError),
+            _ => tun_tx
+                .send_many(&mut tun_packets)
+                .await
+                .map_err(Error::IoError),
+        }
     }
 
-    /// Queue one received data packet on a worker and release it through its peer's receive lane.
-    fn enqueue_incoming_packet(
+    /// Queue each bounded receive run once and release it through its peer's ordered lane.
+    fn enqueue_incoming_run(
         pending: &mut PendingIncoming,
         crypto: CryptoHandle,
         ordered: Arc<OrderStore<IncomingCompletion>>,
         peer_key: usize,
         lane: Arc<OrderedCompletions<IncomingCompletion>>,
-        slot: u64,
+        first_slot: u64,
         peer_arc: Arc<Mutex<PeerState>>,
         device: Weak<RwLock<Self>>,
         tun_tx: impl IpSend + Clone,
-        addr: std::net::SocketAddr,
-        packet: PreparedDecryption,
+        packets: Vec<(PreparedDecryption, std::net::SocketAddr)>,
+        force_worker: bool,
     ) {
-        pending.push(
-            async move {
-                let completion = match crypto.submit_decryption(packet).await {
-                    Some(result) => result
-                        .await
-                        .ok()
-                        .map(|result| IncomingCompletion { result, addr }),
-                    None => None,
-                };
+        assert!(!packets.is_empty());
+        let other_peer_runs =
+            force_worker || packets.len() > CRYPTO_BATCH_SIZE || !pending.is_empty();
+        let mut packets = packets.into_iter();
+        let mut remaining = packets.len();
+        let mut offset = 0_u64;
 
-                let result = lane
-                    .complete_with(slot, completion, |completion| {
-                        let device = device.clone();
-                        let peer_arc = Arc::clone(&peer_arc);
-                        let tun_tx = tun_tx.clone();
-                        async move {
-                            Self::deliver_incoming_data(device, peer_arc, completion, tun_tx).await
-                        }
-                    })
-                    .await;
-                ordered.release_if_idle(peer_key, &lane);
-                result
+        while remaining > 0 {
+            let batch = packets.by_ref().take(CRYPTO_BATCH_SIZE).collect::<Vec<_>>();
+            let batch_len = batch.len();
+            let force_worker = should_force_worker(batch_len, other_peer_runs);
+            let crypto = crypto.clone();
+            let ordered = Arc::clone(&ordered);
+            let lane = Arc::clone(&lane);
+            let peer_arc = Arc::clone(&peer_arc);
+            let device = device.clone();
+            let tun_tx = tun_tx.clone();
+            pending.push(
+                async move {
+                    let results = crypto
+                        .decrypt_run(batch, force_worker)
+                        .await
+                        .map(|completions| completions.into_iter().map(Some).collect())
+                        .unwrap_or_else(|| {
+                            std::iter::repeat_with(|| None).take(batch_len).collect()
+                        });
+
+                    let result = lane
+                        .complete_run(first_slot + offset, results, |completions| {
+                            let device = device.clone();
+                            let peer_arc = Arc::clone(&peer_arc);
+                            let tun_tx = tun_tx.clone();
+                            async move {
+                                Self::deliver_incoming_run(device, peer_arc, completions, tun_tx)
+                                    .await
+                            }
+                        })
+                        .await;
+                    ordered.release_if_idle(peer_key, &lane);
+                    result
+                }
+                .boxed(),
+            );
+            remaining -= batch_len;
+            offset += batch_len as u64;
+        }
+    }
+
+    /// Reserve one contiguous receive range and add its batches to the bounded completion set.
+    ///
+    /// A singleton run does not force worker use; when the pool is otherwise idle, it stays on the
+    /// caller and avoids a worker wake for a sparse flowlet.
+    async fn flush_incoming_run(
+        pending: &mut PendingIncoming,
+        crypto: CryptoHandle,
+        ordered: Arc<OrderStore<IncomingCompletion>>,
+        device: Weak<RwLock<Self>>,
+        tun_tx: impl IpSend + Clone,
+        run: PreparedIncomingRun,
+        force_worker: bool,
+    ) -> Result<(), Error> {
+        if run.packets.is_empty() {
+            return Ok(());
+        }
+        let batch_count = run.packets.len().div_ceil(CRYPTO_BATCH_SIZE);
+        while pending.len() + batch_count > CRYPTO_CHUNK_SIZE {
+            pending
+                .next()
+                .await
+                .expect("a full incoming run has a completion future")?;
+        }
+
+        let (lane, first_slot) = loop {
+            if let Some(reserved) = ordered.reserve_run(run.peer_key, run.packets.len()) {
+                break reserved;
             }
-            .boxed(),
+            pending
+                .next()
+                .await
+                .expect("an in-flight peer run has a completion future")?;
+        };
+        Self::enqueue_incoming_run(
+            pending,
+            crypto,
+            ordered,
+            run.peer_key,
+            lane,
+            first_slot,
+            run.peer_arc,
+            device,
+            tun_tx,
+            run.packets,
+            force_worker,
         );
+        Ok(())
     }
 
     /// Encrypt and send a bounded chunk of handshake-queued packets before newer TUN traffic.
-    async fn flush_handshake_queue(
+    async fn flush_handshake_queue<U: UdpSend + 'static>(
         device: Weak<RwLock<Self>>,
         peer_arc: Arc<Mutex<PeerState>>,
         peer_key: usize,
         first_lane: Arc<OrderedCompletions<WgKind>>,
         first_slot: u64,
         peer_addr: std::net::SocketAddr,
-        udp: impl UdpSend + 'static,
+        udp: U,
+        send_many_buf: Arc<Mutex<U::SendManyBuf>>,
         crypto: CryptoHandle,
         ordered: Arc<OrderStore<WgKind>>,
         pending: &mut PendingOutgoing,
@@ -882,9 +1081,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                 let Some(packet) = peer.tunnel.take_queued_packet() else {
                     break;
                 };
-                let (lane, slot) = ordered
-                    .reserve(peer_key)
-                    .expect("the bounded packet windows fit within the peer order window");
                 let prepared = peer.tunnel.prepare_queued_packet(packet);
                 if let Some(PreparedOutgoing::Ready(packet)) = prepared.as_ref() {
                     Self::register_handshake_idx(&device_guard.peers_by_idx, packet, &peer_arc);
@@ -893,7 +1089,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                 if prepared.is_none() {
                     stop_after_chunk = true;
                 }
-                jobs.push((lane, slot, prepared));
+                jobs.push(prepared);
                 if stop_after_chunk {
                     break;
                 }
@@ -910,29 +1106,32 @@ impl<T: DeviceTransports> DeviceState<T> {
             if jobs.is_empty() {
                 return Ok(());
             }
-            let chunk_lane = Arc::clone(&jobs[0].0);
-            let chunk_last_slot = jobs[jobs.len() - 1].1;
-            for (lane, slot, prepared) in jobs {
-                while pending.len() >= CRYPTO_CHUNK_SIZE {
-                    pending
-                        .next()
-                        .await
-                        .expect("a full crypto chunk has a completion future");
-                }
-                Self::enqueue_outgoing_packet(
-                    pending,
-                    crypto.clone(),
-                    Arc::clone(&ordered),
-                    Arc::clone(&peer_arc),
-                    peer_key,
-                    lane,
-                    slot,
-                    peer_addr,
-                    prepared,
-                    udp.clone(),
-                    true,
-                );
+            let (chunk_lane, first_slot) = ordered
+                .reserve_run(peer_key, jobs.len())
+                .expect("the bounded queue drain fits within the peer order window");
+            let chunk_last_slot = first_slot + jobs.len() as u64 - 1;
+            let batch_count = jobs.len().div_ceil(CRYPTO_BATCH_SIZE);
+            while pending.len() + batch_count > CRYPTO_CHUNK_SIZE {
+                pending
+                    .next()
+                    .await
+                    .expect("a full outgoing run has a completion future");
             }
+            Self::enqueue_outgoing_run(
+                pending,
+                crypto.clone(),
+                Arc::clone(&ordered),
+                Arc::clone(&peer_arc),
+                peer_key,
+                chunk_lane.clone(),
+                first_slot,
+                peer_addr,
+                jobs,
+                udp.clone(),
+                Arc::clone(&send_many_buf),
+                true,
+                false,
+            );
 
             wait_for_outgoing_slot(&chunk_lane, chunk_last_slot, pending).await;
             if flush_guard.is_none() {
@@ -970,6 +1169,61 @@ impl<T: DeviceTransports> DeviceState<T> {
             )
             .boxed(),
         );
+    }
+
+    /// Split a peer's reserved range into bounded runs without creating per-packet futures.
+    ///
+    /// A run spanning multiple worker batches is dispatched even when it is the only active peer;
+    /// one small run stays inline unless other substantial peer work is ready.
+    fn enqueue_outgoing_run<U: UdpSend + 'static>(
+        pending: &mut PendingOutgoing,
+        crypto: CryptoHandle,
+        ordered: Arc<OrderStore<WgKind>>,
+        peer_arc: Arc<Mutex<PeerState>>,
+        peer_key: usize,
+        lane: Arc<OrderedCompletions<WgKind>>,
+        first_slot: u64,
+        peer_addr: std::net::SocketAddr,
+        prepared: Vec<Option<PreparedOutgoing>>,
+        udp: U,
+        send_many_buf: Arc<Mutex<U::SendManyBuf>>,
+        apply_daita: bool,
+        force_worker: bool,
+    ) {
+        assert!(!prepared.is_empty());
+        let other_peer_runs =
+            force_worker || prepared.len() > CRYPTO_BATCH_SIZE || !pending.is_empty();
+        let mut prepared = prepared.into_iter();
+        let mut remaining = prepared.len();
+        let mut offset = 0_u64;
+
+        while remaining > 0 {
+            let batch = prepared
+                .by_ref()
+                .take(CRYPTO_BATCH_SIZE)
+                .collect::<Vec<_>>();
+            let batch_len = batch.len();
+            let force_worker = should_force_worker(batch_len, other_peer_runs);
+            pending.push(
+                complete_outgoing_batch(
+                    crypto.clone(),
+                    Arc::clone(&ordered),
+                    Arc::clone(&peer_arc),
+                    peer_key,
+                    Arc::clone(&lane),
+                    first_slot + offset,
+                    peer_addr,
+                    batch,
+                    udp.clone(),
+                    Arc::clone(&send_many_buf),
+                    apply_daita,
+                    force_worker,
+                )
+                .boxed(),
+            );
+            remaining -= batch_len;
+            offset += batch_len as u64;
+        }
     }
 
     /// Run periodic tunnel maintenance and send each peer's timer output in sequence.
@@ -1081,6 +1335,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         let mut received_packets = Vec::new();
         let mut incoming_pending = PendingIncoming::new();
         let mut outgoing_pending = PendingOutgoing::new();
+        let send_many_buf = Arc::new(Mutex::new(Default::default()));
 
         // Idle memory release. One timer for the task's lifetime, re-armed once per period,
         // and polled only when the socket has nothing to read (`biased` polls the receive
@@ -1139,10 +1394,25 @@ impl<T: DeviceTransports> DeviceState<T> {
                 }
             }
 
+            let mut incoming_runs = HashMap::<usize, PreparedIncomingRun>::new();
             for (src_buf, addr) in received_packets.drain(..) {
                 let parsed_packet = match rate_limiter.verify_packet(addr, src_buf) {
                     Ok(packet) => packet,
                     Err(TunnResult::WriteToNetwork(WgKind::CookieReply(cookie))) => {
+                        let multiple_peer_runs = incoming_runs.len() > 1;
+                        for run in std::mem::take(&mut incoming_runs).into_values() {
+                            let force_worker = multiple_peer_runs && run.packets.len() > 1;
+                            Self::flush_incoming_run(
+                                &mut incoming_pending,
+                                crypto.clone(),
+                                Arc::clone(&incoming_order),
+                                device.clone(),
+                                tun_tx.clone(),
+                                run,
+                                force_worker,
+                            )
+                            .await?;
+                        }
                         // Note: Cookies should not affect counters.
                         udp_tx
                             .send_to(cookie.into(), addr)
@@ -1152,6 +1422,23 @@ impl<T: DeviceTransports> DeviceState<T> {
                     }
                     Err(_) => continue,
                 };
+
+                if !matches!(&parsed_packet, WgKind::Data(_)) && !incoming_runs.is_empty() {
+                    let multiple_peer_runs = incoming_runs.len() > 1;
+                    for run in std::mem::take(&mut incoming_runs).into_values() {
+                        let force_worker = multiple_peer_runs && run.packets.len() > 1;
+                        Self::flush_incoming_run(
+                            &mut incoming_pending,
+                            crypto.clone(),
+                            Arc::clone(&incoming_order),
+                            device.clone(),
+                            tun_tx.clone(),
+                            run,
+                            force_worker,
+                        )
+                        .await?;
+                    }
+                }
 
                 let Some(device_arc) = device.upgrade() else {
                     return Ok(());
@@ -1185,6 +1472,7 @@ impl<T: DeviceTransports> DeviceState<T> {
 
                 match parsed_packet {
                     WgKind::Data(packet) => {
+                        drop(device_guard);
                         let mut peer = peer_arc.lock().await;
                         match peer.prepare_incoming_data(packet) {
                             crate::noise::PreparedIncoming::Immediate(result) => {
@@ -1192,31 +1480,33 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 drop(result);
                             }
                             crate::noise::PreparedIncoming::Decrypt { packet } => {
-                                let (lane, slot) = incoming_order
-                                    .reserve(peer_key)
-                                    .expect("the receive chunk fits within the peer order window");
                                 drop(peer);
-                                drop(device_guard);
-
-                                while incoming_pending.len() >= CRYPTO_CHUNK_SIZE {
-                                    incoming_pending
-                                        .next()
-                                        .await
-                                        .expect("a full receive chunk has a completion future")?;
+                                let reached_limit = {
+                                    let run = incoming_runs.entry(peer_key).or_insert_with(|| {
+                                        PreparedIncomingRun {
+                                            peer_key,
+                                            peer_arc: Arc::clone(&peer_arc),
+                                            packets: Vec::with_capacity(CRYPTO_CHUNK_SIZE),
+                                        }
+                                    });
+                                    run.packets.push((packet, addr));
+                                    run.packets.len() == CRYPTO_CHUNK_SIZE
+                                };
+                                if reached_limit {
+                                    let force_worker = incoming_runs.len() > 1;
+                                    Self::flush_incoming_run(
+                                        &mut incoming_pending,
+                                        crypto.clone(),
+                                        Arc::clone(&incoming_order),
+                                        device.clone(),
+                                        tun_tx.clone(),
+                                        incoming_runs
+                                            .remove(&peer_key)
+                                            .expect("the receive run reached its bound"),
+                                        force_worker,
+                                    )
+                                    .await?;
                                 }
-                                Self::enqueue_incoming_packet(
-                                    &mut incoming_pending,
-                                    crypto.clone(),
-                                    Arc::clone(&incoming_order),
-                                    peer_key,
-                                    lane,
-                                    slot,
-                                    Arc::clone(&peer_arc),
-                                    device.clone(),
-                                    tun_tx.clone(),
-                                    addr,
-                                    packet,
-                                );
                             }
                         }
                     }
@@ -1275,6 +1565,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                     slot,
                                     addr,
                                     udp_tx.clone(),
+                                    Arc::clone(&send_many_buf),
                                     crypto.clone(),
                                     Arc::clone(&outgoing_order),
                                     &mut outgoing_pending,
@@ -1327,6 +1618,20 @@ impl<T: DeviceTransports> DeviceState<T> {
                     }
                 }
             }
+            let multiple_peer_runs = incoming_runs.len() > 1;
+            for run in std::mem::take(&mut incoming_runs).into_values() {
+                let force_worker = multiple_peer_runs && run.packets.len() > 1;
+                Self::flush_incoming_run(
+                    &mut incoming_pending,
+                    crypto.clone(),
+                    Arc::clone(&incoming_order),
+                    device.clone(),
+                    tun_tx.clone(),
+                    run,
+                    force_worker,
+                )
+                .await?;
+            }
         }
     }
 
@@ -1349,6 +1654,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         };
 
         let mut pending = PendingOutgoing::new();
+        let send_many_buf = Arc::new(Mutex::new(Default::default()));
         loop {
             tokio::select! {
                 completed = pending.next(), if !pending.is_empty() => {
@@ -1363,78 +1669,156 @@ impl<T: DeviceTransports> DeviceState<T> {
                         }
                     };
 
-                    for packet in packets {
+                    let Some(device_arc) = device.upgrade() else {
+                        return Ok(());
+                    };
+                    let device_guard = device_arc.read().await;
+                    let runs = group_by_key(packets.into_iter().filter_map(|packet| {
                         let Some(dst_addr) = packet.destination() else {
-                            continue;
+                            return None;
                         };
-
-                        let Some(device_arc) = device.upgrade() else {
-                            return Ok(());
-                        };
-                        let device_guard = device_arc.read().await;
-                        let Some(peer_arc) = device_guard.peers_by_ip.find(dst_addr).cloned() else {
+                        let Some(peer_arc) = device_guard.peers_by_ip.find(dst_addr).cloned()
+                        else {
                             if cfg!(debug_assertions) {
                                 tracing::trace!("Dropping packet with no routable peer");
                             }
-                            continue;
+                            return None;
                         };
 
-                        let peer_key = peer_order_key(&peer_arc);
-                        let mut peer = peer_arc.lock().await;
-                        let Some(peer_addr) = peer.endpoint().addr else {
-                            tracing::error!("No endpoint");
-                            continue;
-                        };
+                        Some((peer_order_key(&peer_arc), peer_arc, packet))
+                    }));
+                    drop(device_guard);
 
-                        #[cfg(feature = "daita")]
-                        let packet = match peer.daita.as_mut() {
-                            Some(daita) => daita.on_normal_sent(packet),
-                            None => packet.into(),
-                        };
-                        #[cfg(not(feature = "daita"))]
-                        let packet = packet.into();
+                    let multiple_peer_runs = runs.len() > 1;
+                    for (peer_key, peer_arc, packets) in runs {
+                        let mut packets = packets.into_iter().peekable();
+                        while packets.peek().is_some() {
+                            let Some(device_arc) = device.upgrade() else {
+                                return Ok(());
+                            };
+                            let device_guard = device_arc.read().await;
+                            let mut peer = peer_arc.lock().await;
+                            let Some(peer_addr) = peer.endpoint().addr else {
+                                tracing::error!("No endpoint");
+                                break;
+                            };
 
-                        if outgoing_order.is_flushing(peer_key) {
-                            peer.tunnel
-                                .queue_outgoing_packet(packet, Some(&mut tun_mtu));
-                            continue;
-                        }
+                            if outgoing_order.is_flushing(peer_key) {
+                                for packet in packets {
+                                    #[cfg(feature = "daita")]
+                                    let packet = match peer.daita.as_mut() {
+                                        Some(daita) => daita.on_normal_sent(packet),
+                                        None => packet.into(),
+                                    };
+                                    #[cfg(not(feature = "daita"))]
+                                    let packet = packet.into();
+                                    peer.tunnel
+                                        .queue_outgoing_packet(packet, Some(&mut tun_mtu));
+                                }
+                                break;
+                            }
 
-                        let (lane, slot) = outgoing_order
-                            .reserve(peer_key)
-                            .expect("the producer chunks fit within the peer order window");
-                        let prepared = peer
-                            .tunnel
-                            .prepare_outgoing_packet(packet, Some(&mut tun_mtu));
-                        if let Some(PreparedOutgoing::Ready(packet)) = prepared.as_ref() {
-                            Self::register_handshake_idx(
-                                &device_guard.peers_by_idx,
-                                packet,
-                                &peer_arc,
+                            let available = outgoing_order.available(peer_key);
+                            if available == 0 {
+                                let lane = outgoing_order.lane(peer_key);
+                                drop(peer);
+                                drop(device_guard);
+                                if let Some(lane) = lane {
+                                    tokio::select! {
+                                        _ = lane.wait_for_capacity() => {}
+                                        _ = pending.next(), if !pending.is_empty() => {}
+                                    }
+                                }
+                                continue;
+                            }
+                            let run_len = packets.len().min(CRYPTO_CHUNK_SIZE).min(available);
+                            let mut prepared = Vec::with_capacity(run_len);
+                            let mut handshake_offset = None;
+                            let mut flush_guard = None;
+
+                            for _ in 0..run_len {
+                                let packet = packets.next().expect("the run length fits its input");
+                                #[cfg(feature = "daita")]
+                                let packet = match peer.daita.as_mut() {
+                                    Some(daita) => daita.on_normal_sent(packet),
+                                    None => packet.into(),
+                                };
+                                #[cfg(not(feature = "daita"))]
+                                let packet = packet.into();
+
+                                let Some(prepared_packet) = peer
+                                    .tunnel
+                                    .prepare_outgoing_packet(packet, Some(&mut tun_mtu))
+                                else {
+                                    prepared.push(None);
+                                    continue;
+                                };
+
+                                if let PreparedOutgoing::Ready(packet) = &prepared_packet {
+                                    Self::register_handshake_idx(
+                                        &device_guard.peers_by_idx,
+                                        packet,
+                                        &peer_arc,
+                                    );
+                                    handshake_offset = Some(prepared.len());
+                                    flush_guard = Some(outgoing_order.begin_flush(peer_key));
+                                }
+                                prepared.push(Some(prepared_packet));
+                                if handshake_offset.is_some() {
+                                    break;
+                                }
+                            }
+
+                            let (lane, first_slot) = outgoing_order
+                                .reserve_run(peer_key, prepared.len())
+                                .expect("the prepared run fits in the peer order window");
+                            drop(peer);
+                            drop(device_guard);
+
+                            let batch_count = prepared.len().div_ceil(CRYPTO_BATCH_SIZE);
+                            while pending.len() + batch_count > CRYPTO_CHUNK_SIZE {
+                                pending
+                                    .next()
+                                    .await
+                                    .expect("a full outgoing run has a completion future");
+                            }
+                            let force_worker = multiple_peer_runs && prepared.len() > 1;
+                            Self::enqueue_outgoing_run(
+                                &mut pending,
+                                crypto.clone(),
+                                Arc::clone(&outgoing_order),
+                                Arc::clone(&peer_arc),
+                                peer_key,
+                                Arc::clone(&lane),
+                                first_slot,
+                                peer_addr,
+                                prepared,
+                                udp.clone(),
+                                Arc::clone(&send_many_buf),
+                                true,
+                                force_worker,
                             );
-                        }
 
-                        drop(peer);
-                        drop(device_guard);
-                        while pending.len() >= CRYPTO_CHUNK_SIZE {
-                            pending
-                                .next()
-                                .await
-                                .expect("a full crypto chunk has a completion future");
+                            if let (Some(offset), Some(flush_guard)) =
+                                (handshake_offset, flush_guard)
+                            {
+                                Self::flush_handshake_queue(
+                                    device.clone(),
+                                    Arc::clone(&peer_arc),
+                                    peer_key,
+                                    lane,
+                                    first_slot + offset as u64,
+                                    peer_addr,
+                                    udp.clone(),
+                                    Arc::clone(&send_many_buf),
+                                    crypto.clone(),
+                                    Arc::clone(&outgoing_order),
+                                    &mut pending,
+                                    flush_guard,
+                                )
+                                .await?;
+                            }
                         }
-                        Self::enqueue_outgoing_packet(
-                            &mut pending,
-                            crypto.clone(),
-                            Arc::clone(&outgoing_order),
-                            Arc::clone(&peer_arc),
-                            peer_key,
-                            lane,
-                            slot,
-                            peer_addr,
-                            prepared,
-                            udp.clone(),
-                            true,
-                        );
                     }
                 }
             }
@@ -1456,6 +1840,31 @@ impl<T: DeviceTransports> Connection<T> {
 
         join!(incoming.stop(), timers.stop(), outgoing.stop(),);
         crypto_workers.stop().await;
+    }
+}
+
+#[cfg(test)]
+mod peer_run_tests {
+    //! Tests for grouping packets into bounded per-peer runs.
+
+    use super::group_by_key;
+
+    /// Interleaved packets keep their per-peer order while sharing one peer-owned run.
+    #[test]
+    fn groups_interleaved_packets_by_peer_without_reordering_peer_packets() {
+        let groups = group_by_key([
+            (2_usize, (), 0_u8),
+            (1_usize, (), 10_u8),
+            (2_usize, (), 1_u8),
+            (1_usize, (), 11_u8),
+        ]);
+        let mut groups = groups
+            .into_iter()
+            .map(|(peer, (), packets)| (peer, packets))
+            .collect::<Vec<_>>();
+        groups.sort_unstable_by_key(|(peer, _)| *peer);
+
+        assert_eq!(groups, vec![(1, vec![10, 11]), (2, vec![0, 1])]);
     }
 }
 

@@ -53,6 +53,12 @@ impl PreparedEncryption {
         self.packet.as_bytes().len()
     }
 
+    /// Return the packet's writable backing address for allocation-reuse tests.
+    #[cfg(test)]
+    pub(crate) fn packet_buffer_ptr(&self) -> *const u8 {
+        self.packet.as_bytes().as_ptr()
+    }
+
     /// Whether the plaintext is a keepalive.
     pub(crate) fn is_keepalive(&self) -> bool {
         self.packet.is_keepalive()
