@@ -1405,6 +1405,100 @@ mod tests {
         assert!(lane.is_idle());
     }
 
+    /// A completed run waiting for the delivery lock must not count as unfinished AEAD work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adaptive_dispatch_ignores_completed_crypto_waiting_for_delivery_lock() {
+        let lane = Arc::new(OrderedCompletions::<()>::default());
+        let first_slot = lane
+            .reserve_run(super::PARALLEL_DISPATCH_HIGH_WATER)
+            .expect("the first run fits the peer's window");
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let release_rx = Arc::new(tokio::sync::Mutex::new(Some(release_rx)));
+        let (delivering_tx, mut delivering_rx) = tokio::sync::mpsc::unbounded_channel();
+        let first_lane = Arc::clone(&lane);
+        let first_release_rx = Arc::clone(&release_rx);
+        let first_completion = tokio::spawn(async move {
+            first_lane
+                .complete_run(
+                    first_slot,
+                    vec![Some(()); super::PARALLEL_DISPATCH_HIGH_WATER],
+                    move |_| {
+                        let release_rx = Arc::clone(&first_release_rx);
+                        let delivering_tx = delivering_tx.clone();
+                        async move {
+                            delivering_tx
+                                .send(())
+                                .expect("the test is waiting for ordered delivery");
+                            let release_rx = release_rx
+                                .lock()
+                                .await
+                                .take()
+                                .expect("the earlier ordered send waits once");
+                            release_rx
+                                .await
+                                .expect("the test releases the earlier ordered send");
+                            Ok::<_, ()>(())
+                        }
+                    },
+                )
+                .await
+        });
+        delivering_rx
+            .recv()
+            .await
+            .expect("the earlier run reached ordered output");
+
+        let completed_slot = lane
+            .reserve_run(super::PARALLEL_DISPATCH_HIGH_WATER)
+            .expect("the next run fits behind the earlier ordered send");
+        let (waiting_tx, mut waiting_rx) = tokio::sync::mpsc::unbounded_channel();
+        let completed_lane = Arc::clone(&lane);
+        let completed_run = tokio::spawn(async move {
+            let mut completion = Box::pin(completed_lane.complete_run(
+                completed_slot,
+                vec![Some(()); super::PARALLEL_DISPATCH_HIGH_WATER],
+                |_| async { Ok::<_, ()>(()) },
+            ));
+            assert!(futures::poll!(&mut completion).is_pending());
+            waiting_tx
+                .send(())
+                .expect("the test is waiting for the blocked completion");
+            completion.await
+        });
+        waiting_rx
+            .recv()
+            .await
+            .expect("the completed run is waiting for ordered delivery");
+
+        let next_slot = lane
+            .reserve_run(MIN_PARALLEL_RUN_SIZE)
+            .expect("the next dispatch decision fits the peer's window");
+        assert!(
+            !lane.should_force_worker(MIN_PARALLEL_RUN_SIZE),
+            "delivery-lock wait must not look like outstanding AEAD work"
+        );
+
+        release_tx
+            .send(())
+            .expect("the earlier ordered send is still waiting");
+        first_completion
+            .await
+            .expect("the earlier completion task succeeds")
+            .expect("the earlier delivery succeeds");
+        completed_run
+            .await
+            .expect("the later completion task succeeds")
+            .expect("the later delivery succeeds");
+        lane.complete_run(
+            next_slot,
+            vec![Some(()); MIN_PARALLEL_RUN_SIZE],
+            |_| async { Ok::<_, ()>(()) },
+        )
+        .await
+        .expect("the next ordered delivery succeeds");
+        assert!(lane.is_idle());
+    }
+
     /// Keep a ready read run contiguous through one worker handoff and ordered release.
     #[test]
     fn ordered_run_uses_the_full_worker_batch_bound() {
