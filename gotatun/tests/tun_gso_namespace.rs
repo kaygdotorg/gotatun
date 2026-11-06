@@ -282,10 +282,7 @@ async fn start_echo_servers() -> Result<(), Box<dyn std::error::Error>> {
             };
             tokio::spawn(async move {
                 let mut bytes = [0; 8192];
-                loop {
-                    let Ok(length) = stream.read(&mut bytes).await else {
-                        break;
-                    };
+                while let Ok(length) = stream.read(&mut bytes).await {
                     if length == 0 || stream.write_all(&bytes[..length]).await.is_err() {
                         break;
                     }
@@ -311,7 +308,7 @@ async fn start_echo_servers() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     let target = (Ipv4Addr::new(10, 77, 0, 2), TCP_ECHO_PORT);
     let tcp = timeout(Duration::from_secs(15), TcpStream::connect(target)).await??;
-    let payload: Vec<u8> = (0..2 * 1024 * 1024)
+    let payload: Vec<u8> = (0..8 * 1024 * 1024)
         .map(|index| (index % 251) as u8)
         .collect();
     let send_payload = payload.clone();
@@ -351,9 +348,16 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     for datagram in &datagrams {
         udp.send(datagram).await?;
     }
-    for expected in &datagrams {
+    for (sequence, expected) in datagrams.iter().enumerate() {
         let mut received = vec![0; 1200];
-        let length = timeout(Duration::from_secs(10), udp.recv(&mut received)).await??;
+        let length = timeout(Duration::from_secs(10), udp.recv(&mut received))
+            .await
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("UDP echo datagram {sequence} timed out: {error}"),
+                )
+            })??;
         assert_eq!(
             &received[..length],
             expected,
@@ -389,13 +393,10 @@ fn assert_output_ok(operation: &str, output: Output) -> Result<(), Box<dyn std::
     if output.status.success() {
         return Ok(());
     }
-    Err(io::Error::new(
-        io::ErrorKind::Other,
-        format!(
-            "{operation} failed with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ),
-    )
+    Err(io::Error::other(format!(
+        "{operation} failed with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    ))
     .into())
 }

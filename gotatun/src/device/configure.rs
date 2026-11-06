@@ -165,7 +165,10 @@ impl<T: DeviceTransports> DeviceRead<'_, T> {
     pub async fn peers(&self) -> Vec<PeerStats> {
         let mut peers = vec![];
         for (pubkey, peer) in self.device.peers.iter() {
-            let p = peer.lock().await;
+            let peer_key = super::peer_order_key(peer);
+            let mut peer_trace = super::PeerLockDiagnostic::waiting("device_read_peers", peer_key);
+            let p =
+                super::lock_peer_state(peer, "device_read_peers", peer_key, &mut peer_trace).await;
 
             #[cfg(feature = "daita")]
             let daita = p.daita_settings().cloned();
@@ -319,7 +322,15 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
         };
 
         let existing_peer_arc = Arc::clone(existing_peer);
-        let mut existing_peer = existing_peer_arc.lock().await;
+        let peer_key = super::peer_order_key(&existing_peer_arc);
+        let mut peer_trace = super::PeerLockDiagnostic::waiting("device_modify_peer", peer_key);
+        let mut existing_peer = super::lock_peer_state(
+            &existing_peer_arc,
+            "device_modify_peer",
+            peer_key,
+            &mut peer_trace,
+        )
+        .await;
 
         let mut peer_mut = PeerMut::default();
         f(&mut peer_mut);
@@ -353,24 +364,11 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
 
         existing_peer.update_allowed_ips(clear_allowed_ips, add_allowed_ips);
 
-        // Update device.peers_by_ip by clearing all entries that refer to this peer and
-        // adding them again.
-        let mut remove_list = vec![];
-        for (peer, ip_network) in self.device.peers_by_ip.iter() {
-            if Arc::ptr_eq(&existing_peer_arc, peer) {
-                remove_list.push(ip_network);
-            }
-        }
-        for network in remove_list {
-            self.device.peers_by_ip.remove_network(network);
-        }
-        for allowed_ip in existing_peer.allowed_ips() {
-            self.device.peers_by_ip.insert(
-                allowed_ip.network(),
-                allowed_ip.prefix(),
-                Arc::clone(&existing_peer_arc),
-            );
-        }
+        // Peer state is locked before the synchronous route index, matching packet-side
+        // revalidation and keeping a configuration writer from holding the index while waiting.
+        self.device
+            .packet_lookup
+            .replace_allowed_ips(&existing_peer_arc, existing_peer.allowed_ips());
 
         true
     }

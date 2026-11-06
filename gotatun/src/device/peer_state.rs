@@ -10,7 +10,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-//! Stores per-peer tunnel state and compact route metadata; packet routing uses the device trie.
+//! Stores per-peer tunnel state and compact route metadata; packet routing uses the shared lookup trie.
 
 use ipnetwork::IpNetwork;
 
@@ -21,10 +21,10 @@ use tokio::sync::watch;
 #[cfg(feature = "daita")]
 use crate::device::daita::{DaitaHooks, DaitaSettings};
 use crate::noise::errors::WireGuardError;
-use crate::noise::{Tunn, TunnResult};
+use crate::noise::{Tunn, TunnResult, VerifiedDecryption};
 #[cfg(feature = "daita")]
 use crate::packet;
-use crate::packet::{Packet, WgHandshakeInit, WgKind};
+use crate::packet::{Packet, WgData, WgHandshakeInit, WgKind};
 #[cfg(feature = "daita")]
 use crate::tun::MtuWatcher;
 #[cfg(feature = "daita")]
@@ -113,6 +113,27 @@ impl PeerState {
         result
     }
 
+    /// Apply the tunnel bookkeeping after a worker decrypts an incoming data packet.
+    pub(crate) fn complete_incoming_data(
+        &mut self,
+        result: Result<VerifiedDecryption, WireGuardError>,
+        addr: SocketAddr,
+    ) -> TunnResult {
+        let result = self.tunnel.complete_incoming_packet(result);
+        if matches!(result, TunnResult::WriteToTunnel(_)) {
+            self.endpoint.addr = Some(addr);
+        }
+        result
+    }
+
+    /// Prepare a data packet for parallel decryption under its selected session.
+    pub(crate) fn prepare_incoming_data(
+        &mut self,
+        packet: Packet<WgData>,
+    ) -> crate::noise::PreparedIncoming {
+        self.tunnel.prepare_incoming_packet(WgKind::Data(packet))
+    }
+
     /// Subscribe to completions of handshakes that we initiated.
     ///
     /// The receiver only sees completions that happen after this call.
@@ -132,7 +153,10 @@ impl PeerState {
         tun_rx_mtu: MtuWatcher,
         udp_tx: US,
     ) -> Result<(), super::Error> {
-        let mut peer_g = peer.lock().await;
+        let peer_key = super::peer_order_key(peer);
+        let mut peer_trace = super::PeerLockDiagnostic::waiting("daita_setup", peer_key);
+        let mut peer_g =
+            super::lock_peer_state(peer, "daita_setup", peer_key, &mut peer_trace).await;
         let Some(daita_settings) = peer_g.daita_settings.clone() else {
             // No DAITA settings; disabled
             return Ok(());
