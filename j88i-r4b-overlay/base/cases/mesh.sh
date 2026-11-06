@@ -298,6 +298,7 @@ start_kernel_plain() {
     # Build the native WireGuard data path directly, without a coordinating daemon.
     mkdir -p "$D/keys"
     python3 -I "$H2H_KIT/lib/gotatun_uapi.py" keys "$D/keys"
+    python3 -I "$H2H_KIT/lib/wg_cli_keys.py" "$D/keys"
     START=$("$H" now)
     ip -n h2h-a link add wgA type wireguard
     ip -n h2h-b link add wgB type wireguard
@@ -306,16 +307,16 @@ start_kernel_plain() {
     ip -n h2h-b addr add 10.66.0.2/24 dev wgB
     ip -n h2h-b link set wgB mtu 1420 up
     ip netns exec h2h-a "$H2H_BIN/wg" set wgA \
-        private-key "$D/keys/a.private" listen-port 51820 \
-        peer "$(cat "$D/keys/b.public")" endpoint 10.220.0.2:51821 \
+        private-key "$D/keys/a.wg.private" listen-port 51820 \
+        peer "$(cat "$D/keys/b.wg.public")" endpoint 10.220.0.2:51821 \
         allowed-ips 10.66.0.2/32
     ip netns exec h2h-b "$H2H_BIN/wg" set wgB \
-        private-key "$D/keys/b.private" listen-port 51821 \
-        peer "$(cat "$D/keys/a.public")" endpoint 10.220.0.1:51820 \
+        private-key "$D/keys/b.wg.private" listen-port 51821 \
+        peer "$(cat "$D/keys/a.wg.public")" endpoint 10.220.0.1:51820 \
         allowed-ips 10.66.0.1/32
     ip netns exec h2h-a "$H2H_BIN/wg" show wgA
     ip netns exec h2h-b "$H2H_BIN/wg" show wgB
-    rm -f "$D/keys/"*.private
+    rm -f "$D/keys/"*.private "$D/keys/"*.public "$D/keys/"*.wg.private "$D/keys/"*.wg.public
     TUN_A=wgA
     TUN_B=wgB
     PEER=10.66.0.2
