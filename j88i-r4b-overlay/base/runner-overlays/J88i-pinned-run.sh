@@ -9,6 +9,7 @@ mode=$3
 label=$4
 plan=$5
 mkdir -p "$out"
+source "$(dirname -- "${BASH_SOURCE[0]}")/J88i-cpuset-state.sh"
 side_a=${H2H_CPUSET_A:-1-2}
 side_b=${H2H_CPUSET_B:-3-4}
 housekeeping=${H2H_CPUSET_HOUSEKEEPING:-0,5}
@@ -152,8 +153,9 @@ restore() {
             cpus=$(unit_cpus "$unit" cpuset.cpus) || rc=1
             effective=$(unit_cpus "$unit" cpuset.cpus.effective) || rc=1
             paths=$(systemctl show "$unit" -p DropInPaths --value)
-            [[ $cpus == "${old_cpuset[$unit]}" && $effective == "${old_effective[$unit]}" && \
-               $paths == "${old_dropins[$unit]}" ]] || rc=1
+            cpuset_state_matches "$cpus" "${old_cpuset[$unit]}" \
+                "$effective" "${old_effective[$unit]}" || rc=1
+            [[ $paths == "${old_dropins[$unit]}" ]] || rc=1
         done
         for irq in "${host_net_irqs[@]}"; do
             [[ $(cat "/proc/irq/$irq/smp_affinity_list") == "${old_irq_affinity[$irq]}" ]] || rc=1

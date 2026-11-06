@@ -10,6 +10,7 @@ irq_manifest=${4:-}
 cgroup_root=${J88I_CGROUP_ROOT:-/sys/fs/cgroup}
 results=()
 failed=0
+source "$(dirname -- "${BASH_SOURCE[0]}")/J88i-cpuset-state.sh"
 
 # Decode the manifest marker used for empty cpuset and DropInPaths values.
 manifest_value() {
@@ -28,8 +29,8 @@ if [[ -n $cgroup_manifest ]]; then
         effective=$(cat "$cgroup/cpuset.cpus.effective")
         actual_group=$(systemctl show "$unit" -p ControlGroup --value)
         dropins=$(systemctl show "$unit" -p DropInPaths --value)
-        if [[ $actual_group != "$group" || $cpus != "$expected_cpus" || \
-              $effective != "$expected_effective" || $dropins != "$expected_dropins" ]]; then
+        if [[ $actual_group != "$group" || $dropins != "$expected_dropins" ]] || \
+           ! cpuset_state_matches "$cpus" "$expected_cpus" "$effective" "$expected_effective"; then
             printf '%s restoration failed: cgroup=%s expected=%s cpuset.cpus=%s expected=%s cpuset.cpus.effective=%s expected=%s DropInPaths=%s expected=%s\n' \
                 "$unit" "$actual_group" "$group" "$cpus" "$expected_cpus" \
                 "$effective" "$expected_effective" "$dropins" "$expected_dropins" >&2

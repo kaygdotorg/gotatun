@@ -14,7 +14,11 @@ from pathlib import Path
 class CpusetRestoreTest(unittest.TestCase):
     """Exercise the real restore verifier against isolated cgroup fixtures."""
 
-    def run_verifier(self, configured_cpus: str) -> subprocess.CompletedProcess[str]:
+    def run_verifier(
+        self,
+        configured_cpus: str,
+        effective_cpus: str = "0-5",
+    ) -> subprocess.CompletedProcess[str]:
         """Verify one cpuset state using a temporary cgroup tree and systemctl stub."""
         verifier = Path(__file__).parent / "base/runner-overlays/J88i-verify-restored.sh"
         with tempfile.TemporaryDirectory(prefix="j88i-cpuset-restore-") as temporary:
@@ -22,7 +26,7 @@ class CpusetRestoreTest(unittest.TestCase):
             cgroup = root / "cgroup/init.scope"
             cgroup.mkdir(parents=True)
             (cgroup / "cpuset.cpus").write_text(configured_cpus)
-            (cgroup / "cpuset.cpus.effective").write_text("0-5")
+            (cgroup / "cpuset.cpus.effective").write_text(effective_cpus)
 
             binary_dir = root / "bin"
             binary_dir.mkdir()
@@ -65,12 +69,19 @@ class CpusetRestoreTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("cpuset.cpus= cpuset.cpus.effective=0-5", result.stdout)
 
-    def test_changed_configured_cpuset_does_not_pass_on_effective_mask_alone(self) -> None:
-        """Changing an originally empty configured mask fails even if effective CPUs match."""
+    def test_explicit_full_mask_is_accepted_when_systemd_reverts_inherited_baseline(self) -> None:
+        """A full configured mask is equivalent when the live effective mask is still 0-5."""
         result = self.run_verifier("0-5")
 
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("cpuset.cpus=0-5 cpuset.cpus.effective=0-5", result.stdout)
+
+    def test_narrow_live_cpuset_does_not_pass_when_effective_mask_changes(self) -> None:
+        """The verifier rejects a real live mask that no longer allows every CPU."""
+        result = self.run_verifier("1-4", "1-4")
+
         self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertIn("cpuset.cpus=0-5 expected=", result.stderr)
+        self.assertIn("cpuset.cpus.effective=1-4 expected=0-5", result.stderr)
 
 
 if __name__ == "__main__":
