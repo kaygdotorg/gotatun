@@ -80,6 +80,51 @@ Heap attribution and candidate results are pending. The temporary diagnostic
 binary uses the existing optional jemalloc feature and reports allocator bins;
 it is separate from the shipping-system-allocator timing binary.
 
+## Matched-build baseline and calibration blocker
+
+The reused diagnostic executable above has SHA-256
+`15a9bfd659ce2a74f7c58acc22c644b7b239de5fba12be85a10e53d640ee41e9`.
+The baseline rebuilt for pairing with the candidate has SHA-256
+`84e342a623596f5bac78156018e0df3753498c930f7f4f82fdb73e06a809b8b7`.
+Both identify the same source base; they are separate artifacts. Only the
+second baseline is suitable for the candidate's matching build comparison.
+It uses the fork flake's rustc 1.95.0 (`59807616e`, LLVM 22.1.2), existing
+release LTO/codegen settings and the system allocator. Compiler evidence:
+compute01 `/home/claude/j324-evidence/compiler.txt`.
+
+| Peers/endpoint | Idle RSS MiB | Loaded RSS MiB | Sampled peak MiB | Recovered MiB | Idle CPU % |
+|---|---:|---:|---:|---:|---:|
+| 1 | 9.125 | 30.043 | 33.086 | 11.242 | 0.0 |
+| 100 | 11.641 | 31.871 | 32.105 | 11.805 | 0.0 |
+| 1,000 | 15.914 | 35.156 | 36.477 | 15.688 | 0.4 |
+
+Artifacts: perf VM `/home/claude/j324/evidence/base-built/base/mesh-gotatun`,
+`base-built-console.log` (exit 0), and `memory-summary.md`. These remain
+memory diagnostics under the same method, with zero forwarding disk-write
+bytes measured during each load phase. The short idle sample counts CPU ticks;
+its 0.0/0.4% variation is not evidence of an idle-CPU optimization.
+
+Three separate short control windows with that rebuilt binary all passed
+case cleanup and CPU audits, but **failed calibration**:
+
+| Gated metric | 1-flow spread | Limit | 8-flow spread | Limit |
+|---|---:|---:|---:|---:|
+| Throughput | 1.995% | 1.6% | 0.327% | 0.8% |
+| Loss-aware p99 | 17.625% | 3.2% | 11.290% | 5.9% |
+
+Evidence: `/home/claude/j324/evidence/calibration-built/spread.json`, raw rows
+under `calibration-built-control-{a,b,c}`, and their post-scope restore receipts.
+The runner's summary invocation had a renamed-file typo; running the unchanged
+`lib/calibration_spread.py` on the completed rows wrote the report above and
+returned 1. No timing sample was rerun or discarded to repair that typo.
+
+The earlier reused-binary calibration also failed (1-flow p99 11.575%,
+8-flow throughput 2.186%); its first case additionally observed an unrelated
+process in the machine diff. Those artifacts remain in `calibration/` and
+`calibration-control-{a,b,c}`. No candidate performance acceptance is enabled.
+The implementation and memory diagnostics can proceed, but neither
+throughput/p99 non-regression nor a CPU win can be claimed from this setup.
+
 ## Reproduction
 
 `scale-overlay.patch` applies to `cases/mesh.sh` in the existing J88i pinned
