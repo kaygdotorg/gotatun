@@ -23,7 +23,7 @@ use crate::tun::tun_async_device::virtio::VirtioNetHeader;
 use bytes::BytesMut;
 use duplicate::duplicate_item;
 use either::Either;
-use libc::{TUN_F_CSUM, TUN_F_TSO4, TUN_F_TSO6, TUNSETOFFLOAD};
+use libc::{TUN_F_CSUM, TUN_F_TSO4, TUN_F_TSO6, TUN_F_USO4, TUN_F_USO6, TUNSETOFFLOAD};
 use std::mem::offset_of;
 use std::{io, os::fd::AsRawFd};
 use zerocopy::{FromBytes, IntoBytes};
@@ -35,6 +35,22 @@ use zerocopy::{FromBytes, IntoBytes};
 /// <https://github.com/torvalds/linux/blob/f443e374ae131c168a065ea1748feac6b2e76613/drivers/net/tun.c#L2803>
 pub fn try_enable_tso(tun: &impl AsRawFd) -> io::Result<()> {
     let offload_flags = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6;
+    set_tun_offloads(tun, offload_flags)
+}
+
+/// Request TCP and UDP segmentation offloads on a Linux TUN device.
+///
+/// The caller enables the TCP flags first, then calls this with the UDP flags added. Keeping the
+/// requests separate lets kernels before UDP L4 segmentation preserve their TCP TSO support.
+pub fn try_enable_udp_segmentation(tun: &impl AsRawFd) -> io::Result<()> {
+    let offload_flags = TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6 | TUN_F_USO4 | TUN_F_USO6;
+    set_tun_offloads(tun, offload_flags)
+}
+
+/// Apply the complete Linux TUN offload mask to `tun`.
+///
+/// `TUNSETOFFLOAD` replaces the descriptor's mask, so callers must repeat flags they want to keep.
+fn set_tun_offloads(tun: &impl AsRawFd, offload_flags: u32) -> io::Result<()> {
     let tun_fd = tun.as_raw_fd();
 
     // SAFETY: `TUNSETOFFLOAD` takes this integer bitmask, not a pointer. The ioctl validates
@@ -237,8 +253,315 @@ pub(super) fn new_tso_iter_from_vnet(mut frame: Packet<[u8]>) -> io::Result<TsoI
             }
             new_tso_iter_ipv6(tcp.into(), gso_size)
         }
+        5 => {
+            if raw_gso_type & 0x80 != 0 {
+                return Err(invalid_vnet("UDP-L4 GSO cannot set the TCP ECN flag"));
+            }
+            new_uso_iter_from_vnet(
+                packet,
+                header_len,
+                gso_size,
+                flags.needs_csum(),
+                csum_start,
+                csum_offset,
+            )
+        }
         _ => Err(invalid_vnet("unsupported TUN GSO type")),
     }
+}
+
+/// The IP header fields that a UDP-L4 GSO segment must update.
+#[derive(Clone, Copy)]
+pub(super) enum UdpGsoIpVersion {
+    Ipv4 {
+        ip_header_len: usize,
+        checksum_udp: bool,
+    },
+    Ipv6,
+}
+
+/// Validate a UDP-L4 virtio frame and return its ordered software segments.
+///
+/// IPv6 extension headers are rejected until their UDP offset can be parsed safely.
+fn new_uso_iter_from_vnet(
+    packet: Packet<[u8]>,
+    header_len: usize,
+    gso_size: usize,
+    needs_csum: bool,
+    csum_start: usize,
+    csum_offset: usize,
+) -> io::Result<TsoIter> {
+    if gso_size == 0 {
+        return Err(invalid_vnet("UDP-L4 GSO size must be nonzero"));
+    }
+
+    match packet.as_ref().first().map(|byte| byte >> 4) {
+        Some(4) => new_uso_iter_ipv4(
+            packet,
+            header_len,
+            gso_size,
+            needs_csum,
+            csum_start,
+            csum_offset,
+        ),
+        Some(6) => new_uso_iter_ipv6(
+            packet,
+            header_len,
+            gso_size,
+            needs_csum,
+            csum_start,
+            csum_offset,
+        ),
+        _ => Err(invalid_vnet("UDP-L4 GSO metadata on a non-IP packet")),
+    }
+}
+
+/// Validate IPv4 UDP-L4 metadata and prepare the ordered output segments.
+///
+/// A zero UDP checksum stays zero unless the virtio header requests checksum completion.
+fn new_uso_iter_ipv4(
+    packet: Packet<[u8]>,
+    header_len: usize,
+    gso_size: usize,
+    needs_csum: bool,
+    csum_start: usize,
+    csum_offset: usize,
+) -> io::Result<TsoIter> {
+    let (ip_header, ip_header_len, total_len) = ipv4_header_and_lengths(packet.as_ref())?;
+    if ip_header.fragment_offset() != 0 || ip_header.more_fragments() {
+        return Err(invalid_vnet(
+            "UDP-L4 GSO metadata on a fragmented IPv4 packet",
+        ));
+    }
+    if ip_header.next_protocol() != IpNextProtocol::Udp {
+        return Err(invalid_vnet("UDP-L4 GSO metadata on a non-UDP IPv4 packet"));
+    }
+
+    let udp_bytes = &packet.as_ref()[ip_header_len..total_len];
+    let udp = Udp::<[u8]>::ref_from_bytes(udp_bytes)
+        .map_err(|_| invalid_vnet("truncated UDP-L4 IPv4 packet"))?;
+    let udp_len = usize::from(udp.header.length.get());
+    if udp_len != 0 && udp_len != udp_bytes.len() {
+        return Err(invalid_vnet("invalid UDP-L4 IPv4 length"));
+    }
+    if needs_csum && (csum_start != ip_header_len || csum_offset != offset_of!(UdpHeader, checksum))
+    {
+        return Err(invalid_vnet("invalid UDP-L4 IPv4 checksum metadata"));
+    }
+
+    let checksum_udp = needs_csum || udp.header.checksum.get() != 0;
+    new_udp_gso_iter(
+        packet,
+        ip_header_len,
+        total_len,
+        header_len,
+        gso_size,
+        UdpGsoIpVersion::Ipv4 {
+            ip_header_len,
+            checksum_udp,
+        },
+    )
+}
+
+/// Validate IPv6 UDP-L4 metadata and prepare the ordered output segments.
+///
+/// The current parser accepts a direct UDP next-header and rejects extension headers.
+fn new_uso_iter_ipv6(
+    packet: Packet<[u8]>,
+    header_len: usize,
+    gso_size: usize,
+    needs_csum: bool,
+    csum_start: usize,
+    csum_offset: usize,
+) -> io::Result<TsoIter> {
+    let ip_bytes = packet
+        .as_ref()
+        .get(..Ipv6Header::LEN)
+        .ok_or_else(|| invalid_vnet("truncated UDP-L4 IPv6 header"))?;
+    let ip_header = Ipv6Header::ref_from_bytes(ip_bytes)
+        .map_err(|_| invalid_vnet("malformed UDP-L4 IPv6 header"))?;
+    if ip_header.version() != 6 {
+        return Err(invalid_vnet("UDP-L4 metadata on a non-IPv6 packet"));
+    }
+    if ip_header.next_header != IpNextProtocol::Udp {
+        return Err(invalid_vnet(
+            "UDP-L4 GSO with IPv6 extension headers is unsupported",
+        ));
+    }
+
+    let total_len = Ipv6Header::LEN + usize::from(ip_header.payload_length.get());
+    if total_len > packet.len() || total_len < Ipv6Header::LEN + UdpHeader::LEN {
+        return Err(invalid_vnet("invalid UDP-L4 IPv6 payload length"));
+    }
+    let udp_bytes = &packet.as_ref()[Ipv6Header::LEN..total_len];
+    let udp = Udp::<[u8]>::ref_from_bytes(udp_bytes)
+        .map_err(|_| invalid_vnet("truncated UDP-L4 IPv6 packet"))?;
+    let udp_len = usize::from(udp.header.length.get());
+    if udp_len != 0 && udp_len != udp_bytes.len() {
+        return Err(invalid_vnet("invalid UDP-L4 IPv6 length"));
+    }
+    if needs_csum
+        && (csum_start != Ipv6Header::LEN || csum_offset != offset_of!(UdpHeader, checksum))
+    {
+        return Err(invalid_vnet("invalid UDP-L4 IPv6 checksum metadata"));
+    }
+
+    new_udp_gso_iter(
+        packet,
+        Ipv6Header::LEN,
+        total_len,
+        header_len,
+        gso_size,
+        UdpGsoIpVersion::Ipv6,
+    )
+}
+
+/// Split a validated UDP superframe while reusing one output buffer for every segment.
+fn new_udp_gso_iter(
+    mut packet: Packet<[u8]>,
+    ip_header_len: usize,
+    total_len: usize,
+    header_len: usize,
+    gso_size: usize,
+    ip_version: UdpGsoIpVersion,
+) -> io::Result<TsoIter> {
+    let expected_header_len = ip_header_len + UdpHeader::LEN;
+    if header_len != expected_header_len {
+        return Err(invalid_vnet("invalid UDP-L4 GSO header length"));
+    }
+
+    packet.truncate(total_len);
+    let headers = Packet::from_bytes(packet.buf_mut().split_to(expected_header_len));
+    let payload = packet;
+    if payload.len() <= gso_size {
+        let mut buf = BytesMut::with_capacity(expected_header_len + payload.len());
+        let packet =
+            build_udp_gso_segment(&mut buf, headers.as_ref(), payload.as_ref(), 0, ip_version);
+        return Ok(single_packet(packet));
+    }
+
+    let capacity = expected_header_len
+        .checked_add(gso_size)
+        .ok_or_else(|| invalid_vnet("UDP-L4 GSO packet size overflow"))?;
+    Ok(TsoIter::CoalescedUdp {
+        buf: BytesMut::with_capacity(capacity),
+        i: 0,
+        segment_payload_len: gso_size,
+        headers,
+        payload,
+        ip_version,
+    })
+}
+
+/// Rebuild one UDP segment's network and transport headers around its payload.
+fn build_udp_gso_segment(
+    buf: &mut BytesMut,
+    headers: &[u8],
+    payload: &[u8],
+    segment_index: usize,
+    ip_version: UdpGsoIpVersion,
+) -> Packet<Ip> {
+    match ip_version {
+        UdpGsoIpVersion::Ipv4 {
+            ip_header_len,
+            checksum_udp,
+        } => build_ipv4_udp_segment(
+            buf,
+            headers,
+            ip_header_len,
+            payload,
+            segment_index,
+            checksum_udp,
+        ),
+        UdpGsoIpVersion::Ipv6 => build_ipv6_udp_segment(buf, headers, payload),
+    }
+}
+
+/// Rebuild one IPv4 UDP segment, including its lengths, ID and checksums.
+fn build_ipv4_udp_segment(
+    buf: &mut BytesMut,
+    headers: &[u8],
+    ip_header_len: usize,
+    payload: &[u8],
+    segment_index: usize,
+    checksum_udp: bool,
+) -> Packet<Ip> {
+    buf.clear();
+    buf.extend_from_slice(headers);
+    buf.extend_from_slice(payload);
+
+    let total_len = u16::try_from(buf.len()).expect("a UDP-L4 IPv4 segment fits in the input");
+    let total_len_offset = offset_of!(Ipv4Header, total_len);
+    buf[total_len_offset..total_len_offset + 2].copy_from_slice(&total_len.to_be_bytes());
+
+    let identification_offset = offset_of!(Ipv4Header, identification);
+    let identification = u16::from_be_bytes(
+        buf[identification_offset..identification_offset + 2]
+            .try_into()
+            .expect("fixed IPv4 identification field"),
+    );
+    buf[identification_offset..identification_offset + 2].copy_from_slice(
+        &identification
+            .wrapping_add(segment_index as u16)
+            .to_be_bytes(),
+    );
+
+    let udp_len = u16::try_from(UdpHeader::LEN + payload.len())
+        .expect("a UDP-L4 IPv4 segment fits in the input UDP length");
+    let udp_len_offset = ip_header_len + offset_of!(UdpHeader, length);
+    buf[udp_len_offset..udp_len_offset + 2].copy_from_slice(&udp_len.to_be_bytes());
+    let udp_checksum_offset = ip_header_len + offset_of!(UdpHeader, checksum);
+    buf[udp_checksum_offset..udp_checksum_offset + 2].fill(0);
+    if checksum_udp {
+        let ip = Ipv4Header::ref_from_bytes(&buf[..ip_header_len])
+            .expect("validated IPv4 header and options are present");
+        let udp = Udp::<[u8]>::ref_from_bytes(&buf[ip_header_len..])
+            .expect("validated UDP header and segment payload are present");
+        let pseudo_header =
+            PseudoHeaderV4::from_udp(ip.source_address, ip.destination_address, udp);
+        let checksum = checksum_udp_with_skip(pseudo_header, udp);
+        buf[udp_checksum_offset..udp_checksum_offset + 2].copy_from_slice(&checksum.to_be_bytes());
+    }
+
+    let ip_checksum_offset = offset_of!(Ipv4Header, header_checksum);
+    buf[ip_checksum_offset..ip_checksum_offset + 2].fill(0);
+    let ip_checksum = checksum_ipv4_with_skip(&buf[..ip_header_len]);
+    buf[ip_checksum_offset..ip_checksum_offset + 2].copy_from_slice(&ip_checksum.to_be_bytes());
+
+    Packet::from_bytes(buf.split())
+        .try_into_ip()
+        .expect("a rebuilt IPv4 UDP segment is a valid IP packet")
+}
+
+/// Rebuild one IPv6 UDP segment, including its lengths and mandatory UDP checksum.
+fn build_ipv6_udp_segment(buf: &mut BytesMut, headers: &[u8], payload: &[u8]) -> Packet<Ip> {
+    buf.clear();
+    buf.extend_from_slice(headers);
+    buf.extend_from_slice(payload);
+
+    let ipv6_payload_len = u16::try_from(buf.len() - Ipv6Header::LEN)
+        .expect("a UDP-L4 IPv6 segment fits in the input payload length");
+    let ipv6_payload_len_offset = offset_of!(Ipv6Header, payload_length);
+    buf[ipv6_payload_len_offset..ipv6_payload_len_offset + 2]
+        .copy_from_slice(&ipv6_payload_len.to_be_bytes());
+
+    let udp_len = u16::try_from(UdpHeader::LEN + payload.len())
+        .expect("a UDP-L4 IPv6 segment fits in the input UDP length");
+    let udp_len_offset = Ipv6Header::LEN + offset_of!(UdpHeader, length);
+    buf[udp_len_offset..udp_len_offset + 2].copy_from_slice(&udp_len.to_be_bytes());
+    let udp_checksum_offset = Ipv6Header::LEN + offset_of!(UdpHeader, checksum);
+    buf[udp_checksum_offset..udp_checksum_offset + 2].fill(0);
+    let ip = Ipv6Header::ref_from_bytes(&buf[..Ipv6Header::LEN])
+        .expect("validated IPv6 header is present");
+    let udp = Udp::<[u8]>::ref_from_bytes(&buf[Ipv6Header::LEN..])
+        .expect("validated UDP header and segment payload are present");
+    let pseudo_header = PseudoHeaderV6::from_udp(ip.source_address, ip.destination_address, udp);
+    let checksum = checksum_udp_with_skip(pseudo_header, udp);
+    buf[udp_checksum_offset..udp_checksum_offset + 2].copy_from_slice(&checksum.to_be_bytes());
+
+    Packet::from_bytes(buf.split())
+        .try_into_ip()
+        .expect("a rebuilt IPv6 UDP segment is a valid IP packet")
 }
 
 fn new_tso_iter_ipv4_with_options(
@@ -557,7 +880,7 @@ fn complete_partial_checksum(
     }
 }
 
-/// An iterator that segments a large TCP packet into smaller TCP packets.
+/// An iterator that segments TUN TCP and UDP superpackets into ordered IP packets.
 pub enum TsoIter {
     SinglePacket {
         packet: Option<Packet<Ip>>,
@@ -587,6 +910,15 @@ pub enum TsoIter {
 
         headers: Packet<Ipv6<Tcp>>,
         payload: Packet<[u8]>,
+    },
+    /// A UDP-L4 GSO frame with one reusable output buffer and its remaining payload.
+    CoalescedUdp {
+        buf: BytesMut,
+        i: usize,
+        segment_payload_len: usize,
+        headers: Packet<[u8]>,
+        payload: Packet<[u8]>,
+        ip_version: UdpGsoIpVersion,
     },
 }
 
@@ -801,6 +1133,26 @@ impl Iterator for TsoIter {
 
                 Some(packet.into())
             }
+
+            TsoIter::CoalescedUdp {
+                buf,
+                i,
+                segment_payload_len,
+                headers,
+                payload,
+                ip_version,
+            } => {
+                if payload.is_empty() {
+                    return None;
+                }
+
+                let len = payload.len().min(*segment_payload_len);
+                let segment_payload = payload.buf_mut().split_to(len).freeze();
+                let packet =
+                    build_udp_gso_segment(buf, headers.as_ref(), &segment_payload, *i, *ip_version);
+                *i += 1;
+                Some(packet)
+            }
         }
     }
 }
@@ -944,6 +1296,7 @@ mod tests {
             .unwrap()
     }
 
+    /// Construct an IPv4 UDP input frame for GSO parser tests.
     fn ipv4_udp_packet(payload: &[u8], partial_checksum: u16) -> Packet<[u8]> {
         let udp_len = UdpHeader::LEN + payload.len();
         let udp_header = UdpHeader::new(123, 456, udp_len.try_into().unwrap(), partial_checksum);
@@ -954,6 +1307,25 @@ mod tests {
             udp_len.try_into().unwrap(),
         );
         let mut bytes = BytesMut::with_capacity(Ipv4Header::LEN + udp_len);
+        bytes.extend_from_slice(ip_header.as_bytes());
+        bytes.extend_from_slice(udp_header.as_bytes());
+        bytes.extend_from_slice(payload);
+        Packet::from_bytes(bytes)
+    }
+
+    /// Construct an IPv6 UDP input frame for GSO parser tests.
+    fn ipv6_udp_packet(payload: &[u8], partial_checksum: u16) -> Packet<[u8]> {
+        let udp_len = UdpHeader::LEN + payload.len();
+        let udp_header = UdpHeader::new(123, 456, udp_len.try_into().unwrap(), partial_checksum);
+        let ip_header = Ipv6Header {
+            version_traffic_flow: Ipv6VersionTrafficFlow::new().with_version(6),
+            payload_length: udp_len.try_into().unwrap(),
+            next_header: IpNextProtocol::Udp,
+            hop_limit: 42,
+            source_address: big_endian::U128::new(u128::from(Ipv6Addr::LOCALHOST)),
+            destination_address: big_endian::U128::new(u128::from(Ipv6Addr::UNSPECIFIED)),
+        };
+        let mut bytes = BytesMut::with_capacity(Ipv6Header::LEN + udp_len);
         bytes.extend_from_slice(ip_header.as_bytes());
         bytes.extend_from_slice(udp_header.as_bytes());
         bytes.extend_from_slice(payload);
@@ -1285,6 +1657,132 @@ mod tests {
             udp.header.checksum.get(),
             checksum_udp_with_skip(pseudo_header, udp)
         );
+    }
+
+    /// Splits IPv4 UDP-L4 input in order and verifies each segment's checksums.
+    #[test]
+    fn vnet_header_segments_udp_l4_ipv4_in_order_and_rebuilds_checksums() {
+        let input_payload = b"abcdefghijklmnopqrstuvwxyz";
+        let packet = ipv4_udp_packet(input_payload, 0x1234);
+        let input_identification = Ipv4Header::ref_from_bytes(&packet.as_ref()[..Ipv4Header::LEN])
+            .unwrap()
+            .identification
+            .get();
+        let mut header = vnet_header(
+            GsoType::VIRTIO_NET_HDR_GSO_UDP_L4,
+            10,
+            (Ipv4Header::LEN + UdpHeader::LEN) as u16,
+        );
+        header.flags = Flags::new().with_needs_csum(true);
+        header.csum_start = Ipv4Header::LEN as u16;
+        header.csum_offset = offset_of!(UdpHeader, checksum) as u16;
+
+        let segments: Vec<_> = new_tso_iter_from_vnet(vnet_frame(header, packet.as_ref()))
+            .unwrap()
+            .map(Packet::into_bytes)
+            .collect();
+
+        assert_eq!(segments.len(), 3);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| {
+                    Udp::<[u8]>::ref_from_bytes(&segment[Ipv4Header::LEN..])
+                        .unwrap()
+                        .payload
+                        .to_vec()
+                })
+                .collect::<Vec<_>>(),
+            [
+                b"abcdefghij".to_vec(),
+                b"klmnopqrst".to_vec(),
+                b"uvwxyz".to_vec()
+            ]
+        );
+
+        for (index, segment) in segments.iter().enumerate() {
+            let ip = Ipv4Header::ref_from_bytes(&segment[..Ipv4Header::LEN]).unwrap();
+            let udp = Udp::<[u8]>::ref_from_bytes(&segment[Ipv4Header::LEN..]).unwrap();
+            let pseudo_header =
+                PseudoHeaderV4::from_udp(ip.source_address, ip.destination_address, udp);
+
+            assert_eq!(usize::from(ip.total_len), segment.len());
+            assert_eq!(
+                ip.identification.get(),
+                input_identification.wrapping_add(index as u16)
+            );
+            assert_eq!(
+                usize::from(udp.header.length),
+                UdpHeader::LEN + udp.payload.len()
+            );
+            assert_eq!(
+                udp.header.checksum.get(),
+                checksum_udp_with_skip(pseudo_header, udp)
+            );
+            assert_eq!(
+                ip.header_checksum.get(),
+                checksum_ipv4_with_skip(&segment[..Ipv4Header::LEN])
+            );
+        }
+    }
+
+    /// Splits IPv6 UDP-L4 input in order and verifies each segment's checksum.
+    #[test]
+    fn vnet_header_segments_udp_l4_ipv6_in_order_and_rebuilds_checksums() {
+        let input_payload = b"abcdefghijklmnopqrstuvwxyz";
+        let packet = ipv6_udp_packet(input_payload, 0x1234);
+        let mut header = vnet_header(
+            GsoType::VIRTIO_NET_HDR_GSO_UDP_L4,
+            10,
+            (Ipv6Header::LEN + UdpHeader::LEN) as u16,
+        );
+        header.flags = Flags::new().with_needs_csum(true);
+        header.csum_start = Ipv6Header::LEN as u16;
+        header.csum_offset = offset_of!(UdpHeader, checksum) as u16;
+
+        let segments: Vec<_> = new_tso_iter_from_vnet(vnet_frame(header, packet.as_ref()))
+            .unwrap()
+            .map(Packet::into_bytes)
+            .collect();
+
+        assert_eq!(segments.len(), 3);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| {
+                    Udp::<[u8]>::ref_from_bytes(&segment[Ipv6Header::LEN..])
+                        .unwrap()
+                        .payload
+                        .to_vec()
+                })
+                .collect::<Vec<_>>(),
+            [
+                b"abcdefghij".to_vec(),
+                b"klmnopqrst".to_vec(),
+                b"uvwxyz".to_vec()
+            ]
+        );
+
+        for segment in &segments {
+            let ip = Ipv6Header::ref_from_bytes(&segment[..Ipv6Header::LEN]).unwrap();
+            let udp = Udp::<[u8]>::ref_from_bytes(&segment[Ipv6Header::LEN..]).unwrap();
+            let pseudo_header =
+                PseudoHeaderV6::from_udp(ip.source_address, ip.destination_address, udp);
+
+            assert_eq!(
+                usize::from(ip.payload_length),
+                segment.len() - Ipv6Header::LEN
+            );
+            assert_eq!(
+                usize::from(udp.header.length),
+                UdpHeader::LEN + udp.payload.len()
+            );
+            assert_eq!(
+                udp.header.checksum.get(),
+                checksum_udp_with_skip(pseudo_header, udp)
+            );
+            assert_eq!(ip.hop_limit, 42);
+        }
     }
 
     #[test]
