@@ -205,6 +205,9 @@ runner=${PERF_RUN:-/usr/local/bin/perf-run}
 [[ -x $runner ]] || { echo "perf runner is not executable: $runner" >&2; exit 2; }
 echo "D348 pinned $mode: $label; results $out"
 run_env=(H2H_CPUSET_AUDIT=1 H2H_RESULTS="$out" "H2H_CPUSET_HOUSEKEEPING=$housekeeping")
+if [[ $mode == validate ]]; then
+    run_env+=(H2H_LAN_TPUT_SECONDS=10)
+fi
 [[ -z ${H2H_ETHTOOL_BIN:-} ]] || run_env+=("H2H_ETHTOOL_BIN=$H2H_ETHTOOL_BIN")
 if [[ $mode == calibration && -z ${H2H_LAN_PING_COUNT:-} ]]; then
     H2H_LAN_PING_COUNT=3600

@@ -168,6 +168,7 @@ class PerfAllCliTest(unittest.TestCase):
                 capture.read_text().splitlines()[:3],
                 ["--root", "--out", str(output / "receipts")],
             )
+            self.assertIn("H2H_LAN_TPUT_SECONDS=10", capture.read_text().splitlines())
             self.assertIn("cpuset.cpus.effective=0-5", (output / "cpuset-restoration.txt").read_text())
 
     def test_validation_resolves_smoke_helper_from_installed_kit_root(self) -> None:

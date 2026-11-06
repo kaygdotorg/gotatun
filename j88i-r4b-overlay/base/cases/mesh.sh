@@ -22,7 +22,7 @@ trap cleanup EXIT
 
 LAT_COUNT=$(h2h_lan_latency_count)
 WAN_LAT_COUNT=$(dur 300 60)
-TPUT_S=$(dur 10 2)
+TPUT_S=$(h2h_lan_tput_duration 10 2)
 WAN_TPUT_S=$(dur 20 4)
 IDLE_S=$(dur 15 3)
 GOTATUN_BIN=${H2H_GOTATUN_BIN:-$H2H_BIN/gotatun}

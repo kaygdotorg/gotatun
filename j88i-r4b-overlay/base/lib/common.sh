@@ -26,6 +26,18 @@ die() { log "FAIL: $*"; exit 1; }
 # Durations shrink in smoke mode; full values are the perf-VM method.
 dur() { if [[ ${H2H_SMOKE:-0} == 1 ]]; then echo "$2"; else echo "$1"; fi; }
 
+# D348 validation uses the normal LAN load window so one short kernel-worker
+# burst does not dominate the per-window unrelated-work budget.
+h2h_lan_tput_duration() {
+    local full_seconds=$1 smoke_seconds=$2 override=${H2H_LAN_TPUT_SECONDS:-}
+    if [[ -z $override ]]; then
+        dur "$full_seconds" "$smoke_seconds"
+        return
+    fi
+    [[ $override =~ ^[1-9][0-9]*$ ]] || die "H2H_LAN_TPUT_SECONDS must be a positive integer"
+    printf '%s\n' "$override"
+}
+
 # The LAN calibration can increase its sample count without changing the normal or smoke method.
 h2h_lan_latency_count() {
     local count=${H2H_LAN_PING_COUNT:-}

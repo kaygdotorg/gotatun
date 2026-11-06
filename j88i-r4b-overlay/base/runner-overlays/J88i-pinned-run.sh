@@ -17,9 +17,9 @@ perf_cpus=${H2H_CPUSET_PERF:-0-5}
 
 topology=$(lscpu --parse=CPU,CORE,SOCKET | awk -F, '!/^#/ {print}')
 cpu_list=$(printf '%s\n' "$topology" | awk -F, '{print $1}' | paste -sd, -)
-core_count=$(printf '%s\n' "$topology" | awk -F, '{print $2 "/" $3}' | sort -u | awk 'END {print NR}')
-[[ $(nproc --all) == 6 && $cpu_list == 0,1,2,3,4,5 && $core_count == 6 ]] || {
-    echo "unexpected post-resize topology: nproc=$(nproc --all) CPUs=$cpu_list cores=$core_count" >&2
+guest_core_count=$(printf '%s\n' "$topology" | awk -F, '{print $2 "/" $3}' | sort -u | awk 'END {print NR}')
+[[ $(nproc --all) == 6 && $cpu_list == 0,1,2,3,4,5 && $guest_core_count == 6 ]] || {
+    echo "unexpected six-vCPU guest topology: nproc=$(nproc --all) CPUs=$cpu_list virtual_cores=$guest_core_count" >&2
     exit 2
 }
 [[ $side_a == 1-2 && $side_b == 3-4 && $housekeeping == 0,5 && $perf_cpus == 0-5 ]] || {
@@ -236,6 +236,7 @@ runner_allowed=$(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status)
 {
     echo "topology: nproc_all=$(nproc --all)"
     printf 'CPU,CORE,SOCKET\n%s\n' "$topology"
+    echo 'host_physical_mapping: vCPU0=host-thread7/core7;vCPU1=host-thread5/core5;vCPU2=host-thread13/core5;vCPU3=host-thread6/core6;vCPU4=host-thread14/core6;vCPU5=host-thread15/core7'
     printf 'side_a=%s\nside_b=%s\nhousekeeping=%s\n' "$side_a" "$side_b" "$housekeeping"
     printf 'perf_slice_cpuset=%s\nperf_slice_effective=%s\n' \
         "$(unit_cpus perf.slice cpuset.cpus)" \

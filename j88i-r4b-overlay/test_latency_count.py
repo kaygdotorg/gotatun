@@ -13,6 +13,27 @@ from pathlib import Path
 class LatencyCountTest(unittest.TestCase):
     """Exercise the LAN probe-count helper without starting a benchmark."""
 
+    def run_tput_duration(
+        self, *, override: str | None = None, smoke: bool = False
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the LAN duration helper with isolated smoke settings."""
+        kit = Path(__file__).parent / "base"
+        environment = os.environ.copy()
+        environment["H2H_KIT"] = str(kit)
+        environment.pop("H2H_LAN_TPUT_SECONDS", None)
+        environment.pop("H2H_SMOKE", None)
+        if override is not None:
+            environment["H2H_LAN_TPUT_SECONDS"] = override
+        if smoke:
+            environment["H2H_SMOKE"] = "1"
+        return subprocess.run(
+            ["bash", "-c", 'source "$H2H_KIT/lib/common.sh"; h2h_lan_tput_duration 10 2'],
+            capture_output=True,
+            text=True,
+            env=environment,
+            check=False,
+        )
+
     def run_count(self, *, override: str | None = None, smoke: bool = False) -> subprocess.CompletedProcess[str]:
         """Run the count helper with isolated calibration settings."""
         kit = Path(__file__).parent / "base"
@@ -66,6 +87,24 @@ class LatencyCountTest(unittest.TestCase):
         result = self.run_count(override="0")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("H2H_LAN_PING_COUNT must be a positive integer", result.stderr)
+
+    def test_validation_window_can_use_the_full_lan_load_duration_in_smoke_mode(self) -> None:
+        """D348 validation keeps the standard 10-second LAN load window in smoke mode."""
+        result = self.run_tput_duration(override="10", smoke=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "10")
+
+    def test_smoke_lan_load_keeps_its_short_duration_without_override(self) -> None:
+        """Other smoke runs retain the existing 2-second LAN load duration."""
+        result = self.run_tput_duration(smoke=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "2")
+
+    def test_invalid_lan_load_duration_is_rejected(self) -> None:
+        """A malformed LAN duration override fails before a case starts."""
+        result = self.run_tput_duration(override="0", smoke=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("H2H_LAN_TPUT_SECONDS must be a positive integer", result.stderr)
 
 
 if __name__ == "__main__":
