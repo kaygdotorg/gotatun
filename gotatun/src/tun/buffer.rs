@@ -19,7 +19,7 @@ use crate::{
     tun::{IpRecv, IpSend, MtuWatcher},
 };
 use tokio::{
-    sync::{Mutex, mpsc},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc},
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
@@ -50,8 +50,17 @@ pub async fn channel<S: IpSend, R: IpRecv>(
 /// processed on another task. This means [`IpSend::send`] won't block unless the channel is full.
 #[derive(Clone)]
 pub struct BufferedIpSend {
-    tx: mpsc::Sender<Packet<Ip>>,
+    tx: mpsc::Sender<BufferedIpMessage>,
+    /// Bounds queued and in-service packets when one channel message carries a run.
+    packet_slots: Arc<Semaphore>,
+    packet_capacity: usize,
     _task: Arc<Task>,
+}
+
+/// A single packet or an ordered run crossing the buffered TUN boundary.
+enum BufferedIpMessage {
+    Single(Packet<Ip>, OwnedSemaphorePermit),
+    Batch(Vec<Packet<Ip>>, OwnedSemaphorePermit),
 }
 
 impl BufferedIpSend {
@@ -64,7 +73,8 @@ impl BufferedIpSend {
     /// # Panics
     /// Panics if the lock is already taken.
     fn new<I: IpSend>(capacity: usize, inner: Arc<Mutex<I>>, token: CancellationToken) -> Self {
-        let (tx, mut rx) = mpsc::channel::<Packet<Ip>>(capacity);
+        let (tx, mut rx) = mpsc::channel::<BufferedIpMessage>(capacity);
+        let packet_slots = Arc::new(Semaphore::new(capacity));
 
         let drop_guard = token.clone().drop_guard();
 
@@ -74,17 +84,24 @@ impl BufferedIpSend {
                 .expect("Deadlock on IpSend. There must be no more than one IpSend active at any given time.");
 
             let mut refused: u64 = 0;
-            while let Some(packet) = rx.recv().await {
-                if let Err(e) = inner.send(packet).await {
+            while let Some(message) = rx.recv().await {
+                let (result, refused_packets) = match message {
+                    BufferedIpMessage::Single(packet, _permit) => (inner.send(packet).await, 1),
+                    BufferedIpMessage::Batch(mut packets, _permit) => {
+                        let batch_len = packets.len() as u64;
+                        (inner.send_many(&mut packets).await, batch_len)
+                    }
+                };
+                if let Err(e) = result {
                     if is_fatal_tun_error(&e) {
                         tracing::error!("TUN device was deleted: {e}");
                         break;
                     }
-                    // The device refused this one packet; the next one may be fine.
-                    refused += 1;
+                    // The device refused this packet or run; the next send may be fine.
+                    refused = refused.saturating_add(refused_packets);
                     if refused.is_power_of_two() {
                         tracing::warn!(
-                            "Dropped IP packet the TUN device refused ({refused} so far): {e}"
+                            "Dropped IP packet(s) the TUN device refused ({refused} so far): {e}"
                         );
                     }
                 }
@@ -99,6 +116,8 @@ impl BufferedIpSend {
 
         Self {
             tx,
+            packet_slots,
+            packet_capacity: capacity,
             _task: Arc::new(task),
         }
     }
@@ -106,10 +125,48 @@ impl BufferedIpSend {
 
 impl IpSend for BufferedIpSend {
     async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
-        self.tx
-            .send(packet)
+        let permit = Arc::clone(&self.packet_slots)
+            .acquire_owned()
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+        self.tx
+            .send(BufferedIpMessage::Single(packet, permit))
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+        Ok(())
+    }
+
+    async fn send_many(&mut self, packets: &mut Vec<Packet<Ip>>) -> io::Result<()> {
+        while !packets.is_empty() {
+            let count = packets.len().min(self.packet_capacity);
+            let permit_count = u32::try_from(count).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("TUN run is too large: {e}"),
+                )
+            })?;
+            let permit = Arc::clone(&self.packet_slots)
+                .acquire_many_owned(permit_count)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+            let batch = if count == packets.len() {
+                std::mem::take(packets)
+            } else {
+                packets.drain(..count).collect()
+            };
+            if let Err(error) = self.tx.send(BufferedIpMessage::Batch(batch, permit)).await {
+                let mut unsent = match error.0 {
+                    BufferedIpMessage::Batch(batch, _) => batch,
+                    BufferedIpMessage::Single(..) => unreachable!("send_many queues a batch"),
+                };
+                unsent.append(packets);
+                *packets = unsent;
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "TUN send task stopped",
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -260,14 +317,14 @@ fn is_fatal_tun_error(err: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::BufferedIpRecv;
+    use super::{BufferedIpRecv, BufferedIpSend};
     use crate::{
         packet::{Ip, Packet, PacketBufPool},
-        tun::{IpRecv, MtuWatcher},
+        tun::{IpRecv, IpSend, MtuWatcher},
     };
     use bytes::BytesMut;
     use std::{collections::VecDeque, io, sync::Arc, time::Duration};
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, mpsc};
     use tokio_util::sync::CancellationToken;
     use zerocopy::IntoBytes;
 
@@ -296,6 +353,89 @@ mod tests {
         bytes[0] = 0x45;
         bytes[4..6].copy_from_slice(&id.to_be_bytes());
         Packet::from_bytes(bytes).try_into_ip().unwrap()
+    }
+
+    /// Records whether the buffered sender forwards a whole run across its task boundary.
+    struct RecordingIpSend {
+        singles: mpsc::UnboundedSender<u16>,
+        batches: mpsc::UnboundedSender<Vec<u16>>,
+    }
+
+    impl IpSend for RecordingIpSend {
+        async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
+            self.singles
+                .send(packet_id(&packet))
+                .expect("the test receiver remains open");
+            Ok(())
+        }
+
+        async fn send_many(&mut self, packets: &mut Vec<Packet<Ip>>) -> io::Result<()> {
+            let ids = packets.iter().map(packet_id).collect();
+            self.batches
+                .send(ids)
+                .expect("the test receiver remains open");
+            packets.clear();
+            Ok(())
+        }
+    }
+
+    fn packet_id(packet: &Packet<Ip>) -> u16 {
+        let bytes = packet.as_bytes();
+        u16::from_be_bytes([bytes[4], bytes[5]])
+    }
+
+    /// Send completed packets as one run instead of one task handoff per packet.
+    #[tokio::test]
+    async fn buffered_send_many_forwards_one_batch() {
+        let (single_tx, mut single_rx) = mpsc::unbounded_channel();
+        let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
+        let inner = Arc::new(Mutex::new(RecordingIpSend {
+            singles: single_tx,
+            batches: batch_tx,
+        }));
+        let mut send = BufferedIpSend::new(3, inner, CancellationToken::new());
+        let mut packets = vec![packet(64, 1), packet(64, 2), packet(64, 3)];
+
+        send.send_many(&mut packets).await.unwrap();
+        assert!(packets.is_empty());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), batch_rx.recv())
+                .await
+                .expect("the batch must cross the buffered sender")
+                .expect("the send task remains open"),
+            [1, 2, 3]
+        );
+        assert!(single_rx.try_recv().is_err());
+    }
+
+    /// A run larger than the packet budget is split without waiting for impossible permits.
+    #[tokio::test]
+    async fn send_many_splits_runs_larger_than_the_packet_budget() {
+        let (single_tx, mut single_rx) = mpsc::unbounded_channel();
+        let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
+        let inner = Arc::new(Mutex::new(RecordingIpSend {
+            singles: single_tx,
+            batches: batch_tx,
+        }));
+        let mut send = BufferedIpSend::new(1, inner, CancellationToken::new());
+        let mut packets = vec![packet(64, 1), packet(64, 2), packet(64, 3)];
+
+        tokio::time::timeout(Duration::from_secs(1), send.send_many(&mut packets))
+            .await
+            .expect("a run larger than capacity must not wait for impossible permits")
+            .expect("the buffered sender must accept every run chunk");
+        assert!(packets.is_empty());
+
+        for expected in [[1], [2], [3]] {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), batch_rx.recv())
+                    .await
+                    .expect("each run chunk must cross the buffered sender")
+                    .expect("the send task remains open"),
+                expected
+            );
+        }
+        assert!(single_rx.try_recv().is_err());
     }
 
     async fn scripted_recv(script: Vec<io::Result<Vec<Packet<Ip>>>>) -> BufferedIpRecv<Script> {
