@@ -13,8 +13,10 @@
 
 use std::{net::SocketAddr, sync::Arc};
 
-use futures::{FutureExt, select};
-use tokio::{io, sync::mpsc};
+use tokio::{
+    io,
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+};
 
 use crate::packet::Packet;
 #[cfg(any(not(target_os = "linux"), test))]
@@ -33,63 +35,117 @@ use crate::udp::UdpSend;
 pub struct BufferedUdpSend {
     _send_task: Arc<Task>,
 
-    /// Channel where IPv4 packets are sent to `_send_task`
-    send_tx_v4: mpsc::Sender<(Packet, SocketAddr)>,
+    /// One FIFO keeps packets ordered when a peer's endpoint changes address family.
+    send_tx: mpsc::Sender<BufferedUdpMessage>,
+    packet_slots: Arc<Semaphore>,
+    packet_capacity: usize,
+}
 
-    /// Channel where IPv6 packets are sent to `_send_task`
-    send_tx_v6: mpsc::Sender<(Packet, SocketAddr)>,
+/// One queued datagram or one ordered run of datagrams.
+enum BufferedUdpMessage {
+    Single(Packet, SocketAddr, OwnedSemaphorePermit),
+    Batch(Vec<(Packet, SocketAddr)>, OwnedSemaphorePermit),
+}
+
+/// Send one same-family UDP run through the transport's reusable send buffer.
+async fn flush_udp_packets<U: UdpSend>(
+    udp_tx: &U,
+    send_buf: &mut U::SendManyBuf,
+    packets: &mut Vec<(Packet, SocketAddr)>,
+) {
+    match packets.len() {
+        0 => {}
+        1 => {
+            let (packet, addr) = packets.pop().expect("one packet was counted");
+            if let Err(error) = udp_tx.send_to(packet, addr).await {
+                tracing::trace!("send_to_err: {error:#}");
+            }
+        }
+        _ => {
+            if let Err(error) = udp_tx.send_many_to(send_buf, packets).await {
+                tracing::trace!("send_to_many_err: {error:#}");
+                packets.clear();
+            }
+        }
+    }
+}
+
+/// Send a bounded run in as few transport calls as its maximum batch size allows.
+async fn flush_udp_run<U: UdpSend>(
+    udp_tx: &U,
+    send_buf: &mut U::SendManyBuf,
+    packets: Vec<(Packet, SocketAddr)>,
+    max_packet_count: usize,
+) {
+    if packets.len() <= max_packet_count {
+        let mut packets = packets;
+        flush_udp_packets(udp_tx, send_buf, &mut packets).await;
+        return;
+    }
+
+    let mut packets = packets.into_iter();
+    while packets.len() > 0 {
+        let mut batch = packets.by_ref().take(max_packet_count).collect::<Vec<_>>();
+        flush_udp_packets(udp_tx, send_buf, &mut batch).await;
+    }
 }
 
 impl BufferedUdpSend {
     /// Wrap a [`UdpSend`] into a [`BufferedUdpSend`] with `capacity`.
     pub fn new(capacity: usize, udp_tx: impl UdpSend + 'static) -> Self {
-        let (send_tx_v4, mut send_rx_v4) = mpsc::channel::<(Packet, SocketAddr)>(capacity);
-        let (send_tx_v6, mut send_rx_v6) = mpsc::channel::<(Packet, SocketAddr)>(capacity);
+        let (send_tx, mut send_rx) = mpsc::channel::<BufferedUdpMessage>(capacity);
+        let packet_slots = Arc::new(Semaphore::new(capacity));
 
         let send_task = Task::spawn("buffered UDP send", async move {
-            let mut buf_v4 = vec![];
-            let mut buf_v6 = vec![];
-            let max_packet_count = udp_tx.max_number_of_packets_to_send();
+            let mut buf = vec![];
+            let max_packet_count = udp_tx.max_number_of_packets_to_send().max(1);
             let mut send_many_buf = Default::default();
+            let mut singles = Vec::with_capacity(max_packet_count);
+            let mut single_permits = Vec::with_capacity(max_packet_count);
 
             loop {
-                // use seperate channels because we musn't call `send_many_to` with mixed IPv4/IPv6.
-                let (count, buf) = select! {
-                    // recv_many is cancel-safe
-                    n = send_rx_v4.recv_many(&mut buf_v4, max_packet_count).fuse() => (n, &mut buf_v4),
-                    n = send_rx_v6.recv_many(&mut buf_v6, max_packet_count).fuse() => (n, &mut buf_v6),
-                };
-                match count {
-                    0 => break,
-                    1 => {
-                        let (packet, addr) =
-                            buf.pop().expect("recv_many received 1 packet into buf");
-                        let _ = udp_tx
-                            .send_to(packet, addr)
-                            .await
-                            .inspect_err(|e| tracing::trace!("send_to_err: {e:#}"));
-                    }
-                    2.. => {
-                        // send all packets at once
-                        if let Err(e) = udp_tx.send_many_to(&mut send_many_buf, buf).await {
-                            tracing::trace!("send_to_many_err: {e:#}");
-                            if !buf.is_empty() {
-                                tracing::trace!(
-                                    "send_to_many dropping {} packets due to error.",
-                                    buf.len()
-                                );
-                                buf.clear(); // give up, drop the packets we meant to send
+                let count = send_rx.recv_many(&mut buf, max_packet_count).await;
+                if count == 0 {
+                    break;
+                }
+
+                for message in buf.drain(..) {
+                    match message {
+                        BufferedUdpMessage::Single(packet, addr, permit) => {
+                            if singles.first().is_some_and(|(_, first_addr)| {
+                                matches!(first_addr, SocketAddr::V4(..))
+                                    != matches!(addr, SocketAddr::V4(..))
+                            }) {
+                                flush_udp_packets(&udp_tx, &mut send_many_buf, &mut singles).await;
+                                single_permits.clear();
                             }
+                            singles.push((packet, addr));
+                            single_permits.push(permit);
+                            if singles.len() == max_packet_count {
+                                flush_udp_packets(&udp_tx, &mut send_many_buf, &mut singles).await;
+                                single_permits.clear();
+                            }
+                        }
+                        BufferedUdpMessage::Batch(packets, permit) => {
+                            flush_udp_packets(&udp_tx, &mut send_many_buf, &mut singles).await;
+                            single_permits.clear();
+                            flush_udp_run(&udp_tx, &mut send_many_buf, packets, max_packet_count)
+                                .await;
+                            drop(permit);
                         }
                     }
                 }
+
+                flush_udp_packets(&udp_tx, &mut send_many_buf, &mut singles).await;
+                single_permits.clear();
             }
         });
 
         Self {
             _send_task: Arc::new(send_task),
-            send_tx_v4,
-            send_tx_v6,
+            send_tx,
+            packet_slots,
+            packet_capacity: capacity,
         }
     }
 }
@@ -98,22 +154,74 @@ impl UdpSend for BufferedUdpSend {
     type SendManyBuf = ();
 
     async fn send_to(&self, packet: Packet, destination: SocketAddr) -> io::Result<()> {
-        let tx = match destination {
-            SocketAddr::V4(..) => &self.send_tx_v4,
-            SocketAddr::V6(..) => &self.send_tx_v6,
-        };
-        tx.send((packet, destination))
+        let permit = Arc::clone(&self.packet_slots)
+            .acquire_owned()
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+        self.send_tx
+            .send(BufferedUdpMessage::Single(packet, destination, permit))
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
         Ok(())
     }
 
+    async fn send_many_to(
+        &self,
+        _send_buf: &mut Self::SendManyBuf,
+        packets: &mut Vec<(Packet, SocketAddr)>,
+    ) -> io::Result<()> {
+        if packets.is_empty() {
+            return Ok(());
+        }
+        let is_v4 = matches!(packets[0].1, SocketAddr::V4(..));
+        if packets
+            .iter()
+            .any(|(_, addr)| matches!(addr, SocketAddr::V4(..)) != is_v4)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a UDP run cannot mix address families",
+            ));
+        }
+        while !packets.is_empty() {
+            let count = packets.len().min(self.packet_capacity);
+            let permit_count = u32::try_from(count).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("UDP run is too large: {e}"),
+                )
+            })?;
+            let permit = Arc::clone(&self.packet_slots)
+                .acquire_many_owned(permit_count)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+            let batch = if count == packets.len() {
+                std::mem::take(packets)
+            } else {
+                packets.drain(..count).collect()
+            };
+            if let Err(error) = self
+                .send_tx
+                .send(BufferedUdpMessage::Batch(batch, permit))
+                .await
+            {
+                let mut unsent = match error.0 {
+                    BufferedUdpMessage::Batch(batch, _) => batch,
+                    BufferedUdpMessage::Single(..) => unreachable!("send_many_to queues a batch"),
+                };
+                unsent.append(packets);
+                *packets = unsent;
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "UDP send task stopped",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn max_number_of_packets_to_send(&self) -> usize {
-        debug_assert_eq!(
-            self.send_tx_v4.max_capacity(),
-            self.send_tx_v6.max_capacity(),
-        );
-        self.send_tx_v4.max_capacity()
+        self.send_tx.max_capacity()
     }
 }
 
@@ -203,7 +311,28 @@ impl UdpRecv for BufferedUdpReceive {
 #[cfg(all(test, target_os = "linux"))]
 mod test {
     use super::*;
-    use crate::udp::socket::{SockOpt, UdpSocket};
+    use crate::udp::{
+        UdpSend,
+        socket::{SockOpt, UdpSocket},
+    };
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use zerocopy::IntoBytes;
+
+    /// Records datagrams that cross the buffered send boundary.
+    #[derive(Clone)]
+    struct RecordingUdpSend(mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>);
+
+    impl UdpSend for RecordingUdpSend {
+        type SendManyBuf = ();
+
+        async fn send_to(&self, packet: Packet, destination: SocketAddr) -> io::Result<()> {
+            self.0
+                .send((packet.as_bytes().to_vec(), destination))
+                .expect("the test receiver remains open");
+            Ok(())
+        }
+    }
 
     /// Hands out scripted receive results, then waits forever.
     struct Script(std::collections::VecDeque<io::Result<(Packet, SocketAddr)>>);
@@ -227,6 +356,85 @@ mod test {
             Packet::from_bytes(bytes::BytesMut::from(payload)),
             "127.0.0.1:51820".parse().unwrap(),
         )
+    }
+
+    /// A run larger than the buffer capacity is split without waiting for impossible permits.
+    #[tokio::test]
+    async fn send_many_splits_runs_larger_than_the_buffer_capacity() {
+        let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+        let send = BufferedUdpSend::new(1, RecordingUdpSend(sent_tx));
+        let address = "127.0.0.1:51820".parse().unwrap();
+        let mut packets = vec![
+            (
+                Packet::from_bytes(bytes::BytesMut::from(&b"first"[..])),
+                address,
+            ),
+            (
+                Packet::from_bytes(bytes::BytesMut::from(&b"second"[..])),
+                address,
+            ),
+            (
+                Packet::from_bytes(bytes::BytesMut::from(&b"third"[..])),
+                address,
+            ),
+        ];
+        let mut send_buf = ();
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            send.send_many_to(&mut send_buf, &mut packets),
+        )
+        .await
+        .expect("an oversized run must not wait for impossible capacity")
+        .expect("the buffered send task must accept each chunk");
+        assert!(packets.is_empty());
+
+        for expected in [b"first".as_slice(), b"second", b"third"] {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), sent_rx.recv())
+                    .await
+                    .expect("the packet must cross the buffer")
+                    .expect("the send task remains open")
+                    .0,
+                expected
+            );
+        }
+    }
+
+    /// A peer that changes address family still sends its queued packets in slot order.
+    #[tokio::test]
+    async fn send_many_preserves_order_across_address_families() {
+        let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+        let send = BufferedUdpSend::new(4, RecordingUdpSend(sent_tx));
+        let address_v6 = "[::1]:51820".parse().unwrap();
+        let address_v4 = "127.0.0.1:51820".parse().unwrap();
+        let mut send_buf = ();
+        let mut first = vec![(
+            Packet::from_bytes(bytes::BytesMut::from(&b"first"[..])),
+            address_v6,
+        )];
+        let mut second = vec![(
+            Packet::from_bytes(bytes::BytesMut::from(&b"second"[..])),
+            address_v4,
+        )];
+
+        send.send_many_to(&mut send_buf, &mut first)
+            .await
+            .expect("the first peer run is queued");
+        send.send_many_to(&mut send_buf, &mut second)
+            .await
+            .expect("the next peer run is queued");
+
+        for expected in [b"first".as_slice(), b"second"] {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), sent_rx.recv())
+                    .await
+                    .expect("both peer runs must be sent")
+                    .expect("the UDP send task remains open")
+                    .0,
+                expected,
+            );
+        }
     }
 
     /// A datagram the socket layer refuses (e.g. truncated) is dropped and the next one is
