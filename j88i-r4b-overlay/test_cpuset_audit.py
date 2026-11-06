@@ -151,6 +151,7 @@ wait "$H2H_SCOPE_CLIENT_PID"
             self.assertIsNotNone(values)
             self.assertIn("cpus_allowed", values)
             self.assertIn("allowed", values)
+            self.assertIn("nr_migrations", values)
 
     def test_audit_stop_propagates_sampler_failure(self) -> None:
         """A failed placement audit must make the measured case fail too."""
@@ -557,6 +558,83 @@ cpu5 0 0 0 0 0 0 0 66 0 0
             )
             self.assertTrue(unrelated["kernel_bound_runtime_limit_exceeded"])
             self.assertFalse(unrelated["clean"], unrelated)
+
+    def test_scheduler_migration_parser_reads_the_kernel_counter(self) -> None:
+        """Read the cumulative per-thread migration counter exposed by procfs."""
+        script = Path(__file__).parent / "base/lib/cpuset_audit.py"
+        spec = importlib.util.spec_from_file_location("cpuset_audit_migrations", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader if spec is not None else None)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        parser = getattr(module, "parse_task_migrations", None)
+        self.assertTrue(callable(parser), "the audit must parse /proc/<task>/sched migrations")
+
+        self.assertEqual(
+            parser("nr_switches : 12\nse.nr_migrations : 34\n"),
+            34,
+        )
+        self.assertIsNone(parser("nr_switches : 12\n"))
+
+    def test_sampler_reports_per_thread_migration_deltas(self) -> None:
+        """Summarize task migration-counter changes over the loaded sample window."""
+        script = Path(__file__).parent / "base/lib/cpuset_audit.py"
+        with tempfile.TemporaryDirectory(prefix="j88i-task-migrations-") as temporary:
+            output = Path(temporary)
+            spec = importlib.util.spec_from_file_location("cpuset_audit_task_migrations", script)
+            self.assertIsNotNone(spec)
+            self.assertIsNotNone(spec.loader if spec is not None else None)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            task = {
+                "pid": 123, "tid": 124, "comm": "gotatun-worker",
+                "processor": 1, "nr_migrations": 7,
+                "runtime_ns": 10, "run_delay_ns": 1,
+            }
+            first = {
+                "time_unix": 100.0, "scope_threads": 1,
+                "scope_processes": [task], "mask_mismatches": [],
+                "external_runnable": [], "proc_stat_steal_ticks_by_cpu": {},
+            }
+            second = {
+                **first,
+                "time_unix": 101.0,
+                "scope_processes": [{
+                    **task, "processor": 2, "nr_migrations": 12,
+                    "runtime_ns": 20, "run_delay_ns": 2,
+                }],
+            }
+            sleep_calls = 0
+
+            def stop_after_two_samples(_seconds: float) -> None:
+                """Stop after the two controlled migration snapshots are recorded."""
+                nonlocal sleep_calls
+                sleep_calls += 1
+                if sleep_calls >= 2:
+                    module.STOP = True
+
+            with (
+                patch.dict(os.environ, {}, clear=True),
+                patch.object(module, "sample", side_effect=iter([first, second])),
+                patch.object(module, "snapshot"),
+                patch.object(module.signal, "signal"),
+                patch.object(module.time, "sleep", side_effect=stop_after_two_samples),
+                patch("sys.argv", [str(script), str(output), str(os.getpid())]),
+                patch.object(module, "STOP", False),
+            ):
+                module.main()
+
+            summary = json.loads((output / "summary.json").read_text())
+            self.assertIn("scope_task_migration_data_available", summary)
+            self.assertTrue(summary["scope_task_migration_data_available"], summary)
+            self.assertEqual(summary["scope_task_migrations_total"], 5)
+            self.assertEqual(
+                summary["scope_task_migrations_by_task"],
+                [{
+                    "pid": 123, "tid": 124, "comm": "gotatun-worker",
+                    "migration_delta": 5, "first_cpu": 1, "last_cpu": 2,
+                }],
+            )
 
 
 if __name__ == "__main__":

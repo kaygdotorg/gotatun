@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Sample D348 placement, runnable work, kernel-worker time, and network counters.
+"""Sample D348 placement, runnable work, scheduler migrations, and network counters.
 
 The R4b cases use veth links between namespaces, so the packet path has no
-device IRQ of its own. This audit records IRQ affinity and per-CPU softirq
-counters beside each loaded phase, while checking that every process in a
-J88i scope has the scope's exact Cpus_allowed_list. Non-kernel runnable tasks
+device IRQ of its own. This audit records IRQ affinity, per-thread migration
+counters, and per-CPU softirq deltas beside each loaded phase, while checking
+that every process in a J88i scope has the scope's exact Cpus_allowed_list. Non-kernel runnable tasks
 on test CPUs reject the window. Root cgroup children of kthreadd that are
 bound to a matching test CPU are measured by role. Only unrelated background
 runtime is compared with the 0.5% budget; kernel crypto and network softirq
@@ -130,11 +130,12 @@ def cgroup_path(pid: int) -> str:
 
 
 def task_values(pid: int, tid: int) -> dict[str, object] | None:
-    """Read one task's state, CPU mask, last CPU and cumulative run-queue delay."""
+    """Read one task's state, CPU mask, migration count, and run-queue delay."""
     root = Path(f"/proc/{pid}/task/{tid}")
     status = read_text(root / "status")
     stat = read_text(root / "stat")
     schedstat = read_text(root / "schedstat").split()
+    scheduler = read_text(root / "sched")
     if not status or not stat:
         return None
     allowed = next((line.split(":", 1)[1].strip() for line in status.splitlines()
@@ -168,6 +169,7 @@ def task_values(pid: int, tid: int) -> dict[str, object] | None:
         "cpus_allowed": allowed_mask,
         "runtime_ns": runtime_ns,
         "run_delay_ns": run_delay_ns,
+        "nr_migrations": parse_task_migrations(scheduler),
     }
 
 
@@ -203,6 +205,18 @@ def parse_per_cpu_counters(text: str) -> dict[str, dict[str, int]]:
         except ValueError:
             continue
     return counters
+
+
+def parse_task_migrations(text: str) -> int | None:
+    """Read a task's cumulative migration count from its procfs scheduler record."""
+    for line in text.splitlines():
+        name, separator, value = line.partition(":")
+        if separator and name.strip() in {"se.nr_migrations", "nr_migrations"}:
+            try:
+                return int(value.strip())
+            except ValueError:
+                return None
+    return None
 
 
 def parse_proc_stat_steal_ticks(text: str) -> dict[str, int]:
@@ -373,6 +387,7 @@ def sample() -> dict[str, object]:
                     "cpus_allowed_list": values["allowed"], "cgroup": group,
                     "runtime_ns": values["runtime_ns"],
                     "run_delay_ns": values["run_delay_ns"],
+                    "nr_migrations": values["nr_migrations"],
                 })
                 if group_cpus not in EXPECTED_MASKS or allowed != group_cpus:
                     mask_mismatches.append({
@@ -481,6 +496,10 @@ def main() -> int:
     run_delay_delta_ns = 0
     previous_stats: dict[str, tuple[int, int]] = {}
     previous_kernel_worker_stats: dict[str, tuple[int, int]] = {}
+    previous_migrations: dict[str, int] = {}
+    task_migrations: dict[str, dict[str, object]] = {}
+    migration_observations = 0
+    missing_migration_observations = 0
     window_start_unix: float | None = None
     window_end_unix: float | None = None
     first_steal_ticks: dict[str, int] = {}
@@ -533,6 +552,7 @@ def main() -> int:
                 key = f"{worker['pid']}:{worker['tid']}"
                 kernel_other_workers[key] = worker
             current_stats: dict[str, tuple[int, int]] = {}
+            current_migrations: dict[str, int] = {}
             for task in current["scope_processes"]:
                 key = f"{task['pid']}:{task['tid']}"
                 runtime = int(task["runtime_ns"])
@@ -541,7 +561,26 @@ def main() -> int:
                 runtime_delta_ns += max(0, runtime - old_runtime)
                 run_delay_delta_ns += max(0, delay - old_delay)
                 current_stats[key] = (runtime, delay)
+                migration_count = task.get("nr_migrations")
+                migration_observations += 1
+                if migration_count is None:
+                    missing_migration_observations += 1
+                    continue
+                migration_count = int(migration_count)
+                current_migrations[key] = migration_count
+                record = task_migrations.setdefault(key, {
+                    "pid": task["pid"], "tid": task["tid"], "comm": task["comm"],
+                    "migration_delta": 0, "first_cpu": task["processor"],
+                    "last_cpu": task["processor"],
+                })
+                previous_count = previous_migrations.get(key)
+                if previous_count is not None:
+                    record["migration_delta"] = int(record["migration_delta"]) + max(
+                        0, migration_count - previous_count
+                    )
+                record["last_cpu"] = task["processor"]
             previous_stats = current_stats
+            previous_migrations = current_migrations
             output.write(json.dumps(current, separators=(",", ":")) + "\n")
             output.flush()
             time.sleep(1.0)
@@ -621,6 +660,21 @@ def main() -> int:
         "max_scope_threads": max_scope_threads,
         "scope_runtime_delta_ns": runtime_delta_ns,
         "scope_run_delay_delta_ns": run_delay_delta_ns,
+        "scope_task_migration_observations": migration_observations,
+        "scope_task_migration_missing_observations": missing_migration_observations,
+        "scope_task_migration_data_available": (
+            migration_observations > 0 and missing_migration_observations == 0
+        ),
+        "scope_task_migrations_total": sum(
+            int(task["migration_delta"]) for task in task_migrations.values()
+        ),
+        "scope_task_migrations_by_task": sorted(
+            task_migrations.values(), key=lambda task: (int(task["pid"]), int(task["tid"]))
+        ),
+        "scope_task_migration_source": (
+            "per-thread /proc/<pid>/task/<tid>/sched se.nr_migrations deltas "
+            "between one-second samples; short-lived tasks may be missed"
+        ),
         "clean": clean,
         "test_cpu_list": sorted(TEST_CPUS),
         "expected_side_cpu_lists": [[1, 2], [3, 4]],
