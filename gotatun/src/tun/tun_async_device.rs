@@ -118,7 +118,7 @@ impl TunDevice {
             if let Ok(name) = tun.tun_name() {
                 linux::raise_tx_queue_len(&name);
             }
-            return TunDevice::from_tun_device_with_vnet_header(tun, vnet_header);
+            TunDevice::from_tun_device_with_vnet_header(tun, vnet_header)
         }
 
         #[cfg(not(target_os = "linux"))]
