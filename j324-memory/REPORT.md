@@ -340,6 +340,12 @@ Allocator-reported bytes, both endpoints combined:
 | 100 | 72.428 | 67.252 | 12.969 | 7.227 | 59.072 | 59.119 |
 | 1,000 | 77.405 | 71.477 | 13.461 | 6.270 | 63.125 | 63.089 |
 
+The candidate Packet descriptor is 80 bytes versus 72 bytes in the base;
+the immutable size-class flag adds one aligned word. A full 256-entry blocked
+queue therefore uses 20 KiB of descriptors versus 18 KiB before payloads,
+until drain/reset releases that backing storage. Fixed PeerState and timer
+sizes are unchanged.
+
 At 1,000 peers the small/full packet bins fall 7.191 MiB while total allocated
 memory falls 5.928 MiB. Other allocations and occupancy vary between samples;
 this is a bin/source attribution, not a precise causal stack profile.
