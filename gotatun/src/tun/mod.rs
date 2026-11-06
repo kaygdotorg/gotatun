@@ -41,6 +41,73 @@ pub trait IpSend: Send + Sync + 'static {
     /// Send a complete IP packet.
     // TODO: consider refactoring trait with methods that take `Packet<Ipv4>` and `Packet<Ipv6>`
     fn send(&mut self, packet: Packet<Ip>) -> impl Future<Output = io::Result<()>> + Send;
+
+    /// Send a consecutive run of complete IP packets in input order.
+    ///
+    /// Buffered implementations can move a run across their boundary with one handoff. The
+    /// default sends packets individually and keeps trying after a nonfatal packet error. A Linux
+    /// TUN implementation may combine compatible adjacent packets into a GSO frame.
+    fn send_many(
+        &mut self,
+        packets: &mut Vec<Packet<Ip>>,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        async move {
+            let mut first_error = None;
+            for packet in packets.drain(..) {
+                if let Err(error) = self.send(packet).await {
+                    if is_fatal_tun_error(&error) {
+                        return Err(error);
+                    }
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+            first_error.map_or(Ok(()), Err)
+        }
+    }
+}
+
+/// Return whether an I/O error means the TUN device has been deleted or is unusable.
+///
+/// Invalid input and data errors describe a single refused frame, so they must not stop later
+/// packets in the same buffered batch.
+pub(crate) fn is_fatal_tun_error(err: &io::Error) -> bool {
+    #[cfg(target_os = "linux")]
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::EBADF) | Some(libc::EBADFD) | Some(libc::ENODEV)
+    ) {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        const ERROR_HANDLE_EOF: i32 = windows_sys::Win32::Foundation::ERROR_HANDLE_EOF as i32;
+
+        if err.raw_os_error() == Some(ERROR_HANDLE_EOF) {
+            return true;
+        }
+
+        // TODO: Propagate the underlying error from tun/wintun-bindings and remove this
+        #[cfg(feature = "tun")]
+        if Some(ERROR_HANDLE_EOF)
+            == err
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<wintun_bindings::Error>())
+                .and_then(|error| match error {
+                    wintun_bindings::Error::Io(io_err) => io_err.raw_os_error(),
+                    _ => None,
+                })
+        {
+            return true;
+        }
+    }
+
+    matches!(
+        err.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe
+    )
 }
 
 /// A type that let's you receive an IP packet.

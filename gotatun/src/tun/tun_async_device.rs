@@ -12,6 +12,8 @@
 //! Implementations of [`IpSend`] and [`IpRecv`] for the [`tun`] crate.
 
 #[cfg(target_os = "linux")]
+mod gso;
+#[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 mod tso;
@@ -28,7 +30,7 @@ use zerocopy::IntoBytes;
 use crate::{
     packet::{Ip, Packet, PacketBufPool},
     task::Task,
-    tun::{IpRecv, IpSend, MtuWatcher},
+    tun::{IpRecv, IpSend, MtuWatcher, is_fatal_tun_error},
 };
 
 #[cfg(not(target_os = "linux"))]
@@ -82,6 +84,9 @@ struct TunDeviceState {
     vnet_header: bool,
 
     #[cfg(target_os = "linux")]
+    offloads: linux::TunOffloadState,
+
+    #[cfg(target_os = "linux")]
     read_buf: tokio::sync::Mutex<BytesMut>,
 }
 
@@ -110,15 +115,26 @@ impl TunDevice {
         {
             let (tun, vnet_header) =
                 linux::create_tun_with_vnet_fallback(&mut tun_config).map_err(Error::OpenTun)?;
-            if vnet_header {
-                linux::enable_tso_with_fallback(tun.deref());
-            }
+            let offloads = if vnet_header {
+                linux::enable_tun_offloads_with_fallback(tun.deref())
+            } else {
+                tracing::debug!(
+                    "TUN virtio network header unavailable; using software packet handling"
+                );
+                linux::TunOffloadState::default()
+            };
+            tracing::info!(
+                vnet_header,
+                tcp_tso = offloads.tcp_tso,
+                udp_uso = offloads.udp_uso,
+                "Linux TUN offload setup"
+            );
             // Only a device we created here: one handed to us via `from_tun_device` keeps
             // whatever its owner configured.
             if let Ok(name) = tun.tun_name() {
                 linux::raise_tx_queue_len(&name);
             }
-            return TunDevice::from_tun_device_with_vnet_header(tun, vnet_header);
+            TunDevice::from_tun_device_with_vnet_header(tun, vnet_header, offloads)
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -149,12 +165,21 @@ impl TunDevice {
 
     /// Construct from a [`tun::AsyncDevice`].
     pub fn from_tun_device(tun: tun::AsyncDevice) -> Result<Self, Error> {
-        Self::from_tun_device_with_vnet_header(tun, false)
+        #[cfg(target_os = "linux")]
+        {
+            Self::from_tun_device_with_vnet_header(tun, false, linux::TunOffloadState::default())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::from_tun_device_with_vnet_header(tun, false)
+        }
     }
 
+    /// Construct with the virtio-header and offload capabilities known for this descriptor.
     fn from_tun_device_with_vnet_header(
         tun: tun::AsyncDevice,
         vnet_header: bool,
+        #[cfg(target_os = "linux")] offloads: linux::TunOffloadState,
     ) -> Result<Self, Error> {
         #[cfg(target_os = "linux")]
         if tun.packet_information() {
@@ -193,9 +218,17 @@ impl TunDevice {
                 _mtu_monitor: mtu_monitor,
                 vnet_header,
                 #[cfg(target_os = "linux")]
+                offloads,
+                #[cfg(target_os = "linux")]
                 read_buf: tokio::sync::Mutex::new(BytesMut::zeroed(MAX_TUN_FRAME_LEN)),
             }),
         })
+    }
+
+    /// Write one raw IP packet when the descriptor does not use virtio headers.
+    async fn write_ip_packet(&self, packet: Packet<Ip>) -> io::Result<()> {
+        self.tun.send(packet.as_bytes()).await?;
+        Ok(())
     }
 
     /// Get the name of the TUN device.
@@ -206,25 +239,57 @@ impl TunDevice {
 
 impl IpSend for TunDevice {
     async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
-        let mut packet = packet.into_bytes();
         #[cfg(target_os = "linux")]
         if self.state.vnet_header {
-            let header = virtio::VirtioNetHeader {
-                flags: virtio::Flags::new(),
-                gso_type: virtio::GsoType::VIRTIO_NET_HDR_GSO_NONE,
-                hdr_len: 0,
-                gso_size: 0,
-                csum_start: 0,
-                csum_offset: 0,
-            };
-            let mut buf =
-                BytesMut::with_capacity(header.as_bytes().len() + packet.as_bytes().len());
-            buf.extend_from_slice(header.as_bytes());
-            buf.extend_from_slice(packet.as_bytes());
-            *packet.buf_mut() = buf;
+            let mut packets = vec![packet];
+            return self.send_many(&mut packets).await;
         }
-        self.tun.send(&packet.into_bytes()).await?;
-        Ok(())
+        self.write_ip_packet(packet).await
+    }
+
+    async fn send_many(&mut self, packets: &mut Vec<Packet<Ip>>) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.state.vnet_header {
+            let frames = gso::coalesce_packets(
+                std::mem::take(packets),
+                self.state.offloads.tcp_tso,
+                self.state.offloads.udp_uso,
+            );
+            let mut first_error = None;
+            let tun = self.tun.as_ref();
+            for frame in frames {
+                let result = gso::write_frame_with_fallback(frame, |frame_bytes| async move {
+                    tun.send(frame_bytes.as_bytes()).await.map(|_| ())
+                })
+                .await;
+                match result {
+                    Ok(()) => {}
+                    Err(error) => {
+                        let fatal = is_fatal_tun_error(&error);
+                        if fatal {
+                            return Err(error);
+                        }
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                }
+            }
+            return first_error.map_or(Ok(()), Err);
+        }
+
+        let mut first_error = None;
+        for packet in packets.drain(..) {
+            if let Err(error) = self.write_ip_packet(packet).await {
+                if is_fatal_tun_error(&error) {
+                    return Err(error);
+                }
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }
 
