@@ -935,6 +935,69 @@ mod tests {
         assert_eq!(completed.len(), 8);
     }
 
+    /// Keep another peer moving while a slow peer has filled its ordered slot window.
+    #[tokio::test]
+    async fn profile_window_does_not_overfill_a_slow_peers_slot_capacity() {
+        let peers = vec![
+            vec![(); PROFILE_READ_PACKETS_PER_PEER * 4],
+            vec![(); PROFILE_READ_PACKETS_PER_PEER * 4],
+        ];
+        let lanes = (0..peers.len())
+            .map(|_| Arc::new(OrderedCompletions::<()>::default()))
+            .collect::<Vec<_>>();
+        let (release_slow_peer_tx, release_slow_peer_rx) = tokio::sync::oneshot::channel();
+        let mut slow_peer_gate = Some(release_slow_peer_rx);
+        let (fast_peer_done_tx, mut fast_peer_done_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut task = tokio::spawn(run_profile_window(
+            profile_peer_batches(peers),
+            4,
+            move |(peer_index, batch)| {
+                let lane = Arc::clone(&lanes[peer_index]);
+                let run_len = batch.len();
+                let first_slot = lane
+                    .reserve_run(run_len)
+                    .expect("the profile scheduler stays within each peer's slot window");
+                let gate = (peer_index == 0 && first_slot == 0)
+                    .then(|| slow_peer_gate.take().expect("the first slow run has a gate"));
+                let fast_peer_done = fast_peer_done_tx.clone();
+
+                async move {
+                    if let Some(gate) = gate {
+                        gate.await.expect("the slow peer is eventually released");
+                    }
+                    lane.complete_run(first_slot, vec![Some(()); run_len], |_| async {
+                        Ok::<_, ()>(())
+                    })
+                    .await
+                    .expect("the profile run completes in order");
+                    if peer_index == 1 {
+                        fast_peer_done
+                            .send(())
+                            .expect("the test is listening for the fast peer");
+                    }
+                }
+            },
+        ));
+
+        for _ in 0..4 {
+            tokio::select! {
+                result = &mut task => panic!("the profile scheduler failed before the fast peer drained: {result:?}"),
+                completed = fast_peer_done_rx.recv() => {
+                    assert!(completed.is_some(), "the fast peer completion channel stays open");
+                }
+            }
+        }
+
+        release_slow_peer_tx
+            .send(())
+            .expect("the slow peer is still waiting");
+        assert_eq!(
+            task.await.expect("the profile scheduler completes"),
+            vec![(), (), (), (), (), (), (), ()]
+        );
+    }
+
     /// Separate runtimes can finish later slots first without exposing them to the consumer.
     #[test]
     fn concurrent_producers_release_each_peers_completions_in_slot_order() {
