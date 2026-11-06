@@ -176,3 +176,29 @@ Artifact: dev-02 `/home/claude/j324-evidence/arm-checks.log`, copied to control
 `/home/kayg/.cache/codex-scratch/j324/evidence/arm-checks.log`. The batch trap
 removed its own target directory. x86 checks, same-build disk comparison,
 candidate RSS and allocator-bin diagnostics remain pending.
+
+## Kernel peer-slab diagnostic
+
+A fresh same-protocol kernel run exposed the dedicated `wg_peer` slab: objects
+are 1,552 bytes, 21 per eight-page slab. Host-wide reserved slab pages were
+unchanged across idle, load and recovery at each scale:
+
+| Peers/endpoint | Reported active objects | Total objects | Slabs | Reserved MiB |
+|---|---:|---:|---:|---:|
+| 1 | 253 | 378 | 18 | 0.5625 |
+| 100 | 399 | 399 | 19 | 0.59375 |
+| 1,000 | 2,205 | 2,205 | 105 | 3.28125 |
+
+These are host-wide allocator counts, including pre-existing objects and
+cached/free capacity. They are not exact live-peer counts or total kernel
+WireGuard memory. Session, allowed-IP, socket and packet allocations remain
+outside this dedicated slab. The 1,552-byte structure is therefore only one
+component of the kernel memory comparison; no kernel-memory win is claimed.
+
+Artifact: perf VM `/home/claude/j324/evidence/kernel-slab/kernel/mesh-kernel-plain/slab-*.txt`;
+console `kernel-slab-console.log` reports exit 0, 129.058 seconds, restored host
+placement, and 5 stolen jiffies of 76,999 host-wide. Case audits/machine diff
+remain alongside the raw rows. `kernel-slab-overlay.patch` adds the snapshot
+to the scale overlay; it does not change the traffic or placement protocol.
+The separate inventory log `kernel-inventory.log` records module and slab
+identity, also under `perf-run` (exit 0).

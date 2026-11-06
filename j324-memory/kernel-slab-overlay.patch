@@ -1,0 +1,10 @@
+--- a/cases/mesh.sh
++++ b/cases/mesh.sh
+@@ -514,6 +514,7 @@
+         done
+     done
+     record_memcg "$phase"
++    cat /proc/slabinfo > "$H2H_RESULTS/$H2H_CASE/slab-$phase.txt"
+ }
+ # J324: configure inert peers without replacing the one active traffic peer.
+ # Each scale has one established peer; the remainder are configured, unhandshaken peers.
