@@ -771,11 +771,11 @@ mod tests {
     /// Number of singleton reads used to measure the low-rate serial fast path.
     const PROFILE_SPARSE_PACKET_COUNT: usize = 2_000;
 
-    /// Inner IP flows carried by one peer in the loaded stage profile.
+    /// Inner IP flows carried by each peer in the loaded stage profile.
     const PROFILE_INNER_FLOW_COUNT: usize = 8;
 
-    /// The profile uses one peer so a read produces one contiguous, order-sensitive run.
-    const PROFILE_PEER_COUNT: usize = 1;
+    /// Two peers let four workers run without exceeding either peer's slot window.
+    const PROFILE_PEER_COUNT: usize = 2;
 
     /// Packets per peer in one ready read from the profile.
     const PROFILE_READ_PACKETS_PER_PEER: usize = CRYPTO_CHUNK_SIZE;
@@ -800,21 +800,25 @@ mod tests {
         }
     }
 
-    /// Lazily split prepared peer traffic into bounded runs without buffering the full profile.
+    /// Lazily split peers into ordered runs and interleave peers without buffering the profile.
     fn profile_peer_batches<T>(peers: Vec<Vec<T>>) -> impl Iterator<Item = (usize, Vec<T>)> {
-        peers
+        let mut peers = peers
             .into_iter()
             .enumerate()
-            .flat_map(|(peer_index, packets)| {
-                let mut packets = packets.into_iter();
-                std::iter::from_fn(move || {
-                    let batch = packets
-                        .by_ref()
-                        .take(PROFILE_READ_PACKETS_PER_PEER)
-                        .collect::<Vec<_>>();
-                    (!batch.is_empty()).then_some((peer_index, batch))
-                })
-            })
+            .map(|(peer_index, packets)| (peer_index, packets.into_iter()))
+            .collect::<VecDeque<_>>();
+
+        std::iter::from_fn(move || {
+            let (peer_index, mut packets) = peers.pop_front()?;
+            let batch = packets
+                .by_ref()
+                .take(PROFILE_READ_PACKETS_PER_PEER)
+                .collect::<Vec<_>>();
+            if !packets.as_slice().is_empty() {
+                peers.push_back((peer_index, packets));
+            }
+            (!batch.is_empty()).then_some((peer_index, batch))
+        })
     }
 
     /// Keep a bounded set of ready reads active, replacing each completed run immediately.
@@ -898,6 +902,37 @@ mod tests {
             task.await.expect("the profile scheduler completes"),
             vec![0, 2, 1]
         );
+    }
+
+    /// Keep four ready worker runs inside each peer's bounded completion window.
+    #[tokio::test]
+    async fn profile_four_worker_window_respects_each_peer_capacity() {
+        let peers = vec![
+            vec![(); PROFILE_READ_PACKETS_PER_PEER * 4],
+            vec![(); PROFILE_READ_PACKETS_PER_PEER * 4],
+        ];
+        let lanes = (0..peers.len())
+            .map(|_| Arc::new(OrderedCompletions::<()>::default()))
+            .collect::<Vec<_>>();
+
+        let completed =
+            run_profile_window(profile_peer_batches(peers), 4, |(peer_index, batch)| {
+                let lane = Arc::clone(&lanes[peer_index]);
+                let run_len = batch.len();
+                let first_slot = lane
+                    .reserve_run(run_len)
+                    .expect("the ready profile window fits each peer's slot bound");
+                async move {
+                    lane.complete_run(first_slot, vec![Some(()); run_len], |_| async {
+                        Ok::<_, ()>(())
+                    })
+                    .await
+                    .expect("the profile run completes in order");
+                }
+            })
+            .await;
+
+        assert_eq!(completed.len(), 8);
     }
 
     /// Separate runtimes can finish later slots first without exposing them to the consumer.
@@ -1431,9 +1466,11 @@ mod tests {
     /// Build this test in release mode on compute01, then run its binary on the pinned performance
     /// host with the shared benchmark lock and `taskset`. Set `GOTATUN_PROFILE_WORKERS` to run one
     /// worker count at a time so its affinity can match the pool size. Packet preparation is outside
-    /// the timed interval. The ordered-stage profile places eight inner IP flows on one peer, so a
-    /// read becomes one contiguous 64-packet run. Its latency runs from read readiness through
-    /// in-order release, including queueing and the bounded worker batch.
+    /// the timed interval. The ordered-stage profile places eight inner IP flows on each of two
+    /// peers, and interleaves their contiguous 64-packet reads so four workers fit inside the peer
+    /// slot bounds. Its latency runs from read readiness through in-order release, including
+    /// queueing and the bounded worker batch. Compare ordered worker counts with the one-worker
+    /// stage row, not the raw per-packet AEAD row, because those rows time different work units.
     #[test]
     #[ignore = "manual crypto-stage measurement on the pinned performance VM"]
     fn crypto_stage_microbenchmark() {
