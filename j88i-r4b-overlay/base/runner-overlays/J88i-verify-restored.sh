@@ -11,10 +11,18 @@ cgroup_root=${J88I_CGROUP_ROOT:-/sys/fs/cgroup}
 results=()
 failed=0
 
+# Decode the manifest marker used for empty cpuset and DropInPaths values.
+manifest_value() {
+    [[ $1 == '__EMPTY__' ]] && printf '' || printf '%s' "$1"
+}
+
 if [[ -n $cgroup_manifest ]]; then
     [[ -r $cgroup_manifest ]] || { echo "missing cgroup baseline manifest: $cgroup_manifest" >&2; exit 2; }
     while IFS=$'\t' read -r unit group expected_cpus expected_effective expected_dropins; do
         [[ -n $unit ]] || continue
+        expected_cpus=$(manifest_value "$expected_cpus")
+        expected_effective=$(manifest_value "$expected_effective")
+        expected_dropins=$(manifest_value "$expected_dropins")
         cgroup="$cgroup_root$group"
         cpus=$(cat "$cgroup/cpuset.cpus")
         effective=$(cat "$cgroup/cpuset.cpus.effective")

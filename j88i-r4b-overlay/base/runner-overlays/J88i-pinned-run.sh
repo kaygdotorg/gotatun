@@ -63,11 +63,19 @@ old_perf_effective=${old_effective[perf.slice]}
 }
 
 for unit in init.scope system.slice user.slice; do
-    [[ ${old_cpuset[$unit]} == 0-5 && ${old_effective[$unit]} == 0-5 ]] || {
-        echo "$unit must be unpinned at 0-5 before D348, got cpuset.cpus=${old_cpuset[$unit]} effective=${old_effective[$unit]}" >&2
+    baseline_cpus=${old_cpuset[$unit]}
+    baseline_effective=${old_effective[$unit]}
+    [[ $baseline_effective == 0-5 && ( -z $baseline_cpus || $baseline_cpus == 0-5 ) ]] || {
+        echo "$unit must inherit or be configured for 0-5 before D348, got cpuset.cpus=$baseline_cpus effective=$baseline_effective" >&2
         exit 2
     }
 done
+
+# Encode empty TSV fields because Bash treats tab separators as whitespace and
+# collapses adjacent separators while reading the restore manifest.
+manifest_field() {
+    [[ -n $1 ]] && printf '%s' "$1" || printf '%s' '__EMPTY__'
+}
 
 # Keep a machine-readable baseline so the second perf-run scope can verify
 # real cgroup files after this scope has gone away.
@@ -75,7 +83,8 @@ done
 for unit in "${units[@]}"; do
     group=$(unit_cgroup "$unit")
     printf '%s\t%s\t%s\t%s\t%s\n' "$unit" "${group#/sys/fs/cgroup}" \
-        "${old_cpuset[$unit]}" "${old_effective[$unit]}" "${old_dropins[$unit]}" \
+        "$(manifest_field "${old_cpuset[$unit]}")" "$(manifest_field "${old_effective[$unit]}")" \
+        "$(manifest_field "${old_dropins[$unit]}")" \
         >> "$out/cgroup-masks-before.tsv"
 done
 
