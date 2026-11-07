@@ -139,8 +139,10 @@ where
             DelayState::Active { bypass: true, .. } if replace && decoy_bypass => {
                 if let Ok(packet) = self.delay_queue_rx.try_recv() {
                     // Replace decoy with a delayed packet
-                    let peer = self.get_peer().await?;
-                    self.send(packet, peer).await
+                    let (peer_trace, peer) = self.get_peer().await?;
+                    let result = self.send(packet, peer).await;
+                    drop(peer_trace);
+                    result
                 } else {
                     // No delayed packet to replace, just send decoy
                     self.send_decoy().await
@@ -159,11 +161,13 @@ where
             }
             // Add packet to delay queue if it shouldn't or cannot be replaced
             DelayState::Active { .. } => {
-                let mut peer = self.get_peer().await?;
+                let (peer_trace, mut peer) = self.get_peer().await?;
                 let mtu = self.mtu.get();
                 let decoy_packet = self.encapsulate_decoy(&mut peer, mtu)?;
                 //  Drop the decoy packet if the delay queue is full
                 let _ = self.delay_watcher.delay_queue_tx.try_send(decoy_packet);
+                drop(peer);
+                drop(peer_trace);
                 Ok(())
             }
             // Replace decoy packet with in-flight packet
@@ -177,7 +181,11 @@ where
         &mut self,
         packets: &mut Vec<(Packet, SocketAddr)>,
     ) -> Result<()> {
-        let Some(addr) = self.get_peer().await?.endpoint().addr else {
+        let (peer_trace, peer) = self.get_peer().await?;
+        let addr = peer.endpoint().addr;
+        drop(peer);
+        drop(peer_trace);
+        let Some(addr) = addr else {
             tracing::trace!("No endpoint");
             return Err(ErrorAction::Close);
         };
@@ -254,10 +262,11 @@ where
 
     pub(crate) async fn send_decoy(&mut self) -> Result<()> {
         let mtu = self.mtu.get();
-        let mut peer = self.get_peer().await?;
+        let (peer_trace, mut peer) = self.get_peer().await?;
 
         let packet = self.encapsulate_decoy(&mut peer, mtu)?;
         self.send(packet, peer).await?;
+        drop(peer_trace);
         Ok(())
     }
 
@@ -281,12 +290,20 @@ where
         Ok(())
     }
 
-    pub(crate) async fn get_peer(&self) -> Result<tokio::sync::OwnedMutexGuard<PeerState>> {
+    async fn get_peer(
+        &self,
+    ) -> Result<(
+        super::super::PeerLockDiagnostic,
+        tokio::sync::OwnedMutexGuard<PeerState>,
+    )> {
         let Some(peer) = self.peer.upgrade() else {
             return Err(ErrorAction::Close);
         };
+        let peer_key = super::super::peer_order_key(&peer);
+        let mut peer_trace = super::super::PeerLockDiagnostic::waiting("daita_action", peer_key);
         let peer = peer.lock_owned().await;
-        Ok(peer)
+        peer_trace.acquired();
+        Ok((peer_trace, peer))
     }
 
     pub(crate) fn send_event(&self, event: TriggerEvent) -> Result<()> {
