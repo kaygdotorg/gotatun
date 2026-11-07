@@ -20,6 +20,9 @@ const MAX_GSO_SEGMENTS: usize = 64;
 /// Maximum frame size accepted for a coalesced TUN write, including its virtio header.
 const MAX_GSO_FRAME_LEN: usize = 64 * 1024;
 
+/// IP and transport header ranges whose values may change between adjacent GSO segments.
+type HeaderDynamicRanges = (&'static [(usize, usize)], &'static [(usize, usize)]);
+
 /// TCP's push bit belongs only on the last segment emitted from one GSO frame.
 const TCP_FLAG_PSH: u8 = 0x08;
 
@@ -374,7 +377,7 @@ fn headers_match(first: &[u8], next: &[u8], metadata: PacketMetadata) -> bool {
         return false;
     };
 
-    let (ip_dynamic, transport_dynamic): (&[(usize, usize)], &[(usize, usize)]) = match metadata {
+    let (ip_dynamic, transport_dynamic): HeaderDynamicRanges = match metadata {
         PacketMetadata {
             ip_version: IpVersion::V4,
             protocol: TransportProtocol::Tcp,
@@ -2015,7 +2018,7 @@ mod tests {
                 }
                 panic!("read AF_PACKET capture: {}", io::Error::last_os_error());
             }
-            if sender.sll_pkttype == libc::PACKET_OUTGOING as u8 || length < 14 {
+            if sender.sll_pkttype == libc::PACKET_OUTGOING || length < 14 {
                 continue;
             }
             let frame = &buffer[..length as usize];
