@@ -53,6 +53,15 @@ async fn flush_udp_packets<U: UdpSend>(
     send_buf: &mut U::SendManyBuf,
     packets: &mut Vec<(Packet, SocketAddr)>,
 ) {
+    if std::env::var_os("GOTATUN_DIAG_UDP_SINGLE_SENDS").is_some() {
+        for (packet, address) in packets.drain(..) {
+            if let Err(error) = udp_tx.send_to(packet, address).await {
+                tracing::trace!("send_to_err: {error:#}");
+            }
+        }
+        return;
+    }
+
     match packets.len() {
         0 => {}
         1 => {

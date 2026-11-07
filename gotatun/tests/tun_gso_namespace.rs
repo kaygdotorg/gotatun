@@ -311,7 +311,7 @@ async fn start_echo_servers() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     let target = (Ipv4Addr::new(10, 77, 0, 2), TCP_ECHO_PORT);
     let tcp = timeout(Duration::from_secs(15), TcpStream::connect(target)).await??;
-    let payload: Vec<u8> = (0..2 * 1024 * 1024)
+    let payload: Vec<u8> = (0..8 * 1024 * 1024)
         .map(|index| (index % 251) as u8)
         .collect();
     let send_payload = payload.clone();
@@ -351,9 +351,16 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     for datagram in &datagrams {
         udp.send(datagram).await?;
     }
-    for expected in &datagrams {
+    for (sequence, expected) in datagrams.iter().enumerate() {
         let mut received = vec![0; 1200];
-        let length = timeout(Duration::from_secs(10), udp.recv(&mut received)).await??;
+        let length = timeout(Duration::from_secs(10), udp.recv(&mut received))
+            .await
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("UDP echo datagram {sequence} timed out: {error}"),
+                )
+            })??;
         assert_eq!(
             &received[..length],
             expected,

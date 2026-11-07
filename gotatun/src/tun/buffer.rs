@@ -137,6 +137,13 @@ impl IpSend for BufferedIpSend {
     }
 
     async fn send_many(&mut self, packets: &mut Vec<Packet<Ip>>) -> io::Result<()> {
+        if std::env::var_os("GOTATUN_DIAG_TUN_SINGLE_SENDS").is_some() {
+            for packet in std::mem::take(packets) {
+                self.send(packet).await?;
+            }
+            return Ok(());
+        }
+
         while !packets.is_empty() {
             let count = packets.len().min(self.packet_capacity);
             let permit_count = u32::try_from(count).map_err(|e| {

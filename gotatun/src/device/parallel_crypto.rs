@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::thread::{self, JoinHandle};
 
@@ -188,6 +188,12 @@ impl<T> OrderedCompletions<T> {
     /// lane's separate high and low water marks prevent mode flapping.
     pub(crate) fn should_force_worker(&self, packet_count: usize) -> bool {
         assert!(packet_count > 0, "a crypto dispatch run cannot be empty");
+        if std::env::var_os("GOTATUN_DIAG_FORCE_INLINE").is_some() {
+            return false;
+        }
+        if std::env::var_os("GOTATUN_DIAG_FORCE_WORKERS").is_some() {
+            return true;
+        }
         let mut state = self.state.lock();
         assert!(
             packet_count <= state.crypto_pending,
@@ -567,6 +573,12 @@ impl CryptoHandle {
             .push(CryptoJob::Encrypt(run, result_tx, active))
             .await
             .ok()?;
+        static REPORTED_ENCRYPT_HANDOFF: AtomicBool = AtomicBool::new(false);
+        if std::env::var_os("GOTATUN_DIAG_FORCE_WORKERS").is_some()
+            && !REPORTED_ENCRYPT_HANDOFF.swap(true, Ordering::Relaxed)
+        {
+            eprintln!("diagnostic: encrypt run handed to crypto worker");
+        }
         #[cfg(test)]
         self.handoff_count.fetch_add(1, Ordering::Relaxed);
         result_rx.await.ok()
@@ -595,6 +607,12 @@ impl CryptoHandle {
             .push(CryptoJob::Decrypt(run, result_tx, active))
             .await
             .ok()?;
+        static REPORTED_DECRYPT_HANDOFF: AtomicBool = AtomicBool::new(false);
+        if std::env::var_os("GOTATUN_DIAG_FORCE_WORKERS").is_some()
+            && !REPORTED_DECRYPT_HANDOFF.swap(true, Ordering::Relaxed)
+        {
+            eprintln!("diagnostic: decrypt run handed to crypto worker");
+        }
         #[cfg(test)]
         self.handoff_count.fetch_add(1, Ordering::Relaxed);
         result_rx.await.ok()
