@@ -7,6 +7,7 @@ output=$1
 cgroup_manifest=${2:-}
 workqueue_manifest=${3:-}
 irq_manifest=${4:-}
+dropin_manifest=${5:-}
 cgroup_root=${J88I_CGROUP_ROOT:-/sys/fs/cgroup}
 results=()
 failed=0
@@ -50,7 +51,13 @@ else
     dropins=$(systemctl show perf.slice -p DropInPaths --value)
     cpus=$(cat "$slice_cgroup/cpuset.cpus")
     effective=$(cat "$slice_cgroup/cpuset.cpus.effective")
-    if [[ $cpus != "$expected" || $effective != "$expected" || -n $dropins ]]; then
+    dropin_state_ok=1
+    if [[ -n $dropins ]]; then
+        cpuset_perf_slice_dropins_are_known "$dropins" && \
+            cpuset_allowed_cpus_dropin_matches \
+                /run/systemd/system.control/perf.slice.d/50-AllowedCPUs.conf "$expected" || dropin_state_ok=0
+    fi
+    if [[ $cpus != "$expected" || $effective != "$expected" ]] || ((dropin_state_ok == 0)); then
         printf 'perf.slice restoration failed: cpuset.cpus=%s expected=%s cpuset.cpus.effective=%s expected=%s DropInPaths=%s (AllowedCPUs=%s EffectiveCPUs=%s informational)\n' \
             "$cpus" "$expected" "$effective" "$expected" "$dropins" "$allowed" "$systemd_effective" >&2
         failed=1
@@ -83,6 +90,19 @@ if [[ -n $irq_manifest ]]; then
         fi
         results+=("IRQ affinity restored: irq=$irq cpus=$actual")
     done < "$irq_manifest"
+fi
+
+if [[ -n $dropin_manifest ]]; then
+    [[ -r $dropin_manifest ]] || { echo "missing drop-in baseline manifest: $dropin_manifest" >&2; exit 2; }
+    while IFS=$'\t' read -r path expected; do
+        [[ -n $path ]] || continue
+        actual=$(sha256sum "$path" | awk '{print $1}')
+        if [[ $actual != "$expected" ]]; then
+            printf 'drop-in file restore failed: %s sha256=%s expected=%s\n' "$path" "$actual" "$expected" >&2
+            failed=1
+        fi
+        results+=("drop-in file restored: $path sha256=$actual")
+    done < "$dropin_manifest"
 fi
 
 if ((failed)); then

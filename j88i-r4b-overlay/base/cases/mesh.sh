@@ -173,6 +173,29 @@ start_gotatun() {
     note version "{\"gotatun\":\"$gotatun_version\",\"source\":\"${H2H_GOTATUN_SOURCE:-unknown}\",\"binary_sha256\":\"$(sha256sum "$GOTATUN_BIN" | awk '{print $1}')\",\"mtu\":1420,\"tun_vnet_hdr\":\"attempted-with-fallback\",\"linux_udp_gso_gro_path\":true}"
 }
 
+pin_locality_workers() {
+    [[ ${H2H_CPUSET_AUDIT_WORKER_PLACEMENT:-default} == round-robin ]] || return 0
+    [[ ${H2H_CPUSET_AUDIT_ROW_TAG:-} =~ ^gotatun-j88i-(locality-)?33ca6fe-[0-9]+$ ]] || return 0
+    [[ $SYSTEM == gotatun && ${H2H_CPUSET_AUDIT_ENGINE:-} == gotatun ]] \
+        || die "round-robin worker placement is only valid for a GotaTun row"
+    [[ -n ${GOTA_A_PID:-} && -n ${GOTA_B_PID:-} ]] \
+        || die "round-robin worker placement has no live GotaTun endpoints"
+
+    local endpoint pid cpus
+    for endpoint in a b; do
+        pid=$GOTA_A_PID
+        cpus=${H2H_CPUSET_A:?D348 side A mask is required}
+        [[ $endpoint == a ]] || {
+            pid=$GOTA_B_PID
+            cpus=${H2H_CPUSET_B:?D348 side B mask is required}
+        }
+        python3 -I "$H2H_KIT/lib/tokio_affinity.py" "$pid" "$cpus" \
+            > "$H2H_RESULTS/$H2H_CASE/tokio-affinity-$endpoint.json" \
+            || die "could not pin GotaTun $endpoint Tokio workers to $cpus"
+    done
+    export H2H_CPUSET_AUDIT_TARGET_PIDS="$GOTA_A_PID,$GOTA_B_PID"
+}
+
 start_wireguard_go() {
     local version
     mkdir -p "$D/a" "$D/b" "$D/keys"
@@ -360,6 +383,7 @@ record_link_offloads
 
 measure first-packet in_ns h2h-a "$H" net-wait --to "$PEER:5201" --since-ns "$START" --timeout-s 120
 in_ns h2h-a ip -o link show > "$H2H_RESULTS/$H2H_CASE/links-a.txt" 2>&1 || true
+pin_locality_workers
 measure idle "$H" proc-idle --pids "$WATCH" --seconds "$IDLE_S"
 record_memcg one
 

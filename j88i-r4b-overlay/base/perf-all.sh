@@ -233,6 +233,7 @@ restore_args=("$out/cpuset-restoration.txt")
 [[ -s $out/cgroup-masks-before.tsv ]] && restore_args+=("$out/cgroup-masks-before.tsv") || restore_args+=("")
 [[ -s $out/workqueue-masks-before.tsv ]] && restore_args+=("$out/workqueue-masks-before.tsv") || restore_args+=("")
 [[ -s $out/irq-affinity-before.tsv ]] && restore_args+=("$out/irq-affinity-before.tsv") || restore_args+=("")
+[[ -s $out/dropin-masks-before.tsv ]] && restore_args+=("$out/dropin-masks-before.tsv") || restore_args+=("")
 if ((run_status == 0)) && [[ ! -s $out/cgroup-masks-before.tsv || ! -s $out/workqueue-masks-before.tsv || ! -s $out/irq-affinity-before.tsv ]]; then
     echo 'D348 baseline manifests are missing after a successful measured scope' >&2
     restore_status=2

@@ -65,6 +65,16 @@ def parse_cpulist(value: str) -> set[int]:
     return cpus
 
 
+def parse_pid_list(value: str) -> set[int]:
+    """Parse the explicit process IDs pinned by the locality-row setup."""
+    if not value:
+        return set()
+    parts = value.split(",")
+    if any(not part.isdecimal() or int(part) <= 0 for part in parts):
+        raise ValueError(f"invalid PID list: {value!r}")
+    return {int(part) for part in parts}
+
+
 def classify_runnable_task(comm: str, case: str) -> str:
     """Separate measured kernel networking work from unrelated runnable tasks."""
     if comm.startswith("ksoftirqd/"):
@@ -130,12 +140,13 @@ def cgroup_path(pid: int) -> str:
 
 
 def task_values(pid: int, tid: int) -> dict[str, object] | None:
-    """Read one task's state, CPU mask, migration count, and run-queue delay."""
+    """Read one task's state, name, CPU mask, migrations, and run-queue delay."""
     root = Path(f"/proc/{pid}/task/{tid}")
     status = read_text(root / "status")
     stat = read_text(root / "stat")
     schedstat = read_text(root / "schedstat").split()
     scheduler = read_text(root / "sched")
+    thread_comm = read_text(root / "comm").strip()
     if not status or not stat:
         return None
     allowed = next((line.split(":", 1)[1].strip() for line in status.splitlines()
@@ -165,12 +176,65 @@ def task_values(pid: int, tid: int) -> dict[str, object] | None:
         "state": fields[0],
         "processor": processor,
         "parent_pid": parsed_parent_pid,
+        "thread_comm": thread_comm,
         "allowed": allowed,
         "cpus_allowed": allowed_mask,
         "runtime_ns": runtime_ns,
         "run_delay_ns": run_delay_ns,
         "nr_migrations": parse_task_migrations(scheduler),
     }
+
+
+def locality_worker_is_in_round_robin_row(
+    *,
+    process_pid: int,
+    target_pids: set[int],
+    thread_comm: str,
+    audit_case: str,
+    audit_engine: str,
+    row_tag: str,
+    worker_placement: str,
+    group_cpus: set[int],
+) -> bool:
+    """Identify Tokio workers that must be pinned in the locality row."""
+    return (
+        process_pid in target_pids
+        and thread_comm == "tokio-runtime-w"
+        and audit_case == "mesh-gotatun"
+        and audit_engine == "gotatun"
+        and re.fullmatch(r"gotatun-j88i-(?:locality-)?33ca6fe-[0-9]+", row_tag) is not None
+        and worker_placement == "round-robin"
+        and len(group_cpus) == 2
+    )
+
+
+def locality_worker_may_use_narrow_mask(
+    *,
+    process_pid: int,
+    target_pids: set[int],
+    thread_comm: str,
+    audit_case: str,
+    audit_engine: str,
+    row_tag: str,
+    worker_placement: str,
+    group_cpus: set[int],
+    allowed: set[int],
+) -> bool:
+    """Allow singleton affinity only for assigned Tokio workers in the locality row."""
+    return (
+        locality_worker_is_in_round_robin_row(
+            process_pid=process_pid,
+            target_pids=target_pids,
+            thread_comm=thread_comm,
+            audit_case=audit_case,
+            audit_engine=audit_engine,
+            row_tag=row_tag,
+            worker_placement=worker_placement,
+            group_cpus=group_cpus,
+        )
+        and len(allowed) == 1
+        and allowed.issubset(group_cpus)
+    )
 
 
 def irq_affinity() -> list[dict[str, str]]:
@@ -319,6 +383,10 @@ def snapshot(name: str) -> None:
 def sample() -> dict[str, object]:
     """Sample J88i scopes and classify other runnable tasks by workload role."""
     audit_case = os.environ.get("H2H_CPUSET_AUDIT_CASE", "")
+    audit_engine = os.environ.get("H2H_CPUSET_AUDIT_ENGINE", "")
+    row_tag = os.environ.get("H2H_CPUSET_AUDIT_ROW_TAG", "")
+    worker_placement = os.environ.get("H2H_CPUSET_AUDIT_WORKER_PLACEMENT", "default")
+    target_pids = parse_pid_list(os.environ.get("H2H_CPUSET_AUDIT_TARGET_PIDS", ""))
     scope_threads = 0
     mask_mismatches = []
     external_runnable = []
@@ -382,6 +450,7 @@ def sample() -> dict[str, object]:
                 run_delay_ns += int(values["run_delay_ns"])
                 scope_processes.append({
                     "pid": pid, "tid": tid, "comm": comm,
+                    "thread_comm": values["thread_comm"],
                     "state": values["state"], "processor": values["processor"],
                     "cpus_allowed": values["cpus_allowed"],
                     "cpus_allowed_list": values["allowed"], "cgroup": group,
@@ -389,9 +458,33 @@ def sample() -> dict[str, object]:
                     "run_delay_ns": values["run_delay_ns"],
                     "nr_migrations": values["nr_migrations"],
                 })
-                if group_cpus not in EXPECTED_MASKS or allowed != group_cpus:
+                locality_worker = locality_worker_may_use_narrow_mask(
+                    process_pid=pid,
+                    target_pids=target_pids,
+                    thread_comm=str(values["thread_comm"]),
+                    audit_case=audit_case,
+                    audit_engine=audit_engine,
+                    row_tag=row_tag,
+                    worker_placement=worker_placement,
+                    group_cpus=group_cpus,
+                    allowed=allowed,
+                )
+                locality_worker_task = locality_worker_is_in_round_robin_row(
+                    process_pid=pid,
+                    target_pids=target_pids,
+                    thread_comm=str(values["thread_comm"]),
+                    audit_case=audit_case,
+                    audit_engine=audit_engine,
+                    row_tag=row_tag,
+                    worker_placement=worker_placement,
+                    group_cpus=group_cpus,
+                )
+                if group_cpus not in EXPECTED_MASKS or (
+                    (allowed != group_cpus or locality_worker_task) and not locality_worker
+                ):
                     mask_mismatches.append({
                         "pid": pid, "tid": tid, "comm": comm,
+                        "thread_comm": values["thread_comm"],
                         "cpus_allowed": values["cpus_allowed"],
                         "allowed": values["allowed"],
                         "scope_allowed": sorted(group_cpus),
@@ -421,6 +514,10 @@ def sample() -> dict[str, object]:
     return {
         "time_unix": time.time(),
         "audit_case": audit_case,
+        "audit_engine": audit_engine,
+        "audit_row_tag": row_tag,
+        "worker_placement": worker_placement,
+        "locality_target_pids": sorted(target_pids),
         "scope_threads": scope_threads,
         "scope_processes": scope_processes,
         "mask_mismatches": mask_mismatches,
@@ -569,7 +666,8 @@ def main() -> int:
                 migration_count = int(migration_count)
                 current_migrations[key] = migration_count
                 record = task_migrations.setdefault(key, {
-                    "pid": task["pid"], "tid": task["tid"], "comm": task["comm"],
+                    "pid": task["pid"], "tid": task["tid"],
+                    "comm": task.get("thread_comm") or task["comm"],
                     "migration_delta": 0, "first_cpu": task["processor"],
                     "last_cpu": task["processor"],
                 })
@@ -684,6 +782,12 @@ def main() -> int:
         "softirq_delta_per_cpu": softirq_delta,
         "veth_irq_note": "veth links have no device IRQ; interrupt affinity and per-CPU softirq deltas are retained for the measured path",
         "audit_case": os.environ.get("H2H_CPUSET_AUDIT_CASE", ""),
+        "audit_engine": os.environ.get("H2H_CPUSET_AUDIT_ENGINE", ""),
+        "audit_row_tag": os.environ.get("H2H_CPUSET_AUDIT_ROW_TAG", ""),
+        "worker_placement": os.environ.get("H2H_CPUSET_AUDIT_WORKER_PLACEMENT", "default"),
+        "locality_target_pids": sorted(parse_pid_list(
+            os.environ.get("H2H_CPUSET_AUDIT_TARGET_PIDS", "")
+        )),
         "interpretation": "bound kthreadd children in cgroup / named and pinned to one test CPU are measured by role and in total; only unrelated background-worker runtime is budgeted against 0.5% of test-CPU time; kernel crypto and network softirq are measured workload and are reported without using that budget; any non-kernel runnable task allowed on test CPUs rejects the window; other root kernel tasks are reported separately",
     }
     (OUTPUT / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")

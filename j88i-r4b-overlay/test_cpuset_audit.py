@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -54,6 +55,121 @@ wait "$H2H_SCOPE_CLIENT_PID"
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_saved_perf_slice_dropin_accepts_only_its_original_allowed_cpus(self) -> None:
+        """Preserve a known perf.slice mask without accepting unrelated settings."""
+        state = Path(__file__).parent / "base/runner-overlays/J88i-cpuset-state.sh"
+        with tempfile.TemporaryDirectory(prefix="j88i-dropin-") as temporary:
+            root = Path(temporary)
+            valid = root / "valid.conf"
+            wrong = root / "wrong.conf"
+            extra = root / "extra.conf"
+            valid.write_text("[Slice]\nAllowedCPUs=1-3\n", encoding="utf-8")
+            wrong.write_text("[Slice]\nAllowedCPUs=0-5\n", encoding="utf-8")
+            extra.write_text("[Slice]\nAllowedCPUs=1-3\nCPUWeight=100\n", encoding="utf-8")
+            code = r"""
+set -euo pipefail
+source "$1"
+cpuset_allowed_cpus_dropin_matches "$2" 1-3
+"""
+            accepted = subprocess.run(
+                ["bash", "-c", code, "bash", str(state), str(valid)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            for path in (wrong, extra):
+                with self.subTest(path=path):
+                    rejected = subprocess.run(
+                        ["bash", "-c", code, "bash", str(state), str(path)],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertNotEqual(rejected.returncode, 0, path)
+
+    def test_generated_cpu_dropin_reset_then_saved_mask_is_valid(self) -> None:
+        """Accept systemd's empty list reset before its active saved CPU mask."""
+        state = Path(__file__).parent / "base/runner-overlays/J88i-cpuset-state.sh"
+        with tempfile.TemporaryDirectory(prefix="j88i-dropin-reset-") as temporary:
+            generated = Path(temporary) / "50-AllowedCPUs.conf"
+            generated.write_text(
+                "[Slice]\nAllowedCPUs=\nAllowedCPUs=1-3\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    "bash", "-c",
+                    'set -euo pipefail; source "$1"; '
+                    'cpuset_allowed_cpus_dropin_matches "$2" 1-3',
+                    "bash", str(state), str(generated),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_perf_slice_accepts_only_the_cpu_and_memory_runtime_dropins(self) -> None:
+        """Recognize the live CPU and memory files without accepting extra policy."""
+        state = Path(__file__).parent / "base/runner-overlays/J88i-cpuset-state.sh"
+        cpu = "/run/systemd/system.control/perf.slice.d/50-AllowedCPUs.conf"
+        memory = "/run/systemd/system.control/perf.slice.d/50-MemoryMax.conf"
+        accepted = subprocess.run(
+            [
+                "bash", "-c",
+                'set -euo pipefail; source "$1"; cpuset_perf_slice_dropins_are_known "$2"',
+                "bash", str(state), f"{cpu} {memory}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        for paths in (f"{cpu} /run/unexpected.conf", memory):
+            with self.subTest(paths=paths):
+                rejected = subprocess.run(
+                    [
+                        "bash", "-c",
+                        'set -euo pipefail; source "$1"; '
+                        'cpuset_perf_slice_dropins_are_known "$2"',
+                        "bash", str(state), paths,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotEqual(rejected.returncode, 0, paths)
+
+    def test_restoring_cpu_dropin_leaves_memory_dropin_untouched(self) -> None:
+        """Restore the original CPU bytes without removing the perf memory cap."""
+        state = Path(__file__).parent / "base/runner-overlays/J88i-cpuset-state.sh"
+        with tempfile.TemporaryDirectory(prefix="j88i-dropin-restore-") as temporary:
+            root = Path(temporary)
+            saved_cpu = root / "saved-AllowedCPUs.conf"
+            current_cpu = root / "50-AllowedCPUs.conf"
+            memory = root / "50-MemoryMax.conf"
+            saved_bytes = b"[Slice]\nAllowedCPUs=\nAllowedCPUs=1-3\n"
+            memory_bytes = b"[Slice]\nMemoryMax=6G\n"
+            saved_cpu.write_bytes(saved_bytes)
+            current_cpu.write_text("[Slice]\nAllowedCPUs=0-5\n", encoding="utf-8")
+            memory.write_bytes(memory_bytes)
+            result = subprocess.run(
+                [
+                    "bash", "-c",
+                    'set -euo pipefail; source "$1"; '
+                    'cpuset_restore_saved_dropin "$2" "$3"',
+                    "bash", str(state), str(saved_cpu), str(current_cpu),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(current_cpu.read_bytes(), saved_bytes)
+            self.assertEqual(memory.read_bytes(), memory_bytes)
 
     def test_sampler_signals_only_a_clean_startup_before_loaded_samples(self) -> None:
         """The workload must stay stopped until the sampler sees a clean CPU set."""
@@ -152,6 +268,132 @@ wait "$H2H_SCOPE_CLIENT_PID"
             self.assertIn("cpus_allowed", values)
             self.assertIn("allowed", values)
             self.assertIn("nr_migrations", values)
+
+    def _sample_scoped_worker(
+        self,
+        *,
+        row_tag: str,
+        worker_placement: str,
+        worker_comm: str,
+        worker_allowed: str,
+        target_pids: str = "500",
+    ) -> dict[str, object]:
+        """Sample a main task and one worker with controlled procfs values."""
+        script = Path(__file__).parent / "base/lib/cpuset_audit.py"
+        spec = importlib.util.spec_from_file_location("cpuset_audit_locality", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader if spec is not None else None)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        def entries(path: str) -> list[SimpleNamespace]:
+            if path == "/proc":
+                return [SimpleNamespace(name="500")]
+            if path == "/proc/500/task":
+                return [SimpleNamespace(name="500"), SimpleNamespace(name="501")]
+            return []
+
+        def read_proc(path: Path) -> str:
+            if str(path) == "/proc/500/comm":
+                return "j88i-gotatun\n"
+            if str(path).endswith("/cpuset.cpus.effective"):
+                return "1-2\n"
+            return ""
+
+        def task_values(_pid: int, tid: int) -> dict[str, object]:
+            allowed = "1-2" if tid == 500 else worker_allowed
+            return {
+                "state": "S",
+                "processor": 1,
+                "parent_pid": 500,
+                "allowed": allowed,
+                "cpus_allowed": "00000006" if allowed == "1-2" else "00000002",
+                "runtime_ns": 10,
+                "run_delay_ns": 1,
+                "nr_migrations": 0,
+                "thread_comm": "gotatun" if tid == 500 else worker_comm,
+            }
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "H2H_CPUSET_AUDIT_CASE": "mesh-gotatun",
+                    "H2H_CPUSET_AUDIT_ENGINE": "gotatun",
+                    "H2H_CPUSET_AUDIT_ROW_TAG": row_tag,
+                    "H2H_CPUSET_AUDIT_WORKER_PLACEMENT": worker_placement,
+                    "H2H_CPUSET_AUDIT_TARGET_PIDS": target_pids,
+                },
+                clear=True,
+            ),
+            patch.object(module.os, "scandir", side_effect=entries),
+            patch.object(module, "read_text", side_effect=read_proc),
+            patch.object(module, "cgroup_path", return_value="/perf.slice/j88i-mesh-gotatun.scope"),
+            patch.object(module, "task_values", side_effect=task_values),
+        ):
+            return module.sample()
+
+    def test_narrow_mask_is_allowed_only_for_tagged_locality_tokio_workers(self) -> None:
+        """A singleton worker mask is valid only for Tokio workers in the locality row."""
+        locality_row = "gotatun-j88i-locality-33ca6fe-1"
+        locality = self._sample_scoped_worker(
+            row_tag=locality_row,
+            worker_placement="round-robin",
+            worker_comm="tokio-runtime-w",
+            worker_allowed="1",
+        )
+        self.assertEqual(locality["mask_mismatches"], [])
+        self.assertEqual(locality["scope_processes"][1]["thread_comm"], "tokio-runtime-w")
+
+        invalid_cases = (
+            (locality_row, "default", "tokio-runtime-w", "1"),
+            ("gotatun-j88i-fair-33ca6fe-1", "round-robin", "tokio-runtime-w", "1"),
+            (locality_row, "round-robin", "bulk-worker", "1"),
+            (locality_row, "round-robin", "tokio-runtime-w", "1-3"),
+            # A worker created after the initial pin pass keeps its side's
+            # broad mask; the locality audit must reject it.
+            (locality_row, "round-robin", "tokio-runtime-w", "1-2"),
+        )
+        for row_tag, placement, worker_comm, worker_allowed in invalid_cases:
+            with self.subTest(row_tag=row_tag, placement=placement, worker_comm=worker_comm):
+                sample = self._sample_scoped_worker(
+                    row_tag=row_tag,
+                    worker_placement=placement,
+                    worker_comm=worker_comm,
+                    worker_allowed=worker_allowed,
+                )
+                self.assertEqual(
+                    [task["tid"] for task in sample["mask_mismatches"]],
+                    [501],
+                )
+
+        unrelated = self._sample_scoped_worker(
+            row_tag=locality_row,
+            worker_placement="round-robin",
+            worker_comm="tokio-runtime-w",
+            worker_allowed="1",
+            target_pids="999",
+        )
+        self.assertEqual([task["tid"] for task in unrelated["mask_mismatches"]], [501])
+
+    def test_matrix_j88i_tag_is_locality_only_when_explicitly_placed(self) -> None:
+        """The J317 row tag permits narrowed workers only in its locality placement."""
+        j317_row = "gotatun-j88i-33ca6fe-1"
+        locality = self._sample_scoped_worker(
+            row_tag=j317_row,
+            worker_placement="round-robin",
+            worker_comm="tokio-runtime-w",
+            worker_allowed="1",
+        )
+        self.assertEqual(locality["mask_mismatches"], [])
+
+        ordinary = self._sample_scoped_worker(
+            row_tag=j317_row,
+            worker_placement="default",
+            worker_comm="tokio-runtime-w",
+            worker_allowed="1",
+        )
+        self.assertEqual([task["tid"] for task in ordinary["mask_mismatches"]], [501])
 
     def test_audit_stop_propagates_sampler_failure(self) -> None:
         """A failed placement audit must make the measured case fail too."""

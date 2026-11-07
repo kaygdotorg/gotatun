@@ -12,3 +12,49 @@ cpuset_state_matches() {
        ( -z $expected_cpus || $expected_cpus == 0-5 ) && \
        ( -z $actual_cpus || $actual_cpus == 0-5 ) ]]
 }
+
+# Recognize systemd's exact known perf.slice runtime drop-in set. The memory
+# file is left in place while the CPU file is temporarily rewritten.
+cpuset_perf_slice_dropins_are_known() {
+    local paths=$1
+    local cpu=/run/systemd/system.control/perf.slice.d/50-AllowedCPUs.conf
+    local memory=/run/systemd/system.control/perf.slice.d/50-MemoryMax.conf
+    [[ $paths == "$cpu" || $paths == "$cpu $memory" || $paths == "$memory $cpu" ]]
+}
+
+# Accept the saved effective mask after an optional systemd list reset.
+cpuset_allowed_cpus_dropin_matches() {
+    local path=$1 expected=$2
+    [[ -r $path && -n $expected ]] || return 1
+    awk -v expected="$expected" '
+        /^[[:space:]]*($|#|;)/ { next }
+        /^[[:space:]]*\[Slice\][[:space:]]*$/ {
+            sections++
+            if (sections > 1) exit 1
+            in_slice = 1
+            next
+        }
+        {
+            if ($0 ~ /^[[:space:]]*\[/ || !in_slice) exit 1
+            if ($0 !~ /^[[:space:]]*AllowedCPUs[[:space:]]*=/) exit 1
+            value = $0
+            sub(/^[[:space:]]*AllowedCPUs[[:space:]]*=/, "", value)
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            if (value == "") {
+                active = ""
+                next
+            }
+            if (value != expected || assigned++) exit 1
+            active = value
+        }
+        END { if (sections != 1 || active != expected || assigned != 1) exit 1 }
+    ' "$path"
+}
+
+# Restore one saved systemd drop-in without reverting its unit or neighbours.
+cpuset_restore_saved_dropin() {
+    local saved=$1 destination=$2
+    [[ -r $saved && -d $(dirname -- "$destination") ]] || return 1
+    cp -a -- "$saved" "$destination"
+}

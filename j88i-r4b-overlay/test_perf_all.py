@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import tempfile
@@ -60,6 +61,8 @@ class PerfAllCliTest(unittest.TestCase):
         allowed: str = "0-5",
         systemd_effective: str | None = None,
         workqueue_manifest: Path | None = None,
+        dropin_manifest: Path | None = None,
+        dropins: str = "",
     ) -> subprocess.CompletedProcess[str]:
         """Run the post-scope verifier against a temporary cgroup and systemd view."""
         script = Path(__file__).parent / "base/runner-overlays/J88i-verify-restored.sh"
@@ -70,12 +73,17 @@ class PerfAllCliTest(unittest.TestCase):
         (state_dir / "effective").write_text(
             f"{effective if systemd_effective is None else systemd_effective}\n"
         )
+        (state_dir / "dropins").write_text(f"{dropins}\n" if dropins else "")
         cgroup_manifest = root / "cgroup-masks-before.tsv"
-        cgroup_manifest.write_text("perf.slice\t/perf.slice\t0-5\t0-5\t\n")
+        cgroup_manifest.write_text(f"perf.slice\t/perf.slice\t0-5\t0-5\t{dropins}\n")
         environment["J88I_CGROUP_ROOT"] = str(root)
         command = ["bash", str(script), str(output), str(cgroup_manifest)]
-        if workqueue_manifest is not None:
-            command.append(str(workqueue_manifest))
+        if workqueue_manifest is not None or dropin_manifest is not None:
+            command.extend([
+                str(workqueue_manifest) if workqueue_manifest is not None else "",
+                "",
+                str(dropin_manifest) if dropin_manifest is not None else "",
+            ])
         return subprocess.run(
             command,
             capture_output=True,
@@ -83,6 +91,44 @@ class PerfAllCliTest(unittest.TestCase):
             env=environment,
             check=False,
         )
+
+    def test_restore_check_verifies_saved_dropin_file_hashes(self) -> None:
+        """The second locked pass must detect edits to either saved perf.slice file."""
+        with tempfile.TemporaryDirectory(prefix="j88i-restore-dropins-") as temporary:
+            root = Path(temporary)
+            cpu = root / "50-AllowedCPUs.conf"
+            memory = root / "50-MemoryMax.conf"
+            cpu.write_bytes(b"[Slice]\nAllowedCPUs=\nAllowedCPUs=1-3\n")
+            memory.write_bytes(b"[Slice]\nMemoryMax=6442450944\n")
+            manifest = root / "dropin-masks-before.tsv"
+            manifest.write_text(
+                f"{cpu}\t{hashlib.sha256(cpu.read_bytes()).hexdigest()}\n"
+                f"{memory}\t{hashlib.sha256(memory.read_bytes()).hexdigest()}\n",
+                encoding="utf-8",
+            )
+
+            known_paths = (
+                "/run/systemd/system.control/perf.slice.d/50-AllowedCPUs.conf "
+                "/run/systemd/system.control/perf.slice.d/50-MemoryMax.conf"
+            )
+            clean = self.run_restore_check(
+                root,
+                "0-5",
+                dropin_manifest=manifest,
+                dropins=known_paths,
+            )
+            self.assertEqual(clean.returncode, 0, clean.stderr)
+            self.assertIn("drop-in file restored", (root / "restoration.txt").read_text())
+
+            memory.write_bytes(b"[Slice]\nMemoryMax=4294967296\n")
+            changed = self.run_restore_check(
+                root,
+                "0-5",
+                dropin_manifest=manifest,
+                dropins=known_paths,
+            )
+            self.assertEqual(changed.returncode, 2, changed.stderr)
+            self.assertIn(str(memory), changed.stderr)
 
     def test_restore_check_accepts_baseline_cgroup_after_scope_exit(self) -> None:
         """The second locked run must see every captured cgroup mask restored."""

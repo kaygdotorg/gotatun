@@ -47,14 +47,38 @@ unit_cpus() {
 
 units=(init.scope system.slice user.slice perf.slice)
 declare -A old_cpuset old_effective old_dropins old_irq_affinity
+perf_slice_cpu_dropin_path=/run/systemd/system.control/perf.slice.d/50-AllowedCPUs.conf
+perf_slice_memory_dropin_path=/run/systemd/system.control/perf.slice.d/50-MemoryMax.conf
+perf_slice_cpu_dropin_backup="$out/perf.slice-cpu-dropin-before.conf"
+perf_slice_cpu_dropin_sha=""
+perf_slice_memory_dropin_sha=""
+: > "$out/dropin-masks-before.tsv"
 for unit in "${units[@]}"; do
     old_cpuset[$unit]=$(unit_cpus "$unit" cpuset.cpus)
     old_effective[$unit]=$(unit_cpus "$unit" cpuset.cpus.effective)
     old_dropins[$unit]=$(systemctl show "$unit" -p DropInPaths --value)
-    [[ -z ${old_dropins[$unit]} ]] || {
-        echo "refusing to alter $unit with existing drop-ins: ${old_dropins[$unit]}" >&2
-        exit 2
-    }
+    if [[ -n ${old_dropins[$unit]} ]]; then
+        if [[ $unit == perf.slice ]] && \
+           cpuset_perf_slice_dropins_are_known "${old_dropins[$unit]}" && \
+           cpuset_allowed_cpus_dropin_matches "$perf_slice_cpu_dropin_path" "${old_effective[$unit]}"; then
+            cp -a -- "$perf_slice_cpu_dropin_path" "$perf_slice_cpu_dropin_backup"
+            perf_slice_cpu_dropin_sha=$(sha256sum "$perf_slice_cpu_dropin_backup" | awk '{print $1}')
+            printf '%s\t%s\n' "$perf_slice_cpu_dropin_path" "$perf_slice_cpu_dropin_sha" \
+                >> "$out/dropin-masks-before.tsv"
+            if [[ ${old_dropins[$unit]} == *"$perf_slice_memory_dropin_path"* ]]; then
+                [[ -r $perf_slice_memory_dropin_path ]] || {
+                    echo "known perf.slice memory drop-in is unreadable: $perf_slice_memory_dropin_path" >&2
+                    exit 2
+                }
+                perf_slice_memory_dropin_sha=$(sha256sum "$perf_slice_memory_dropin_path" | awk '{print $1}')
+                printf '%s\t%s\n' "$perf_slice_memory_dropin_path" "$perf_slice_memory_dropin_sha" \
+                    >> "$out/dropin-masks-before.tsv"
+            fi
+        else
+            echo "refusing to alter $unit with unexpected drop-ins: ${old_dropins[$unit]}" >&2
+            exit 2
+        fi
+    fi
 done
 old_cpus=${old_cpuset[perf.slice]}
 old_perf_effective=${old_effective[perf.slice]}
@@ -145,8 +169,16 @@ restore() {
         systemctl set-property --runtime "$unit" "AllowedCPUs=${old_effective[$unit]}" >/dev/null || command_rc=1
     done
     for unit in "${units[@]}"; do
-        systemctl revert "$unit" >/dev/null || command_rc=1
+        if [[ $unit == perf.slice && -n $perf_slice_cpu_dropin_sha ]]; then
+            cpuset_restore_saved_dropin "$perf_slice_cpu_dropin_backup" \
+                "$perf_slice_cpu_dropin_path" || command_rc=1
+        else
+            systemctl revert "$unit" >/dev/null || command_rc=1
+        fi
     done
+    if [[ -n $perf_slice_cpu_dropin_sha ]]; then
+        systemctl daemon-reload >/dev/null || command_rc=1
+    fi
     for attempt in {1..50}; do
         rc=0
         for unit in "${units[@]}"; do
@@ -156,6 +188,12 @@ restore() {
             cpuset_state_matches "$cpus" "${old_cpuset[$unit]}" \
                 "$effective" "${old_effective[$unit]}" || rc=1
             [[ $paths == "${old_dropins[$unit]}" ]] || rc=1
+            if [[ $unit == perf.slice && -n $perf_slice_cpu_dropin_sha ]]; then
+                [[ $(sha256sum "$perf_slice_cpu_dropin_path" | awk '{print $1}') == "$perf_slice_cpu_dropin_sha" ]] || rc=1
+                if [[ -n $perf_slice_memory_dropin_sha ]]; then
+                    [[ $(sha256sum "$perf_slice_memory_dropin_path" | awk '{print $1}') == "$perf_slice_memory_dropin_sha" ]] || rc=1
+                fi
+            fi
         done
         for irq in "${host_net_irqs[@]}"; do
             [[ $(cat "/proc/irq/$irq/smp_affinity_list") == "${old_irq_affinity[$irq]}" ]] || rc=1
@@ -183,6 +221,14 @@ restore() {
                     printf 'workqueue_cpumask_%s=%s\n' "${path##*/}" "$(cat "$path")"
                 done
             } > "$out/host-layout-restored.txt"
+            if [[ -n $perf_slice_cpu_dropin_sha ]]; then
+                printf 'preserved_perf_slice_cpu_dropin=%s sha256=%s\n' \
+                    "$perf_slice_cpu_dropin_path" "$perf_slice_cpu_dropin_sha" >> "$out/host-layout-restored.txt"
+            fi
+            if [[ -n $perf_slice_memory_dropin_sha ]]; then
+                printf 'preserved_perf_slice_memory_dropin=%s sha256=%s\n' \
+                    "$perf_slice_memory_dropin_path" "$perf_slice_memory_dropin_sha" >> "$out/host-layout-restored.txt"
+            fi
             echo "host service slices, IRQ affinities, and workqueue masks restored; perf.slice cpuset.cpus=$cpus cpuset.cpus.effective=$effective"
             return 0
         fi
@@ -293,7 +339,7 @@ export H2H_CPUSET_AUDIT_REQUIRE_CLEAN=1
 
 run_row() {
     local tag=$1 engine=$2 binary=$3 source_sha=$4 smoke=$5
-    local case_name row_dir row_label
+    local case_name row_dir row_label worker_placement=default
     case $engine in
         gotatun) case_name=mesh-gotatun ;;
         kernel) case_name=mesh-netbird ;;
@@ -302,17 +348,26 @@ run_row() {
         underlay) case_name=mesh-underlay ;;
         *) echo "unknown engine $engine for $tag" >&2; return 2 ;;
     esac
+    worker_placement=$(python3 -I "$kit/lib/matrix_locality.py" "$tag" "${H2H_MATRIX_LOCALITY:-0}") || return 2
     row_dir="$out/$tag"
-    row_label="perf VM $(hostname), $(uname -m); D348 A=$side_a B=$side_b housekeeping=$housekeeping; $mode $label; row $tag=$engine"
+    row_label="perf VM $(hostname), $(uname -m); D348 A=$side_a B=$side_b housekeeping=$housekeeping; $mode $label; row $tag=$engine worker-placement=$worker_placement"
     mkdir -p "$row_dir"
     local -a args=(--only "$case_name" --label "$row_label")
+    local -a row_env=(
+        "H2H_RESULTS=$row_dir"
+        "H2H_GOTATUN_BIN=$binary"
+        "H2H_GOTATUN_SOURCE=$source_sha"
+        "H2H_CPUSET_AUDIT_CASE=$case_name"
+        "H2H_CPUSET_AUDIT_ENGINE=$engine"
+        "H2H_CPUSET_AUDIT_ROW_TAG=$tag"
+        "H2H_CPUSET_AUDIT_WORKER_PLACEMENT=$worker_placement"
+    )
     [[ $smoke == 1 ]] && args+=(--smoke)
     if [[ $mode == soak ]]; then
-        taskset -c "$housekeeping" env H2H_RESULTS="$row_dir" H2H_GOTATUN_BIN="$binary" H2H_GOTATUN_SOURCE="$source_sha" \
-            H2H_SOAK_SECONDS=3600 bash "$kit/run.sh" "${args[@]}"
+        row_env+=(H2H_SOAK_SECONDS=3600)
+        taskset -c "$housekeeping" env "${row_env[@]}" bash "$kit/run.sh" "${args[@]}"
     else
-        taskset -c "$housekeeping" env H2H_RESULTS="$row_dir" H2H_GOTATUN_BIN="$binary" H2H_GOTATUN_SOURCE="$source_sha" \
-            bash "$kit/run.sh" "${args[@]}"
+        taskset -c "$housekeeping" env "${row_env[@]}" bash "$kit/run.sh" "${args[@]}"
     fi
 }
 
