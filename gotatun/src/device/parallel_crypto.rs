@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread::{self, JoinHandle};
 
@@ -64,6 +64,9 @@ pub(crate) const MAX_QUEUED_CRYPTO_JOBS: usize = 128;
 
 /// Number of lock-free checks a worker makes for newly queued chunks before it parks.
 const WORKER_SPIN_COUNT: usize = 128;
+
+/// Assigns a diagnostic identity that stays unique after a drained lane is retired.
+static NEXT_ORDERED_LANE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Whether a ready run has enough queued work behind it to justify entering parallel dispatch.
 ///
@@ -128,6 +131,8 @@ impl AdaptiveDispatch {
 /// each completion keeps its own result and delivery callback while waiting for its sequence turn.
 /// Completed crypto leaves the dispatch backlog before the serialized delivery lock is acquired.
 pub(crate) struct OrderedCompletions<T> {
+    /// Distinguishes this lane generation when allocator addresses are later reused.
+    lane_id: u64,
     state: Mutex<CompletionState>,
     delivery: AsyncMutex<()>,
     progress: Notify,
@@ -138,6 +143,7 @@ impl<T> Default for OrderedCompletions<T> {
     /// Create a lane with no reserved peer sequence slots.
     fn default() -> Self {
         Self {
+            lane_id: NEXT_ORDERED_LANE_ID.fetch_add(1, Ordering::Relaxed),
             state: Mutex::new(CompletionState {
                 next_slot: 0,
                 next_release: 0,
@@ -188,6 +194,12 @@ impl<T> OrderedCompletions<T> {
     /// lane's separate high and low water marks prevent mode flapping.
     pub(crate) fn should_force_worker(&self, packet_count: usize) -> bool {
         assert!(packet_count > 0, "a crypto dispatch run cannot be empty");
+        if std::env::var_os("GOTATUN_DIAG_FORCE_INLINE").is_some() {
+            return false;
+        }
+        if std::env::var_os("GOTATUN_DIAG_FORCE_WORKERS").is_some() {
+            return true;
+        }
         let mut state = self.state.lock();
         assert!(
             packet_count <= state.crypto_pending,
@@ -202,8 +214,41 @@ impl<T> OrderedCompletions<T> {
     /// Record AEAD completion and deliver this run when its slot range reaches the front.
     ///
     /// `None` marks a slot that completed without a packet, such as an invalid receive packet.
+    #[cfg(test)]
     pub(crate) async fn complete_run<F, Fut, E>(
         &self,
+        first_slot: u64,
+        results: Vec<Option<T>>,
+        deliver: F,
+    ) -> Result<(), E>
+    where
+        F: FnMut(Vec<Option<T>>) -> Fut,
+        Fut: Future<Output = Result<(), E>>,
+    {
+        self.complete_run_inner(None, first_slot, results, deliver)
+            .await
+    }
+
+    /// Complete a run with the peer and direction attached to its diagnostics.
+    pub(crate) async fn complete_run_traced<F, Fut, E>(
+        &self,
+        direction: &'static str,
+        peer_key: usize,
+        first_slot: u64,
+        results: Vec<Option<T>>,
+        deliver: F,
+    ) -> Result<(), E>
+    where
+        F: FnMut(Vec<Option<T>>) -> Fut,
+        Fut: Future<Output = Result<(), E>>,
+    {
+        self.complete_run_inner(Some((direction, peer_key)), first_slot, results, deliver)
+            .await
+    }
+
+    async fn complete_run_inner<F, Fut, E>(
+        &self,
+        diagnostic_lane: Option<(&'static str, usize)>,
         first_slot: u64,
         results: Vec<Option<T>>,
         mut deliver: F,
@@ -213,10 +258,13 @@ impl<T> OrderedCompletions<T> {
         Fut: Future<Output = Result<(), E>>,
     {
         assert!(!results.is_empty(), "a completion run cannot be empty");
+        let lane_key = self.lane_id;
         let run_len = results.len();
         let end_slot = first_slot
             .checked_add(run_len as u64)
             .expect("a peer crypto sequence cannot wrap");
+        let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
+            || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some();
         {
             let mut state = self.state.lock();
             assert!(
@@ -233,14 +281,47 @@ impl<T> OrderedCompletions<T> {
             );
             state.crypto_pending -= run_len;
         }
+        if diagnostic {
+            if let Some((direction, peer_key)) = diagnostic_lane {
+                eprintln!(
+                    "pipeline stage=ordered_completion_ready direction={direction} peer={peer_key} lane=0x{lane_key:x} first_slot={first_slot} packets={run_len}"
+                );
+            } else {
+                eprintln!(
+                    "pipeline stage=ordered_completion_ready lane=0x{lane_key:x} first_slot={first_slot} packets={run_len}"
+                );
+            }
+        }
 
         loop {
             let notified = self.progress.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
 
+            if diagnostic {
+                if let Some((direction, peer_key)) = diagnostic_lane {
+                    eprintln!(
+                        "pipeline stage=ordered_delivery_lock_wait direction={direction} peer={peer_key} lane=0x{lane_key:x} first_slot={first_slot}"
+                    );
+                } else {
+                    eprintln!(
+                        "pipeline stage=ordered_delivery_lock_wait lane=0x{lane_key:x} first_slot={first_slot}"
+                    );
+                }
+            }
             let delivery = self.delivery.lock().await;
-            let is_next_run = {
+            if diagnostic {
+                if let Some((direction, peer_key)) = diagnostic_lane {
+                    eprintln!(
+                        "pipeline stage=ordered_delivery_lock_acquired direction={direction} peer={peer_key} lane=0x{lane_key:x} first_slot={first_slot}"
+                    );
+                } else {
+                    eprintln!(
+                        "pipeline stage=ordered_delivery_lock_acquired lane=0x{lane_key:x} first_slot={first_slot}"
+                    );
+                }
+            }
+            let (is_next_run, next_release, wait_snapshot) = {
                 let mut state = self.state.lock();
                 assert!(
                     first_slot >= state.next_release && end_slot <= state.next_slot,
@@ -254,20 +335,66 @@ impl<T> OrderedCompletions<T> {
                     );
                     // Claim the ordered turn before awaiting I/O; `next_delivered` advances later.
                     state.next_release = end_slot;
-                    true
+                    (true, state.next_release, None)
                 } else {
-                    false
+                    let snapshot = diagnostic.then(|| {
+                        (
+                            state.next_slot,
+                            state.next_delivered,
+                            state.in_flight,
+                            state.crypto_pending,
+                            state.completed.keys().copied().collect::<Vec<_>>(),
+                        )
+                    });
+                    (false, state.next_release, snapshot)
                 }
             };
 
             if !is_next_run {
+                if diagnostic {
+                    let (next_slot, next_delivered, in_flight, crypto_pending, completed) =
+                        wait_snapshot.expect("diagnostics capture an ordered wait snapshot");
+                    if let Some((direction, peer_key)) = diagnostic_lane {
+                        eprintln!(
+                            "pipeline stage=ordered_wait_predecessor direction={direction} peer={peer_key} lane=0x{lane_key:x} first_slot={first_slot} next_release={next_release} next_slot={next_slot} next_delivered={next_delivered} in_flight={in_flight} crypto_pending={crypto_pending} completed={completed:?}"
+                        );
+                    } else {
+                        eprintln!(
+                            "pipeline stage=ordered_wait_predecessor lane=0x{lane_key:x} first_slot={first_slot} next_release={next_release} next_slot={next_slot} next_delivered={next_delivered} in_flight={in_flight} crypto_pending={crypto_pending} completed={completed:?}"
+                        );
+                    }
+                }
                 drop(delivery);
                 notified.await;
                 continue;
             }
 
+            if diagnostic {
+                if let Some((direction, peer_key)) = diagnostic_lane {
+                    eprintln!(
+                        "pipeline stage=ordered_delivery_start direction={direction} peer={peer_key} lane=0x{lane_key:x} first_slot={first_slot}"
+                    );
+                } else {
+                    eprintln!(
+                        "pipeline stage=ordered_delivery_start lane=0x{lane_key:x} first_slot={first_slot}"
+                    );
+                }
+            }
             let result = deliver(results).await;
-            {
+            if diagnostic {
+                if let Some((direction, peer_key)) = diagnostic_lane {
+                    eprintln!(
+                        "pipeline stage=ordered_delivery_done direction={direction} peer={peer_key} lane=0x{lane_key:x} first_slot={first_slot} success={}",
+                        result.is_ok()
+                    );
+                } else {
+                    eprintln!(
+                        "pipeline stage=ordered_delivery_done lane=0x{lane_key:x} first_slot={first_slot} success={}",
+                        result.is_ok()
+                    );
+                }
+            }
+            let (next_release, next_delivered, in_flight, crypto_pending, completed) = {
                 let mut state = self.state.lock();
                 assert_eq!(
                     state.next_delivered, first_slot,
@@ -275,6 +402,24 @@ impl<T> OrderedCompletions<T> {
                 );
                 state.next_delivered = end_slot;
                 state.in_flight -= run_len;
+                (
+                    state.next_release,
+                    state.next_delivered,
+                    state.in_flight,
+                    state.crypto_pending,
+                    state.completed.keys().copied().collect::<Vec<_>>(),
+                )
+            };
+            if diagnostic {
+                if let Some((direction, peer_key)) = diagnostic_lane {
+                    eprintln!(
+                        "pipeline stage=ordered_delivery_commit direction={direction} peer={peer_key} lane=0x{lane_key:x} first_slot={first_slot} end_slot={end_slot} next_release={next_release} next_delivered={next_delivered} in_flight={in_flight} crypto_pending={crypto_pending} completed={completed:?}"
+                    );
+                } else {
+                    eprintln!(
+                        "pipeline stage=ordered_delivery_commit lane=0x{lane_key:x} first_slot={first_slot} end_slot={end_slot} next_release={next_release} next_delivered={next_delivered} in_flight={in_flight} crypto_pending={crypto_pending} completed={completed:?}"
+                    );
+                }
             }
             self.progress.notify_waiters();
             drop(delivery);
@@ -361,6 +506,14 @@ impl<T> OrderStore<T> {
             .entry(peer)
             .or_insert_with(|| Arc::new(OrderedCompletions::default()));
         let first_slot = lane.reserve_run(count)?;
+        if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
+            || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some()
+        {
+            eprintln!(
+                "pipeline stage=ordered_lane_reserve peer={peer} lane={} first_slot={first_slot} packets={count}",
+                lane.lane_id
+            );
+        }
         Some((Arc::clone(lane), first_slot))
     }
 
@@ -399,6 +552,14 @@ impl<T> OrderStore<T> {
             .get(&peer)
             .is_some_and(|current| Arc::ptr_eq(current, lane) && current.is_idle())
         {
+            if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
+                || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some()
+            {
+                eprintln!(
+                    "pipeline stage=ordered_lane_retire peer={peer} lane={}",
+                    lane.lane_id
+                );
+            }
             lanes.remove(&peer);
         }
     }
@@ -567,6 +728,12 @@ impl CryptoHandle {
             .push(CryptoJob::Encrypt(run, result_tx, active))
             .await
             .ok()?;
+        static REPORTED_ENCRYPT_HANDOFF: AtomicBool = AtomicBool::new(false);
+        if std::env::var_os("GOTATUN_DIAG_FORCE_WORKERS").is_some()
+            && !REPORTED_ENCRYPT_HANDOFF.swap(true, Ordering::Relaxed)
+        {
+            eprintln!("diagnostic: encrypt run handed to crypto worker");
+        }
         #[cfg(test)]
         self.handoff_count.fetch_add(1, Ordering::Relaxed);
         result_rx.await.ok()
@@ -595,6 +762,12 @@ impl CryptoHandle {
             .push(CryptoJob::Decrypt(run, result_tx, active))
             .await
             .ok()?;
+        static REPORTED_DECRYPT_HANDOFF: AtomicBool = AtomicBool::new(false);
+        if std::env::var_os("GOTATUN_DIAG_FORCE_WORKERS").is_some()
+            && !REPORTED_DECRYPT_HANDOFF.swap(true, Ordering::Relaxed)
+        {
+            eprintln!("diagnostic: decrypt run handed to crypto worker");
+        }
         #[cfg(test)]
         self.handoff_count.fetch_add(1, Ordering::Relaxed);
         result_rx.await.ok()

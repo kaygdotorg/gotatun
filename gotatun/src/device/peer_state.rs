@@ -153,7 +153,10 @@ impl PeerState {
         tun_rx_mtu: MtuWatcher,
         udp_tx: US,
     ) -> Result<(), super::Error> {
-        let mut peer_g = peer.lock().await;
+        let peer_key = super::peer_order_key(peer);
+        let mut peer_trace = super::PeerLockDiagnostic::waiting("daita_setup", peer_key);
+        let mut peer_g =
+            super::lock_peer_state(peer, "daita_setup", peer_key, &mut peer_trace).await;
         let Some(daita_settings) = peer_g.daita_settings.clone() else {
             // No DAITA settings; disabled
             return Ok(());
