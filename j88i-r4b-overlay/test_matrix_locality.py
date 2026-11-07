@@ -42,6 +42,22 @@ class MatrixLocalityTests(unittest.TestCase):
         self.assertEqual(locality_tag.returncode, 0, locality_tag.stderr)
         self.assertEqual(locality_tag.stdout.strip(), "round-robin")
 
+    def test_hold_candidate_names_select_locality_only_when_enabled(self) -> None:
+        """The hold runner's fixed candidate row names can activate locality explicitly."""
+        candidate_a = self.placement("candidate-a", True)
+        candidate_b = self.placement("candidate-b", True)
+        ordinary = self.placement("candidate-a", False)
+        control = self.placement("control-a", True)
+
+        self.assertEqual(candidate_a.returncode, 0, candidate_a.stderr)
+        self.assertEqual(candidate_a.stdout.strip(), "round-robin")
+        self.assertEqual(candidate_b.returncode, 0, candidate_b.stderr)
+        self.assertEqual(candidate_b.stdout.strip(), "round-robin")
+        self.assertEqual(ordinary.returncode, 0, ordinary.stderr)
+        self.assertEqual(ordinary.stdout.strip(), "default")
+        self.assertEqual(control.returncode, 0, control.stderr)
+        self.assertEqual(control.stdout.strip(), "default")
+
 
 if __name__ == "__main__":
     unittest.main()

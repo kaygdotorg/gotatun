@@ -395,6 +395,24 @@ cpuset_allowed_cpus_dropin_matches "$2" 1-3
         )
         self.assertEqual([task["tid"] for task in ordinary["mask_mismatches"]], [501])
 
+    def test_hold_candidate_tag_allows_locality_workers_only_for_round_robin(self) -> None:
+        """The fixed candidate-a row accepts narrow masks only when locality was selected."""
+        locality = self._sample_scoped_worker(
+            row_tag="candidate-a",
+            worker_placement="round-robin",
+            worker_comm="tokio-runtime-w",
+            worker_allowed="1",
+        )
+        self.assertEqual(locality["mask_mismatches"], [])
+
+        ordinary = self._sample_scoped_worker(
+            row_tag="candidate-a",
+            worker_placement="default",
+            worker_comm="tokio-runtime-w",
+            worker_allowed="1",
+        )
+        self.assertEqual([task["tid"] for task in ordinary["mask_mismatches"]], [501])
+
     def test_audit_stop_propagates_sampler_failure(self) -> None:
         """A failed placement audit must make the measured case fail too."""
         common = Path(__file__).parent / "base/lib/common.sh"

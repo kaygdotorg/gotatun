@@ -202,7 +202,10 @@ def locality_worker_is_in_round_robin_row(
         and thread_comm == "tokio-runtime-w"
         and audit_case == "mesh-gotatun"
         and audit_engine == "gotatun"
-        and re.fullmatch(r"gotatun-j88i-(?:locality-)?33ca6fe-[0-9]+", row_tag) is not None
+        and re.fullmatch(
+            r"(?:gotatun-j88i-(?:locality-)?33ca6fe-[0-9]+|candidate-[ab])",
+            row_tag,
+        ) is not None
         and worker_placement == "round-robin"
         and len(group_cpus) == 2
     )

@@ -102,6 +102,11 @@ while (($#)); do
 done
 
 [[ -n $mode ]] || { usage >&2; exit 2; }
+locality_matrix=${H2H_MATRIX_LOCALITY:-0}
+[[ $locality_matrix == 0 || $locality_matrix == 1 ]] || {
+    echo 'H2H_MATRIX_LOCALITY must be 0 or 1' >&2
+    exit 2
+}
 if [[ $mode == validate ]]; then
     ((${#rows[@]} == 0 && binary_count == 0 && source_count == 0)) || {
         echo '--validate does not take row, binary, or source options' >&2; exit 2;
@@ -205,6 +210,7 @@ runner=${PERF_RUN:-/usr/local/bin/perf-run}
 [[ -x $runner ]] || { echo "perf runner is not executable: $runner" >&2; exit 2; }
 echo "D348 pinned $mode: $label; results $out"
 run_env=(H2H_CPUSET_AUDIT=1 H2H_RESULTS="$out" "H2H_CPUSET_HOUSEKEEPING=$housekeeping")
+run_env+=("H2H_MATRIX_LOCALITY=$locality_matrix")
 if [[ $mode == validate ]]; then
     run_env+=(H2H_LAN_TPUT_SECONDS=10)
 fi

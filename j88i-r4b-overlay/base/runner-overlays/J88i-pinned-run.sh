@@ -348,7 +348,9 @@ run_row() {
         underlay) case_name=mesh-underlay ;;
         *) echo "unknown engine $engine for $tag" >&2; return 2 ;;
     esac
-    worker_placement=$(python3 -I "$kit/lib/matrix_locality.py" "$tag" "${H2H_MATRIX_LOCALITY:-0}") || return 2
+    if [[ $engine == gotatun ]]; then
+        worker_placement=$(python3 -I "$kit/lib/matrix_locality.py" "$tag" "${H2H_MATRIX_LOCALITY:-0}") || return 2
+    fi
     row_dir="$out/$tag"
     row_label="perf VM $(hostname), $(uname -m); D348 A=$side_a B=$side_b housekeeping=$housekeeping; $mode $label; row $tag=$engine worker-placement=$worker_placement"
     mkdir -p "$row_dir"

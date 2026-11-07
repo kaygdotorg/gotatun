@@ -16,7 +16,9 @@ def placement(row_tag: str, locality_matrix: bool) -> str:
     """Return the placement to use for this row in a locality experiment."""
     if LOCALITY_ROW.fullmatch(row_tag):
         return "round-robin"
-    if locality_matrix and FAIRNESS_ROW.fullmatch(row_tag):
+    if locality_matrix and (
+        FAIRNESS_ROW.fullmatch(row_tag) or row_tag in {"candidate-a", "candidate-b"}
+    ):
         return "round-robin"
     return "default"
 

@@ -217,6 +217,52 @@ class PerfAllCliTest(unittest.TestCase):
             self.assertIn("H2H_LAN_TPUT_SECONDS=10", capture.read_text().splitlines())
             self.assertIn("cpuset.cpus.effective=0-5", (output / "cpuset-restoration.txt").read_text())
 
+    def test_smoke_forwards_locality_mode_into_the_measured_scope(self) -> None:
+        """The locality experiment flag must cross perf-run's sudo boundary."""
+        script = Path(__file__).parent / "base/perf-all.sh"
+        with tempfile.TemporaryDirectory(prefix="j88i-locality-mode-") as temporary:
+            root = Path(temporary)
+            runner = root / "perf-run"
+            capture = root / "runner-args.txt"
+            count_file = root / "runner-count.txt"
+            output = root / "locality-smoke"
+            runner.write_text(
+                "#!/usr/bin/env bash\n"
+                "count=0\n"
+                "[[ ! -f $PERF_RUN_COUNT_FILE ]] || count=$(cat \"$PERF_RUN_COUNT_FILE\")\n"
+                "count=$((count + 1))\n"
+                "printf '%s\\n' \"$count\" > \"$PERF_RUN_COUNT_FILE\"\n"
+                "if ((count == 1)); then printf '%s\\n' \"$@\" > \"$PERF_RUN_CAPTURE\"; exit 23; fi\n"
+                "while (($#)) && [[ $1 != -- ]]; do shift; done\n"
+                "[[ ${1:-} == -- ]] && shift\n"
+                "\"$@\"\n"
+            )
+            runner.chmod(0o755)
+            environment = self.fake_restore_environment(root, "0-5")
+            environment["PERF_RUN"] = str(runner)
+            environment["PERF_RUN_CAPTURE"] = str(capture)
+            environment["PERF_RUN_COUNT_FILE"] = str(count_file)
+            environment["H2H_MATRIX_LOCALITY"] = "1"
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(script),
+                    "--smoke",
+                    "--row",
+                    "candidate-a=gotatun",
+                    "--out",
+                    str(output),
+                ],
+                capture_output=True,
+                text=True,
+                env=environment,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 23, result.stderr)
+            self.assertIn("H2H_MATRIX_LOCALITY=1", capture.read_text().splitlines())
+
     def test_validation_resolves_smoke_helper_from_installed_kit_root(self) -> None:
         """D348 validation must find the helper copied beside the installed harness kit."""
         overlay = Path(__file__).parent

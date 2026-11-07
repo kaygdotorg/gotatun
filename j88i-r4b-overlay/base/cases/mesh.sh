@@ -175,7 +175,6 @@ start_gotatun() {
 
 pin_locality_workers() {
     [[ ${H2H_CPUSET_AUDIT_WORKER_PLACEMENT:-default} == round-robin ]] || return 0
-    [[ ${H2H_CPUSET_AUDIT_ROW_TAG:-} =~ ^gotatun-j88i-(locality-)?33ca6fe-[0-9]+$ ]] || return 0
     [[ $SYSTEM == gotatun && ${H2H_CPUSET_AUDIT_ENGINE:-} == gotatun ]] \
         || die "round-robin worker placement is only valid for a GotaTun row"
     [[ -n ${GOTA_A_PID:-} && -n ${GOTA_B_PID:-} ]] \
