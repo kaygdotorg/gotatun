@@ -1230,6 +1230,88 @@ mod tests {
         assert!(completions.is_idle());
     }
 
+    /// A later batch must run its own delivery callback after an earlier packet closes the gap.
+    #[test]
+    fn concurrent_producers_keep_each_runs_delivery_callback() {
+        let completions = Arc::new(OrderedCompletions::<u64>::default());
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let (first_slot_tx, first_slot_rx) = mpsc::sync_channel(1);
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel();
+
+        let first_completions = Arc::clone(&completions);
+        let first_delivered = Arc::clone(&delivered);
+        let first = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let slot = first_completions.reserve_run(1).unwrap();
+                first_slot_tx.send(slot).unwrap();
+                release_first_rx.await.unwrap();
+                first_completions
+                    .complete_run(slot, vec![Some(0)], |values| {
+                        let delivered = Arc::clone(&first_delivered);
+                        async move {
+                            delivered
+                                .lock()
+                                .unwrap()
+                                .push((slot, values.into_iter().flatten().collect::<Vec<_>>()));
+                            Ok::<_, ()>(())
+                        }
+                    })
+                    .await
+                    .unwrap();
+            });
+        });
+
+        assert_eq!(first_slot_rx.recv().unwrap(), 0);
+
+        let (later_ready_tx, later_ready_rx) = mpsc::sync_channel(1);
+        let (later_waiting_tx, later_waiting_rx) = mpsc::sync_channel(1);
+        let later_completions = Arc::clone(&completions);
+        let later_delivered = Arc::clone(&delivered);
+        let later = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let slot = later_completions.reserve_run(2).unwrap();
+                later_ready_tx.send(slot).unwrap();
+                let mut completion = Box::pin(later_completions.complete_run(
+                    slot,
+                    vec![Some(1), Some(2)],
+                    |values| {
+                        let delivered = Arc::clone(&later_delivered);
+                        async move {
+                            delivered
+                                .lock()
+                                .unwrap()
+                                .push((slot, values.into_iter().flatten().collect::<Vec<_>>()));
+                            Ok::<_, ()>(())
+                        }
+                    },
+                ));
+                assert!(futures::poll!(&mut completion).is_pending());
+                later_waiting_tx.send(()).unwrap();
+                completion.await.unwrap();
+            });
+        });
+
+        assert_eq!(later_ready_rx.recv().unwrap(), 1);
+        later_waiting_rx.recv().unwrap();
+        assert!(delivered.lock().unwrap().is_empty());
+
+        release_first_tx.send(()).unwrap();
+        first.join().unwrap();
+        later.join().unwrap();
+
+        assert_eq!(
+            *delivered.lock().unwrap(),
+            vec![(0, vec![0]), (1, vec![1, 2])]
+        );
+        assert!(completions.is_idle());
+    }
+
     /// A test-first control confirms why an append-on-completion stage is unsafe.
     #[test]
     fn naive_parallel_completion_reorders_a_peers_packets() {
