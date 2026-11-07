@@ -1488,7 +1488,7 @@ mod tests {
     }
 
     /// A completed run waiting for the delivery lock must not count as unfinished AEAD work.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn adaptive_dispatch_ignores_completed_crypto_waiting_for_delivery_lock() {
         let lane = Arc::new(OrderedCompletions::<()>::default());
         let first_slot = lane
