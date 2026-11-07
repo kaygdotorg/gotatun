@@ -85,13 +85,30 @@ impl BufferedIpSend {
 
             let mut refused: u64 = 0;
             while let Some(message) = rx.recv().await {
+                let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some();
                 let (result, refused_packets) = match message {
-                    BufferedIpMessage::Single(packet, _permit) => (inner.send(packet).await, 1),
+                    BufferedIpMessage::Single(packet, _permit) => {
+                        if diagnostic {
+                            eprintln!("pipeline stage=tun_buffer_dequeue mode=single packets=1");
+                        }
+                        (inner.send(packet).await, 1)
+                    }
                     BufferedIpMessage::Batch(mut packets, _permit) => {
                         let batch_len = packets.len() as u64;
+                        if diagnostic {
+                            eprintln!(
+                                "pipeline stage=tun_buffer_dequeue mode=batch packets={batch_len}"
+                            );
+                        }
                         (inner.send_many(&mut packets).await, batch_len)
                     }
                 };
+                if diagnostic {
+                    eprintln!(
+                        "pipeline stage=tun_device_write packets={refused_packets} success={}",
+                        result.is_ok()
+                    );
+                }
                 if let Err(e) = result {
                     if is_fatal_tun_error(&e) {
                         tracing::error!("TUN device was deleted: {e}");
@@ -125,14 +142,27 @@ impl BufferedIpSend {
 
 impl IpSend for BufferedIpSend {
     async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
+        let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some();
+        if diagnostic {
+            eprintln!(
+                "pipeline stage=tun_buffer_permit_wait packets=1 available={} mode=single",
+                self.packet_slots.available_permits()
+            );
+        }
         let permit = Arc::clone(&self.packet_slots)
             .acquire_owned()
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+        if diagnostic {
+            eprintln!("pipeline stage=tun_buffer_permit_acquired packets=1 mode=single");
+        }
         self.tx
             .send(BufferedIpMessage::Single(packet, permit))
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+        if diagnostic {
+            eprintln!("pipeline stage=tun_buffer_channel_sent packets=1 mode=single");
+        }
         Ok(())
     }
 
@@ -146,6 +176,13 @@ impl IpSend for BufferedIpSend {
 
         while !packets.is_empty() {
             let count = packets.len().min(self.packet_capacity);
+            let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some();
+            if diagnostic {
+                eprintln!(
+                    "pipeline stage=tun_buffer_permit_wait packets={count} available={} mode=batch",
+                    self.packet_slots.available_permits()
+                );
+            }
             let permit_count = u32::try_from(count).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -156,6 +193,9 @@ impl IpSend for BufferedIpSend {
                 .acquire_many_owned(permit_count)
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+            if diagnostic {
+                eprintln!("pipeline stage=tun_buffer_permit_acquired packets={count} mode=batch");
+            }
             let batch = if count == packets.len() {
                 std::mem::take(packets)
             } else {
@@ -172,6 +212,9 @@ impl IpSend for BufferedIpSend {
                     io::ErrorKind::BrokenPipe,
                     "TUN send task stopped",
                 ));
+            }
+            if diagnostic {
+                eprintln!("pipeline stage=tun_buffer_channel_sent packets={count} mode=batch");
             }
         }
         Ok(())

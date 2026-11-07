@@ -53,11 +53,18 @@ async fn flush_udp_packets<U: UdpSend>(
     send_buf: &mut U::SendManyBuf,
     packets: &mut Vec<(Packet, SocketAddr)>,
 ) {
+    let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some();
+    let packet_count = packets.len();
     if std::env::var_os("GOTATUN_DIAG_UDP_SINGLE_SENDS").is_some() {
+        let mut sent = 0;
         for (packet, address) in packets.drain(..) {
-            if let Err(error) = udp_tx.send_to(packet, address).await {
-                tracing::trace!("send_to_err: {error:#}");
+            match udp_tx.send_to(packet, address).await {
+                Ok(()) => sent += 1,
+                Err(error) => tracing::trace!("send_to_err: {error:#}"),
             }
+        }
+        if diagnostic {
+            eprintln!("pipeline stage=udp_socket_send packets={sent}/{packet_count} mode=single");
         }
         return;
     }
@@ -66,12 +73,32 @@ async fn flush_udp_packets<U: UdpSend>(
         0 => {}
         1 => {
             let (packet, addr) = packets.pop().expect("one packet was counted");
-            if let Err(error) = udp_tx.send_to(packet, addr).await {
+            let result = udp_tx.send_to(packet, addr).await;
+            if diagnostic {
+                eprintln!(
+                    "pipeline stage=udp_socket_send packets={} mode=single success={}",
+                    u8::from(result.is_ok()),
+                    result.is_ok()
+                );
+            }
+            if let Err(error) = result {
                 tracing::trace!("send_to_err: {error:#}");
             }
         }
         _ => {
-            if let Err(error) = udp_tx.send_many_to(send_buf, packets).await {
+            let result = udp_tx.send_many_to(send_buf, packets).await;
+            if diagnostic {
+                eprintln!(
+                    "pipeline stage=udp_socket_send packets={} mode=batch success={}",
+                    if result.is_ok() {
+                        packet_count
+                    } else {
+                        packet_count - packets.len()
+                    },
+                    result.is_ok()
+                );
+            }
+            if let Err(error) = result {
                 tracing::trace!("send_to_many_err: {error:#}");
                 packets.clear();
             }

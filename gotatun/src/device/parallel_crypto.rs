@@ -223,6 +223,7 @@ impl<T> OrderedCompletions<T> {
         let end_slot = first_slot
             .checked_add(run_len as u64)
             .expect("a peer crypto sequence cannot wrap");
+        let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some();
         {
             let mut state = self.state.lock();
             assert!(
@@ -239,14 +240,25 @@ impl<T> OrderedCompletions<T> {
             );
             state.crypto_pending -= run_len;
         }
+        if diagnostic {
+            eprintln!(
+                "pipeline stage=ordered_completion_ready first_slot={first_slot} packets={run_len}"
+            );
+        }
 
         loop {
             let notified = self.progress.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
 
+            if diagnostic {
+                eprintln!("pipeline stage=ordered_delivery_lock_wait first_slot={first_slot}");
+            }
             let delivery = self.delivery.lock().await;
-            let is_next_run = {
+            if diagnostic {
+                eprintln!("pipeline stage=ordered_delivery_lock_acquired first_slot={first_slot}");
+            }
+            let (is_next_run, next_release) = {
                 let mut state = self.state.lock();
                 assert!(
                     first_slot >= state.next_release && end_slot <= state.next_slot,
@@ -260,19 +272,33 @@ impl<T> OrderedCompletions<T> {
                     );
                     // Claim the ordered turn before awaiting I/O; `next_delivered` advances later.
                     state.next_release = end_slot;
-                    true
+                    (true, state.next_release)
                 } else {
-                    false
+                    (false, state.next_release)
                 }
             };
 
             if !is_next_run {
+                if diagnostic {
+                    eprintln!(
+                        "pipeline stage=ordered_wait_predecessor first_slot={first_slot} next_release={next_release}"
+                    );
+                }
                 drop(delivery);
                 notified.await;
                 continue;
             }
 
+            if diagnostic {
+                eprintln!("pipeline stage=ordered_delivery_start first_slot={first_slot}");
+            }
             let result = deliver(results).await;
+            if diagnostic {
+                eprintln!(
+                    "pipeline stage=ordered_delivery_done first_slot={first_slot} success={}",
+                    result.is_ok()
+                );
+            }
             {
                 let mut state = self.state.lock();
                 assert_eq!(

@@ -354,10 +354,32 @@ async fn complete_outgoing_batch<U: UdpSend + 'static>(
         send_many_buf,
     } = context;
     let count = prepared.len();
+    let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some();
+    if diagnostic {
+        eprintln!(
+            "pipeline stage=encrypt_start first_slot={first_slot} packets={count} dispatch={}",
+            if force_worker { "worker" } else { "inline" }
+        );
+    }
     let packets = crypto
         .encrypt_run(prepared, force_worker)
         .await
         .unwrap_or_else(|| std::iter::repeat_with(|| None).take(count).collect());
+    if diagnostic {
+        let counters = packets.iter().filter_map(|packet| match packet {
+            Some(WgKind::Data(packet)) => Some(packet.header.counter.get()),
+            _ => None,
+        });
+        let (first_counter, last_counter) = {
+            let mut counters = counters;
+            let first = counters.next();
+            let last = counters.last().or(first);
+            (first, last)
+        };
+        eprintln!(
+            "pipeline stage=encrypt_complete first_slot={first_slot} packets={count} counter_first={first_counter:?} counter_last={last_counter:?}"
+        );
+    }
 
     let _ = lane
         .complete_run(first_slot, packets, |packets| {
@@ -396,21 +418,37 @@ async fn complete_outgoing_batch<U: UdpSend + 'static>(
                 #[cfg(feature = "daita")]
                 drop(peer);
 
+                let output_count = output.len();
+                if diagnostic {
+                    eprintln!(
+                        "pipeline stage=ordered_udp_release first_slot={first_slot} packets={output_count}"
+                    );
+                }
                 match output.len() {
                     0 => {}
                     1 => {
                         let (packet, addr) = output.pop().expect("one packet was counted");
-                        if udp.send_to(packet, addr).await.is_err() {
+                        let result = udp.send_to(packet, addr).await;
+                        if diagnostic {
+                            eprintln!(
+                                "pipeline stage=udp_queue_send first_slot={first_slot} packets=1 success={}",
+                                result.is_ok()
+                            );
+                        }
+                        if result.is_err() {
                             tracing::trace!("udp.send_to failed");
                         }
                     }
                     _ => {
                         let mut send_many_buf = send_many_buf.lock().await;
-                        if udp
-                            .send_many_to(&mut send_many_buf, &mut output)
-                            .await
-                            .is_err()
-                        {
+                        let result = udp.send_many_to(&mut send_many_buf, &mut output).await;
+                        if diagnostic {
+                            eprintln!(
+                                "pipeline stage=udp_queue_send first_slot={first_slot} packets={output_count} success={}",
+                                result.is_ok()
+                            );
+                        }
+                        if result.is_err() {
                             tracing::trace!("udp.send_many_to failed");
                         }
                     }
@@ -958,11 +996,32 @@ impl<T: DeviceTransports> DeviceState<T> {
         completions: Vec<Option<IncomingCompletion>>,
         mut tun_tx: impl IpSend,
     ) -> Result<(), Error> {
+        let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some();
+        let completion_count = completions.len();
+        if diagnostic {
+            eprintln!(
+                "pipeline stage=incoming_delivery_callback_start completions={completion_count}"
+            );
+        }
         let Some(device_arc) = device.upgrade() else {
             return Ok(());
         };
+        if diagnostic {
+            eprintln!("pipeline stage=incoming_device_lock_wait");
+        }
         let device_guard = device_arc.read().await;
+        if diagnostic {
+            eprintln!("pipeline stage=incoming_device_lock_acquired");
+            eprintln!("pipeline stage=incoming_delivery_peer_lock_wait");
+        }
         let mut peer = peer_arc.lock().await;
+        if diagnostic {
+            eprintln!("pipeline stage=incoming_delivery_peer_lock_acquired");
+        }
+        let mut tunnel_result_count = 0;
+        let mut empty_packet_count = 0;
+        let mut malformed_packet_count = 0;
+        let mut rejected_source_count = 0;
         let mut tun_packets = Vec::with_capacity(completions.len());
 
         for completion in completions.into_iter().flatten() {
@@ -971,6 +1030,7 @@ impl<T: DeviceTransports> DeviceState<T> {
             let TunnResult::WriteToTunnel(mut packet) = result else {
                 continue;
             };
+            tunnel_result_count += 1;
 
             #[cfg(feature = "daita")]
             if let Some(daita) = peer.daita.as_mut() {
@@ -981,9 +1041,11 @@ impl<T: DeviceTransports> DeviceState<T> {
             }
 
             if packet.is_empty() {
+                empty_packet_count += 1;
                 continue;
             }
             let Ok(packet) = packet.try_into_ipvx() else {
+                malformed_packet_count += 1;
                 continue;
             };
 
@@ -1003,6 +1065,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                         peer.endpoint().addr.unwrap_or(unspecified)
                     );
                 }
+                rejected_source_count += 1;
                 continue;
             }
             tun_packets.push(packet);
@@ -1010,7 +1073,14 @@ impl<T: DeviceTransports> DeviceState<T> {
 
         drop(peer);
         drop(device_guard);
-        match tun_packets.len() {
+        let tunnel_packet_count = tun_packets.len();
+        if diagnostic {
+            eprintln!(
+                "pipeline stage=incoming_release completions={completion_count} tunnel_results={tunnel_result_count} empty={empty_packet_count} malformed={malformed_packet_count} rejected_source={rejected_source_count} queued={tunnel_packet_count}"
+            );
+            eprintln!("pipeline stage=tun_queue_send_start packets={tunnel_packet_count}");
+        }
+        let result = match tunnel_packet_count {
             0 => Ok(()),
             1 => tun_tx
                 .send(tun_packets.pop().expect("one packet was counted"))
@@ -1020,7 +1090,14 @@ impl<T: DeviceTransports> DeviceState<T> {
                 .send_many(&mut tun_packets)
                 .await
                 .map_err(Error::IoError),
+        };
+        if diagnostic {
+            eprintln!(
+                "pipeline stage=tun_queue_enqueue packets={tunnel_packet_count} success={}",
+                result.is_ok()
+            );
         }
+        result
     }
 
     /// Queue each bounded receive run once and release it through its peer's ordered lane.
@@ -1050,6 +1127,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         while remaining > 0 {
             let batch = packets.by_ref().take(CRYPTO_BATCH_SIZE).collect::<Vec<_>>();
             let batch_len = batch.len();
+            let batch_first_slot = first_slot + offset;
             let force_worker = lane.should_force_worker(batch_len);
             let crypto = crypto.clone();
             let ordered = Arc::clone(&ordered);
@@ -1059,16 +1137,34 @@ impl<T: DeviceTransports> DeviceState<T> {
             let tun_tx = tun_tx.clone();
             pending.push(
                 async move {
-                    let results = crypto
-                        .decrypt_run(batch, force_worker)
-                        .await
+                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                        eprintln!(
+                            "pipeline stage=decrypt_start first_slot={batch_first_slot} packets={batch_len} worker={force_worker}"
+                        );
+                    }
+                    let results = crypto.decrypt_run(batch, force_worker).await;
+                    let verified_count = results
+                        .as_ref()
+                        .map(|completions| {
+                            completions
+                                .iter()
+                                .filter(|completion| completion.result.is_ok())
+                                .count()
+                        })
+                        .unwrap_or_default();
+                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                        eprintln!(
+                            "pipeline stage=decrypt_complete first_slot={batch_first_slot} packets={batch_len} verified={verified_count} worker={force_worker}"
+                        );
+                    }
+                    let results = results
                         .map(|completions| completions.into_iter().map(Some).collect())
                         .unwrap_or_else(|| {
                             std::iter::repeat_with(|| None).take(batch_len).collect()
                         });
 
                     let result = lane
-                        .complete_run(first_slot + offset, results, |completions| {
+                        .complete_run(batch_first_slot, results, |completions| {
                             let device = device.clone();
                             let peer_arc = Arc::clone(&peer_arc);
                             let tun_tx = tun_tx.clone();
@@ -1078,6 +1174,12 @@ impl<T: DeviceTransports> DeviceState<T> {
                             }
                         })
                         .await;
+                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                        eprintln!(
+                            "pipeline stage=ordered_complete first_slot={batch_first_slot} packets={batch_len} success={}",
+                            result.is_ok()
+                        );
+                    }
                     ordered.release_if_idle(peer_key, &lane);
                     result
                 }
@@ -1102,8 +1204,24 @@ impl<T: DeviceTransports> DeviceState<T> {
         if run.packets.is_empty() {
             return Ok(());
         }
+        let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some();
+        let packet_count = run.packets.len();
         let batch_count = run.packets.len().div_ceil(CRYPTO_BATCH_SIZE);
+        if diagnostic {
+            eprintln!(
+                "pipeline stage=incoming_flush_start peer={} packets={packet_count} pending_runs={} batches={batch_count}",
+                run.peer_key,
+                pending.len()
+            );
+        }
         while pending.len() + batch_count > CRYPTO_CHUNK_SIZE {
+            if diagnostic {
+                eprintln!(
+                    "pipeline stage=incoming_flush_wait_pending peer={} pending_runs={} batches={batch_count}",
+                    run.peer_key,
+                    pending.len()
+                );
+            }
             pending
                 .next()
                 .await
@@ -1112,7 +1230,20 @@ impl<T: DeviceTransports> DeviceState<T> {
 
         let (lane, first_slot) = loop {
             if let Some(reserved) = ordered.reserve_run(run.peer_key, run.packets.len()) {
+                if diagnostic {
+                    eprintln!(
+                        "pipeline stage=incoming_slots_reserved peer={} first_slot={} packets={packet_count}",
+                        run.peer_key, reserved.1
+                    );
+                }
                 break reserved;
+            }
+            if diagnostic {
+                eprintln!(
+                    "pipeline stage=incoming_flush_wait_peer_capacity peer={} pending_runs={}",
+                    run.peer_key,
+                    pending.len()
+                );
             }
             pending
                 .next()
@@ -1133,6 +1264,13 @@ impl<T: DeviceTransports> DeviceState<T> {
             first_slot,
             run.packets,
         );
+        if diagnostic {
+            eprintln!(
+                "pipeline stage=incoming_crypto_enqueued peer={} first_slot={first_slot} packets={packet_count} pending_runs={}",
+                run.peer_key,
+                pending.len()
+            );
+        }
         Ok(())
     }
 
@@ -1435,6 +1573,13 @@ impl<T: DeviceTransports> DeviceState<T> {
                     &mut packet_pool,
                     &mut received_packets,
                 ) => {
+                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                        eprintln!(
+                            "pipeline stage=udp_receive packets={} error={}",
+                            received_packets.len(),
+                            received.is_err()
+                        );
+                    }
                     if let Err(err) = received {
                         if crate::udp::is_fatal_udp_error(&err) {
                             return Err(Error::IoError(err));
@@ -1537,14 +1682,34 @@ impl<T: DeviceTransports> DeviceState<T> {
 
                 match parsed_packet {
                     WgKind::Data(packet) => {
+                        let counter = packet.header.counter.get();
+                        if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                            eprintln!("pipeline stage=udp_data_arrival counter={counter}");
+                            eprintln!("pipeline stage=incoming_peer_lock_wait counter={counter}");
+                        }
                         drop(device_guard);
                         let mut peer = peer_arc.lock().await;
+                        if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                            eprintln!(
+                                "pipeline stage=incoming_peer_lock_acquired counter={counter}"
+                            );
+                        }
                         match peer.prepare_incoming_data(packet) {
                             crate::noise::PreparedIncoming::Immediate(result) => {
                                 // The serial data path also discarded packets without a session.
+                                if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                    eprintln!(
+                                        "pipeline stage=incoming_prepare_immediate counter={counter}"
+                                    );
+                                }
                                 drop(result);
                             }
                             crate::noise::PreparedIncoming::Decrypt { packet } => {
+                                if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                    eprintln!(
+                                        "pipeline stage=incoming_prepare_decrypt counter={counter}"
+                                    );
+                                }
                                 drop(peer);
                                 let reached_limit = {
                                     let run = incoming_runs.entry(peer_key).or_insert_with(|| {
@@ -1728,6 +1893,10 @@ impl<T: DeviceTransports> DeviceState<T> {
                             return Err(Error::IoError(e));
                         }
                     };
+                    let packets = packets.collect::<Vec<_>>();
+                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                        eprintln!("pipeline stage=tun_receive packets={}", packets.len());
+                    }
 
                     let Some(device_arc) = device.upgrade() else {
                         return Ok(());
