@@ -256,9 +256,14 @@ impl IpSend for TunDevice {
                 self.state.offloads.udp_uso,
             );
             let mut first_error = None;
+            let tun = self.tun.as_ref();
             for frame in frames {
-                match self.tun.send(frame.frame.as_bytes()).await {
-                    Ok(_) => {}
+                let result = gso::write_frame_with_fallback(frame, |frame_bytes| async move {
+                    tun.send(frame_bytes.as_bytes()).await.map(|_| ())
+                })
+                .await;
+                match result {
+                    Ok(()) => {}
                     Err(error) => {
                         let fatal = is_fatal_tun_error(&error);
                         if fatal {
