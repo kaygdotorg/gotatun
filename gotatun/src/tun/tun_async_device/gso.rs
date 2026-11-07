@@ -11,7 +11,7 @@ use crate::packet::{
 };
 use crate::tun::tun_async_device::virtio::{Flags, GsoType, VirtioNetHeader};
 use bytes::BytesMut;
-use std::{mem::offset_of, ops::Deref};
+use std::{future::Future, io, mem::offset_of, ops::Deref};
 use zerocopy::IntoBytes;
 
 /// Maximum number of input packets represented by one Linux TUN GSO frame.
@@ -19,6 +19,9 @@ const MAX_GSO_SEGMENTS: usize = 64;
 
 /// Maximum frame size accepted for a coalesced TUN write, including its virtio header.
 const MAX_GSO_FRAME_LEN: usize = 64 * 1024;
+
+/// TCP's push bit belongs only on the last segment emitted from one GSO frame.
+const TCP_FLAG_PSH: u8 = 0x08;
 
 /// IP version carried by a packet that can be described by Linux GSO metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,13 +44,26 @@ enum TransportProtocol {
 /// Header offsets and flow data needed to test whether two packets can share a GSO frame.
 #[derive(Clone, Copy, Debug)]
 struct PacketMetadata {
+    /// Whether the packet uses IPv4 or IPv6 headers.
     ip_version: IpVersion,
+    /// Whether the packet carries TCP or UDP.
     protocol: TransportProtocol,
+    /// Number of bytes in the IP header, including the IPv6 base header.
     ip_header_len: usize,
+    /// Number of bytes in the transport header, including TCP options.
     transport_header_len: usize,
+    /// Offset of the first payload byte in the original packet.
     payload_offset: usize,
+    /// Number of payload bytes in the original packet.
     payload_len: usize,
+    /// TCP sequence number, present only for TCP packets.
     tcp_sequence: Option<u32>,
+    /// TCP control flags, present only for TCP packets.
+    tcp_flags: Option<u8>,
+    /// IPv4 identification value, present only for IPv4 packets.
+    ipv4_identification: Option<u16>,
+    /// Whether an IPv4 packet sets DF, present only for IPv4 packets.
+    ipv4_dont_fragment: Option<bool>,
 }
 
 impl PacketMetadata {
@@ -78,6 +94,8 @@ impl PacketMetadata {
 pub(super) struct CoalescedFrame {
     /// The virtio header followed by a complete IP packet or GSO super-packet.
     pub(super) frame: Packet<[u8]>,
+    /// Original segments kept only for a GSO frame that the TUN may reject.
+    source_packets: Option<Vec<Packet<Ip>>>,
 }
 
 impl Deref for CoalescedFrame {
@@ -86,6 +104,13 @@ impl Deref for CoalescedFrame {
     /// Borrow the frame bytes for callers that only need to inspect or write the packet.
     fn deref(&self) -> &Self::Target {
         &self.frame
+    }
+}
+
+impl CoalescedFrame {
+    /// Split the encoded frame from the original segments retained for a refusal fallback.
+    pub(super) fn into_write_parts(self) -> (Packet<[u8]>, Option<Vec<Packet<Ip>>>) {
+        (self.frame, self.source_packets)
     }
 }
 
@@ -158,7 +183,14 @@ pub(super) fn coalesce_packets(
 /// Parse a direct TCP or UDP packet without accepting IP fragments or extension headers.
 fn packet_metadata(bytes: &[u8]) -> Option<PacketMetadata> {
     let version = bytes.first()? >> 4;
-    let (ip_version, ip_header_len, total_len, protocol_number) = match version {
+    let (
+        ip_version,
+        ip_header_len,
+        total_len,
+        protocol_number,
+        ipv4_identification,
+        ipv4_dont_fragment,
+    ) = match version {
         4 => {
             let ip_header_len = usize::from(bytes.first()? & 0x0f) * 4;
             if ip_header_len != Ipv4Header::LEN {
@@ -169,7 +201,14 @@ fn packet_metadata(bytes: &[u8]) -> Option<PacketMetadata> {
             if total_len != bytes.len() || fragment & 0xbfff != 0 {
                 return None;
             }
-            (IpVersion::V4, ip_header_len, total_len, *bytes.get(9)?)
+            (
+                IpVersion::V4,
+                ip_header_len,
+                total_len,
+                *bytes.get(9)?,
+                Some(read_u16(bytes, 4)?),
+                Some(fragment & 0x4000 != 0),
+            )
         }
         6 => {
             if bytes.len() < Ipv6Header::LEN {
@@ -179,13 +218,20 @@ fn packet_metadata(bytes: &[u8]) -> Option<PacketMetadata> {
             if total_len != bytes.len() {
                 return None;
             }
-            (IpVersion::V6, Ipv6Header::LEN, total_len, *bytes.get(6)?)
+            (
+                IpVersion::V6,
+                Ipv6Header::LEN,
+                total_len,
+                *bytes.get(6)?,
+                None,
+                None,
+            )
         }
         _ => return None,
     };
 
     let transport_offset = ip_header_len;
-    let (protocol, transport_header_len, tcp_sequence) = match protocol_number {
+    let (protocol, transport_header_len, tcp_sequence, tcp_flags) = match protocol_number {
         6 => {
             let tcp_header_len = usize::from(*bytes.get(transport_offset + 12)? >> 4) * 4;
             let flags = *bytes.get(transport_offset + 13)?;
@@ -202,6 +248,7 @@ fn packet_metadata(bytes: &[u8]) -> Option<PacketMetadata> {
                 TransportProtocol::Tcp,
                 tcp_header_len,
                 Some(read_u32(bytes, transport_offset + 4)?),
+                Some(flags),
             )
         }
         17 => {
@@ -218,7 +265,7 @@ fn packet_metadata(bytes: &[u8]) -> Option<PacketMetadata> {
             if payload_len == 0 {
                 return None;
             }
-            (TransportProtocol::Udp, UdpHeader::LEN, None)
+            (TransportProtocol::Udp, UdpHeader::LEN, None, None)
         }
         _ => return None,
     };
@@ -232,6 +279,9 @@ fn packet_metadata(bytes: &[u8]) -> Option<PacketMetadata> {
         payload_offset,
         payload_len: total_len - payload_offset,
         tcp_sequence,
+        tcp_flags,
+        ipv4_identification,
+        ipv4_dont_fragment,
     })
 }
 
@@ -252,6 +302,10 @@ fn can_append(
         || next.payload_len > first.payload_len
         || last.payload_len < first.payload_len
         || grouped_packet_count >= MAX_GSO_SEGMENTS
+        || (first.ip_version == IpVersion::V4 && !ipv4_identification_can_follow(last, next))
+        || (first.protocol == TransportProtocol::Tcp
+            && (last.tcp_flags.is_none_or(|flags| flags & TCP_FLAG_PSH != 0)
+                || !tcp_flags_match_ignoring_psh(first_packet, next_packet, first)))
         || !headers_match(first_packet, next_packet, first)
     {
         return false;
@@ -278,11 +332,39 @@ fn can_append(
     }
 }
 
+/// Check the IPv4 ID rule before merging two packets into one GSO frame.
+///
+/// Non-DF packets keep their original, consecutive IDs so a later fragment cannot collide with
+/// another datagram. DF packets are atomic and may use different IDs.
+fn ipv4_identification_can_follow(last: PacketMetadata, next: PacketMetadata) -> bool {
+    match (
+        last.ipv4_identification,
+        last.ipv4_dont_fragment,
+        next.ipv4_identification,
+        next.ipv4_dont_fragment,
+    ) {
+        (Some(_), Some(true), Some(_), Some(true)) => true,
+        (Some(last_id), Some(false), Some(next_id), Some(false)) => {
+            next_id == last_id.wrapping_add(1)
+        }
+        _ => false,
+    }
+}
+
+/// Compare TCP control flags while allowing only a trailing packet to carry PSH.
+fn tcp_flags_match_ignoring_psh(first: &[u8], next: &[u8], metadata: PacketMetadata) -> bool {
+    let flags_offset = metadata.ip_header_len + offset_of!(TcpHeader, flags);
+    match (first.get(flags_offset), next.get(flags_offset)) {
+        (Some(first), Some(next)) => *first & !TCP_FLAG_PSH == *next & !TCP_FLAG_PSH,
+        _ => false,
+    }
+}
+
 /// Compare IP and transport headers while ignoring fields that naturally change per segment.
 ///
 /// Address and port bytes remain part of the comparison, so this also enforces the 5-tuple for
-/// TCP and the 4-tuple for UDP. Only lengths, IPv4 IDs/checksums, TCP sequence/checksum, and UDP
-/// length/checksum may differ.
+/// TCP and the 4-tuple for UDP. Only lengths, IPv4 IDs/checksums, TCP sequence/checksum/PSH, and
+/// UDP length/checksum may differ; the IPv4 ID and TCP PSH rules are checked separately.
 fn headers_match(first: &[u8], next: &[u8], metadata: PacketMetadata) -> bool {
     let header_len = metadata.header_len();
     let Some(first_header) = first.get(..header_len) else {
@@ -297,7 +379,17 @@ fn headers_match(first: &[u8], next: &[u8], metadata: PacketMetadata) -> bool {
             ip_version: IpVersion::V4,
             protocol: TransportProtocol::Tcp,
             ..
-        } => (&[(2, 4), (4, 6), (10, 12)], &[(4, 8), (16, 18)]),
+        } => (
+            &[(2, 4), (4, 6), (10, 12)],
+            &[
+                (4, 8),
+                (
+                    offset_of!(TcpHeader, flags),
+                    offset_of!(TcpHeader, flags) + 1,
+                ),
+                (16, 18),
+            ],
+        ),
         PacketMetadata {
             ip_version: IpVersion::V4,
             protocol: TransportProtocol::Udp,
@@ -307,7 +399,17 @@ fn headers_match(first: &[u8], next: &[u8], metadata: PacketMetadata) -> bool {
             ip_version: IpVersion::V6,
             protocol: TransportProtocol::Tcp,
             ..
-        } => (&[(4, 6)], &[(4, 8), (16, 18)]),
+        } => (
+            &[(4, 6)],
+            &[
+                (4, 8),
+                (
+                    offset_of!(TcpHeader, flags),
+                    offset_of!(TcpHeader, flags) + 1,
+                ),
+                (16, 18),
+            ],
+        ),
         PacketMetadata {
             ip_version: IpVersion::V6,
             protocol: TransportProtocol::Udp,
@@ -357,6 +459,7 @@ fn single_frame(packet: Packet<Ip>) -> CoalescedFrame {
     bytes.extend_from_slice(packet.as_bytes());
     CoalescedFrame {
         frame: Packet::from_bytes(bytes),
+        source_packets: None,
     }
 }
 
@@ -390,6 +493,16 @@ fn gso_frame(
     }
 
     let ip_offset = VirtioNetHeader::LEN;
+    if metadata.protocol == TransportProtocol::Tcp {
+        let flags_offset = ip_offset + metadata.ip_header_len + offset_of!(TcpHeader, flags);
+        let first_flags = bytes[flags_offset];
+        let last_packet = group.last().expect("a GSO group has an input packet");
+        let last_flags =
+            last_packet.as_bytes()[metadata.ip_header_len + offset_of!(TcpHeader, flags)];
+        // Linux uses the super-packet's PSH flag to put PSH on its final output segment.
+        bytes[flags_offset] = (first_flags & !TCP_FLAG_PSH) | (last_flags & TCP_FLAG_PSH);
+    }
+
     let total_ip_len = header_len + payload_len;
     match metadata.ip_version {
         IpVersion::V4 => {
@@ -438,10 +551,56 @@ fn gso_frame(
 
     CoalescedFrame {
         frame: Packet::from_bytes(bytes),
+        source_packets: Some(group),
     }
 }
 
-/// Calculate the one's-complement pseudo-header checksum seed for `CHECKSUM_PARTIAL`.
+/// Write a TUN frame and retry its original packets if the kernel refuses its GSO metadata.
+///
+/// The retry is limited to `EINVAL` and `EOPNOTSUPP`-style errors. A rejected GSO write is atomic,
+/// so writing the retained source packets individually cannot duplicate an accepted segment.
+pub(super) async fn write_frame_with_fallback<F, Fut>(
+    frame: CoalescedFrame,
+    mut write: F,
+) -> io::Result<()>
+where
+    F: FnMut(Packet<[u8]>) -> Fut,
+    Fut: Future<Output = io::Result<()>>,
+{
+    let (frame_bytes, source_packets) = frame.into_write_parts();
+    match write(frame_bytes).await {
+        Ok(()) => Ok(()),
+        Err(error) if is_tun_gso_refusal(&error) => {
+            let Some(packets) = source_packets else {
+                return Err(error);
+            };
+            let mut first_error = None;
+            for packet in packets {
+                let fallback = single_frame(packet).frame;
+                if let Err(error) = write(fallback).await {
+                    if crate::tun::is_fatal_tun_error(&error) {
+                        return Err(error);
+                    }
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+            first_error.map_or(Ok(()), Err)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Identify errors that mean the TUN rejected this GSO frame's metadata.
+fn is_tun_gso_refusal(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+    )
+}
+
+/// Return the folded, uncomplemented pseudo-header sum required by `CHECKSUM_PARTIAL`.
 ///
 /// The kernel completes each segment checksum from this seed and the segment's transport header
 /// and payload. A zero seed would omit the IP addresses, protocol, and transport length.
@@ -474,7 +633,7 @@ fn partial_checksum_seed(packet: &[u8], metadata: PacketMetadata, transport_len:
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
-    !(sum as u16)
+    sum as u16
 }
 
 /// Sum 16-bit network-order words as required by an Internet checksum.
@@ -505,9 +664,10 @@ mod tests {
     use super::{CoalescedFrame, coalesce_packets};
     use crate::{
         packet::{
-            Ip, IpNextProtocol, Ipv4, Ipv4Header, Ipv4VersionIhl, Ipv6, Ipv6Header,
-            Ipv6VersionTrafficFlow, Packet, PseudoHeaderV4, PseudoHeaderV6, Tcp, TcpDataOffset,
-            TcpFlags, TcpHeader, Udp, UdpHeader, checksum_ipv4_with_skip, checksum_udp_with_skip,
+            Ip, IpNextProtocol, Ipv4, Ipv4FlagsFragmentOffset, Ipv4Header, Ipv4VersionIhl, Ipv6,
+            Ipv6Header, Ipv6VersionTrafficFlow, Packet, PseudoHeaderV4, PseudoHeaderV6, Tcp,
+            TcpDataOffset, TcpFlags, TcpHeader, Udp, UdpHeader, checksum_ipv4_with_skip,
+            checksum_udp_with_skip,
         },
         tun::tun_async_device::{
             tso,
@@ -515,29 +675,54 @@ mod tests {
         },
     };
     use bytes::BytesMut;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::{
+        ffi::CString,
+        fs::File,
+        io,
+        net::{Ipv4Addr, Ipv6Addr},
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
+        panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+        process::Command,
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
     use zerocopy::{FromBytes, IntoBytes, big_endian};
 
     /// Builds a valid IPv4 TCP packet with the selected source address and sequence number.
     fn ipv4_tcp(flow: u8, seq_num: u32, payload: &[u8]) -> Packet<Ip> {
+        ipv4_tcp_with_fields(flow, seq_num, payload, 0, true, false)
+    }
+
+    /// Builds IPv4 TCP with explicit identification, DF, and PSH fields for boundary tests.
+    fn ipv4_tcp_with_fields(
+        flow: u8,
+        seq_num: u32,
+        payload: &[u8],
+        identification: u16,
+        dont_fragment: bool,
+        psh: bool,
+    ) -> Packet<Ip> {
         let tcp_header = TcpHeader {
             source_port: 111.into(),
             destination_port: 222.into(),
             seq_num: seq_num.into(),
             ack_num: 444.into(),
             data_offset: TcpDataOffset::no_options(),
-            flags: TcpFlags::new().with_ack(true),
+            flags: TcpFlags::new().with_ack(true).with_psh(psh),
             window: 555.into(),
             checksum: 0.into(),
             urgent_pointer: 0.into(),
         };
         let tcp_len = TcpHeader::LEN + payload.len();
-        let ip_header = Ipv4Header::new_for_length(
+        let mut ip_header = Ipv4Header::new_for_length(
             Ipv4Addr::new(10, 0, 0, flow),
             Ipv4Addr::new(10, 0, 1, 1),
             IpNextProtocol::Tcp,
             tcp_len.try_into().unwrap(),
         );
+        ip_header.identification = identification.into();
+        ip_header.flags_and_fragment_offset =
+            Ipv4FlagsFragmentOffset::new().with_dont_fragment(dont_fragment);
         let mut bytes = BytesMut::with_capacity(Ipv4Header::LEN + tcp_len);
         bytes.extend_from_slice(ip_header.as_bytes());
         bytes.extend_from_slice(tcp_header.as_bytes());
@@ -577,7 +762,9 @@ mod tests {
             source_address: big_endian::U128::new(u128::from(Ipv6Addr::new(
                 0x2001, 0x0db8, 0, 0, 0, 0, 0, flow,
             ))),
-            destination_address: big_endian::U128::new(u128::from(Ipv6Addr::LOCALHOST)),
+            destination_address: big_endian::U128::new(u128::from(Ipv6Addr::new(
+                0xfd38, 1, 0, 0, 0, 0, 0, 1,
+            ))),
         };
         let mut bytes = BytesMut::with_capacity(Ipv6Header::LEN + tcp_len);
         bytes.extend_from_slice(ip_header.as_bytes());
@@ -596,14 +783,27 @@ mod tests {
 
     /// Builds a valid IPv4 UDP datagram with a distinct source address for each flow.
     fn ipv4_udp(flow: u8, payload: &[u8]) -> Packet<Ip> {
+        ipv4_udp_with_fields(flow, payload, 0, true)
+    }
+
+    /// Builds IPv4 UDP with explicit identification and DF fields for boundary tests.
+    fn ipv4_udp_with_fields(
+        flow: u8,
+        payload: &[u8],
+        identification: u16,
+        dont_fragment: bool,
+    ) -> Packet<Ip> {
         let udp_len = UdpHeader::LEN + payload.len();
         let udp_header = UdpHeader::new(111, 222, udp_len.try_into().unwrap(), 0);
-        let ip_header = Ipv4Header::new_for_length(
+        let mut ip_header = Ipv4Header::new_for_length(
             Ipv4Addr::new(10, 0, 0, flow),
             Ipv4Addr::new(10, 0, 1, 1),
             IpNextProtocol::Udp,
             udp_len.try_into().unwrap(),
         );
+        ip_header.identification = identification.into();
+        ip_header.flags_and_fragment_offset =
+            Ipv4FlagsFragmentOffset::new().with_dont_fragment(dont_fragment);
         let mut bytes = BytesMut::with_capacity(Ipv4Header::LEN + udp_len);
         bytes.extend_from_slice(ip_header.as_bytes());
         bytes.extend_from_slice(udp_header.as_bytes());
@@ -638,7 +838,9 @@ mod tests {
             source_address: big_endian::U128::new(u128::from(Ipv6Addr::new(
                 0x2001, 0x0db8, 0, 0, 0, 0, 0, flow,
             ))),
-            destination_address: big_endian::U128::new(u128::from(Ipv6Addr::LOCALHOST)),
+            destination_address: big_endian::U128::new(u128::from(Ipv6Addr::new(
+                0xfd38, 1, 0, 0, 0, 0, 0, 1,
+            ))),
         };
         let mut bytes = BytesMut::with_capacity(Ipv6Header::LEN + udp_len);
         bytes.extend_from_slice(ip_header.as_bytes());
@@ -842,7 +1044,7 @@ mod tests {
         }
     }
 
-    /// Computes the independently expected one's-complement checksum of an IP pseudo-header.
+    /// Computes the independently expected folded pseudo-header sum used by `CHECKSUM_PARTIAL`.
     fn expected_partial_checksum_seed(
         packet: &[u8],
         ip_header_len: usize,
@@ -868,7 +1070,7 @@ mod tests {
         while sum >> 16 != 0 {
             sum = (sum & 0xffff) + (sum >> 16);
         }
-        !(sum as u16)
+        sum as u16
     }
 
     /// Checks that a coalesced frame carries the pseudo-header seed required by partial checksum.
@@ -1101,6 +1303,155 @@ mod tests {
         assert_eq!(ipv4_tcp_payload(&frames[1]).as_slice(), b"other");
     }
 
+    /// A PSH packet can close a GSO group, but later packets must begin another frame.
+    #[test]
+    fn tcp_psh_packet_ends_its_gso_group() {
+        let packets = vec![
+            ipv4_tcp_with_fields(1, 1000, b"first", 10, true, false),
+            ipv4_tcp_with_fields(1, 1005, b"push!", 11, true, true),
+            ipv4_tcp_with_fields(1, 1010, b"later", 12, true, false),
+        ];
+
+        let frames = coalesce_packets(packets, true, false);
+
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            frame_header(&frames[0]).gso_type,
+            GsoType::VIRTIO_NET_HDR_GSO_TCPV4
+        );
+        let grouped = segments(&frames[0]);
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].as_bytes()[Ipv4Header::LEN + 13] & 0x08, 0);
+        assert_eq!(grouped[1].as_bytes()[Ipv4Header::LEN + 13] & 0x08, 0x08);
+        assert_eq!(
+            frame_header(&frames[1]).gso_type,
+            GsoType::VIRTIO_NET_HDR_GSO_NONE
+        );
+        assert_eq!(ipv4_tcp_payload(&frames[1]).as_slice(), b"later");
+    }
+
+    /// Non-DF IPv4 packets merge only while each identification follows the previous one.
+    #[test]
+    fn ipv4_non_df_gso_requires_consecutive_identification_values() {
+        let packets = vec![
+            ipv4_tcp_with_fields(1, 1000, b"first", 100, false, false),
+            ipv4_tcp_with_fields(1, 1005, b"other", 101, false, false),
+            ipv4_tcp_with_fields(1, 1010, b"later", 900, false, false),
+        ];
+
+        let frames = coalesce_packets(packets, true, false);
+
+        assert_eq!(frames.len(), 2);
+        assert_eq!(segments(&frames[0]).len(), 2);
+        assert_eq!(
+            frame_header(&frames[1]).gso_type,
+            GsoType::VIRTIO_NET_HDR_GSO_NONE
+        );
+        assert_eq!(ipv4_tcp_payload(&frames[1]).as_slice(), b"later");
+    }
+
+    /// DF-set IPv4 packets can share a GSO frame even when their IDs differ.
+    #[test]
+    fn ipv4_df_gso_allows_nonconsecutive_identification_values() {
+        let packets = vec![
+            ipv4_tcp_with_fields(1, 1000, b"first", 100, true, false),
+            ipv4_tcp_with_fields(1, 1005, b"other", 900, true, false),
+        ];
+
+        let frames = coalesce_packets(packets, true, false);
+
+        assert_eq!(frames.len(), 1);
+        assert_eq!(segments(&frames[0]).len(), 2);
+    }
+
+    /// Non-DF IPv4 UDP packets with unrelated IDs remain separate datagrams.
+    #[test]
+    fn ipv4_udp_non_df_gso_requires_consecutive_identification_values() {
+        let packets = vec![
+            ipv4_udp_with_fields(1, b"first", 100, false),
+            ipv4_udp_with_fields(1, b"other", 900, false),
+        ];
+
+        let frames = coalesce_packets(packets, false, true);
+
+        assert_eq!(frames.len(), 2);
+        assert!(
+            frames
+                .iter()
+                .all(|frame| { frame_header(frame).gso_type == GsoType::VIRTIO_NET_HDR_GSO_NONE })
+        );
+    }
+
+    /// A rejected GSO write retries its exact source packets as individual `GSO_NONE` frames.
+    #[tokio::test]
+    async fn refused_gso_frame_retries_the_original_packets_individually() {
+        let packets = vec![
+            ipv4_tcp_with_fields(1, 1000, b"first", 100, true, false),
+            ipv4_tcp_with_fields(1, 1005, b"other", 101, true, false),
+        ];
+        let expected: Vec<Vec<u8>> = packets
+            .iter()
+            .map(|packet| packet.as_bytes().to_vec())
+            .collect();
+        let frame = coalesce_packets(packets, true, false).pop().unwrap();
+        let writes = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let mut writer = {
+            let writes = Arc::clone(&writes);
+            move |bytes: Packet<[u8]>| {
+                let writes = Arc::clone(&writes);
+                async move {
+                    let is_gso = bytes.as_bytes()[1] != GsoType::VIRTIO_NET_HDR_GSO_NONE.bits();
+                    writes.lock().unwrap().push(bytes.as_bytes().to_vec());
+                    if is_gso {
+                        Err(io::Error::from(io::ErrorKind::InvalidInput))
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+        };
+
+        let result = super::write_frame_with_fallback(frame, &mut writer).await;
+
+        assert!(result.is_ok());
+        drop(writer);
+        let writes = Arc::try_unwrap(writes).unwrap().into_inner().unwrap();
+        assert_eq!(writes.len(), 3, "one refused GSO write plus two retries");
+        assert_ne!(writes[0][1], GsoType::VIRTIO_NET_HDR_GSO_NONE.bits());
+        for (retry, original) in writes[1..].iter().zip(expected) {
+            assert_eq!(retry[1], GsoType::VIRTIO_NET_HDR_GSO_NONE.bits());
+            assert_eq!(&retry[VirtioNetHeader::LEN..], original.as_slice());
+        }
+    }
+
+    /// A non-refusal error is returned without retrying the source packets.
+    #[tokio::test]
+    async fn non_refusal_gso_error_does_not_retry_original_packets() {
+        let frame = coalesce_packets(
+            vec![ipv4_tcp(1, 1000, b"first"), ipv4_tcp(1, 1005, b"other")],
+            true,
+            false,
+        )
+        .pop()
+        .unwrap();
+        let writes = Arc::new(Mutex::new(0));
+        let mut writer = {
+            let writes = Arc::clone(&writes);
+            move |_bytes: Packet<[u8]>| {
+                let writes = Arc::clone(&writes);
+                async move {
+                    *writes.lock().unwrap() += 1;
+                    Err(io::Error::from(io::ErrorKind::PermissionDenied))
+                }
+            }
+        };
+
+        let result = super::write_frame_with_fallback(frame, &mut writer).await;
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(*writes.lock().unwrap(), 1);
+    }
+
     /// Interleaved flows retain input order and do not coalesce across one another.
     #[test]
     fn interleaved_tcp_flows_keep_order_without_cross_flow_coalescing() {
@@ -1226,5 +1577,584 @@ mod tests {
             GsoType::VIRTIO_NET_HDR_GSO_NONE
         );
         assert_eq!(ipv4_udp_payload(&frames[1]), vec![64; 400]);
+    }
+
+    /// Linux splits and checksums coalesced TCP and UDP frames before forwarding them out a veth.
+    #[test]
+    #[ignore = "requires root, Linux network namespaces, TUN GSO, veth, and ethtool"]
+    fn forwarded_gso_segments_have_valid_checksums_for_all_ip_transports() {
+        assert_eq!(unsafe { libc::geteuid() }, 0, "run this proof as root");
+        // SAFETY: this test runs in its own libtest worker thread; the child commands inherit the
+        // new network namespace, and the worker drops it when the test returns.
+        let status = unsafe { libc::unshare(libc::CLONE_NEWNET) };
+        assert_eq!(
+            status,
+            0,
+            "create isolated network namespace: {}",
+            io::Error::last_os_error()
+        );
+
+        let mut configuration = tun::Configuration::default();
+        configuration.tun_name("j316tn").layer(tun::Layer::L3);
+        configuration.platform_config(|platform| {
+            platform.ensure_root_privileges(false);
+            platform.vnet_hdr(true);
+        });
+        let device = tun::create(&configuration).expect("open a virtio-header TUN");
+        let offloads = libc::TUN_F_CSUM
+            | libc::TUN_F_TSO4
+            | libc::TUN_F_TSO6
+            | libc::TUN_F_USO4
+            | libc::TUN_F_USO6;
+        // SAFETY: TUNSETOFFLOAD takes the integer flags as an ioctl argument, and `device` owns
+        // the descriptor for the duration of this call.
+        let status = unsafe {
+            libc::ioctl(
+                device.as_raw_fd(),
+                libc::TUNSETOFFLOAD,
+                offloads as libc::c_ulong,
+            )
+        };
+        assert_eq!(
+            status,
+            0,
+            "enable TCP and UDP TUN GSO: {}",
+            io::Error::last_os_error()
+        );
+
+        let peer_namespace = configure_forwarding_veth();
+        let capture = peer_namespace.open_packet_capture("j316vb");
+        let payloads = forwarding_payloads();
+
+        let mut tcp_v4_sequence = 50_000;
+        let tcp_v4 = payloads
+            .iter()
+            .map(|payload| {
+                let packet = ipv4_tcp_with_fields(2, tcp_v4_sequence, payload, 0, true, false);
+                tcp_v4_sequence = tcp_v4_sequence.wrapping_add(payload.len() as u32);
+                packet
+            })
+            .collect();
+        let mut tcp_v6_sequence = 70_000;
+        let tcp_v6 = payloads
+            .iter()
+            .map(|payload| {
+                let packet = ipv6_tcp(2, tcp_v6_sequence, payload);
+                tcp_v6_sequence = tcp_v6_sequence.wrapping_add(payload.len() as u32);
+                packet
+            })
+            .collect();
+        let cases: Vec<(&str, Vec<Packet<Ip>>, bool, bool)> = vec![
+            ("IPv4 TCP", tcp_v4, true, false),
+            ("IPv6 TCP", tcp_v6, true, false),
+            (
+                "IPv4 UDP",
+                payloads
+                    .iter()
+                    .map(|payload| ipv4_udp_with_fields(2, payload, 0, true))
+                    .collect(),
+                false,
+                true,
+            ),
+            (
+                "IPv6 UDP",
+                payloads
+                    .iter()
+                    .map(|payload| ipv6_udp(2, payload))
+                    .collect(),
+                false,
+                true,
+            ),
+        ];
+
+        for (name, packets, tcp_tso, udp_uso) in cases {
+            let expected_payloads: Vec<Vec<u8>> = packets
+                .iter()
+                .map(|packet| wire_packet_payload(packet.as_bytes()))
+                .collect();
+            let mut frames = coalesce_packets(packets, tcp_tso, udp_uso);
+            assert_eq!(frames.len(), 1, "{name} should be one GSO frame");
+            let frame = frames.pop().unwrap();
+            assert!(
+                frame_header(&frame).flags.needs_csum(),
+                "{name} needs checksum completion"
+            );
+            drain_packet_capture(capture.as_raw_fd());
+            let written = device
+                .send(frame.as_bytes())
+                .unwrap_or_else(|error| panic!("write {name} GSO frame to TUN: {error}"));
+            assert_eq!(written, frame.as_bytes().len(), "short {name} TUN write");
+
+            let emitted = capture_forwarded_packets(capture.as_raw_fd(), expected_payloads.len());
+            let capture_samples: Vec<String> = emitted
+                .iter()
+                .take(12)
+                .map(|packet| format!("{:02x?}", &packet[..packet.len().min(80)]))
+                .collect();
+            assert_eq!(
+                emitted.len(),
+                expected_payloads.len(),
+                "{name} segment count; first captured packets: {capture_samples:?}"
+            );
+            let actual_payloads: Vec<Vec<u8>> = emitted
+                .iter()
+                .map(|packet| {
+                    assert_forwarded_checksums(packet, name);
+                    wire_packet_payload(packet)
+                })
+                .collect();
+            assert_eq!(
+                actual_payloads, expected_payloads,
+                "{name} payload or order changed"
+            );
+        }
+    }
+
+    /// Build a private IPv4/IPv6 forwarding route and disable veth segmentation/checksum offloads.
+    fn configure_forwarding_veth() -> PeerNetworkNamespace {
+        run_root_command("ip", &["link", "set", "lo", "up"]);
+        run_root_command("ip", &["addr", "add", "10.0.0.254/24", "dev", "j316tn"]);
+        run_root_command(
+            "ip",
+            &[
+                "-6",
+                "addr",
+                "add",
+                "fd38::ffff/64",
+                "dev",
+                "j316tn",
+                "nodad",
+            ],
+        );
+        run_root_command("ip", &["link", "set", "j316tn", "mtu", "1500", "up"]);
+        run_root_command(
+            "ip",
+            &[
+                "link", "add", "j316va", "type", "veth", "peer", "name", "j316vb",
+            ],
+        );
+        let peer_namespace = PeerNetworkNamespace::new();
+        run_root_command(
+            "ip",
+            &["link", "set", "j316vb", "netns", &peer_namespace.name],
+        );
+        run_root_command(
+            "ip",
+            &[
+                "-n",
+                &peer_namespace.name,
+                "link",
+                "set",
+                "j316vb",
+                "address",
+                "02:00:00:00:00:99",
+            ],
+        );
+        run_root_command("ip", &["link", "set", "j316va", "up"]);
+        run_root_command(
+            "ip",
+            &["-n", &peer_namespace.name, "link", "set", "j316vb", "up"],
+        );
+        run_root_command(
+            "ethtool",
+            &[
+                "-K", "j316va", "tx", "off", "tso", "off", "gso", "off", "sg", "off",
+            ],
+        );
+        peer_namespace.run("ethtool", &["-K", "j316vb", "gro", "off", "rx", "off"]);
+        run_root_command(
+            "sysctl",
+            &[
+                "-qw",
+                "net.ipv4.ip_forward=1",
+                "net.ipv6.conf.all.forwarding=1",
+                "net.ipv4.conf.all.rp_filter=0",
+                "net.ipv4.conf.j316tn.rp_filter=0",
+                "net.ipv4.conf.j316tn.forwarding=1",
+                "net.ipv6.conf.j316tn.forwarding=1",
+            ],
+        );
+        run_root_command("ip", &["route", "add", "10.0.1.0/24", "dev", "j316va"]);
+        run_root_command(
+            "ip",
+            &["-6", "route", "add", "fd38:1::/64", "dev", "j316va"],
+        );
+        run_root_command(
+            "ip",
+            &[
+                "neigh",
+                "add",
+                "10.0.1.1",
+                "lladdr",
+                "02:00:00:00:00:99",
+                "dev",
+                "j316va",
+                "nud",
+                "permanent",
+            ],
+        );
+        run_root_command(
+            "ip",
+            &[
+                "-6",
+                "neigh",
+                "add",
+                "fd38:1::1",
+                "lladdr",
+                "02:00:00:00:00:99",
+                "dev",
+                "j316va",
+                "nud",
+                "permanent",
+            ],
+        );
+        peer_namespace
+    }
+
+    /// A separate receive namespace prevents forwarded packets from routing back into the sender.
+    struct PeerNetworkNamespace {
+        name: String,
+    }
+
+    impl PeerNetworkNamespace {
+        /// Create a uniquely named namespace whose mount disappears when this fixture is dropped.
+        fn new() -> Self {
+            let name = format!("j316-gso-{}", std::process::id());
+            run_root_command("ip", &["netns", "add", &name]);
+            Self { name }
+        }
+
+        /// Run a command inside the receive namespace and fail with the command's stderr.
+        fn run(&self, program: &str, arguments: &[&str]) {
+            let mut command = Command::new("ip");
+            command.args(["netns", "exec", self.name.as_str(), program]);
+            command.args(arguments);
+            let output = command
+                .output()
+                .unwrap_or_else(|error| panic!("run {program} in {}: {error}", self.name));
+            assert!(
+                output.status.success(),
+                "run {program} {arguments:?} in {} failed: {}",
+                self.name,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        /// Open an AF_PACKET socket in the peer namespace and restore the test thread's namespace.
+        fn open_packet_capture(&self, interface: &str) -> OwnedFd {
+            let original =
+                File::open("/proc/self/ns/net").expect("open original network namespace");
+            let target = File::open(format!("/run/netns/{}", self.name))
+                .expect("open peer network namespace");
+            // SAFETY: `target` is an open network-namespace descriptor and this test runs as root.
+            let status = unsafe { libc::setns(target.as_raw_fd(), libc::CLONE_NEWNET) };
+            assert_eq!(
+                status,
+                0,
+                "enter peer network namespace: {}",
+                io::Error::last_os_error()
+            );
+
+            let capture = catch_unwind(AssertUnwindSafe(|| open_packet_capture(interface)));
+            // SAFETY: `original` is the open network-namespace descriptor saved before setns(2).
+            let restore_status = unsafe { libc::setns(original.as_raw_fd(), libc::CLONE_NEWNET) };
+            assert_eq!(
+                restore_status,
+                0,
+                "restore original network namespace: {}",
+                io::Error::last_os_error()
+            );
+            match capture {
+                Ok(capture) => capture,
+                Err(payload) => resume_unwind(payload),
+            }
+        }
+    }
+
+    impl Drop for PeerNetworkNamespace {
+        fn drop(&mut self) {
+            let _ = Command::new("ip")
+                .args(["netns", "del", self.name.as_str()])
+                .status();
+        }
+    }
+
+    /// Run one root-only setup command and show its stderr when the kernel rejects it.
+    fn run_root_command(program: &str, arguments: &[&str]) {
+        let output = Command::new(program)
+            .args(arguments)
+            .output()
+            .unwrap_or_else(|error| panic!("run {program} {arguments:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "{program} {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Bind an AF_PACKET socket to the veth's receiving side for software-segmented frames.
+    fn open_packet_capture(interface: &str) -> OwnedFd {
+        let protocol = (libc::ETH_P_ALL as u16).to_be();
+        // SAFETY: socket(2) receives a valid Linux packet-socket domain, type, and protocol.
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_PACKET,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                i32::from(protocol),
+            )
+        };
+        assert!(
+            fd >= 0,
+            "open AF_PACKET capture: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: `fd` is a newly opened descriptor owned by this function.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let name = CString::new(interface).unwrap();
+        // SAFETY: `name` is NUL-terminated and lives across the interface-index lookup.
+        let interface_index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+        assert_ne!(interface_index, 0, "find capture interface {interface}");
+        // SAFETY: zero is a valid initial value for this address structure; the fields below are
+        // filled before bind(2) reads it.
+        let mut address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+        address.sll_family = libc::AF_PACKET as libc::c_ushort;
+        address.sll_protocol = protocol;
+        address.sll_ifindex = interface_index as libc::c_int;
+        // SAFETY: `address` is a complete sockaddr_ll and `fd` is an AF_PACKET socket.
+        let status = unsafe {
+            libc::bind(
+                fd.as_raw_fd(),
+                (&raw const address).cast(),
+                std::mem::size_of_val(&address) as libc::socklen_t,
+            )
+        };
+        assert_eq!(
+            status,
+            0,
+            "bind AF_PACKET capture: {}",
+            io::Error::last_os_error()
+        );
+        fd
+    }
+
+    /// Discard setup traffic and any packets left over from the previous forwarding case.
+    fn drain_packet_capture(fd: libc::c_int) {
+        let mut buffer = vec![0_u8; 70_000];
+        loop {
+            // SAFETY: `buffer` is writable and `fd` is the live capture socket.
+            let length = unsafe {
+                libc::recv(
+                    fd,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if length >= 0 {
+                continue;
+            }
+            if io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+                break;
+            }
+            panic!("drain AF_PACKET capture: {}", io::Error::last_os_error());
+        }
+    }
+
+    /// Capture forwarded IPv4/IPv6 TCP/UDP packets until the expected count arrives and goes quiet.
+    fn capture_forwarded_packets(fd: libc::c_int, expected_count: usize) -> Vec<Vec<u8>> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut packets = Vec::with_capacity(expected_count);
+        let mut buffer = vec![0_u8; 70_000];
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let wait = if packets.len() >= expected_count {
+                100
+            } else {
+                500
+            };
+            let mut poll_fd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `poll_fd` points to one initialized descriptor and is valid for this call.
+            let ready = unsafe { libc::poll(&mut poll_fd, 1, wait) };
+            if ready < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!("poll AF_PACKET capture: {}", io::Error::last_os_error());
+            }
+            if ready == 0 {
+                if packets.len() >= expected_count {
+                    break;
+                }
+                continue;
+            }
+
+            // SAFETY: `buffer` is writable and `sender` is a sockaddr_ll-sized output buffer.
+            let (length, sender) = unsafe {
+                let mut sender: libc::sockaddr_ll = std::mem::zeroed();
+                let mut sender_len = std::mem::size_of_val(&sender) as libc::socklen_t;
+                let length = libc::recvfrom(
+                    fd,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    libc::MSG_DONTWAIT,
+                    (&raw mut sender).cast(),
+                    &mut sender_len,
+                );
+                (length, sender)
+            };
+            if length < 0 {
+                if io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+                    continue;
+                }
+                panic!("read AF_PACKET capture: {}", io::Error::last_os_error());
+            }
+            if sender.sll_pkttype == libc::PACKET_OUTGOING as u8 || length < 14 {
+                continue;
+            }
+            let frame = &buffer[..length as usize];
+            let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+            if !matches!(ethertype, 0x0800 | 0x86dd) {
+                continue;
+            }
+            let packet = &frame[14..];
+            let (packet_length, protocol) = match packet.first().map(|byte| byte >> 4) {
+                Some(4) if packet.len() >= 20 => (
+                    usize::from(u16::from_be_bytes([packet[2], packet[3]])),
+                    packet[9],
+                ),
+                Some(6) if packet.len() >= Ipv6Header::LEN => (
+                    Ipv6Header::LEN + usize::from(u16::from_be_bytes([packet[4], packet[5]])),
+                    packet[6],
+                ),
+                _ => continue,
+            };
+            if !matches!(protocol, 6 | 17) || packet_length > packet.len() {
+                continue;
+            }
+            packets.push(packet[..packet_length].to_vec());
+        }
+        packets
+    }
+
+    /// Create distinct full and final-short payloads so segmentation order is observable.
+    fn forwarding_payloads() -> Vec<Vec<u8>> {
+        [1000, 1000, 1000, 400]
+            .into_iter()
+            .enumerate()
+            .map(|(packet_index, length)| {
+                (0..length)
+                    .map(|byte_index| ((packet_index * 53 + byte_index * 17) % 251) as u8)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Return a direct TCP or UDP payload from a complete IPv4/IPv6 packet.
+    fn wire_packet_payload(packet: &[u8]) -> Vec<u8> {
+        let (ip_header_len, protocol, total_len) = match packet.first().map(|byte| byte >> 4) {
+            Some(4) => (
+                usize::from(packet[0] & 0x0f) * 4,
+                packet[9],
+                usize::from(u16::from_be_bytes([packet[2], packet[3]])),
+            ),
+            Some(6) => (
+                Ipv6Header::LEN,
+                packet[6],
+                Ipv6Header::LEN + usize::from(u16::from_be_bytes([packet[4], packet[5]])),
+            ),
+            _ => panic!("unsupported forwarded IP packet"),
+        };
+        let transport = &packet[ip_header_len..total_len];
+        let header_len = match protocol {
+            6 => usize::from(transport[12] >> 4) * 4,
+            17 => UdpHeader::LEN,
+            other => panic!("unexpected forwarded IP protocol {other}"),
+        };
+        let payload_len = if protocol == 17 {
+            usize::from(u16::from_be_bytes([transport[4], transport[5]])) - UdpHeader::LEN
+        } else {
+            transport.len() - header_len
+        };
+        transport[header_len..header_len + payload_len].to_vec()
+    }
+
+    /// Verify IPv4 header and TCP/UDP pseudo-header checksums independently of GotaTun's helpers.
+    fn assert_forwarded_checksums(packet: &[u8], case: &str) {
+        let version = packet[0] >> 4;
+        let (ip_header_len, protocol, total_len) = match version {
+            4 => (
+                usize::from(packet[0] & 0x0f) * 4,
+                packet[9],
+                usize::from(u16::from_be_bytes([packet[2], packet[3]])),
+            ),
+            6 => (
+                Ipv6Header::LEN,
+                packet[6],
+                Ipv6Header::LEN + usize::from(u16::from_be_bytes([packet[4], packet[5]])),
+            ),
+            _ => panic!("{case} emitted a non-IP packet"),
+        };
+        assert_eq!(total_len, packet.len(), "{case} IP length");
+        if version == 4 {
+            assert_eq!(
+                folded_checksum_sum(&packet[..ip_header_len]),
+                0xffff,
+                "{case} IPv4 header checksum"
+            );
+        }
+        assert!(matches!(protocol, 6 | 17), "{case} transport protocol");
+        let transport = &packet[ip_header_len..total_len];
+        let mut pseudo = Vec::new();
+        if version == 4 {
+            pseudo.extend_from_slice(&packet[12..20]);
+            pseudo.extend_from_slice(&[0, protocol]);
+            pseudo.extend_from_slice(&(transport.len() as u16).to_be_bytes());
+        } else {
+            pseudo.extend_from_slice(&packet[8..40]);
+            pseudo.extend_from_slice(&(transport.len() as u32).to_be_bytes());
+            pseudo.extend_from_slice(&[0, 0, 0, protocol]);
+        }
+        if protocol == 17 {
+            assert_eq!(
+                usize::from(u16::from_be_bytes([transport[4], transport[5]])),
+                transport.len(),
+                "{case} UDP length"
+            );
+            assert_ne!(
+                u16::from_be_bytes([transport[6], transport[7]]),
+                0,
+                "{case} UDP checksum"
+            );
+        }
+        pseudo.extend_from_slice(transport);
+        assert_eq!(
+            folded_checksum_sum(&pseudo),
+            0xffff,
+            "{case} transport checksum"
+        );
+    }
+
+    /// Fold one's-complement 16-bit network words without applying the final complement.
+    fn folded_checksum_sum(bytes: &[u8]) -> u16 {
+        let mut sum = 0_u32;
+        for word in bytes.chunks(2) {
+            let value = if word.len() == 2 {
+                u16::from_be_bytes([word[0], word[1]])
+            } else {
+                u16::from(word[0]) << 8
+            };
+            sum += u32::from(value);
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        sum as u16
     }
 }
