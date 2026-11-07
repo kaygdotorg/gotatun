@@ -617,15 +617,16 @@ impl CryptoHandle {
 struct ActiveBatch(Arc<AtomicUsize>);
 
 impl ActiveBatch {
-    /// Claim the caller-side fast path only while no batch is active.
+    /// Keep a shallow peer run on its caller even while unrelated crypto work is active.
+    ///
+    /// The peer-local adaptive latch already decides whether a run needs a worker handoff. A
+    /// global active count must not put an interactive peer behind another peer's queued work.
     fn try_enter_inline(active_batches: &Arc<AtomicUsize>, force_worker: bool) -> Option<Self> {
-        if force_worker
-            || active_batches
-                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-        {
+        if force_worker {
             return None;
         }
+
+        active_batches.fetch_add(1, Ordering::AcqRel);
         Some(Self(Arc::clone(active_batches)))
     }
 
@@ -1421,6 +1422,46 @@ mod tests {
 
         assert!(bulk_peer.should_force_worker(MIN_PARALLEL_RUN_SIZE));
         assert!(!interactive_peer.should_force_worker(MIN_PARALLEL_RUN_SIZE));
+    }
+
+    /// A shallow peer keeps its caller-side path while another peer has worker work active.
+    #[tokio::test]
+    async fn shallow_peer_run_stays_inline_while_another_batch_is_active() {
+        let (mut sender, _) = established_tunnels();
+        let packets = prepared_encryptions(&mut sender, MIN_PARALLEL_RUN_SIZE);
+        let workers = CryptoWorkers::with_worker_count(2).expect("the worker pool starts");
+        let crypto = workers.handle();
+        let other_peer_batch = super::ActiveBatch::enter_queued(&crypto.active_batches);
+        let lane = OrderedCompletions::<WgKind>::default();
+        let first_slot = lane
+            .reserve_run(MIN_PARALLEL_RUN_SIZE)
+            .expect("the interactive run fits the peer's ordered window");
+        let run = packets
+            .into_iter()
+            .map(|packet| Some(PreparedOutgoing::Encrypt(packet)))
+            .collect();
+        let force_worker = lane.should_force_worker(MIN_PARALLEL_RUN_SIZE);
+        assert!(!force_worker, "the interactive peer's queue stays shallow");
+
+        let results = crypto
+            .encrypt_run(run, force_worker)
+            .await
+            .expect("the shallow run completes while bulk work is active");
+        lane.complete_run(first_slot, results, |results| async move {
+            black_box(results);
+            Ok::<_, ()>(())
+        })
+        .await
+        .expect("the interactive run is released in its peer order");
+
+        assert_eq!(
+            crypto.handoff_count(),
+            0,
+            "a shallow peer must not be queued behind another peer's work"
+        );
+        assert!(lane.is_idle());
+        drop(other_peer_batch);
+        workers.stop().await;
     }
 
     /// Completed crypto waiting for ordered output must not keep another run on a worker.
