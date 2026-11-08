@@ -10,7 +10,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-//! Stores per-peer tunnel state and compact route metadata; packet routing uses the device trie.
+//! Stores per-peer tunnel state and compact route metadata; packet routing uses the shared lookup trie.
 
 use ipnetwork::IpNetwork;
 

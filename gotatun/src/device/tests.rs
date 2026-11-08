@@ -302,7 +302,7 @@ async fn peer_lock_wait_polls_the_completion_queued_ahead_of_it() {
         .expect("the queued completion ran before the parent acquired the lock");
 }
 
-/// The control drain releases its device snapshot before a queued writer blocks delivery reads.
+/// A control drain polls earlier delivery work without retaining the async device lock.
 #[tokio::test]
 async fn j369_control_drain_progresses_with_a_queued_device_writer() {
     use super::parallel_crypto::OrderedCompletions;
@@ -310,14 +310,19 @@ async fn j369_control_drain_progresses_with_a_queued_device_writer() {
     alice.device.suspend().await;
     bob.device.suspend().await;
     let device = Arc::clone(&alice.device.inner);
-    let device_guard = device.read().await;
-    let peer = device_guard.peers.values().next().unwrap().clone();
+    let (peer, packet_lookup) = {
+        let state = device.read().await;
+        (
+            state.peers.values().next().unwrap().clone(),
+            Arc::clone(&state.packet_lookup),
+        )
+    };
+    let held_peer = peer.lock().await;
     let lane = Arc::new(OrderedCompletions::default());
     let slot = lane.reserve_run(1).unwrap();
     let (tun, _tx, _rx) = mock::mock_tun();
     let delivery_device = Arc::downgrade(&device);
-    let mut writer = Box::pin(device.write());
-    assert!(futures::poll!(writer.as_mut()).is_pending());
+    let completion_lookup = Arc::clone(&packet_lookup);
     let mut incoming = PendingIncoming::new();
     let completion_lane = Arc::clone(&lane);
     incoming.push(
@@ -327,6 +332,7 @@ async fn j369_control_drain_progresses_with_a_queued_device_writer() {
                     super::DeviceState::deliver_incoming_run(
                         slot,
                         delivery_device.clone(),
+                        completion_lookup.clone(),
                         peer.clone(),
                         completions,
                         tun.clone(),
@@ -337,29 +343,27 @@ async fn j369_control_drain_progresses_with_a_queued_device_writer() {
         .boxed(),
     );
     let mut drain = Box::pin(super::drain_incoming_before_control(
-        device_guard,
         Some(Arc::clone(&lane)),
         &mut incoming,
     ));
     assert!(futures::poll!(drain.as_mut()).is_pending());
-    let writer_guard = writer
-        .as_mut()
-        .now_or_never()
-        .expect("the control drain released the read guard to the queued writer");
-    drop(writer_guard);
-    let progressed = match futures::poll!(drain.as_mut()) {
-        std::task::Poll::Ready(result) => {
-            result.expect("the control drain completes after the writer releases its guard");
-            true
-        }
-        std::task::Poll::Pending => false,
-    };
-    drop(drain);
+    let writer_device = Arc::clone(&device);
+    let writer_peer = Arc::clone(&peer);
+    let mut writer = Box::pin(async move {
+        let _device_guard = writer_device.write().await;
+        let _peer_guard = writer_peer.lock().await;
+    });
+    assert!(futures::poll!(writer.as_mut()).is_pending());
+    drop(held_peer);
+    drain
+        .await
+        .expect("delivery completes after peer state is released");
+    writer.await;
     alice.device.stop().await;
     bob.device.stop().await;
     assert!(
-        progressed,
-        "the queued writer must not block the delivery callback's nested device read"
+        lane.is_idle(),
+        "the control drain must poll its owned completion"
     );
 }
 
@@ -767,12 +771,20 @@ async fn add_peers_rejects_duplicate_public_keys() {
     assert_eq!(bob.device.peers().await.len(), initial_peers);
 
     let state = bob.device.inner.read().await;
-    assert!(state.peers_by_ip.iter().all(|(routed_peer, _)| {
+    assert!(
         state
-            .peers
-            .values()
-            .any(|peer| Arc::ptr_eq(peer, routed_peer))
-    }));
+            .packet_lookup
+            .state
+            .read()
+            .peers_by_ip
+            .iter()
+            .all(|(routed_peer, _)| {
+                state
+                    .peers
+                    .values()
+                    .any(|peer| Arc::ptr_eq(peer, routed_peer))
+            })
+    );
 }
 
 /// Replacing a peer's routes keeps canonical IPv4/IPv6 entries in its listing and the device trie.
@@ -812,15 +824,15 @@ async fn allowed_ip_updates_preserve_v4_v6_listing_and_routes() {
     for address in ["192.0.2.123", "2001:db8:1::1"] {
         let address: IpAddr = address.parse().unwrap();
         let route_owner = state
-            .peers_by_ip
-            .find(address)
+            .packet_lookup
+            .peer_by_ip(address)
             .expect("updated address should remain routable");
-        assert!(Arc::ptr_eq(peer, route_owner));
+        assert!(Arc::ptr_eq(peer, &route_owner));
     }
     assert!(
         state
-            .peers_by_ip
-            .find("198.51.100.1".parse().unwrap())
+            .packet_lookup
+            .peer_by_ip("198.51.100.1".parse().unwrap())
             .is_none()
     );
 }
@@ -1274,4 +1286,68 @@ async fn test_device_pair(eavesdrop: impl AsyncFnOnce(MockEavesdropper) + Send) 
         drive_connection,
         eavesdrop
     };
+}
+
+/// Packet lookup progresses while configuration owns the device write lock and waits for a peer.
+#[tokio::test]
+async fn j380_packet_lookup_progresses_with_a_queued_device_writer() {
+    use super::parallel_crypto::OrderedCompletions;
+    let (alice, bob, _eve) = mock::device_pair().await;
+    alice.device.suspend().await;
+    bob.device.suspend().await;
+    let device = Arc::clone(&alice.device.inner);
+    let (peer, packet_lookup) = {
+        let state = device.read().await;
+        (
+            state.peers.values().next().unwrap().clone(),
+            Arc::clone(&state.packet_lookup),
+        )
+    };
+    let held_peer = peer.lock().await;
+    let lane = Arc::new(OrderedCompletions::default());
+    let slot = lane.reserve_run(1).unwrap();
+    let (tun, _tx, _rx) = mock::mock_tun();
+    let delivery_device = Arc::downgrade(&device);
+    let completion_peer = peer.clone();
+    let completion_lookup = Arc::clone(&packet_lookup);
+    let mut incoming = PendingIncoming::new();
+    incoming.push(
+        async move {
+            lane.complete_run(slot, vec![None], |completions| {
+                super::DeviceState::deliver_incoming_run(
+                    slot,
+                    delivery_device.clone(),
+                    completion_lookup.clone(),
+                    completion_peer.clone(),
+                    completions,
+                    tun.clone(),
+                )
+            })
+            .await
+        }
+        .boxed(),
+    );
+    // The receive owner polls this callback while it waits for peer state.
+    assert!(futures::poll!(incoming.next()).is_pending());
+    let writer_device = Arc::clone(&device);
+    let writer_peer = Arc::clone(&peer);
+    let mut writer = Box::pin(async move {
+        let _device_guard = writer_device.write().await;
+        let _peer_guard = writer_peer.lock().await;
+    });
+    // The configuration writer owns the device lock while it queues on the peer mutex.
+    assert!(futures::poll!(writer.as_mut()).is_pending());
+    let route: std::net::IpAddr = "203.0.113.1".parse().unwrap();
+    let lookup_progressed = packet_lookup
+        .peer_by_ip(route)
+        .is_some_and(|current| Arc::ptr_eq(&current, &peer));
+    drop(held_peer);
+    incoming.next().await.unwrap().unwrap();
+    writer.await;
+    alice.device.stop().await;
+    bob.device.stop().await;
+    assert!(
+        lookup_progressed,
+        "packet lookup must progress while a queued writer waits on the peer mutex"
+    );
 }

@@ -19,7 +19,7 @@ use crate::noise::index_table::IndexTable;
 #[cfg(feature = "tun")]
 use crate::tun::tun_async_device::TunDevice;
 use crate::{
-    device::{Device, DeviceState, allowed_ips::AllowedIps, peer::Peer, uapi::UapiServer},
+    device::{Device, DeviceState, peer::Peer, uapi::UapiServer},
     task::Task,
     tun::{IpRecv, IpSend},
     udp::{UdpTransportFactory, socket::UdpSocketFactory},
@@ -287,8 +287,7 @@ impl<Udp: UdpTransportFactory, TunTx: IpSend, TunRx: IpRecv> DeviceBuilder<Udp, 
             key_pair: None,
             index_table: self.index_table.unwrap_or_else(IndexTable::from_os_rng),
             peers: Default::default(),
-            peers_by_idx: parking_lot::Mutex::new(Default::default()),
-            peers_by_ip: AllowedIps::new(),
+            packet_lookup: Arc::new(Default::default()),
             rate_limiter: None,
             port: self.port,
             connection: None,
