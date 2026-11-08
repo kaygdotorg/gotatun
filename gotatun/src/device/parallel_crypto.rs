@@ -846,13 +846,16 @@ fn decrypt_run(run: Vec<(PreparedDecryption, SocketAddr)>) -> Vec<IncomingComple
 ///
 /// Each worker removes one complete contiguous run from the queue, performs its AEAD operations
 /// without per-packet handoffs, and immediately returns to the queue. The queue is bounded, and
-/// shutdown closes it before joining workers so cloned handles cannot keep parked threads alive.
+/// owner drop closes it so cloned handles cannot keep parked threads alive.
 pub(crate) struct CryptoWorkers {
     handle: CryptoHandle,
     queue: Arc<CryptoQueue>,
     threads: Vec<JoinHandle<()>>,
     #[cfg(test)]
     worker_count: usize,
+    /// Receives one notice when each test worker thread has exited.
+    #[cfg(test)]
+    worker_exit_rx: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
 }
 
 impl CryptoWorkers {
@@ -875,12 +878,16 @@ impl CryptoWorkers {
         let active_batches = Arc::new(AtomicUsize::new(0));
         #[cfg(test)]
         let worker_run_count = Arc::new(AtomicUsize::new(0));
+        #[cfg(test)]
+        let (worker_exit_tx, worker_exit_rx) = std::sync::mpsc::channel();
         let mut threads = Vec::with_capacity(worker_count);
 
         for worker_index in 0..worker_count {
             let worker_queue = Arc::clone(&queue);
             #[cfg(test)]
             let completed_runs = Arc::clone(&worker_run_count);
+            #[cfg(test)]
+            let worker_exit_tx = worker_exit_tx.clone();
             let thread = thread::Builder::new()
                 .name(format!("gotatun-crypto-{worker_index}"))
                 .spawn(move || {
@@ -898,6 +905,8 @@ impl CryptoWorkers {
                             }
                         }
                     }
+                    #[cfg(test)]
+                    let _ = worker_exit_tx.send(());
                 });
 
             match thread {
@@ -930,6 +939,8 @@ impl CryptoWorkers {
             threads,
             #[cfg(test)]
             worker_count,
+            #[cfg(test)]
+            worker_exit_rx: Arc::new(Mutex::new(worker_exit_rx)),
         })
     }
 
@@ -945,15 +956,9 @@ impl CryptoWorkers {
     }
 
     /// Close the job queue and join every worker.
-    pub(crate) async fn stop(self) {
-        let Self {
-            handle,
-            queue,
-            threads,
-            ..
-        } = self;
-        queue.close();
-        drop(handle);
+    pub(crate) async fn stop(mut self) {
+        self.queue.close();
+        let threads = std::mem::take(&mut self.threads);
 
         let join = tokio::task::spawn_blocking(move || {
             for thread in threads {
@@ -965,6 +970,13 @@ impl CryptoWorkers {
         if let Err(error) = join.await {
             tracing::error!("failed to join packet crypto workers: {error}");
         }
+    }
+}
+
+impl Drop for CryptoWorkers {
+    /// Wake the worker threads even when orderly asynchronous shutdown cannot be awaited.
+    fn drop(&mut self) {
+        self.queue.close();
     }
 }
 
@@ -1528,6 +1540,217 @@ mod tests {
         first.join().unwrap();
 
         assert_eq!(*naive.lock().unwrap(), vec![1, 2, 3, 0]);
+    }
+
+    /// Randomized gates interleave real inline and worker AEAD while delivery remains serialized.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn j369_randomized_inline_worker_transitions_preserve_order() {
+        use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
+
+        let workers = CryptoWorkers::with_worker_count(4).unwrap();
+        for seed in 0..64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (mut sender, _) = established_tunnels();
+            let lane = Arc::new(OrderedCompletions::default());
+            let delivered = Arc::new(Mutex::new(Vec::new()));
+            let mut saw_inline = false;
+            let mut saw_worker = false;
+            for _ in 0..3 {
+                let mut gates = Vec::new();
+                let mut tasks = Vec::new();
+                for count in [32, 16, 1, 8, 32, 16, 1, 8] {
+                    let first = lane.reserve_run(count).unwrap();
+                    let force_worker = lane.should_force_worker(count);
+                    saw_worker |= force_worker;
+                    saw_inline |= !force_worker;
+                    let prepared = prepared_encryptions(&mut sender, count)
+                        .into_iter()
+                        .map(|packet| Some(PreparedOutgoing::Encrypt(packet)))
+                        .collect();
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    gates.push(tx);
+                    let crypto = workers.handle();
+                    let lane = Arc::clone(&lane);
+                    let delivered = Arc::clone(&delivered);
+                    tasks.push(tokio::spawn(async move {
+                        rx.await.unwrap();
+                        let results = crypto.encrypt_run(prepared, force_worker).await.unwrap();
+                        lane.complete_run(first, results, |packets| {
+                            let delivered = Arc::clone(&delivered);
+                            async move {
+                                for packet in packets.into_iter().flatten() {
+                                    let WgKind::Data(packet) = packet else {
+                                        panic!("expected data")
+                                    };
+                                    delivered.lock().unwrap().push(packet.header.counter.get());
+                                    tokio::task::yield_now().await;
+                                }
+                                Ok::<_, ()>(())
+                            }
+                        })
+                        .await
+                        .unwrap();
+                    }));
+                }
+                gates.shuffle(&mut rng);
+                for gate in gates {
+                    gate.send(()).unwrap();
+                    tokio::task::yield_now().await;
+                }
+                for task in tasks {
+                    task.await.unwrap();
+                }
+                assert!(lane.is_idle(), "seed {seed}");
+            }
+            let counters = delivered.lock().unwrap();
+            assert_eq!(counters.len(), 342);
+            assert!(
+                counters.windows(2).all(|pair| pair[1] == pair[0] + 1),
+                "seed {seed}"
+            );
+            assert!(saw_inline && saw_worker);
+        }
+        workers.stop().await;
+    }
+
+    /// Randomized receive schedules deliver each authenticated counter once despite duplicates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn j369_randomized_decrypt_commits_replays_only_once() {
+        use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
+
+        let workers = CryptoWorkers::with_worker_count(4).unwrap();
+        for seed in 0..64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (mut sender, mut receiver) = established_tunnels();
+            let address = "127.0.0.1:51820".parse().unwrap();
+            let mut prepared = Vec::new();
+            for sequence in 0_u64..112 {
+                let plaintext =
+                    Packet::from_bytes(BytesMut::from(sequence.to_le_bytes().as_slice()));
+                let Some(WgKind::Data(packet)) = sender.handle_outgoing_packet(plaintext, None)
+                else {
+                    panic!("expected data")
+                };
+                let replay = packet.clone();
+                for packet in [packet, replay] {
+                    let PreparedIncoming::Decrypt { packet } =
+                        receiver.prepare_incoming_packet(WgKind::Data(packet))
+                    else {
+                        panic!("expected prepared packet")
+                    };
+                    prepared.push((packet, address));
+                }
+            }
+            // Two windows avoid exceeding the peer's 128-slot cap; every counter is duplicated.
+            let lane = Arc::new(OrderedCompletions::default());
+            let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+            let delivered = Arc::new(Mutex::new(Vec::new()));
+            let rejected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut prepared = prepared.into_iter();
+            for _ in 0..2 {
+                let mut gates = Vec::new();
+                let mut tasks = Vec::new();
+                for count in [32, 16, 8, 8, 32, 16] {
+                    let first = lane.reserve_run(count).unwrap();
+                    let force_worker = lane.should_force_worker(count);
+                    let run = prepared.by_ref().take(count).collect();
+                    let crypto = workers.handle();
+                    let lane = Arc::clone(&lane);
+                    let receiver = Arc::clone(&receiver);
+                    let delivered = Arc::clone(&delivered);
+                    let rejected = Arc::clone(&rejected);
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    gates.push(tx);
+                    tasks.push(tokio::spawn(async move {
+                        rx.await.unwrap();
+                        let results = crypto.decrypt_run(run, force_worker).await.unwrap();
+                        lane.complete_run(
+                            first,
+                            results.into_iter().map(Some).collect(),
+                            |results| {
+                                let receiver = Arc::clone(&receiver);
+                                let delivered = Arc::clone(&delivered);
+                                let rejected = Arc::clone(&rejected);
+                                async move {
+                                    let mut receiver = receiver.lock().await;
+                                    for result in results.into_iter().flatten() {
+                                        match receiver.complete_incoming_packet(result.result) {
+                                            TunnResult::WriteToTunnel(packet) => {
+                                                let sequence = u64::from_le_bytes(
+                                                    packet.as_bytes()[..8].try_into().unwrap(),
+                                                );
+                                                delivered.lock().unwrap().push(sequence);
+                                            }
+                                            TunnResult::Err(_) => {
+                                                rejected.fetch_add(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                            }
+                                            _ => panic!("unexpected receive outcome"),
+                                        }
+                                        tokio::task::yield_now().await;
+                                    }
+                                    Ok::<_, ()>(())
+                                }
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    }));
+                }
+                gates.shuffle(&mut rng);
+                for gate in gates {
+                    gate.send(()).unwrap();
+                    tokio::task::yield_now().await;
+                }
+                for task in tasks {
+                    task.await.unwrap();
+                }
+                assert!(lane.is_idle());
+            }
+            assert_eq!(
+                *delivered.lock().unwrap(),
+                (0_u64..112).collect::<Vec<_>>(),
+                "seed {seed}"
+            );
+            assert_eq!(
+                rejected.load(std::sync::atomic::Ordering::Relaxed),
+                112,
+                "seed {seed}"
+            );
+        }
+        workers.stop().await;
+    }
+
+    /// Dropping the owner closes the queue and lets each parked worker thread exit.
+    #[test]
+    fn j369_dropping_workers_closes_the_queue() {
+        let workers = CryptoWorkers::with_worker_count(2).unwrap();
+        let queue = Arc::clone(&workers.queue);
+        let worker_exit_rx = Arc::clone(&workers.worker_exit_rx);
+        drop(workers);
+        let closed = queue.state.lock().closed;
+        let exited_workers = (0..2)
+            .take_while(|_| {
+                worker_exit_rx
+                    .lock()
+                    .recv_timeout(Duration::from_secs(2))
+                    .is_ok()
+            })
+            .count();
+        if !closed {
+            // Clean up the red reproduction after recording whether owner drop shut it down.
+            queue.close();
+        }
+        assert!(
+            closed,
+            "dropping the owner leaves its crypto workers parked forever"
+        );
+        assert_eq!(
+            exited_workers, 2,
+            "dropping the owner must stop every worker thread"
+        );
     }
 
     /// Keep a lone ready run inline and dispatch substantial work only when another run exists.
