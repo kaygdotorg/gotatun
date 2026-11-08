@@ -2735,4 +2735,111 @@ mod tests {
         workers.stop().await;
         (elapsed, latencies)
     }
+    /// The final handshake chunk reserves its slots before newer TUN traffic can fill the lane.
+    #[tokio::test]
+    async fn j380_final_handshake_chunk_survives_a_concurrent_tun_reservation() {
+        use super::OrderStore;
+        use crate::device::tests::mock;
+        use crate::device::{
+            DeviceState, OutgoingBatchContext, OutgoingPeerContext, PendingOutgoing,
+        };
+        let (alice, bob, _eve) = mock::device_pair().await;
+        let udp = alice
+            .device
+            .inner
+            .read()
+            .await
+            .connection
+            .as_ref()
+            .unwrap()
+            .udp
+            .clone();
+        alice.device.suspend().await;
+        bob.device.suspend().await;
+        let device = Arc::clone(&alice.device.inner);
+        let peer = device.read().await.peers.values().next().unwrap().clone();
+        let peer_key = crate::device::peer_order_key(&peer);
+        let peer_addr;
+        {
+            let mut guard = peer.lock().await;
+            peer_addr = guard.endpoint().addr.unwrap();
+            guard.tunnel = established_tunnels().0;
+            for _ in 0..64 {
+                guard
+                    .tunnel
+                    .queue_outgoing_packet(mock::packet(b"queued").into(), None);
+            }
+        }
+        let order = Arc::new(OrderStore::default());
+        let (lane, slot) = order.reserve(peer_key).unwrap();
+        lane.complete_run(slot, vec![None], |_| async { Ok::<_, ()>(()) })
+            .await
+            .unwrap();
+        let flush_guard = order.begin_flush(peer_key);
+        let workers = CryptoWorkers::with_worker_count(2).unwrap();
+        let context = OutgoingBatchContext {
+            peer: OutgoingPeerContext {
+                crypto: workers.handle(),
+                ordered: Arc::clone(&order),
+                peer_arc: Arc::clone(&peer),
+                peer_key,
+                peer_addr,
+                udp,
+            },
+            send_many_buf: Arc::new(tokio::sync::Mutex::new(Default::default())),
+        };
+        // Hold only the lane-map mutex to stop the real flush immediately before reservation.
+        // The flush releases the marker and peer mutex first, exposing the concurrent TUN path.
+        let lane_map = order.lanes.lock();
+        let flush_device = Arc::downgrade(&device);
+        let flush_lane = Arc::clone(&lane);
+        let flush = thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    DeviceState::flush_handshake_queue(
+                        flush_device,
+                        context,
+                        flush_lane,
+                        slot,
+                        &mut PendingOutgoing::new(),
+                        flush_guard,
+                    )
+                    .await
+                })
+        });
+        let watchdog = Instant::now() + Duration::from_secs(5);
+        while order.is_flushing(peer_key) && Instant::now() < watchdog {
+            thread::yield_now();
+        }
+        let marker_released = !order.is_flushing(peer_key);
+        // This is the state change made by a TUN producer after it acquires the peer mutex.
+        // Access the already-locked map directly to impose that legal scheduler interleaving.
+        let mut peer_released = false;
+        while marker_released && Instant::now() < watchdog {
+            if peer.try_lock().is_ok() {
+                peer_released = true;
+                break;
+            }
+            thread::yield_now();
+        }
+        if peer_released {
+            lane_map
+                .get(&peer_key)
+                .unwrap()
+                .reserve_run(MAX_PEER_CRYPTO_IN_FLIGHT)
+                .unwrap();
+        }
+        drop(lane_map);
+        let result = flush.join();
+        workers.stop().await;
+        alice.device.stop().await;
+        bob.device.stop().await;
+        assert!(
+            result.is_ok(),
+            "the real final-chunk flush panicked after a legal TUN reservation"
+        );
+    }
 }
