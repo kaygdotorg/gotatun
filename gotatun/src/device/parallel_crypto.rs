@@ -259,7 +259,7 @@ impl<T> OrderedCompletions<T> {
             if diagnostic {
                 eprintln!("pipeline stage=ordered_delivery_lock_acquired first_slot={first_slot}");
             }
-            let (is_next_run, next_release) = {
+            let (is_next_run, next_release, wait_snapshot) = {
                 let mut state = self.state.lock();
                 assert!(
                     first_slot >= state.next_release && end_slot <= state.next_slot,
@@ -273,16 +273,27 @@ impl<T> OrderedCompletions<T> {
                     );
                     // Claim the ordered turn before awaiting I/O; `next_delivered` advances later.
                     state.next_release = end_slot;
-                    (true, state.next_release)
+                    (true, state.next_release, None)
                 } else {
-                    (false, state.next_release)
+                    let snapshot = diagnostic.then(|| {
+                        (
+                            state.next_slot,
+                            state.next_delivered,
+                            state.in_flight,
+                            state.crypto_pending,
+                            state.completed.keys().copied().collect::<Vec<_>>(),
+                        )
+                    });
+                    (false, state.next_release, snapshot)
                 }
             };
 
             if !is_next_run {
                 if diagnostic {
+                    let (next_slot, next_delivered, in_flight, crypto_pending, completed) =
+                        wait_snapshot.expect("diagnostics capture an ordered wait snapshot");
                     eprintln!(
-                        "pipeline stage=ordered_wait_predecessor first_slot={first_slot} next_release={next_release}"
+                        "pipeline stage=ordered_wait_predecessor first_slot={first_slot} next_release={next_release} next_slot={next_slot} next_delivered={next_delivered} in_flight={in_flight} crypto_pending={crypto_pending} completed={completed:?}"
                     );
                 }
                 drop(delivery);

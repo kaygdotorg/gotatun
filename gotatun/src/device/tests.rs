@@ -21,15 +21,17 @@ use std::{
     time::Duration,
 };
 
-use futures::{StreamExt, future::pending};
+use futures::{FutureExt, StreamExt, future::pending};
 use mock::MockEavesdropper;
 use rand::{SeedableRng, rngs::StdRng};
 use tokio::{
     join, select,
-    sync::{Mutex, mpsc},
+    sync::{Mutex, mpsc, oneshot},
     time::{sleep, timeout},
 };
 use zerocopy::IntoBytes;
+
+use super::{PendingCompletions, PendingIncoming, PendingOutgoing, await_while_completing};
 
 use crate::noise::TimerParams;
 use crate::noise::index_table::IndexTable;
@@ -254,6 +256,49 @@ fn assert_packet_order(label: &str, input: &[Vec<u8>], received: &[Vec<u8>]) {
     }
 }
 
+/// Verify a queued same-task completion progresses before its parent acquires the peer lock.
+///
+/// This small regression pins the scheduler behavior that can stop the duplex path: a child
+/// completion is first in Tokio's mutex queue, but it only runs when its parent polls the pending
+/// completion stream. The parent must keep polling that stream while waiting for the same mutex.
+#[tokio::test]
+async fn peer_lock_wait_polls_the_completion_queued_ahead_of_it() {
+    let peer = Arc::new(Mutex::new(()));
+    let holder = peer.lock().await;
+    let (completion_tx, completion_rx) = oneshot::channel();
+    let completion_peer = Arc::clone(&peer);
+    let mut incoming = PendingIncoming::new();
+    incoming.push(
+        async move {
+            let _peer = completion_peer.lock().await;
+            completion_tx
+                .send(())
+                .expect("the regression test still observes its completion");
+            Ok(())
+        }
+        .boxed(),
+    );
+
+    assert!(
+        incoming.next().now_or_never().is_none(),
+        "the queued completion waits behind the holder"
+    );
+
+    let mut outgoing = PendingOutgoing::new();
+    let mut pending = PendingCompletions::Incoming(&mut incoming, &mut outgoing);
+    let mut acquire = Box::pin(await_while_completing(peer.lock(), &mut pending));
+    assert!(futures::poll!(acquire.as_mut()).is_pending());
+    drop(holder);
+
+    let _peer = timeout(Duration::from_secs(1), acquire)
+        .await
+        .expect("the peer lock becomes available after its queued completion runs")
+        .expect("the completion stream has no error");
+    completion_rx
+        .await
+        .expect("the queued completion ran before the parent acquired the lock");
+}
+
 /// Keep the data path moving and ordered while a reverse producer sends ACK-sized packets.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn threaded_reverse_traffic_preserves_order_and_progress() {
@@ -288,8 +333,7 @@ async fn threaded_reverse_traffic_preserves_order_and_progress() {
                 for sequence in 0..DATA_PACKET_COUNT {
                     let mut payload = vec![0; DATA_PAYLOAD_LEN];
                     payload[..8].copy_from_slice(&0_u64.to_be_bytes());
-                    let sequence =
-                        u64::try_from(sequence).expect("test packet ids fit in u64");
+                    let sequence = u64::try_from(sequence).expect("test packet ids fit in u64");
                     payload[8..16].copy_from_slice(&sequence.to_be_bytes());
                     alice_tx
                         .send(mock::packet(payload))
@@ -328,8 +372,8 @@ async fn threaded_reverse_traffic_preserves_order_and_progress() {
                             let sequence = u64::try_from(ack_sequence)
                                 .expect("test acknowledgement ids fit in u64");
                             payload[8..16].copy_from_slice(&sequence.to_be_bytes());
-                            let acknowledged = u64::try_from(received_count)
-                                .expect("test packet ids fit in u64");
+                            let acknowledged =
+                                u64::try_from(received_count).expect("test packet ids fit in u64");
                             payload[16..24].copy_from_slice(&acknowledged.to_be_bytes());
                             bob_tx
                                 .send(mock::packet(payload))
@@ -358,12 +402,16 @@ async fn threaded_reverse_traffic_preserves_order_and_progress() {
     })
     .await;
 
-    alice_producer.join().expect("data producer thread completes");
+    alice_producer
+        .join()
+        .expect("data producer thread completes");
     let received_data = reverse_producer
         .join()
         .expect("reverse producer thread completes")
         .unwrap_or_else(|received| {
-            panic!("reverse path stopped after receiving {received}/{DATA_PACKET_COUNT} data packets")
+            panic!(
+                "reverse path stopped after receiving {received}/{DATA_PACKET_COUNT} data packets"
+            )
         });
     let received_acks = received_acks
         .expect("the reverse acknowledgements reach the data endpoint")

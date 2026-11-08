@@ -144,6 +144,48 @@ type PendingOutgoing = FuturesUnordered<BoxFuture<'static, ()>>;
 /// Futures that finish one incoming worker result and release it toward the TUN in order.
 type PendingIncoming = FuturesUnordered<BoxFuture<'static, Result<(), Error>>>;
 
+/// Completion streams that a packet task must keep polling while it waits for peer state.
+enum PendingCompletions<'a> {
+    /// Receive-side completions can deliver packets and propagate device errors.
+    Incoming(&'a mut PendingIncoming, &'a mut PendingOutgoing),
+    /// A send-side task owns only its outgoing completion stream.
+    Outgoing(&'a mut PendingOutgoing),
+}
+
+impl PendingCompletions<'_> {
+    /// Report whether the owner task has any completion future that still needs polling.
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Incoming(incoming, outgoing) => incoming.is_empty() && outgoing.is_empty(),
+            Self::Outgoing(outgoing) => outgoing.is_empty(),
+        }
+    }
+
+    /// Poll one completion so a queued mutex waiter can receive its granted permit.
+    async fn next(&mut self) -> Result<(), Error> {
+        match self {
+            Self::Incoming(incoming, outgoing) => {
+                tokio::select! {
+                    completed = incoming.next(), if !incoming.is_empty() => {
+                        completed.expect("a nonempty receive set has a completion future")
+                    }
+                    completed = outgoing.next(), if !outgoing.is_empty() => {
+                        completed.expect("a nonempty send set has a completion future");
+                        Ok(())
+                    }
+                }
+            }
+            Self::Outgoing(outgoing) => {
+                outgoing
+                    .next()
+                    .await
+                    .expect("a nonempty send set has a completion future");
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Prepared authenticated work gathered from one peer in a receive batch.
 struct PreparedIncomingRun {
     peer_key: usize,
@@ -311,6 +353,48 @@ async fn lock_peer_state<'a>(
     let guard = peer.lock().await;
     diagnostic.acquired();
     guard
+}
+
+/// Wait for a peer lock while continuing to poll the completion futures owned by this task.
+///
+/// Completion futures are not spawned, so a child waiting ahead of its parent in Tokio's FIFO
+/// mutex queue must be polled by the parent before the lock can make progress. Poll completions
+/// first when work is pending, then keep the lock future pinned across completion polls. The empty
+/// path awaits the lock directly so low-rate traffic pays no select-loop cost.
+async fn await_while_completing<F, T>(
+    future: F,
+    pending: &mut PendingCompletions<'_>,
+) -> Result<T, Error>
+where
+    F: std::future::Future<Output = T>,
+{
+    if pending.is_empty() {
+        return Ok(future.await);
+    }
+
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            completed = pending.next(), if !pending.is_empty() => completed?,
+            output = &mut future => return Ok(output),
+        }
+    }
+}
+
+/// Acquire one peer-state mutex while its owner task continues draining earlier completions.
+async fn lock_peer_state_while_completing<'a>(
+    peer: &'a Arc<Mutex<PeerState>>,
+    operation: &'static str,
+    peer_key: usize,
+    diagnostic: &mut PeerLockDiagnostic,
+    pending: &mut PendingCompletions<'_>,
+) -> Result<MutexGuard<'a, PeerState>, Error> {
+    debug_assert_eq!(diagnostic.operation, operation);
+    debug_assert_eq!(diagnostic.peer_key, peer_key);
+    let guard = await_while_completing(peer.lock(), pending).await?;
+    diagnostic.acquired();
+    Ok(guard)
 }
 
 /// Group interleaved items by key while keeping each group's input order.
@@ -1460,13 +1544,16 @@ impl<T: DeviceTransports> DeviceState<T> {
             };
             let device_guard = device_arc.read().await;
             let mut peer_trace = PeerLockDiagnostic::waiting("handshake_queue_flush", peer_key);
-            let mut peer = lock_peer_state(
+            let mut pending_completions = PendingCompletions::Outgoing(pending);
+            let mut peer = lock_peer_state_while_completing(
                 &peer_arc,
                 "handshake_queue_flush",
                 peer_key,
                 &mut peer_trace,
+                &mut pending_completions,
             )
-            .await;
+            .await?;
+            drop(pending_completions);
             if !peer.tunnel.has_queued_packets() {
                 drop(flush_guard.take());
                 return Ok(());
@@ -1855,13 +1942,19 @@ impl<T: DeviceTransports> DeviceState<T> {
                         drop(device_guard);
                         let mut peer_trace =
                             PeerLockDiagnostic::waiting("incoming_prepare", peer_key);
-                        let mut peer = lock_peer_state(
+                        let mut pending_completions = PendingCompletions::Incoming(
+                            &mut incoming_pending,
+                            &mut outgoing_pending,
+                        );
+                        let mut peer = lock_peer_state_while_completing(
                             &peer_arc,
                             "incoming_prepare",
                             peer_key,
                             &mut peer_trace,
+                            &mut pending_completions,
                         )
-                        .await;
+                        .await?;
+                        drop(pending_completions);
                         if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
                             eprintln!(
                                 "pipeline stage=incoming_peer_lock_acquired counter={counter}"
@@ -1924,13 +2017,19 @@ impl<T: DeviceTransports> DeviceState<T> {
 
                         let mut peer_trace =
                             PeerLockDiagnostic::waiting("incoming_control", peer_key);
-                        let mut peer = lock_peer_state(
+                        let mut pending_completions = PendingCompletions::Incoming(
+                            &mut incoming_pending,
+                            &mut outgoing_pending,
+                        );
+                        let mut peer = lock_peer_state_while_completing(
                             &peer_arc,
                             "incoming_control",
                             peer_key,
                             &mut peer_trace,
+                            &mut pending_completions,
                         )
-                        .await;
+                        .await?;
+                        drop(pending_completions);
                         let result = peer.handle_incoming_packet(packet, addr);
                         match result {
                             TunnResult::Done | TunnResult::Err(_) => {}
@@ -2154,13 +2253,17 @@ impl<T: DeviceTransports> DeviceState<T> {
                             let device_guard = device_arc.read().await;
                             let mut peer_trace =
                                 PeerLockDiagnostic::waiting("outgoing_prepare", peer_key);
-                            let mut peer = lock_peer_state(
+                            let mut pending_completions =
+                                PendingCompletions::Outgoing(&mut pending);
+                            let mut peer = lock_peer_state_while_completing(
                                 &peer_arc,
                                 "outgoing_prepare",
                                 peer_key,
                                 &mut peer_trace,
+                                &mut pending_completions,
                             )
-                            .await;
+                            .await?;
+                            drop(pending_completions);
                             let Some(peer_addr) = peer.endpoint().addr else {
                                 tracing::error!("No endpoint");
                                 break;
