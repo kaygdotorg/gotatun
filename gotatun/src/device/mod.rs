@@ -53,7 +53,9 @@ use crate::udp::buffer::BufferedUdpSend;
 use crate::udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams};
 use crate::x25519;
 use allowed_ips::AllowedIps;
-use fair_queue::fair_schedule_routed_batch;
+use fair_queue::{
+    BatchRouteCache, MAX_PEER_BUCKETS, fair_schedule, packet_flow_key_and_destination,
+};
 use peer_state::{PeerState, PendingHandshake};
 
 #[cfg(feature = "tun")]
@@ -932,22 +934,23 @@ impl<T: DeviceTransports> DeviceState<T> {
                     return Ok(());
                 };
                 let device_guard = device_arc.read().await;
+                let mut route_cache = BatchRouteCache::<
+                    IpAddr,
+                    Option<*const Mutex<PeerState>>,
+                    MAX_PEER_BUCKETS,
+                >::new();
                 let routed_batch = packets.into_iter().filter_map(|packet| {
-                    let destination = packet.destination()?;
-                    let peer_key = device_guard.peers_by_ip.find(destination).map(Arc::as_ptr);
-                    Some((peer_key, packet, ()))
+                    let (destination, flow) = packet_flow_key_and_destination(&packet)?;
+                    let peer_key = route_cache.get_or_insert_with(destination, |destination| {
+                        device_guard.peers_by_ip.find(destination).map(Arc::as_ptr)
+                    });
+                    Some((peer_key, flow, (packet, destination)))
                 });
-                fair_schedule_routed_batch(routed_batch)
+                fair_schedule(routed_batch)
             };
 
-            // Re-resolve each packet below so a route change during batch preparation takes
-            // effect.
-            for (packet, ()) in packets {
-                // Determine peer to use from the destination address
-                let Some(dst_addr) = packet.destination() else {
-                    continue;
-                };
-
+            // Re-resolve each packet so a route change after batch classification takes effect.
+            for (packet, dst_addr) in packets {
                 let Some(device_arc) = device.upgrade() else {
                     return Ok(());
                 };
