@@ -213,7 +213,7 @@ struct PeerQueue<T> {
     active_flows: VecDeque<usize>,
 }
 
-/// Bound the route lookups cached while classifying one packet batch.
+/// Bound both the route lookups cached for one batch and the allocation-free peer buckets.
 pub(super) const MAX_PEER_BUCKETS: usize = 8;
 
 /// Reuse route lookups for repeated destinations without growing past a fixed capacity.
@@ -252,11 +252,171 @@ where
     }
 }
 
+const MAX_FLOW_BUCKETS_PER_PEER: usize = 16;
+const NO_PACKET: usize = usize::MAX;
+
+#[derive(Clone, Copy)]
+struct FlowBucket {
+    representative: usize,
+    head: usize,
+    tail: usize,
+}
+
+impl FlowBucket {
+    const EMPTY: Self = Self {
+        representative: NO_PACKET,
+        head: NO_PACKET,
+        tail: NO_PACKET,
+    };
+
+    const fn new(representative: usize) -> Self {
+        Self {
+            representative,
+            head: NO_PACKET,
+            tail: NO_PACKET,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PeerBucket {
+    representative: usize,
+    flows: [FlowBucket; MAX_FLOW_BUCKETS_PER_PEER],
+    flow_count: usize,
+    next_flow: usize,
+    packet_count: usize,
+}
+
+impl PeerBucket {
+    const EMPTY: Self = Self {
+        representative: NO_PACKET,
+        flows: [FlowBucket::EMPTY; MAX_FLOW_BUCKETS_PER_PEER],
+        flow_count: 0,
+        next_flow: 0,
+        packet_count: 0,
+    };
+
+    const fn new(representative: usize) -> Self {
+        Self {
+            representative,
+            ..Self::EMPTY
+        }
+    }
+}
+
 /// Return the batch in hierarchical round-robin order, keeping FIFO within each flow.
 ///
 /// The caller supplies one already-bounded receive batch. This scheduler only moves its packets
 /// between temporary per-flow queues; it never retains work across calls.
 pub(super) fn fair_schedule<P, F, T>(packets: impl IntoIterator<Item = (P, F, T)>) -> Vec<T>
+where
+    P: Eq + Hash,
+    F: Eq + Hash,
+{
+    let mut batch = packets
+        .into_iter()
+        .map(|(peer, flow, packet)| (peer, flow, Some(packet)))
+        .collect::<Vec<_>>();
+    if batch.is_empty() {
+        return Vec::new();
+    }
+
+    let packet_count = batch.len();
+    let mut next_packet = vec![NO_PACKET; packet_count];
+    let mut peer_buckets = [PeerBucket::EMPTY; MAX_PEER_BUCKETS];
+    let mut peer_count = 0;
+
+    for index in 0..packet_count {
+        let peer_index = peer_buckets[..peer_count]
+            .iter()
+            .position(|peer| batch[peer.representative].0 == batch[index].0);
+        let peer_index = match peer_index {
+            Some(peer_index) => peer_index,
+            None if peer_count < MAX_PEER_BUCKETS => {
+                peer_buckets[peer_count] = PeerBucket::new(index);
+                let peer_index = peer_count;
+                peer_count += 1;
+                peer_index
+            }
+            None => return fair_schedule_hashed_batch(batch),
+        };
+
+        let peer = &mut peer_buckets[peer_index];
+        let flow_index = peer.flows[..peer.flow_count]
+            .iter()
+            .position(|flow| batch[flow.representative].1 == batch[index].1);
+        let flow_index = match flow_index {
+            Some(flow_index) => flow_index,
+            None if peer.flow_count < MAX_FLOW_BUCKETS_PER_PEER => {
+                let flow_index = peer.flow_count;
+                peer.flows[flow_index] = FlowBucket::new(index);
+                peer.flow_count += 1;
+                flow_index
+            }
+            None => return fair_schedule_hashed_batch(batch),
+        };
+
+        let flow = &mut peer.flows[flow_index];
+        if flow.tail == NO_PACKET {
+            flow.head = index;
+        } else {
+            next_packet[flow.tail] = index;
+        }
+        flow.tail = index;
+        peer.packet_count += 1;
+    }
+
+    let mut scheduled = Vec::with_capacity(packet_count);
+    let mut remaining = packet_count;
+    let mut peer_cursor = 0;
+    while remaining > 0 {
+        while peer_buckets[peer_cursor].packet_count == 0 {
+            peer_cursor = (peer_cursor + 1) % peer_count;
+        }
+
+        let packet_index = {
+            let peer = &mut peer_buckets[peer_cursor];
+            let mut flow_index = peer.next_flow;
+            while peer.flows[flow_index].head == NO_PACKET {
+                flow_index = (flow_index + 1) % peer.flow_count;
+            }
+
+            let flow = &mut peer.flows[flow_index];
+            let packet_index = flow.head;
+            flow.head = next_packet[packet_index];
+            if flow.head == NO_PACKET {
+                flow.tail = NO_PACKET;
+            }
+            peer.packet_count -= 1;
+            peer.next_flow = (flow_index + 1) % peer.flow_count;
+            packet_index
+        };
+
+        let (_, _, packet) = &mut batch[packet_index];
+        scheduled.push(packet.take().expect("scheduled packet is present"));
+        remaining -= 1;
+        peer_cursor = (peer_cursor + 1) % peer_count;
+    }
+
+    scheduled
+}
+
+/// Keep the established hash scheduler as a bounded-batch fallback when the fixed buckets fill.
+fn fair_schedule_hashed_batch<P, F, T>(batch: Vec<(P, F, Option<T>)>) -> Vec<T>
+where
+    P: Eq + Hash,
+    F: Eq + Hash,
+{
+    fair_schedule_hashed(batch.into_iter().map(|(peer, flow, packet)| {
+        (
+            peer,
+            flow,
+            packet.expect("batch packets are present before fallback scheduling"),
+        )
+    }))
+}
+
+fn fair_schedule_hashed<P, F, T>(packets: impl IntoIterator<Item = (P, F, T)>) -> Vec<T>
 where
     P: Eq + Hash,
     F: Eq + Hash,
@@ -477,6 +637,33 @@ mod tests {
         let second = packet_v4(17, 0, 0, &[0x13, 0x89]);
 
         assert_eq!(packet_flow_key(&first), packet_flow_key(&second));
+    }
+
+    /// A small mixed batch keeps fair FIFO ordering without hashing peer or flow keys.
+    #[test]
+    fn mixed_flow_batch_uses_fixed_buckets_without_hashing() {
+        let scheduled = fair_schedule([
+            (HashForbidden(1), HashForbidden(10), "bulk-0"),
+            (HashForbidden(1), HashForbidden(10), "bulk-1"),
+            (HashForbidden(1), HashForbidden(11), "probe-0"),
+            (HashForbidden(1), HashForbidden(10), "bulk-2"),
+            (HashForbidden(1), HashForbidden(11), "probe-1"),
+        ]);
+
+        assert_eq!(
+            scheduled,
+            ["bulk-0", "probe-0", "bulk-1", "probe-1", "bulk-2"]
+        );
+    }
+
+    /// A key that fails the test if a common peer or flow lookup reaches a hasher.
+    #[derive(PartialEq, Eq)]
+    struct HashForbidden(u8);
+
+    impl std::hash::Hash for HashForbidden {
+        fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {
+            panic!("bounded peer and flow buckets must not hash keys");
+        }
     }
 
     /// A sparse ICMP probe advances between bulk TCP packets assigned to the same peer.
