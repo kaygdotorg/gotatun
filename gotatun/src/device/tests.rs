@@ -321,6 +321,8 @@ async fn threaded_reverse_traffic_preserves_order_and_progress() {
         observed_input: bob_input,
     } = bob;
     let received_data_progress = Arc::new(AtomicUsize::new(0));
+    // Keep both TUN inputs open until in-flight completions have reached the opposite endpoint.
+    let tun_input_guards = (alice_tx.clone(), bob_tx.clone());
 
     // Establish both peer sessions before the flood so the bounded handshake queue does not
     // discard setup traffic and masquerade as an ordered-lane stall.
@@ -456,6 +458,7 @@ async fn threaded_reverse_traffic_preserves_order_and_progress() {
         .expect("the reverse input-order record is not poisoned");
     assert_packet_order("data", &alice_input, &received_data);
     assert_packet_order("reverse acknowledgements", &bob_input, &received_acks);
+    drop(tun_input_guards);
 }
 
 /// Assert that the expected number of packets is sent.
