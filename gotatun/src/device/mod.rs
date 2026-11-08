@@ -1716,36 +1716,42 @@ impl<T: DeviceTransports> DeviceState<T> {
         outgoing_order: Arc<OrderStore<WgKind>>,
     ) {
         loop {
-            let Some(device) = device.upgrade() else {
-                break;
+            let peers = {
+                let Some(device_arc) = device.upgrade() else {
+                    break;
+                };
+                let peers = {
+                    let device_guard = device_arc.read().await;
+                    // Remove stale session indices. Once a session is stale it is dropped by
+                    // `update_session_timers`, and its associated index is freed from the table.
+                    device_guard
+                        .peers_by_idx
+                        .lock()
+                        .retain(|idx, _| device_guard.index_table.in_use(*idx));
+
+                    // Keep resetting counts when a device has no peers, where per-peer timer
+                    // updates would otherwise never run.
+                    if let Some(rate_limiter) = device_guard.rate_limiter.as_ref() {
+                        rate_limiter.try_reset_count();
+                    }
+
+                    device_guard.peers.values().cloned().collect::<Vec<_>>()
+                };
+                drop(device_arc);
+                peers
             };
-            let device = device.read().await;
-            // Remove stale session indices.
-            //
-            // `device.index_table` is a singleton which identifies ongoing handshakes and active sessions.
-            // Once a session is stale it is dropped (see `update_session_timers`), and its
-            // associated index is freed from the table.
-            device
-                .peers_by_idx
-                .lock()
-                .retain(|idx, _| device.index_table.in_use(*idx));
 
-            // NOTE: Try to reset the packet counts here in addition to inside of `PeerState::update_timers`.
-            // Otherwise if the device has no peers, try_reset_count will never trigger, and packet
-            // counts will accumulate indefinitely. Fixes GHSA-m2rr-7rr7-vmp7.
-            if let Some(rate_limiter) = device.rate_limiter.as_ref() {
-                rate_limiter.try_reset_count();
-            }
-
-            // TODO: pass in peers instead?
-            let peer_map = &device.peers;
-
-            // Go over each peer and invoke the timer function
-            for peer in peer_map.values() {
-                let peer_key = peer_order_key(peer);
-                let mut peer_trace = PeerLockDiagnostic::waiting("timer", peer_key);
-                let mut p = lock_peer_state(peer, "timer", peer_key, &mut peer_trace).await;
+            // The snapshot owns peer handles, so timer work does not keep a device read lock
+            // across peer waits or packet completions.
+            for peer in peers {
+                let peer_key = peer_order_key(&peer);
                 if outgoing_order.is_flushing(peer_key) {
+                    continue;
+                }
+                let mut peer_trace = PeerLockDiagnostic::waiting("timer", peer_key);
+                let mut p = lock_peer_state(&peer, "timer", peer_key, &mut peer_trace).await;
+                if outgoing_order.is_flushing(peer_key) || outgoing_order.available(peer_key) == 0 {
+                    // Leave due timers untouched until a bounded output slot is available.
                     continue;
                 }
                 let endpoint_addr = match p.endpoint().addr {
@@ -1755,22 +1761,45 @@ impl<T: DeviceTransports> DeviceState<T> {
 
                 match p.update_timers() {
                     Ok(Some(packet)) => {
-                        // Register sender_idx from outgoing handshake packets
-                        Self::register_handshake_idx(&device.peers_by_idx, &packet, peer);
-
-                        let (lane, slot) = outgoing_order
-                            .reserve(peer_key)
-                            .expect("timer output fits within the peer order window");
+                        // All slot producers for this peer hold its state lock, except for a
+                        // control flush that is marked above. The free-slot check therefore
+                        // remains valid until this reservation.
+                        let Some((lane, slot)) = outgoing_order.reserve(peer_key) else {
+                            tracing::warn!(
+                                "Deferring timer packet because the peer order window filled"
+                            );
+                            continue;
+                        };
 
                         drop(p);
                         drop(peer_trace);
+
+                        if matches!(&packet, WgKind::HandshakeInit(_) | WgKind::HandshakeResp(_)) {
+                            let Some(device_arc) = device.upgrade() else {
+                                return;
+                            };
+                            let device_guard = device_arc.read().await;
+                            let peer_is_current = device_guard
+                                .peers
+                                .values()
+                                .any(|configured| Arc::ptr_eq(configured, &peer));
+                            if peer_is_current {
+                                // Register sender_idx from timer-generated handshake packets.
+                                Self::register_handshake_idx(
+                                    &device_guard.peers_by_idx,
+                                    &packet,
+                                    &peer,
+                                );
+                            }
+                            drop(device_guard);
+                        }
 
                         // NOTE: we don't bother with triggering TunnelRecv DAITA events here.
                         complete_outgoing_packet(
                             OutgoingPeerContext {
                                 crypto: crypto.clone(),
                                 ordered: Arc::clone(&outgoing_order),
-                                peer_arc: Arc::clone(peer),
+                                peer_arc: Arc::clone(&peer),
                                 peer_key,
                                 peer_addr: endpoint_addr,
                                 udp: udp.clone(),
@@ -1788,7 +1817,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                 }
             }
 
-            drop(device);
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }

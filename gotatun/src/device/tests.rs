@@ -363,6 +363,57 @@ async fn j369_control_drain_progresses_with_a_queued_device_writer() {
     );
 }
 
+/// Timer output is deferred instead of panicking while the peer's bounded order window is full.
+#[tokio::test]
+async fn j369_timer_output_survives_a_full_peer_window() {
+    use super::parallel_crypto::{CryptoWorkers, MAX_PEER_CRYPTO_IN_FLIGHT, OrderStore};
+    let (alice, bob, _eve) = mock::device_pair().await;
+    let udp = alice
+        .device
+        .inner
+        .read()
+        .await
+        .connection
+        .as_ref()
+        .unwrap()
+        .udp
+        .clone();
+    alice.device.suspend().await;
+    bob.device.suspend().await;
+    let peer = alice
+        .device
+        .inner
+        .read()
+        .await
+        .peers
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    peer.lock().await.tunnel.set_persistent_keepalive(Some(1));
+    let order = Arc::new(OrderStore::default());
+    order
+        .reserve_run(super::peer_order_key(&peer), MAX_PEER_CRYPTO_IN_FLIGHT)
+        .unwrap();
+    let workers = CryptoWorkers::with_worker_count(2).unwrap();
+    let timers = super::DeviceState::handle_timers(
+        Arc::downgrade(&alice.device.inner),
+        udp,
+        workers.handle(),
+        order,
+    );
+    let outcome = std::panic::AssertUnwindSafe(timers)
+        .catch_unwind()
+        .now_or_never();
+    workers.stop().await;
+    alice.device.stop().await;
+    bob.device.stop().await;
+    assert!(
+        outcome.is_none(),
+        "timer task panicked at the bounded lane's normal full state"
+    );
+}
+
 /// Keep the data path moving and ordered while a reverse producer sends ACK-sized packets.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn threaded_reverse_traffic_preserves_order_and_progress() {
