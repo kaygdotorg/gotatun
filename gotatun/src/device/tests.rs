@@ -1275,3 +1275,56 @@ async fn test_device_pair(eavesdrop: impl AsyncFnOnce(MockEavesdropper) + Send) 
         eavesdrop
     };
 }
+
+/// A packet lookup keeps polling earlier delivery reads while a configuration writer is queued.
+#[tokio::test]
+async fn j380_packet_lookup_progresses_with_a_pending_delivery_reader() {
+    use super::parallel_crypto::OrderedCompletions;
+    let (alice, bob, _eve) = mock::device_pair().await;
+    alice.device.suspend().await;
+    bob.device.suspend().await;
+    let device = Arc::clone(&alice.device.inner);
+    let peer = device.read().await.peers.values().next().unwrap().clone();
+    let held_peer = peer.lock().await;
+    let lane = Arc::new(OrderedCompletions::default());
+    let slot = lane.reserve_run(1).unwrap();
+    let (tun, _tx, _rx) = mock::mock_tun();
+    let delivery_device = Arc::downgrade(&device);
+    let completion_peer = peer.clone();
+    let mut incoming = PendingIncoming::new();
+    incoming.push(
+        async move {
+            lane.complete_run(slot, vec![None], |completions| {
+                super::DeviceState::deliver_incoming_run(
+                    slot,
+                    delivery_device.clone(),
+                    completion_peer.clone(),
+                    completions,
+                    tun.clone(),
+                )
+            })
+            .await
+        }
+        .boxed(),
+    );
+    // The receive select polls this callback, which holds a device read while awaiting peer state.
+    assert!(futures::poll!(incoming.next()).is_pending());
+    let mut writer = Box::pin(device.write());
+    assert!(futures::poll!(writer.as_mut()).is_pending());
+    drop(held_peer);
+    // A ready UDP datagram wins the receive select. Its packet lookup is the exact direct
+    // device.read().await used by handle_incoming, without polling incoming_pending alongside it.
+    let mut lookup = Box::pin(device.read());
+    let lookup_progressed = futures::poll!(lookup.as_mut()).is_ready();
+    let writer_blocked = futures::poll!(writer.as_mut()).is_pending();
+    drop(lookup);
+    // Break the cycle only for cleanup by manually polling the completion the parent owns.
+    incoming.next().await.unwrap().unwrap();
+    drop(writer.await);
+    alice.device.stop().await;
+    bob.device.stop().await;
+    assert!(
+        lookup_progressed || !writer_blocked,
+        "packet lookup and writer are both blocked behind an unpolled delivery read guard"
+    );
+}
