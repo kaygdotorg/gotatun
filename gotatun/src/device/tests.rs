@@ -302,6 +302,61 @@ async fn peer_lock_wait_polls_the_completion_queued_ahead_of_it() {
         .expect("the queued completion ran before the parent acquired the lock");
 }
 
+/// The control drain releases its device snapshot before a queued writer blocks delivery reads.
+#[tokio::test]
+async fn j369_control_drain_progresses_with_a_queued_device_writer() {
+    use super::parallel_crypto::OrderedCompletions;
+    let (alice, bob, _eve) = mock::device_pair().await;
+    alice.device.suspend().await;
+    bob.device.suspend().await;
+    let device = Arc::clone(&alice.device.inner);
+    let device_guard = device.read().await;
+    let peer = device_guard.peers.values().next().unwrap().clone();
+    let lane = Arc::new(OrderedCompletions::default());
+    let slot = lane.reserve_run(1).unwrap();
+    let (tun, _tx, _rx) = mock::mock_tun();
+    let delivery_device = Arc::downgrade(&device);
+    let mut writer = Box::pin(device.write());
+    assert!(futures::poll!(writer.as_mut()).is_pending());
+    let mut incoming = PendingIncoming::new();
+    let completion_lane = Arc::clone(&lane);
+    incoming.push(
+        async move {
+            completion_lane
+                .complete_run(slot, vec![None], |completions| {
+                    super::DeviceState::deliver_incoming_run(
+                        slot,
+                        delivery_device.clone(),
+                        peer.clone(),
+                        completions,
+                        tun.clone(),
+                    )
+                })
+                .await
+        }
+        .boxed(),
+    );
+    let mut drain = Box::pin(super::drain_incoming_before_control(
+        device_guard,
+        Some(Arc::clone(&lane)),
+        &mut incoming,
+    ));
+    assert!(futures::poll!(drain.as_mut()).is_pending());
+    let writer_guard = writer
+        .as_mut()
+        .now_or_never()
+        .expect("the control drain released the read guard to the queued writer");
+    drop(writer_guard);
+    let progressed = futures::poll!(drain.as_mut()).is_ready();
+    drain.await.unwrap();
+    alice.device.stop().await;
+    bob.device.stop().await;
+    assert!(
+        progressed,
+        "the queued writer must not block the delivery callback's nested device read"
+    );
+}
+
 /// Keep the data path moving and ordered while a reverse producer sends ACK-sized packets.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn threaded_reverse_traffic_preserves_order_and_progress() {

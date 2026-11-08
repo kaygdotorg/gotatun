@@ -144,6 +144,28 @@ type PendingOutgoing = FuturesUnordered<BoxFuture<'static, ()>>;
 /// Futures that finish one incoming worker result and release it toward the TUN in order.
 type PendingIncoming = FuturesUnordered<BoxFuture<'static, Result<(), Error>>>;
 
+/// Release the configuration snapshot before a control packet waits for incoming completions.
+///
+/// The peer was cloned from the snapshot before this call. A delivery callback may need the same
+/// device read lock, so retaining it while polling that callback can deadlock behind a queued
+/// configuration writer.
+async fn drain_incoming_before_control<T: DeviceTransports>(
+    device_guard: tokio::sync::RwLockReadGuard<'_, DeviceState<T>>,
+    lane: Option<Arc<OrderedCompletions<IncomingCompletion>>>,
+    incoming_pending: &mut PendingIncoming,
+) -> Result<(), Error> {
+    drop(device_guard);
+    if let Some(lane) = lane {
+        while !lane.is_idle() {
+            incoming_pending
+                .next()
+                .await
+                .expect("an incoming data slot has a completion future")?;
+        }
+    }
+    Ok(())
+}
+
 /// Completion streams that a packet task must keep polling while it waits for peer state.
 enum PendingCompletions<'a> {
     /// Receive-side completions can deliver packets and propagate device errors.
@@ -2010,14 +2032,12 @@ impl<T: DeviceTransports> DeviceState<T> {
                         }
                     }
                     packet => {
-                        if let Some(lane) = incoming_order.lane(peer_key) {
-                            while !lane.is_idle() {
-                                incoming_pending
-                                    .next()
-                                    .await
-                                    .expect("an incoming data slot has a completion future")?;
-                            }
-                        }
+                        drain_incoming_before_control(
+                            device_guard,
+                            incoming_order.lane(peer_key),
+                            &mut incoming_pending,
+                        )
+                        .await?;
 
                         let mut peer_trace =
                             PeerLockDiagnostic::waiting("incoming_control", peer_key);
@@ -2033,22 +2053,42 @@ impl<T: DeviceTransports> DeviceState<T> {
                             &mut pending_completions,
                         )
                         .await?;
+                        let peer_endpoint = peer.endpoint().addr;
                         let result = peer.handle_incoming_packet(packet, addr);
                         match result {
-                            TunnResult::Done | TunnResult::Err(_) => {}
-                            TunnResult::WriteToNetwork(packet) => {
-                                Self::register_handshake_idx(
-                                    &device_guard.peers_by_idx,
-                                    &packet,
-                                    &peer_arc,
-                                );
-                                let flush_guard = outgoing_order.begin_flush(peer_key);
-                                // Keep later TUN packets behind this control packet while its
-                                // bounded peer lane has no free sequence slot. Release peer and
-                                // device locks so the pending completions can drain the lane.
+                            TunnResult::Done | TunnResult::Err(_) => {
                                 drop(peer);
                                 drop(peer_trace);
-                                drop(device_guard);
+                            }
+                            TunnResult::WriteToNetwork(packet) => {
+                                let flush_guard = outgoing_order.begin_flush(peer_key);
+                                // Keep later TUN packets behind this control packet while its
+                                // bounded peer lane has no free sequence slot.
+                                drop(peer);
+                                drop(peer_trace);
+                                let Some(device_arc) = device.upgrade() else {
+                                    drop(flush_guard);
+                                    return Ok(());
+                                };
+                                let peer_is_current = {
+                                    let device_guard = device_arc.read().await;
+                                    let peer_is_current = device_guard
+                                        .peers
+                                        .values()
+                                        .any(|configured| Arc::ptr_eq(configured, &peer_arc));
+                                    if peer_is_current {
+                                        Self::register_handshake_idx(
+                                            &device_guard.peers_by_idx,
+                                            &packet,
+                                            &peer_arc,
+                                        );
+                                    }
+                                    peer_is_current
+                                };
+                                if !peer_is_current {
+                                    drop(flush_guard);
+                                    continue;
+                                }
                                 let (lane, slot) = loop {
                                     if let Some(reserved) = outgoing_order.reserve(peer_key) {
                                         if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
@@ -2146,17 +2186,25 @@ impl<T: DeviceTransports> DeviceState<T> {
                                     |ipv4| (ipv4.header.source().into(), ipv4.into()),
                                     |ipv6| (ipv6.header.source().into(), ipv6.into()),
                                 );
-                                let routed_to_this_peer = device_guard
-                                    .peers_by_ip
-                                    .find(source)
-                                    .is_some_and(|owner| Arc::ptr_eq(owner, &peer_arc));
+                                drop(peer);
+                                drop(peer_trace);
+                                let Some(device_arc) = device.upgrade() else {
+                                    return Ok(());
+                                };
+                                let routed_to_this_peer = {
+                                    let device_guard = device_arc.read().await;
+                                    device_guard
+                                        .peers_by_ip
+                                        .find(source)
+                                        .is_some_and(|owner| Arc::ptr_eq(owner, &peer_arc))
+                                };
                                 if !routed_to_this_peer {
                                     if cfg!(debug_assertions) {
                                         let unspecified =
                                             SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into();
                                         tracing::warn!(
                                             "peer at {} is not allowed to send us packets from: {source}",
-                                            peer.endpoint().addr.unwrap_or(unspecified)
+                                            peer_endpoint.unwrap_or(unspecified)
                                         );
                                     }
                                     continue;
