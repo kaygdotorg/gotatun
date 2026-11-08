@@ -199,18 +199,29 @@ struct PeerQueue<T> {
 /// Return the batch in hierarchical round-robin order, keeping FIFO within each flow.
 ///
 /// The caller supplies one already-bounded receive batch. This scheduler only moves its packets
-/// between temporary per-flow queues; it never retains work across calls.
+/// between temporary per-flow queues; it never retains work across calls. A batch with one peer
+/// and one flow is already in fair FIFO order and bypasses the keyed queue construction.
 pub(super) fn fair_schedule<P, F, T>(packets: impl IntoIterator<Item = (P, F, T)>) -> Vec<T>
 where
     P: Eq + Hash,
     F: Eq + Hash,
 {
+    let batch = packets.into_iter().collect::<Vec<_>>();
+    let one_flow = batch.first().is_some_and(|(first_peer, first_flow, _)| {
+        batch
+            .iter()
+            .all(|(peer, flow, _)| peer == first_peer && flow == first_flow)
+    });
+    if one_flow {
+        return batch.into_iter().map(|(_, _, packet)| packet).collect();
+    }
+
     let mut peers: Vec<PeerQueue<T>> = Vec::new();
     let mut peer_indices: HashMap<P, usize> = HashMap::new();
     let mut flow_indices: HashMap<(usize, F), usize> = HashMap::new();
     let mut packet_count = 0;
 
-    for (peer, flow, packet) in packets {
+    for (peer, flow, packet) in batch {
         let peer_index = match peer_indices.entry(peer) {
             std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -386,6 +397,28 @@ mod tests {
         let second = packet_v4(17, 0, 0, &[0x13, 0x89]);
 
         assert_eq!(packet_flow_key(&first), packet_flow_key(&second));
+    }
+
+    /// One peer and one flow are already FIFO ordered, so their keys should not be hashed.
+    #[test]
+    fn one_peer_and_flow_bypasses_key_hashing() {
+        let scheduled = fair_schedule([
+            (HashForbidden, HashForbidden, "first"),
+            (HashForbidden, HashForbidden, "second"),
+            (HashForbidden, HashForbidden, "third"),
+        ]);
+
+        assert_eq!(scheduled, ["first", "second", "third"]);
+    }
+
+    /// A key that fails the test if a known single-flow batch reaches a hasher.
+    #[derive(PartialEq, Eq)]
+    struct HashForbidden;
+
+    impl std::hash::Hash for HashForbidden {
+        fn hash<H: std::hash::Hasher>(&self, _state: &mut H) {
+            panic!("single-flow batches must bypass key hashing");
+        }
     }
 
     /// A sparse ICMP probe advances between bulk TCP packets assigned to the same peer.
