@@ -46,20 +46,21 @@ unit_cpus() {
 }
 
 units=(init.scope system.slice user.slice perf.slice)
-declare -A old_cpuset old_effective old_dropins old_irq_affinity
+declare -A old_cpuset old_effective old_dropins old_allowed old_restore_mode old_irq_affinity
 for unit in "${units[@]}"; do
     old_cpuset[$unit]=$(unit_cpus "$unit" cpuset.cpus)
     old_effective[$unit]=$(unit_cpus "$unit" cpuset.cpus.effective)
     old_dropins[$unit]=$(systemctl show "$unit" -p DropInPaths --value)
-    [[ -z ${old_dropins[$unit]} ]] || {
+    old_allowed[$unit]=$(systemctl show "$unit" -p AllowedCPUs --value)
+    old_restore_mode[$unit]=$(cpuset_restore_mode "$unit" "${old_dropins[$unit]}" "${old_allowed[$unit]}") || {
         echo "refusing to alter $unit with existing drop-ins: ${old_dropins[$unit]}" >&2
         exit 2
     }
 done
 old_cpus=${old_cpuset[perf.slice]}
 old_perf_effective=${old_effective[perf.slice]}
-[[ $old_cpus == 1-3 && $old_perf_effective == 1-3 ]] || {
-    echo "unexpected perf.slice baseline: cpuset.cpus=$old_cpus cpuset.cpus.effective=$old_perf_effective" >&2
+[[ $old_cpus == 1-3 && $old_perf_effective == 1-3 && ${old_allowed[perf.slice]} == 1-3 ]] || {
+    echo "unexpected perf.slice baseline: cpuset.cpus=$old_cpus cpuset.cpus.effective=$old_perf_effective AllowedCPUs=${old_allowed[perf.slice]}" >&2
     exit 2
 }
 
@@ -83,9 +84,9 @@ manifest_field() {
 : > "$out/cgroup-masks-before.tsv"
 for unit in "${units[@]}"; do
     group=$(unit_cgroup "$unit")
-    printf '%s\t%s\t%s\t%s\t%s\n' "$unit" "${group#/sys/fs/cgroup}" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$unit" "${group#/sys/fs/cgroup}" \
         "$(manifest_field "${old_cpuset[$unit]}")" "$(manifest_field "${old_effective[$unit]}")" \
-        "$(manifest_field "${old_dropins[$unit]}")" \
+        "$(manifest_field "${old_dropins[$unit]}")" "$(manifest_field "${old_allowed[$unit]}")" \
         >> "$out/cgroup-masks-before.tsv"
 done
 
@@ -132,20 +133,22 @@ restored=0
 # Restore saved cgroup masks and IRQ affinities, then verify the real state.
 restore() {
     ((restored == 0)) || return 0
-    local rc=0 command_rc=0 cpus effective paths attempt irq unit path
+    local rc=0 command_rc=0 cpus effective paths allowed attempt irq unit path
     for path in "${workqueue_mask_files[@]}"; do
         printf '%s\n' "${old_workqueue_mask[$path]}" > "$path" || command_rc=1
     done
     for irq in "${host_net_irqs[@]}"; do
         printf '%s\n' "${old_irq_affinity[$irq]}" > "/proc/irq/$irq/smp_affinity_list" || command_rc=1
     done
-    # Put every unit back on its captured effective mask before removing the
-    # temporary AllowedCPUs properties that created the test placement.
+    # Restore existing units in place; revert only the temporary drop-ins this
+    # run added, never the perf.slice resource limits already owned by the host.
     for unit in "${units[@]}"; do
-        systemctl set-property --runtime "$unit" "AllowedCPUs=${old_effective[$unit]}" >/dev/null || command_rc=1
-    done
-    for unit in "${units[@]}"; do
-        systemctl revert "$unit" >/dev/null || command_rc=1
+        if [[ ${old_restore_mode[$unit]} == preserve-existing-dropins ]]; then
+            systemctl set-property --runtime "$unit" "AllowedCPUs=${old_allowed[$unit]}" >/dev/null || command_rc=1
+        else
+            systemctl set-property --runtime "$unit" "AllowedCPUs=${old_effective[$unit]}" >/dev/null || command_rc=1
+            systemctl revert "$unit" >/dev/null || command_rc=1
+        fi
     done
     for attempt in {1..50}; do
         rc=0
@@ -153,9 +156,11 @@ restore() {
             cpus=$(unit_cpus "$unit" cpuset.cpus) || rc=1
             effective=$(unit_cpus "$unit" cpuset.cpus.effective) || rc=1
             paths=$(systemctl show "$unit" -p DropInPaths --value)
+            allowed=$(systemctl show "$unit" -p AllowedCPUs --value)
             cpuset_state_matches "$cpus" "${old_cpuset[$unit]}" \
                 "$effective" "${old_effective[$unit]}" || rc=1
             [[ $paths == "${old_dropins[$unit]}" ]] || rc=1
+            [[ $allowed == "${old_allowed[$unit]}" ]] || rc=1
         done
         for irq in "${host_net_irqs[@]}"; do
             [[ $(cat "/proc/irq/$irq/smp_affinity_list") == "${old_irq_affinity[$irq]}" ]] || rc=1
@@ -171,10 +176,11 @@ restore() {
             {
                 echo "restored at $(date -Is)"
                 for unit in "${units[@]}"; do
-                    printf '%s cpuset.cpus=%s cpuset.cpus.effective=%s dropins=%s\n' "$unit" \
+                    printf '%s cpuset.cpus=%s cpuset.cpus.effective=%s dropins=%s AllowedCPUs=%s\n' "$unit" \
                         "$(unit_cpus "$unit" cpuset.cpus)" \
                         "$(unit_cpus "$unit" cpuset.cpus.effective)" \
-                        "$(systemctl show "$unit" -p DropInPaths --value)"
+                        "$(systemctl show "$unit" -p DropInPaths --value)" \
+                        "$(systemctl show "$unit" -p AllowedCPUs --value)"
                 done
                 for irq in "${host_net_irqs[@]}"; do
                     printf 'host_network_irq_%s_affinity=%s\n' "$irq" "$(cat "/proc/irq/$irq/smp_affinity_list")"

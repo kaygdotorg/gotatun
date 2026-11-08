@@ -19,26 +19,27 @@ manifest_value() {
 
 if [[ -n $cgroup_manifest ]]; then
     [[ -r $cgroup_manifest ]] || { echo "missing cgroup baseline manifest: $cgroup_manifest" >&2; exit 2; }
-    while IFS=$'\t' read -r unit group expected_cpus expected_effective expected_dropins; do
+    while IFS=$'\t' read -r unit group expected_cpus expected_effective expected_dropins expected_allowed; do
         [[ -n $unit ]] || continue
         expected_cpus=$(manifest_value "$expected_cpus")
         expected_effective=$(manifest_value "$expected_effective")
         expected_dropins=$(manifest_value "$expected_dropins")
+        expected_allowed=$(manifest_value "$expected_allowed")
         cgroup="$cgroup_root$group"
         cpus=$(cat "$cgroup/cpuset.cpus")
         effective=$(cat "$cgroup/cpuset.cpus.effective")
         actual_group=$(systemctl show "$unit" -p ControlGroup --value)
         dropins=$(systemctl show "$unit" -p DropInPaths --value)
-        if [[ $actual_group != "$group" || $dropins != "$expected_dropins" ]] || \
+        allowed=$(systemctl show "$unit" -p AllowedCPUs --value)
+        if [[ $actual_group != "$group" || $dropins != "$expected_dropins" || $allowed != "$expected_allowed" ]] || \
            ! cpuset_state_matches "$cpus" "$expected_cpus" "$effective" "$expected_effective"; then
-            printf '%s restoration failed: cgroup=%s expected=%s cpuset.cpus=%s expected=%s cpuset.cpus.effective=%s expected=%s DropInPaths=%s expected=%s\n' \
+            printf '%s restoration failed: cgroup=%s expected=%s cpuset.cpus=%s expected=%s cpuset.cpus.effective=%s expected=%s DropInPaths=%s expected=%s AllowedCPUs=%s expected=%s\n' \
                 "$unit" "$actual_group" "$group" "$cpus" "$expected_cpus" \
-                "$effective" "$expected_effective" "$dropins" "$expected_dropins" >&2
+                "$effective" "$expected_effective" "$dropins" "$expected_dropins" "$allowed" "$expected_allowed" >&2
             failed=1
         fi
-        allowed=$(systemctl show "$unit" -p AllowedCPUs --value)
         systemd_effective=$(systemctl show "$unit" -p EffectiveCPUs --value)
-        results+=("$unit restored: cpuset.cpus=$cpus cpuset.cpus.effective=$effective DropInPaths=$dropins (AllowedCPUs=$allowed EffectiveCPUs=$systemd_effective informational)")
+        results+=("$unit restored: cpuset.cpus=$cpus cpuset.cpus.effective=$effective DropInPaths=$dropins AllowedCPUs=$allowed EffectiveCPUs=$systemd_effective")
     done < "$cgroup_manifest"
 else
     # Keep a safe read-only check for an early failure before the overlay could
@@ -50,12 +51,13 @@ else
     dropins=$(systemctl show perf.slice -p DropInPaths --value)
     cpus=$(cat "$slice_cgroup/cpuset.cpus")
     effective=$(cat "$slice_cgroup/cpuset.cpus.effective")
-    if [[ $cpus != "$expected" || $effective != "$expected" || -n $dropins ]]; then
-        printf 'perf.slice restoration failed: cpuset.cpus=%s expected=%s cpuset.cpus.effective=%s expected=%s DropInPaths=%s (AllowedCPUs=%s EffectiveCPUs=%s informational)\n' \
-            "$cpus" "$expected" "$effective" "$expected" "$dropins" "$allowed" "$systemd_effective" >&2
+    expected_allowed=${J88I_EXPECTED_PERF_ALLOWED:-1-3}
+    if [[ $cpus != "$expected" || $effective != "$expected" || $allowed != "$expected_allowed" ]]; then
+        printf 'perf.slice state check failed: cpuset.cpus=%s expected=%s cpuset.cpus.effective=%s expected=%s DropInPaths=%s AllowedCPUs=%s expected=%s EffectiveCPUs=%s\n' \
+            "$cpus" "$expected" "$effective" "$expected" "$dropins" "$allowed" "$expected_allowed" "$systemd_effective" >&2
         failed=1
     fi
-    results+=("perf.slice restored: cpuset.cpus=$cpus cpuset.cpus.effective=$effective DropInPaths=$dropins (AllowedCPUs=$allowed EffectiveCPUs=$systemd_effective informational)")
+    results+=("perf.slice state: cpuset.cpus=$cpus cpuset.cpus.effective=$effective DropInPaths=$dropins AllowedCPUs=$allowed EffectiveCPUs=$systemd_effective")
 fi
 
 if [[ -n $workqueue_manifest ]]; then

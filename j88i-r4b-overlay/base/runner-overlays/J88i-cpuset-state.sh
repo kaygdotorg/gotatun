@@ -12,3 +12,18 @@ cpuset_state_matches() {
        ( -z $expected_cpus || $expected_cpus == 0-5 ) && \
        ( -z $actual_cpus || $actual_cpus == 0-5 ) ]]
 }
+
+# Preserve pre-existing unit properties when removing a temporary CPU limit.
+# perf.slice may have AllowedCPUs and MemoryMax control drop-ins; reverting the
+# unit would delete both, so its captured AllowedCPUs value is restored in place.
+cpuset_restore_mode() {
+    local unit=$1 drop_ins=$2 allowed_cpus=$3
+    if [[ -z $drop_ins ]]; then
+        printf 'revert-generated-dropin\n'
+    elif [[ $unit == perf.slice && -n $allowed_cpus ]]; then
+        printf 'preserve-existing-dropins\n'
+    else
+        echo "cannot safely change $unit with existing drop-ins and AllowedCPUs=$allowed_cpus" >&2
+        return 2
+    fi
+}
