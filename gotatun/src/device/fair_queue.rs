@@ -253,7 +253,8 @@ impl PeerBucket {
 /// Return the batch in hierarchical round-robin order, keeping FIFO within each flow.
 ///
 /// The caller supplies one already-bounded receive batch. This scheduler only moves its packets
-/// between temporary per-flow queues; it never retains work across calls.
+/// between temporary per-flow queues; it never retains work across calls. A batch with one peer
+/// and one flow is already in fair FIFO order and bypasses the keyed queue construction.
 pub(super) fn fair_schedule<P, F, T>(packets: impl IntoIterator<Item = (P, F, T)>) -> Vec<T>
 where
     P: Eq + Hash,
@@ -265,6 +266,12 @@ where
         .collect::<Vec<_>>();
     if batch.is_empty() {
         return Vec::new();
+    }
+
+    // One peer and one flow are already in fair FIFO order, so skip bucket construction.
+    let one_flow = batch.iter().all(|(peer, flow, _)| *peer == batch[0].0 && *flow == batch[0].1);
+    if one_flow {
+        return batch.into_iter().filter_map(|(_, _, packet)| packet).collect();
     }
 
     let packet_count = batch.len();
@@ -372,7 +379,7 @@ where
     let mut flow_indices: HashMap<(usize, F), usize> = HashMap::new();
     let mut packet_count = 0;
 
-    for (peer, flow, packet) in packets {
+    for (peer, flow, packet) in batch {
         let peer_index = match peer_indices.entry(peer) {
             std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -548,6 +555,18 @@ mod tests {
         let second = packet_v4(17, 0, 0, &[0x13, 0x89]);
 
         assert_eq!(packet_flow_key(&first), packet_flow_key(&second));
+    }
+
+    /// One peer and one flow are already FIFO ordered, so their keys should not be hashed.
+    #[test]
+    fn one_peer_and_flow_bypasses_key_hashing() {
+        let scheduled = fair_schedule([
+            (HashForbidden(1), HashForbidden(10), "first"),
+            (HashForbidden(1), HashForbidden(10), "second"),
+            (HashForbidden(1), HashForbidden(10), "third"),
+        ]);
+
+        assert_eq!(scheduled, ["first", "second", "third"]);
     }
 
     /// A small mixed batch keeps fair FIFO ordering without hashing peer or flow keys.
