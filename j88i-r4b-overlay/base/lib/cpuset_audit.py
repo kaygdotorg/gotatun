@@ -34,6 +34,9 @@ BOUND_WORKER_PATTERNS = (
     re.compile(r"^kworker/(\d+):"),
     re.compile(r"^ksoftirqd/(\d+)$"),
 )
+# Keep the placement exception aligned with tokio_affinity.py across the
+# current and older Linux-visible Tokio worker names.
+TOKIO_WORKER_COMMS = frozenset({"tokio-rt-worker", "tokio-runtime-w"})
 BOUND_WORKER_RUNTIME_LIMIT_PERCENT = 0.5
 STOP = False
 
@@ -199,7 +202,7 @@ def locality_worker_is_in_round_robin_row(
     """Identify Tokio workers that must be pinned in the locality row."""
     return (
         process_pid in target_pids
-        and thread_comm == "tokio-runtime-w"
+        and thread_comm in TOKIO_WORKER_COMMS
         and audit_case == "mesh-gotatun"
         and audit_engine == "gotatun"
         and re.fullmatch(

@@ -376,6 +376,16 @@ cpuset_allowed_cpus_dropin_matches "$2" 1-3
         )
         self.assertEqual([task["tid"] for task in unrelated["mask_mismatches"]], [501])
 
+    def test_current_tokio_worker_comm_is_allowed_in_locality_row(self) -> None:
+        """Accept Tokio 1.50's shortened worker name in locality audits."""
+        sample = self._sample_scoped_worker(
+            row_tag="gotatun-j88i-locality-33ca6fe-1",
+            worker_placement="round-robin",
+            worker_comm="tokio-rt-worker",
+            worker_allowed="1",
+        )
+        self.assertEqual(sample["mask_mismatches"], [])
+
     def test_matrix_j88i_tag_is_locality_only_when_explicitly_placed(self) -> None:
         """The J317 row tag permits narrowed workers only in its locality placement."""
         j317_row = "gotatun-j88i-33ca6fe-1"

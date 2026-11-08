@@ -69,6 +69,28 @@ class TokioAffinityTests(unittest.TestCase):
         )
         self.assertEqual(calls, [(101, {1}), (103, {2}), (104, {1})])
 
+    def test_current_tokio_worker_name_is_detected(self) -> None:
+        """Find the worker name used by the fork's locked Tokio version."""
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._make_process(
+                root,
+                150,
+                {150: "gotatun", 151: "tokio-rt-worker", 152: "udp-recv"},
+            )
+            calls: list[tuple[int, set[int]]] = []
+
+            assigned = module.pin_tokio_workers(
+                150,
+                (3, 4),
+                proc_root=root,
+                set_affinity=lambda tid, cpus: calls.append((tid, cpus)),
+            )
+
+        self.assertEqual([(row["tid"], row["cpu"]) for row in assigned], [(151, 3)])
+        self.assertEqual(calls, [(151, {3})])
+
     def test_missing_tokio_workers_fails_without_changing_any_affinity(self) -> None:
         """Do not silently claim a locality row if the runtime has no workers."""
         module = load_module()

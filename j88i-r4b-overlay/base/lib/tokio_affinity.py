@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 
-TOKIO_WORKER_COMM = "tokio-runtime-w"
+# Tokio 1.50 shortened its default; Linux `comm` also exposes the old name
+# only through its 15-byte truncation.
+TOKIO_WORKER_COMMS = frozenset({"tokio-rt-worker", "tokio-runtime-w"})
 
 
 def pin_tokio_workers(
@@ -40,7 +42,7 @@ def pin_tokio_workers(
         except FileNotFoundError:
             # Threads can exit while procfs is being enumerated.
             continue
-        if comm == TOKIO_WORKER_COMM:
+        if comm in TOKIO_WORKER_COMMS:
             workers.append(int(entry.name))
 
     workers.sort()
