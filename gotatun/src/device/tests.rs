@@ -60,13 +60,16 @@ struct BatchedDevice {
     observed_input: Arc<StdMutex<Vec<Vec<u8>>>>,
 }
 
-/// Create the two packet channels and an order record for one test TUN endpoint.
-fn batched_tun() -> (
+/// Packet channels and the observed input record returned by a fake TUN endpoint.
+type BatchedTunChannels = (
     BatchedTun,
     mpsc::UnboundedSender<Packet<Ip>>,
     mpsc::UnboundedReceiver<Packet<Ip>>,
     Arc<StdMutex<Vec<Vec<u8>>>>,
-) {
+);
+
+/// Create the two packet channels and an order record for one test TUN endpoint.
+fn batched_tun() -> BatchedTunChannels {
     let (app_to_tun_tx, app_to_tun_rx) = mpsc::unbounded_channel();
     let (tun_to_app_tx, tun_to_app_rx) = mpsc::unbounded_channel();
     let observed_input = Arc::new(StdMutex::new(Vec::new()));

@@ -282,10 +282,7 @@ async fn start_echo_servers() -> Result<(), Box<dyn std::error::Error>> {
             };
             tokio::spawn(async move {
                 let mut bytes = [0; 8192];
-                loop {
-                    let Ok(length) = stream.read(&mut bytes).await else {
-                        break;
-                    };
+                while let Ok(length) = stream.read(&mut bytes).await {
                     if length == 0 || stream.write_all(&bytes[..length]).await.is_err() {
                         break;
                     }
@@ -396,13 +393,10 @@ fn assert_output_ok(operation: &str, output: Output) -> Result<(), Box<dyn std::
     if output.status.success() {
         return Ok(());
     }
-    Err(io::Error::new(
-        io::ErrorKind::Other,
-        format!(
-            "{operation} failed with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ),
-    )
+    Err(io::Error::other(format!(
+        "{operation} failed with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    ))
     .into())
 }

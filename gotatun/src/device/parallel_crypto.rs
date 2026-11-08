@@ -214,6 +214,7 @@ impl<T> OrderedCompletions<T> {
     /// Record AEAD completion and deliver this run when its slot range reaches the front.
     ///
     /// `None` marks a slot that completed without a packet, such as an invalid receive packet.
+    #[cfg(test)]
     pub(crate) async fn complete_run<F, Fut, E>(
         &self,
         first_slot: u64,

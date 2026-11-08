@@ -550,7 +550,7 @@ async fn complete_outgoing_batch<U: UdpSend + 'static>(
         let (first_counter, last_counter) = {
             let mut counters = counters;
             let first = counters.next();
-            let last = counters.last().or(first);
+            let last = counters.next_back().or(first);
             (first, last)
         };
         eprintln!(
@@ -1559,7 +1559,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                 &mut pending_completions,
             )
             .await?;
-            drop(pending_completions);
             if !peer.tunnel.has_queued_packets() {
                 drop(flush_guard.take());
                 return Ok(());
@@ -1960,7 +1959,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                             &mut pending_completions,
                         )
                         .await?;
-                        drop(pending_completions);
                         if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
                             eprintln!(
                                 "pipeline stage=incoming_peer_lock_acquired counter={counter}"
@@ -2035,7 +2033,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                             &mut pending_completions,
                         )
                         .await?;
-                        drop(pending_completions);
                         let result = peer.handle_incoming_packet(packet, addr);
                         match result {
                             TunnResult::Done | TunnResult::Err(_) => {}
@@ -2272,7 +2269,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 &mut pending_completions,
                             )
                             .await?;
-                            drop(pending_completions);
                             let Some(peer_addr) = peer.endpoint().addr else {
                                 tracing::error!("No endpoint");
                                 break;
