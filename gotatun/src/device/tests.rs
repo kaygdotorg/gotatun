@@ -322,6 +322,37 @@ async fn threaded_reverse_traffic_preserves_order_and_progress() {
     } = bob;
     let received_data_progress = Arc::new(AtomicUsize::new(0));
 
+    // Establish both peer sessions before the flood so the bounded handshake queue does not
+    // discard setup traffic and masquerade as an ordered-lane stall.
+    let alice_seed = mock::packet(b"duplex warm-up from Alice");
+    alice_tx
+        .send(alice_seed.clone())
+        .expect("the first endpoint accepts its warm-up packet");
+    let received_alice_seed = timeout(Duration::from_secs(2), bob_rx.recv())
+        .await
+        .expect("the first endpoint's warm-up packet reaches the second endpoint")
+        .expect("the second endpoint remains open during setup");
+    assert_eq!(received_alice_seed.as_bytes(), alice_seed.as_bytes());
+
+    let bob_seed = mock::packet(b"duplex warm-up from Bob");
+    bob_tx
+        .send(bob_seed.clone())
+        .expect("the second endpoint accepts its warm-up packet");
+    let received_bob_seed = timeout(Duration::from_secs(2), alice_rx.recv())
+        .await
+        .expect("the second endpoint's warm-up packet reaches the first endpoint")
+        .expect("the first endpoint remains open during setup");
+    assert_eq!(received_bob_seed.as_bytes(), bob_seed.as_bytes());
+
+    alice_input
+        .lock()
+        .expect("the first endpoint's input-order record is not poisoned")
+        .clear();
+    bob_input
+        .lock()
+        .expect("the second endpoint's input-order record is not poisoned")
+        .clear();
+
     let alice_producer = thread::Builder::new()
         .name("data-packet-producer".into())
         .spawn(move || {

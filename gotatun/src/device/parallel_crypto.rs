@@ -212,6 +212,38 @@ impl<T> OrderedCompletions<T> {
         &self,
         first_slot: u64,
         results: Vec<Option<T>>,
+        deliver: F,
+    ) -> Result<(), E>
+    where
+        F: FnMut(Vec<Option<T>>) -> Fut,
+        Fut: Future<Output = Result<(), E>>,
+    {
+        self.complete_run_inner(None, first_slot, results, deliver)
+            .await
+    }
+
+    /// Complete a run with the peer and direction attached to its diagnostics.
+    pub(crate) async fn complete_run_traced<F, Fut, E>(
+        &self,
+        direction: &'static str,
+        peer_key: usize,
+        first_slot: u64,
+        results: Vec<Option<T>>,
+        deliver: F,
+    ) -> Result<(), E>
+    where
+        F: FnMut(Vec<Option<T>>) -> Fut,
+        Fut: Future<Output = Result<(), E>>,
+    {
+        self.complete_run_inner(Some((direction, peer_key)), first_slot, results, deliver)
+            .await
+    }
+
+    async fn complete_run_inner<F, Fut, E>(
+        &self,
+        diagnostic_lane: Option<(&'static str, usize)>,
+        first_slot: u64,
+        results: Vec<Option<T>>,
         mut deliver: F,
     ) -> Result<(), E>
     where
@@ -242,9 +274,15 @@ impl<T> OrderedCompletions<T> {
             state.crypto_pending -= run_len;
         }
         if diagnostic {
-            eprintln!(
-                "pipeline stage=ordered_completion_ready first_slot={first_slot} packets={run_len}"
-            );
+            if let Some((direction, peer_key)) = diagnostic_lane {
+                eprintln!(
+                    "pipeline stage=ordered_completion_ready direction={direction} peer={peer_key} first_slot={first_slot} packets={run_len}"
+                );
+            } else {
+                eprintln!(
+                    "pipeline stage=ordered_completion_ready first_slot={first_slot} packets={run_len}"
+                );
+            }
         }
 
         loop {
@@ -253,11 +291,25 @@ impl<T> OrderedCompletions<T> {
             notified.as_mut().enable();
 
             if diagnostic {
-                eprintln!("pipeline stage=ordered_delivery_lock_wait first_slot={first_slot}");
+                if let Some((direction, peer_key)) = diagnostic_lane {
+                    eprintln!(
+                        "pipeline stage=ordered_delivery_lock_wait direction={direction} peer={peer_key} first_slot={first_slot}"
+                    );
+                } else {
+                    eprintln!("pipeline stage=ordered_delivery_lock_wait first_slot={first_slot}");
+                }
             }
             let delivery = self.delivery.lock().await;
             if diagnostic {
-                eprintln!("pipeline stage=ordered_delivery_lock_acquired first_slot={first_slot}");
+                if let Some((direction, peer_key)) = diagnostic_lane {
+                    eprintln!(
+                        "pipeline stage=ordered_delivery_lock_acquired direction={direction} peer={peer_key} first_slot={first_slot}"
+                    );
+                } else {
+                    eprintln!(
+                        "pipeline stage=ordered_delivery_lock_acquired first_slot={first_slot}"
+                    );
+                }
             }
             let (is_next_run, next_release, wait_snapshot) = {
                 let mut state = self.state.lock();
@@ -292,9 +344,15 @@ impl<T> OrderedCompletions<T> {
                 if diagnostic {
                     let (next_slot, next_delivered, in_flight, crypto_pending, completed) =
                         wait_snapshot.expect("diagnostics capture an ordered wait snapshot");
-                    eprintln!(
-                        "pipeline stage=ordered_wait_predecessor first_slot={first_slot} next_release={next_release} next_slot={next_slot} next_delivered={next_delivered} in_flight={in_flight} crypto_pending={crypto_pending} completed={completed:?}"
-                    );
+                    if let Some((direction, peer_key)) = diagnostic_lane {
+                        eprintln!(
+                            "pipeline stage=ordered_wait_predecessor direction={direction} peer={peer_key} first_slot={first_slot} next_release={next_release} next_slot={next_slot} next_delivered={next_delivered} in_flight={in_flight} crypto_pending={crypto_pending} completed={completed:?}"
+                        );
+                    } else {
+                        eprintln!(
+                            "pipeline stage=ordered_wait_predecessor first_slot={first_slot} next_release={next_release} next_slot={next_slot} next_delivered={next_delivered} in_flight={in_flight} crypto_pending={crypto_pending} completed={completed:?}"
+                        );
+                    }
                 }
                 drop(delivery);
                 notified.await;
@@ -302,14 +360,27 @@ impl<T> OrderedCompletions<T> {
             }
 
             if diagnostic {
-                eprintln!("pipeline stage=ordered_delivery_start first_slot={first_slot}");
+                if let Some((direction, peer_key)) = diagnostic_lane {
+                    eprintln!(
+                        "pipeline stage=ordered_delivery_start direction={direction} peer={peer_key} first_slot={first_slot}"
+                    );
+                } else {
+                    eprintln!("pipeline stage=ordered_delivery_start first_slot={first_slot}");
+                }
             }
             let result = deliver(results).await;
             if diagnostic {
-                eprintln!(
-                    "pipeline stage=ordered_delivery_done first_slot={first_slot} success={}",
-                    result.is_ok()
-                );
+                if let Some((direction, peer_key)) = diagnostic_lane {
+                    eprintln!(
+                        "pipeline stage=ordered_delivery_done direction={direction} peer={peer_key} first_slot={first_slot} success={}",
+                        result.is_ok()
+                    );
+                } else {
+                    eprintln!(
+                        "pipeline stage=ordered_delivery_done first_slot={first_slot} success={}",
+                        result.is_ok()
+                    );
+                }
             }
             {
                 let mut state = self.state.lock();

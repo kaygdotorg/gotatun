@@ -461,7 +461,7 @@ async fn complete_outgoing_packet<U: UdpSend>(
         .unwrap_or_else(|| vec![None]);
 
     let _ = lane
-        .complete_run(slot, packets, |mut packets| {
+        .complete_run_traced("outgoing", peer_key, slot, packets, |mut packets| {
             #[cfg(feature = "daita")]
             let peer_arc = Arc::clone(&peer_arc);
             let udp = udp.clone();
@@ -559,7 +559,7 @@ async fn complete_outgoing_batch<U: UdpSend + 'static>(
     }
 
     let _ = lane
-        .complete_run(first_slot, packets, |packets| {
+        .complete_run_traced("outgoing", peer_key, first_slot, packets, |packets| {
             let peer_arc = Arc::clone(&peer_arc);
             let udp = udp.clone();
             let send_many_buf = Arc::clone(&send_many_buf);
@@ -1394,7 +1394,12 @@ impl<T: DeviceTransports> DeviceState<T> {
                         });
 
                     let result = lane
-                        .complete_run(batch_first_slot, results, |completions| {
+                        .complete_run_traced(
+                            "incoming",
+                            peer_key,
+                            batch_first_slot,
+                            results,
+                            |completions| {
                             let device = device.clone();
                             let peer_arc = Arc::clone(&peer_arc);
                             let tun_tx = tun_tx.clone();
@@ -1408,7 +1413,8 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 )
                                 .await
                             }
-                        })
+                            },
+                        )
                         .await;
                     if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
                         || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some()
@@ -2212,6 +2218,9 @@ impl<T: DeviceTransports> DeviceState<T> {
             tokio::select! {
                 completed = pending.next(), if !pending.is_empty() => {
                     let _ = completed;
+                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                        eprintln!("pipeline stage=outgoing_pending_complete remaining={}", pending.len());
+                    }
                 }
                 packets = tun_rx.recv(&mut packet_pool) => {
                     let packets = match packets {
@@ -2351,10 +2360,22 @@ impl<T: DeviceTransports> DeviceState<T> {
 
                             let batch_count = prepared.len().div_ceil(CRYPTO_BATCH_SIZE);
                             while pending.len() + batch_count > CRYPTO_CHUNK_SIZE {
+                                if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                    eprintln!(
+                                        "pipeline stage=outgoing_pending_wait peer={peer_key} pending={} batches={batch_count}",
+                                        pending.len()
+                                    );
+                                }
                                 pending
                                     .next()
                                     .await
                                     .expect("a full outgoing run has a completion future");
+                                if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                    eprintln!(
+                                        "pipeline stage=outgoing_pending_wake peer={peer_key} pending={}",
+                                        pending.len()
+                                    );
+                                }
                             }
                             let batch_context = OutgoingBatchContext {
                                 peer: OutgoingPeerContext {
