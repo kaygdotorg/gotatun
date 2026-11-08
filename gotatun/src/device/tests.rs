@@ -347,8 +347,14 @@ async fn j369_control_drain_progresses_with_a_queued_device_writer() {
         .now_or_never()
         .expect("the control drain released the read guard to the queued writer");
     drop(writer_guard);
-    let progressed = futures::poll!(drain.as_mut()).is_ready();
-    drain.await.unwrap();
+    let progressed = match futures::poll!(drain.as_mut()) {
+        std::task::Poll::Ready(result) => {
+            result.expect("the control drain completes after the writer releases its guard");
+            true
+        }
+        std::task::Poll::Pending => false,
+    };
+    drop(drain);
     alice.device.stop().await;
     bob.device.stop().await;
     assert!(
