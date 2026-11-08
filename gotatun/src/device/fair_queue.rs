@@ -35,19 +35,7 @@ enum FlowDiscriminator {
 }
 
 /// Identify an inner flow without depending on payload bytes or trusting packet lengths.
-#[cfg(test)]
 pub(super) fn packet_flow_key(packet: &Packet<Ip>) -> FlowKey {
-    packet_flow_classification(packet).1
-}
-
-/// Return the parsed destination together with the flow key so a batch can reuse that parse for routing.
-pub(super) fn packet_flow_key_and_destination(packet: &Packet<Ip>) -> Option<(IpAddr, FlowKey)> {
-    let (destination, flow) = packet_flow_classification(packet);
-    destination.map(|destination| (destination, flow))
-}
-
-/// Parse a packet's routing and flow fields once, preserving the flow-key fallback for malformed data.
-fn packet_flow_classification(packet: &Packet<Ip>) -> (Option<IpAddr>, FlowKey) {
     let bytes = packet.as_bytes();
     let version = bytes.first().map_or(0, |first| first >> 4);
     let unspecified = match version {
@@ -55,8 +43,7 @@ fn packet_flow_classification(packet: &Packet<Ip>) -> (Option<IpAddr>, FlowKey) 
         _ => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
     };
     let source = packet.source().unwrap_or(unspecified);
-    let parsed_destination = packet.destination();
-    let destination = parsed_destination.unwrap_or(unspecified);
+    let destination = packet.destination().unwrap_or(unspecified);
 
     let (protocol, discriminator) = match version {
         4 => ipv4_flow_discriminator(bytes),
@@ -64,15 +51,12 @@ fn packet_flow_classification(packet: &Packet<Ip>) -> (Option<IpAddr>, FlowKey) 
         _ => (0, FlowDiscriminator::Network),
     };
 
-    (
-        parsed_destination,
-        FlowKey {
-            source,
-            destination,
-            protocol,
-            discriminator,
-        },
-    )
+    FlowKey {
+        source,
+        destination,
+        protocol,
+        discriminator,
+    }
 }
 
 fn ipv4_flow_discriminator(bytes: &[u8]) -> (u8, FlowDiscriminator) {
@@ -191,7 +175,6 @@ fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
 ///
 /// The caller passes only packets from the current bounded receive batch. The function retains no
 /// packets after returning, and stable FIFO order is preserved within each peer and inner flow.
-#[cfg(test)]
 pub(super) fn fair_schedule_routed_batch<P, M>(
     packets: impl IntoIterator<Item = (P, Packet<Ip>, M)>,
 ) -> Vec<(Packet<Ip>, M)>
@@ -213,222 +196,11 @@ struct PeerQueue<T> {
     active_flows: VecDeque<usize>,
 }
 
-/// Bound the peer and destination buckets used during one packet batch.
-pub(super) const MAX_PEER_BUCKETS: usize = 8;
-const MAX_FLOW_BUCKETS_PER_PEER: usize = 16;
-const NO_PACKET: usize = usize::MAX;
-
-/// Cache a small set of per-batch lookups without hashing or growing past its fixed capacity.
-///
-/// The caller must still revalidate routes before sending. When the cache is full, lookups continue
-/// normally and the result is not retained.
-pub(super) struct BatchRouteCache<K, V, const N: usize> {
-    entries: [Option<(K, V)>; N],
-    len: usize,
-}
-
-impl<K, V, const N: usize> BatchRouteCache<K, V, N>
-where
-    K: Copy + Eq,
-    V: Copy,
-{
-    /// Create an empty cache whose storage is fixed at compile time.
-    pub(super) const fn new() -> Self {
-        Self {
-            entries: [None; N],
-            len: 0,
-        }
-    }
-
-    /// Return a cached value for `key`, or call `lookup` and remember it when space remains.
-    pub(super) fn get_or_insert_with(&mut self, key: K, lookup: impl FnOnce(K) -> V) -> V {
-        for (cached_key, cached_value) in self.entries[..self.len].iter().flatten() {
-            if *cached_key == key {
-                return *cached_value;
-            }
-        }
-
-        let value = lookup(key);
-        if self.len < N {
-            self.entries[self.len] = Some((key, value));
-            self.len += 1;
-        }
-        value
-    }
-}
-
-#[derive(Clone, Copy)]
-struct FlowBucket {
-    representative: usize,
-    head: usize,
-    tail: usize,
-}
-
-impl FlowBucket {
-    const EMPTY: Self = Self {
-        representative: NO_PACKET,
-        head: NO_PACKET,
-        tail: NO_PACKET,
-    };
-
-    const fn new(representative: usize) -> Self {
-        Self {
-            representative,
-            head: NO_PACKET,
-            tail: NO_PACKET,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PeerBucket {
-    representative: usize,
-    flows: [FlowBucket; MAX_FLOW_BUCKETS_PER_PEER],
-    flow_count: usize,
-    next_flow: usize,
-    packet_count: usize,
-}
-
-impl PeerBucket {
-    const EMPTY: Self = Self {
-        representative: NO_PACKET,
-        flows: [FlowBucket::EMPTY; MAX_FLOW_BUCKETS_PER_PEER],
-        flow_count: 0,
-        next_flow: 0,
-        packet_count: 0,
-    };
-
-    const fn new(representative: usize) -> Self {
-        Self {
-            representative,
-            ..Self::EMPTY
-        }
-    }
-}
-
 /// Return the batch in hierarchical round-robin order, keeping FIFO within each flow.
 ///
 /// The caller supplies one already-bounded receive batch. This scheduler only moves its packets
 /// between temporary per-flow queues; it never retains work across calls.
 pub(super) fn fair_schedule<P, F, T>(packets: impl IntoIterator<Item = (P, F, T)>) -> Vec<T>
-where
-    P: Eq + Hash,
-    F: Eq + Hash,
-{
-    let mut batch = packets
-        .into_iter()
-        .map(|(peer, flow, packet)| (peer, flow, Some(packet)))
-        .collect::<Vec<_>>();
-    if batch.is_empty() {
-        return Vec::new();
-    }
-
-    let one_flow = batch[1..]
-        .iter()
-        .all(|(peer, flow, _)| peer == &batch[0].0 && flow == &batch[0].1);
-    if one_flow {
-        let mut scheduled = Vec::with_capacity(batch.len());
-        for (_, _, packet) in batch {
-            scheduled.push(packet.expect("batch packets are present before scheduling"));
-        }
-        return scheduled;
-    }
-
-    let packet_count = batch.len();
-    let mut next_packet = vec![NO_PACKET; packet_count];
-    let mut peer_buckets = [PeerBucket::EMPTY; MAX_PEER_BUCKETS];
-    let mut peer_count = 0;
-
-    for index in 0..packet_count {
-        let peer_index = peer_buckets[..peer_count]
-            .iter()
-            .position(|peer| batch[peer.representative].0 == batch[index].0);
-        let peer_index = match peer_index {
-            Some(peer_index) => peer_index,
-            None if peer_count < MAX_PEER_BUCKETS => {
-                peer_buckets[peer_count] = PeerBucket::new(index);
-                let peer_index = peer_count;
-                peer_count += 1;
-                peer_index
-            }
-            None => return fair_schedule_hashed_batch(batch),
-        };
-
-        let peer = &mut peer_buckets[peer_index];
-        let flow_index = peer.flows[..peer.flow_count]
-            .iter()
-            .position(|flow| batch[flow.representative].1 == batch[index].1);
-        let flow_index = match flow_index {
-            Some(flow_index) => flow_index,
-            None if peer.flow_count < MAX_FLOW_BUCKETS_PER_PEER => {
-                let flow_index = peer.flow_count;
-                peer.flows[flow_index] = FlowBucket::new(index);
-                peer.flow_count += 1;
-                flow_index
-            }
-            None => return fair_schedule_hashed_batch(batch),
-        };
-
-        let flow = &mut peer.flows[flow_index];
-        if flow.tail == NO_PACKET {
-            flow.head = index;
-        } else {
-            next_packet[flow.tail] = index;
-        }
-        flow.tail = index;
-        peer.packet_count += 1;
-    }
-
-    let mut scheduled = Vec::with_capacity(packet_count);
-    let mut remaining = packet_count;
-    let mut peer_cursor = 0;
-    while remaining > 0 {
-        while peer_buckets[peer_cursor].packet_count == 0 {
-            peer_cursor = (peer_cursor + 1) % peer_count;
-        }
-
-        let packet_index = {
-            let peer = &mut peer_buckets[peer_cursor];
-            let mut flow_index = peer.next_flow;
-            while peer.flows[flow_index].head == NO_PACKET {
-                flow_index = (flow_index + 1) % peer.flow_count;
-            }
-
-            let flow = &mut peer.flows[flow_index];
-            let packet_index = flow.head;
-            flow.head = next_packet[packet_index];
-            if flow.head == NO_PACKET {
-                flow.tail = NO_PACKET;
-            }
-            peer.packet_count -= 1;
-            peer.next_flow = (flow_index + 1) % peer.flow_count;
-            packet_index
-        };
-
-        let (_, _, packet) = &mut batch[packet_index];
-        scheduled.push(packet.take().expect("scheduled packet is present"));
-        remaining -= 1;
-        peer_cursor = (peer_cursor + 1) % peer_count;
-    }
-
-    scheduled
-}
-
-fn fair_schedule_hashed_batch<P, F, T>(batch: Vec<(P, F, Option<T>)>) -> Vec<T>
-where
-    P: Eq + Hash,
-    F: Eq + Hash,
-{
-    fair_schedule_hashed(batch.into_iter().map(|(peer, flow, packet)| {
-        (
-            peer,
-            flow,
-            packet.expect("batch packets are present before fallback scheduling"),
-        )
-    }))
-}
-
-fn fair_schedule_hashed<P, F, T>(packets: impl IntoIterator<Item = (P, F, T)>) -> Vec<T>
 where
     P: Eq + Hash,
     F: Eq + Hash,
@@ -502,15 +274,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        BatchRouteCache, fair_schedule, fair_schedule_routed_batch, packet_flow_key,
-        packet_flow_key_and_destination,
-    };
+    use super::{fair_schedule, fair_schedule_routed_batch, packet_flow_key};
     use crate::packet::{Ip, Packet};
-    use std::hash::{Hash, Hasher};
-    use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A sparse flow gets service between packets from one bulk flow.
     #[test]
@@ -562,120 +327,6 @@ mod tests {
         let scheduled = fair_schedule([(1, 10, "first"), (1, 10, "second"), (1, 10, "third")]);
 
         assert_eq!(scheduled, ["first", "second", "third"]);
-    }
-
-    /// A bulk batch on one peer and flow keeps FIFO without hashing keys into scheduler maps.
-    #[test]
-    fn single_flow_batch_skips_hash_maps() {
-        let hash_calls = Arc::new(AtomicUsize::new(0));
-        let scheduled = fair_schedule((0..256).map(|packet| {
-            (
-                HashCountingKey::new(1, &hash_calls),
-                HashCountingKey::new(10, &hash_calls),
-                packet,
-            )
-        }));
-
-        assert_eq!(scheduled, (0..256).collect::<Vec<_>>());
-        assert_eq!(hash_calls.load(Ordering::Relaxed), 0);
-    }
-
-    /// A small mixed-flow batch keeps sparse-flow priority without hashing every flow key.
-    #[test]
-    fn small_mixed_flow_batch_skips_hash_maps() {
-        let hash_calls = Arc::new(AtomicUsize::new(0));
-        let key = |value| HashCountingKey::new(value, &hash_calls);
-        let scheduled = fair_schedule([
-            (key(1), key(10), "bulk-0"),
-            (key(1), key(10), "bulk-1"),
-            (key(1), key(11), "probe-0"),
-            (key(1), key(10), "bulk-2"),
-            (key(1), key(11), "probe-1"),
-        ]);
-
-        assert_eq!(
-            scheduled,
-            ["bulk-0", "probe-0", "bulk-1", "probe-1", "bulk-2"]
-        );
-        assert_eq!(hash_calls.load(Ordering::Relaxed), 0);
-    }
-
-    /// A repeated batch destination reuses its route result without growing the fixed cache.
-    #[test]
-    fn batch_route_cache_reuses_and_bounds_lookups() {
-        let mut cache = BatchRouteCache::<u8, Option<u8>, 1>::new();
-        let mut lookups = 0;
-
-        assert_eq!(
-            cache.get_or_insert_with(1, |_| {
-                lookups += 1;
-                Some(10)
-            }),
-            Some(10)
-        );
-        assert_eq!(
-            cache.get_or_insert_with(1, |_| {
-                lookups += 1;
-                Some(11)
-            }),
-            Some(10)
-        );
-        assert_eq!(
-            cache.get_or_insert_with(2, |_| {
-                lookups += 1;
-                Some(20)
-            }),
-            Some(20)
-        );
-        assert_eq!(
-            cache.get_or_insert_with(2, |_| {
-                lookups += 1;
-                Some(21)
-            }),
-            Some(21)
-        );
-        assert_eq!(lookups, 3);
-    }
-
-    /// The flow classifier exposes the destination so routing can reuse the same parse.
-    #[test]
-    fn flow_classification_returns_destination_for_route_lookup() {
-        let packet = packet_v4(6, 0, 0, &[0x13, 0x88, 0x01, 0xbb, 1]);
-
-        let (destination, flow) = packet_flow_key_and_destination(&packet).unwrap();
-
-        assert_eq!(destination, IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)));
-        assert_eq!(flow.destination, destination);
-    }
-
-    #[derive(Clone)]
-    struct HashCountingKey {
-        value: u8,
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl HashCountingKey {
-        fn new(value: u8, calls: &Arc<AtomicUsize>) -> Self {
-            Self {
-                value,
-                calls: Arc::clone(calls),
-            }
-        }
-    }
-
-    impl PartialEq for HashCountingKey {
-        fn eq(&self, other: &Self) -> bool {
-            self.value == other.value
-        }
-    }
-
-    impl Eq for HashCountingKey {}
-
-    impl Hash for HashCountingKey {
-        fn hash<H: Hasher>(&self, state: &mut H) {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            self.value.hash(state);
-        }
     }
 
     /// TCP packets in one five-tuple stay together, while another source port is a separate flow.
