@@ -223,7 +223,8 @@ impl<T> OrderedCompletions<T> {
         let end_slot = first_slot
             .checked_add(run_len as u64)
             .expect("a peer crypto sequence cannot wrap");
-        let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some();
+        let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
+            || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some();
         {
             let mut state = self.state.lock();
             assert!(

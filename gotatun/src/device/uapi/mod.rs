@@ -485,7 +485,9 @@ impl<T: DeviceTransports> DeviceState<T> {
 async fn on_api_get(_: Get, d: &DeviceState<impl DeviceTransports>) -> GetResponse {
     let mut peers = vec![];
     for (public_key, peer) in &d.peers {
-        let peer = peer.lock().await;
+        let peer_key = super::peer_order_key(peer);
+        let mut peer_trace = super::PeerLockDiagnostic::waiting("uapi_get", peer_key);
+        let peer = super::lock_peer_state(peer, "uapi_get", peer_key, &mut peer_trace).await;
         let (_, tx_bytes, rx_bytes, ..) = peer.tunnel.stats();
         let endpoint = peer.endpoint().addr;
         #[cfg(feature = "daita-uapi")]
@@ -632,7 +634,16 @@ async fn on_api_set(
             }
             Some(old_peer) => {
                 // Take existing peer
-                let peer = old_peer.lock().await;
+                let peer_key = super::peer_order_key(&old_peer);
+                let mut peer_trace =
+                    super::PeerLockDiagnostic::waiting("uapi_replace_peer", peer_key);
+                let peer = super::lock_peer_state(
+                    &old_peer,
+                    "uapi_replace_peer",
+                    peer_key,
+                    &mut peer_trace,
+                )
+                .await;
 
                 crate::device::Peer {
                     public_key,
