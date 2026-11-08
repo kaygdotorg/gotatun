@@ -35,7 +35,19 @@ enum FlowDiscriminator {
 }
 
 /// Identify an inner flow without depending on payload bytes or trusting packet lengths.
+#[cfg(test)]
 pub(super) fn packet_flow_key(packet: &Packet<Ip>) -> FlowKey {
+    packet_flow_classification(packet).1
+}
+
+/// Parse the destination and flow identity together so routing can reuse the same header parse.
+pub(super) fn packet_flow_key_and_destination(packet: &Packet<Ip>) -> Option<(IpAddr, FlowKey)> {
+    let (destination, flow) = packet_flow_classification(packet);
+    destination.map(|destination| (destination, flow))
+}
+
+/// Parse a packet's routing and flow fields once, preserving a stable fallback for malformed data.
+fn packet_flow_classification(packet: &Packet<Ip>) -> (Option<IpAddr>, FlowKey) {
     let bytes = packet.as_bytes();
     let version = bytes.first().map_or(0, |first| first >> 4);
     let unspecified = match version {
@@ -43,7 +55,8 @@ pub(super) fn packet_flow_key(packet: &Packet<Ip>) -> FlowKey {
         _ => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
     };
     let source = packet.source().unwrap_or(unspecified);
-    let destination = packet.destination().unwrap_or(unspecified);
+    let parsed_destination = packet.destination();
+    let destination = parsed_destination.unwrap_or(unspecified);
 
     let (protocol, discriminator) = match version {
         4 => ipv4_flow_discriminator(bytes),
@@ -51,12 +64,15 @@ pub(super) fn packet_flow_key(packet: &Packet<Ip>) -> FlowKey {
         _ => (0, FlowDiscriminator::Network),
     };
 
-    FlowKey {
-        source,
-        destination,
-        protocol,
-        discriminator,
-    }
+    (
+        parsed_destination,
+        FlowKey {
+            source,
+            destination,
+            protocol,
+            discriminator,
+        },
+    )
 }
 
 fn ipv4_flow_discriminator(bytes: &[u8]) -> (u8, FlowDiscriminator) {
@@ -175,6 +191,7 @@ fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
 ///
 /// The caller passes only packets from the current bounded receive batch. The function retains no
 /// packets after returning, and stable FIFO order is preserved within each peer and inner flow.
+#[cfg(test)]
 pub(super) fn fair_schedule_routed_batch<P, M>(
     packets: impl IntoIterator<Item = (P, Packet<Ip>, M)>,
 ) -> Vec<(Packet<Ip>, M)>
@@ -194,6 +211,45 @@ struct FlowQueue<T> {
 struct PeerQueue<T> {
     flows: Vec<FlowQueue<T>>,
     active_flows: VecDeque<usize>,
+}
+
+/// Bound the route lookups cached while classifying one packet batch.
+pub(super) const MAX_PEER_BUCKETS: usize = 8;
+
+/// Reuse route lookups for repeated destinations without growing past a fixed capacity.
+pub(super) struct BatchRouteCache<K, V, const N: usize> {
+    entries: [Option<(K, V)>; N],
+    len: usize,
+}
+
+impl<K, V, const N: usize> BatchRouteCache<K, V, N>
+where
+    K: Copy + Eq,
+    V: Copy,
+{
+    /// Create an empty cache whose storage is fixed at compile time.
+    pub(super) const fn new() -> Self {
+        Self {
+            entries: [None; N],
+            len: 0,
+        }
+    }
+
+    /// Return a cached value or look it up once when fixed capacity remains.
+    pub(super) fn get_or_insert_with(&mut self, key: K, lookup: impl FnOnce(K) -> V) -> V {
+        for (cached_key, cached_value) in self.entries[..self.len].iter().flatten() {
+            if *cached_key == key {
+                return *cached_value;
+            }
+        }
+
+        let value = lookup(key);
+        if self.len < N {
+            self.entries[self.len] = Some((key, value));
+            self.len += 1;
+        }
+        value
+    }
 }
 
 /// Return the batch in hierarchical round-robin order, keeping FIFO within each flow.
@@ -274,8 +330,43 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{fair_schedule, fair_schedule_routed_batch, packet_flow_key};
+    use super::{BatchRouteCache, fair_schedule, fair_schedule_routed_batch, packet_flow_key};
     use crate::packet::{Ip, Packet};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    /// Repeated destinations in one batch reuse the same route lookup.
+    #[test]
+    fn batch_route_cache_reuses_lookup_for_a_repeated_destination() {
+        let mut cache = BatchRouteCache::<u8, usize, 2>::new();
+        let mut lookups = 0;
+
+        assert_eq!(
+            cache.get_or_insert_with(7, |key| {
+                lookups += 1;
+                usize::from(key)
+            }),
+            7
+        );
+        assert_eq!(
+            cache.get_or_insert_with(7, |key| {
+                lookups += 1;
+                usize::from(key)
+            }),
+            7
+        );
+        assert_eq!(lookups, 1);
+    }
+
+    /// The classifier returns the destination used by the route table alongside its flow key.
+    #[test]
+    fn flow_classification_returns_destination_for_route_lookup() {
+        let packet = packet_v4(6, 0, 0, &[0x13, 0x88, 0x01, 0xbb, 1]);
+
+        let (destination, flow) = super::packet_flow_key_and_destination(&packet).unwrap();
+
+        assert_eq!(destination, IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)));
+        assert_eq!(flow.destination, destination);
+    }
 
     /// A sparse flow gets service between packets from one bulk flow.
     #[test]
