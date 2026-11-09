@@ -1245,6 +1245,15 @@ async fn force_handshake() {
 
 /// Helper method to test that packets can be sent from one [`Device`] to another.
 /// Use `eavesdrop` to sniff wireguard packets and assert things about the connection.
+/// Deadline for one device-pair exchange in [`test_device_pair`]: the handshake, every packet
+/// from [`mock::packets_of_every_size`], and shutdown.
+///
+/// This catches a hang, not a slow run. A quiet host needs about 0.15–0.5 s in a debug build, but
+/// on a loaded build VM even the unmodified base needed over 1 s, so the old 1 s deadline failed
+/// both base and candidate there (#260 comments 88702 and 88507). The tests' assertions on packet
+/// contents, indices, counts and sizes don't depend on this value.
+const DEVICE_PAIR_DEADLINE: Duration = Duration::from_secs(10);
+
 async fn test_device_pair(eavesdrop: impl AsyncFnOnce(MockEavesdropper) + Send) {
     let (mut alice, mut bob, eve) = mock::device_pair().await;
 
@@ -1252,7 +1261,8 @@ async fn test_device_pair(eavesdrop: impl AsyncFnOnce(MockEavesdropper) + Send) 
     let eavesdrop = async {
         select! {
             _ = eavesdrop(eve) => {}
-            _ = sleep(Duration::from_secs(1)) => panic!("eavesdrop timeout"),
+            // sleep: bounds the eavesdropper until both devices shut down; see DEVICE_PAIR_DEADLINE.
+            _ = sleep(DEVICE_PAIR_DEADLINE) => panic!("eavesdrop timeout"),
         }
     };
 
@@ -1281,7 +1291,8 @@ async fn test_device_pair(eavesdrop: impl AsyncFnOnce(MockEavesdropper) + Send) 
             _ = wait_for_packets => {},
             _ = send_packets => unreachable!(),
             _ = alice.app_rx.recv() => panic!("no data is sent from bob to alice"),
-            _ = sleep(Duration::from_secs(1)) => panic!("timeout"),
+            // sleep: bounds delivery of every test packet; see DEVICE_PAIR_DEADLINE.
+            _ = sleep(DEVICE_PAIR_DEADLINE) => panic!("timeout"),
         }
 
         // Shut down alice and bob after `wait_for_packets`
