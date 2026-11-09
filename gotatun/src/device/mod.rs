@@ -1309,6 +1309,12 @@ impl<T: DeviceTransports> DeviceState<T> {
 
         if let Some(timer_params) = peer_builder.danger_timer_params {
             tunn.dangerously_set_timer_params(timer_params);
+        } else if let Some(rekey_after) = crate::diag::rekey_after() {
+            // Diagnostic only: frequent rekeys for rekey-under-load tests (see `diag`).
+            tunn.dangerously_set_timer_params(crate::noise::TimerParams {
+                rekey_after_time: rekey_after..=rekey_after,
+                ..Default::default()
+            });
         }
 
         PeerState::new(
