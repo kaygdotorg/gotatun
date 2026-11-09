@@ -42,6 +42,7 @@ impl<D> AllowedIps<D> {
         }
     }
 
+    #[cfg(test)]
     pub fn clear(&mut self) {
         self.ips = IpNetworkTable::new();
     }
@@ -60,12 +61,7 @@ impl<D> AllowedIps<D> {
         self.ips.retain(|_, v| !predicate(v));
     }
 
-    pub fn remove_network(&mut self, network: IpNetwork) {
-        let network = ip_network::IpNetwork::new_truncate(network.ip(), network.prefix())
-            .expect("cidr is valid length");
-        self.ips.remove(network);
-    }
-
+    #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = (&D, IpNetwork)> {
         self.ips.iter().map(|(ip_network, d)| {
             let ip_network = IpNetwork::new(ip_network.network_address(), ip_network.netmask())

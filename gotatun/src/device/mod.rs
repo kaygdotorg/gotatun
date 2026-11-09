@@ -11,6 +11,32 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! WireGuard device implementation with support for peers, handshakes, and packet routing.
+//!
+//! # Lock order
+//!
+//! 1. Configuration takes the async device lock first. A peer update then takes that peer's
+//!    mutex and briefly writes the synchronous packet lookup. Peer insertion/removal updates the
+//!    lookup while holding the device lock. Packet tasks receive the lookup and a weak task-
+//!    liveness token, never a device-lock handle, so they cannot reacquire the async device lock.
+//! 2. Packet tasks snapshot a peer or route under packet lookup and release its synchronous
+//!    read guard before awaiting the peer mutex. While holding a peer mutex they may briefly
+//!    recheck packet lookup, read the flush marker, or reserve through the order-store map and
+//!    lane state. These nested locks are taken in the order peer, lookup/flush marker/order store,
+//!    then lane state. No synchronous lookup or lane guard crosses an await.
+//! 3. Producers reserve while holding peer state. If capacity is unavailable, they release peer
+//!    state and wait for delivery progress. A handshake flush keeps its marker set and its peer
+//!    mutex held through reservation, then releases both before crypto dispatch or I/O; TUN work
+//!    arriving during a flush stays queued behind that range.
+//! 4. Completion code releases lane state before waiting for the async delivery gate. The gate
+//!    may then acquire peer state for replay or send delivery. A producer holding peer state only
+//!    takes lane metadata synchronously and never waits for the delivery gate.
+//! 5. Timers snapshot peers from packet lookup and release it before taking peer state. They
+//!    reserve under that peer mutex, skip a peer with an active handshake flush, and hold no
+//!    device, peer, or lane lock while sleeping or waiting for output.
+//!
+//! Connection setup snapshots the key pair, rate limiter, index table, MTU watcher, and lookup
+//! handle before spawning tasks. Running packet and timer tasks never reacquire the async device
+//! lock, so reconfiguration can hold its write guard while stopping and joining them.
 pub(crate) mod allowed_ips;
 mod builder;
 pub mod configure;
@@ -29,7 +55,7 @@ pub mod uapi;
 use crate::noise::index_table::IndexTable;
 use builder::Nul;
 use futures::{FutureExt, StreamExt, TryFutureExt, future::BoxFuture, stream::FuturesUnordered};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::ops::BitOrAssign;
@@ -144,17 +170,11 @@ type PendingOutgoing = FuturesUnordered<BoxFuture<'static, ()>>;
 /// Futures that finish one incoming worker result and release it toward the TUN in order.
 type PendingIncoming = FuturesUnordered<BoxFuture<'static, Result<(), Error>>>;
 
-/// Release the configuration snapshot before a control packet waits for incoming completions.
-///
-/// The peer was cloned from the snapshot before this call. A delivery callback may need the same
-/// device read lock, so retaining it while polling that callback can deadlock behind a queued
-/// configuration writer.
-async fn drain_incoming_before_control<T: DeviceTransports>(
-    device_guard: tokio::sync::RwLockReadGuard<'_, DeviceState<T>>,
+/// Drain prior data completions before a control packet mutates the same peer tunnel state.
+async fn drain_incoming_before_control(
     lane: Option<Arc<OrderedCompletions<IncomingCompletion>>>,
     incoming_pending: &mut PendingIncoming,
 ) -> Result<(), Error> {
-    drop(device_guard);
     if let Some(lane) = lane {
         while !lane.is_idle() {
             incoming_pending
@@ -208,11 +228,176 @@ impl PendingCompletions<'_> {
     }
 }
 
+/// Packet-facing peer maps that remain available while configuration owns the async device lock.
+///
+/// Each method returns cloned handles or updates one bounded map under a synchronous guard. A
+/// guard is never returned to a caller, so packet tasks cannot await peer state while holding the
+/// lookup lock.
+#[derive(Default)]
+struct PacketLookup {
+    state: parking_lot::RwLock<PacketLookupState>,
+}
+
+/// All packet-facing indices protected by one short synchronous read/write lock.
+struct PacketLookupState {
+    peers_by_key: HashMap<x25519::PublicKey, Arc<Mutex<PeerState>>>,
+    peer_ids: HashSet<usize>,
+    peers_by_ip: AllowedIps<Arc<Mutex<PeerState>>>,
+    peers_by_idx: HashMap<u32, Arc<Mutex<PeerState>>>,
+}
+
+/// Create empty packet indices without requiring the peer handle type to be defaultable.
+impl Default for PacketLookupState {
+    fn default() -> Self {
+        Self {
+            peers_by_key: HashMap::new(),
+            peer_ids: HashSet::new(),
+            peers_by_ip: AllowedIps::new(),
+            peers_by_idx: HashMap::new(),
+        }
+    }
+}
+
+impl PacketLookup {
+    /// Add a peer and its initial packet routes while configuration owns the device lock.
+    fn insert_peer(
+        &self,
+        public_key: x25519::PublicKey,
+        peer: Arc<Mutex<PeerState>>,
+        allowed_ips: impl IntoIterator<Item = ipnetwork::IpNetwork>,
+    ) {
+        let mut state = self.state.write();
+        state.peers_by_key.insert(public_key, Arc::clone(&peer));
+        state.peer_ids.insert(peer_order_key(&peer));
+        for allowed_ip in allowed_ips {
+            state
+                .peers_by_ip
+                .insert(allowed_ip.network(), allowed_ip.prefix(), Arc::clone(&peer));
+        }
+    }
+
+    /// Remove every packet index that points at a peer being removed.
+    fn remove_peer(&self, public_key: &x25519::PublicKey, peer: &Arc<Mutex<PeerState>>) {
+        let mut state = self.state.write();
+        if state
+            .peers_by_key
+            .get(public_key)
+            .is_some_and(|current| Arc::ptr_eq(current, peer))
+        {
+            state.peers_by_key.remove(public_key);
+        }
+        state.peer_ids.remove(&peer_order_key(peer));
+        state
+            .peers_by_idx
+            .retain(|_, current| !Arc::ptr_eq(current, peer));
+        state
+            .peers_by_ip
+            .remove(&|current: &Arc<Mutex<PeerState>>| Arc::ptr_eq(current, peer));
+    }
+
+    /// Replace the allowed-IP routes for a peer after its peer state has been updated.
+    fn replace_allowed_ips(
+        &self,
+        peer: &Arc<Mutex<PeerState>>,
+        allowed_ips: impl IntoIterator<Item = ipnetwork::IpNetwork>,
+    ) {
+        let mut state = self.state.write();
+        state
+            .peers_by_ip
+            .remove(&|current: &Arc<Mutex<PeerState>>| Arc::ptr_eq(current, peer));
+        for allowed_ip in allowed_ips {
+            state
+                .peers_by_ip
+                .insert(allowed_ip.network(), allowed_ip.prefix(), Arc::clone(peer));
+        }
+    }
+
+    /// Remove all packet-facing indices when the device clears its peer set.
+    fn clear(&self) {
+        *self.state.write() = PacketLookupState::default();
+    }
+
+    /// Clone the peer selected by an allowed source or destination address.
+    fn peer_by_ip(&self, address: IpAddr) -> Option<Arc<Mutex<PeerState>>> {
+        self.state.read().peers_by_ip.find(address).cloned()
+    }
+
+    /// Clone the configured peer with this static public key.
+    fn peer_by_key(&self, public_key: &x25519::PublicKey) -> Option<Arc<Mutex<PeerState>>> {
+        self.state.read().peers_by_key.get(public_key).cloned()
+    }
+
+    /// Clone the peer registered for a receiver index.
+    fn peer_by_index(&self, index: u32) -> Option<Arc<Mutex<PeerState>>> {
+        self.state.read().peers_by_idx.get(&index).cloned()
+    }
+
+    /// Snapshot peers for timer work without retaining lookup state.
+    fn peers(&self) -> Vec<Arc<Mutex<PeerState>>> {
+        self.state.read().peers_by_key.values().cloned().collect()
+    }
+
+    /// Whether this exact peer handle remains in the configured packet set.
+    fn contains_peer(&self, peer: &Arc<Mutex<PeerState>>) -> bool {
+        self.state.read().peer_ids.contains(&peer_order_key(peer))
+    }
+
+    /// Register a handshake sender index only while its peer is still configured.
+    fn register_handshake_idx(&self, packet: &WgKind, peer: &Arc<Mutex<PeerState>>) -> bool {
+        let sender_idx = match packet {
+            WgKind::HandshakeInit(packet) => Some(packet.sender_idx.get()),
+            WgKind::HandshakeResp(packet) => Some(packet.sender_idx.get()),
+            _ => None,
+        };
+        let mut state = self.state.write();
+        if !state.peer_ids.contains(&peer_order_key(peer)) {
+            return false;
+        }
+        if let Some(sender_idx) = sender_idx {
+            state.peers_by_idx.insert(sender_idx, Arc::clone(peer));
+        }
+        true
+    }
+
+    /// Drop session indices whose underlying index-table reservation has expired.
+    fn retain_live_indices(&self, index_table: &IndexTable) {
+        self.state
+            .write()
+            .peers_by_idx
+            .retain(|index, _| index_table.in_use(*index));
+    }
+}
+
 /// Prepared authenticated work gathered from one peer in a receive batch.
 struct PreparedIncomingRun {
     peer_key: usize,
     peer_arc: Arc<Mutex<PeerState>>,
     packets: Vec<(PreparedDecryption, std::net::SocketAddr)>,
+}
+
+/// Everything a running packet or timer task may use to reach shared device state.
+///
+/// This is the type-level form of lock-order rule 1 in the module docs. A task gets a weak
+/// liveness token and the synchronous packet lookup, and nothing that can reach the async
+/// device lock. Configuration can therefore hold the device write lock while it stops and joins
+/// these tasks, and a task waiting on peer state can never sit behind a queued configuration
+/// writer (J380 P1 on #260).
+#[derive(Clone)]
+struct PacketTaskHandles {
+    /// Upgrades only while the device still exists. Tasks stop once this fails.
+    liveness: Weak<()>,
+    /// Peer, route and session-index maps. Never hold one of its guards across an await.
+    lookup: Arc<PacketLookup>,
+}
+
+/// Device identity used by the UDP receive task to answer handshakes and rate-limit them.
+struct HandshakeResponder {
+    /// The device's static private key.
+    private_key: x25519::StaticSecret,
+    /// The public key matching `private_key`.
+    public_key: x25519::PublicKey,
+    /// Shared handshake rate limiter. Timers reset its counters.
+    rate_limiter: Arc<RateLimiter>,
 }
 
 /// Crypto stages and peer-order lanes shared by the UDP receive task.
@@ -226,7 +411,7 @@ struct CryptoOrderContext {
 }
 
 /// Shared state needed to enqueue and release one bounded receive run.
-struct IncomingRunContext<D, TunTx> {
+struct IncomingRunContext<TunTx> {
     /// Shared worker handle used for each bounded run.
     crypto: CryptoHandle,
     /// Peer lanes that retain the receive sequence until TUN delivery.
@@ -237,13 +422,15 @@ struct IncomingRunContext<D, TunTx> {
     lane: Arc<OrderedCompletions<IncomingCompletion>>,
     /// Peer state updated only after ordered replay validation.
     peer_arc: Arc<Mutex<PeerState>>,
-    /// Device state accessed when delivering authenticated packets.
-    device: Weak<RwLock<D>>,
+    /// Weak lifetime check without giving a queued callback access to the device lock.
+    device: Weak<()>,
+    /// Packet routes and session indices used without taking the async device lock.
+    lookup: Arc<PacketLookup>,
     /// Tunnel writer cloned by each bounded delivery future.
     tun_tx: TunTx,
 }
 
-impl<D, TunTx: Clone> Clone for IncomingRunContext<D, TunTx> {
+impl<TunTx: Clone> Clone for IncomingRunContext<TunTx> {
     /// Clone the shared handles needed by another run without cloning device state.
     fn clone(&self) -> Self {
         Self {
@@ -253,6 +440,7 @@ impl<D, TunTx: Clone> Clone for IncomingRunContext<D, TunTx> {
             lane: Arc::clone(&self.lane),
             peer_arc: Arc::clone(&self.peer_arc),
             device: self.device.clone(),
+            lookup: Arc::clone(&self.lookup),
             tun_tx: self.tun_tx.clone(),
         }
     }
@@ -695,6 +883,9 @@ pub(crate) struct DeviceState<T: DeviceTransports> {
     key_pair: Option<(x25519::StaticSecret, x25519::PublicKey)>,
     fwmark: Option<u32>,
 
+    /// Strong token used by packet tasks for a lifetime check without access to this device lock.
+    task_liveness: Arc<()>,
+
     tun_tx: Arc<Mutex<T::IpSend>>,
     /// The tun device reader.
     ///
@@ -710,8 +901,7 @@ pub(crate) struct DeviceState<T: DeviceTransports> {
     tun_rx_mtu: MtuWatcher,
 
     peers: HashMap<x25519::PublicKey, Arc<Mutex<PeerState>>>,
-    peers_by_ip: AllowedIps<Arc<Mutex<PeerState>>>,
-    peers_by_idx: parking_lot::Mutex<HashMap<u32, Arc<Mutex<PeerState>>>>,
+    packet_lookup: Arc<PacketLookup>,
     index_table: IndexTable,
 
     rate_limiter: Option<Arc<RateLimiter>>,
@@ -811,6 +1001,18 @@ impl<T: DeviceTransports> Connection<T> {
         let crypto = crypto_workers.handle();
         let outgoing_order = Arc::new(OrderStore::default());
         let incoming_order = Arc::new(OrderStore::default());
+        let (private_key, public_key) = device.key_pair.clone().expect("Key not set");
+        let rate_limiter = device
+            .rate_limiter
+            .as_ref()
+            .expect("Setting a private key creates a rate limiter")
+            .clone();
+        let index_table = device.index_table.clone();
+        let tun_rx_mtu = device.tun_rx_mtu.clone();
+        let handles = PacketTaskHandles {
+            liveness: Arc::downgrade(&device.task_liveness),
+            lookup: Arc::clone(&device.packet_lookup),
+        };
 
         let fatal_error = device.fatal_error.clone();
         let register_fatal_error = move |e| {
@@ -826,8 +1028,9 @@ impl<T: DeviceTransports> Connection<T> {
         // Start device tasks
         let outgoing = Task::spawn(
             "handle_outgoing",
-            DeviceState::handle_outgoing(
-                Arc::downgrade(&device_arc),
+            DeviceState::<T>::handle_outgoing(
+                handles.clone(),
+                tun_rx_mtu,
                 buffered_ip_rx,
                 buffered_udp_tx.clone(),
                 pool.clone(),
@@ -838,8 +1041,10 @@ impl<T: DeviceTransports> Connection<T> {
         );
         let timers = Task::spawn(
             "handle_timers",
-            DeviceState::handle_timers(
-                Arc::downgrade(&device_arc),
+            DeviceState::<T>::handle_timers(
+                handles.clone(),
+                index_table,
+                rate_limiter.clone(),
                 buffered_udp_tx.clone(),
                 crypto.clone(),
                 Arc::clone(&outgoing_order),
@@ -847,8 +1052,13 @@ impl<T: DeviceTransports> Connection<T> {
         );
         let incoming = Task::spawn(
             "handle_incoming",
-            DeviceState::handle_incoming(
-                Arc::downgrade(&device_arc),
+            DeviceState::<T>::handle_incoming(
+                handles,
+                HandshakeResponder {
+                    private_key,
+                    public_key,
+                    rate_limiter,
+                },
                 buffered_ip_tx.clone(),
                 buffered_udp_tx,
                 incoming_udp_rx,
@@ -969,35 +1179,48 @@ impl<T: DeviceTransports> Device<T> {
     ///
     /// Returns [`Error::PeerNotFound`] if the peer does not exist or is removed while waiting.
     pub async fn force_handshake(&self, public_key: &x25519::PublicKey) -> Result<(), Error> {
-        let mut completed = {
+        let (peer_arc, udp, packet_lookup) = {
             let device = self.inner.read().await;
             let connection = device.connection.as_ref().ok_or(Error::NotConnected)?;
-            let peer_arc = device.peers.get(public_key).ok_or(Error::PeerNotFound)?;
-
-            let peer_key = peer_order_key(peer_arc);
-            let mut peer_trace = PeerLockDiagnostic::waiting("force_handshake", peer_key);
-            let mut peer =
-                lock_peer_state(peer_arc, "force_handshake", peer_key, &mut peer_trace).await;
-            let Some(PendingHandshake {
-                completed,
-                initiation,
-            }) = peer.force_handshake()?
-            else {
-                return Ok(());
-            };
-
-            if let Some((packet, endpoint_addr)) = initiation {
-                let packet = WgKind::from(packet);
-                DeviceState::<T>::register_handshake_idx(&device.peers_by_idx, &packet, peer_arc);
-                drop(peer);
-                drop(peer_trace);
-
-                // NOTE: Like `handle_timers`, this does not trigger DAITA events.
-                connection.udp.send_to(packet.into(), endpoint_addr).await?;
-            }
-
-            completed
+            let peer_arc = Arc::clone(device.peers.get(public_key).ok_or(Error::PeerNotFound)?);
+            (
+                peer_arc,
+                connection.udp.clone(),
+                Arc::clone(&device.packet_lookup),
+            )
         };
+
+        let peer_key = peer_order_key(&peer_arc);
+        let mut peer_trace = PeerLockDiagnostic::waiting("force_handshake", peer_key);
+        let mut peer =
+            lock_peer_state(&peer_arc, "force_handshake", peer_key, &mut peer_trace).await;
+        if !packet_lookup.contains_peer(&peer_arc) {
+            return Err(Error::PeerNotFound);
+        }
+        let Some(PendingHandshake {
+            mut completed,
+            initiation,
+        }) = peer.force_handshake()?
+        else {
+            return Ok(());
+        };
+
+        let initiation = if let Some((packet, endpoint_addr)) = initiation {
+            let packet = WgKind::from(packet);
+            if !packet_lookup.register_handshake_idx(&packet, &peer_arc) {
+                return Err(Error::PeerNotFound);
+            }
+            Some((packet, endpoint_addr))
+        } else {
+            None
+        };
+        drop(peer);
+        drop(peer_trace);
+
+        if let Some((packet, endpoint_addr)) = initiation {
+            // NOTE: Like `handle_timers`, this does not trigger DAITA events.
+            udp.send_to(packet.into(), endpoint_addr).await?;
+        }
 
         // The sender is dropped along with the peer
         completed.changed().await.map_err(|_| Error::PeerNotFound)
@@ -1045,12 +1268,7 @@ impl BitOrAssign for Reconfigure {
 impl<T: DeviceTransports> DeviceState<T> {
     async fn remove_peer(&mut self, pub_key: &x25519::PublicKey) -> Option<Arc<Mutex<PeerState>>> {
         if let Some(peer) = self.peers.remove(pub_key) {
-            // Remove all session index entries that point to this peer
-            self.peers_by_idx
-                .lock()
-                .retain(|_idx, p| !Arc::ptr_eq(&peer, p));
-            self.peers_by_ip
-                .remove(&|p: &Arc<Mutex<PeerState>>| Arc::ptr_eq(&peer, p));
+            self.packet_lookup.remove_peer(pub_key, &peer);
 
             tracing::info!("Peer removed");
 
@@ -1067,12 +1285,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         let peer = Arc::new(Mutex::new(peer));
 
         self.peers.insert(pub_key, Arc::clone(&peer));
-
-        for allowed_ip in allowed_ips {
-            let addr = allowed_ip.network();
-            let cidr = allowed_ip.prefix();
-            self.peers_by_ip.insert(addr, cidr, Arc::clone(&peer));
-        }
+        self.packet_lookup.insert_peer(pub_key, peer, allowed_ips);
 
         tracing::info!("Peer added");
     }
@@ -1197,30 +1410,16 @@ impl<T: DeviceTransports> DeviceState<T> {
     fn clear_peers(&mut self) -> usize {
         let n = self.peers.len();
         self.peers.clear();
-        self.peers_by_idx.lock().clear();
-        self.peers_by_ip.clear();
+        self.packet_lookup.clear();
         // TODO: tear down connection?
         n
-    }
-
-    /// If `packet` is a handshake init or response, register its `sender_idx` in `peers_by_idx`.
-    fn register_handshake_idx(
-        peers_by_idx: &parking_lot::Mutex<HashMap<u32, Arc<Mutex<PeerState>>>>,
-        packet: &WgKind,
-        peer: &Arc<Mutex<PeerState>>,
-    ) {
-        let sender_idx = match packet {
-            WgKind::HandshakeInit(p) => p.sender_idx.get(),
-            WgKind::HandshakeResp(p) => p.sender_idx.get(),
-            _ => return,
-        };
-        peers_by_idx.lock().insert(sender_idx, Arc::clone(peer));
     }
 
     /// Finish a contiguous receive run while holding peer state only once, retaining its first slot for diagnostics.
     async fn deliver_incoming_run(
         first_slot: u64,
-        device: Weak<RwLock<Self>>,
+        device: Weak<()>,
+        lookup: Arc<PacketLookup>,
         peer_arc: Arc<Mutex<PeerState>>,
         completions: Vec<Option<IncomingCompletion>>,
         mut tun_tx: impl IpSend,
@@ -1233,15 +1432,10 @@ impl<T: DeviceTransports> DeviceState<T> {
                 "pipeline stage=incoming_delivery_callback_start completions={completion_count}"
             );
         }
-        let Some(device_arc) = device.upgrade() else {
+        if device.upgrade().is_none() {
             return Ok(());
-        };
-        if diagnostic {
-            eprintln!("pipeline stage=incoming_device_lock_wait");
         }
-        let device_guard = device_arc.read().await;
         if diagnostic {
-            eprintln!("pipeline stage=incoming_device_lock_acquired");
             eprintln!("pipeline stage=incoming_delivery_peer_lock_wait");
         }
         let peer_key = peer_order_key(&peer_arc);
@@ -1286,10 +1480,9 @@ impl<T: DeviceTransports> DeviceState<T> {
                 |ipv4| (ipv4.header.source().into(), ipv4.into()),
                 |ipv6| (ipv6.header.source().into(), ipv6.into()),
             );
-            let routed_to_this_peer = device_guard
-                .peers_by_ip
-                .find(source)
-                .is_some_and(|owner| Arc::ptr_eq(owner, &peer_arc));
+            let routed_to_this_peer = lookup
+                .peer_by_ip(source)
+                .is_some_and(|owner| Arc::ptr_eq(&owner, &peer_arc));
             if !routed_to_this_peer {
                 if cfg!(debug_assertions) {
                     let unspecified = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into();
@@ -1306,7 +1499,6 @@ impl<T: DeviceTransports> DeviceState<T> {
 
         drop(peer);
         drop(peer_trace);
-        drop(device_guard);
         let tunnel_packet_count = tun_packets.len();
         if diagnostic {
             eprintln!(
@@ -1354,7 +1546,7 @@ impl<T: DeviceTransports> DeviceState<T> {
     /// do not move a shallow queue off the inline path.
     fn enqueue_incoming_run<TunTx: IpSend + Clone>(
         pending: &mut PendingIncoming,
-        context: IncomingRunContext<Self, TunTx>,
+        context: IncomingRunContext<TunTx>,
         first_slot: u64,
         packets: Vec<(PreparedDecryption, std::net::SocketAddr)>,
     ) {
@@ -1365,6 +1557,7 @@ impl<T: DeviceTransports> DeviceState<T> {
             lane,
             peer_arc,
             device,
+            lookup,
             tun_tx,
         } = context;
         assert!(!packets.is_empty());
@@ -1382,6 +1575,7 @@ impl<T: DeviceTransports> DeviceState<T> {
             let lane = Arc::clone(&lane);
             let peer_arc = Arc::clone(&peer_arc);
             let device = device.clone();
+            let lookup = Arc::clone(&lookup);
             let tun_tx = tun_tx.clone();
             pending.push(
                 async move {
@@ -1423,12 +1617,14 @@ impl<T: DeviceTransports> DeviceState<T> {
                             results,
                             |completions| {
                             let device = device.clone();
+                            let lookup = Arc::clone(&lookup);
                             let peer_arc = Arc::clone(&peer_arc);
                             let tun_tx = tun_tx.clone();
                             async move {
                                 Self::deliver_incoming_run(
                                     batch_first_slot,
                                     device,
+                                    lookup,
                                     peer_arc,
                                     completions,
                                     tun_tx,
@@ -1463,7 +1659,8 @@ impl<T: DeviceTransports> DeviceState<T> {
         pending: &mut PendingIncoming,
         crypto: CryptoHandle,
         ordered: Arc<OrderStore<IncomingCompletion>>,
-        device: Weak<RwLock<Self>>,
+        device: Weak<()>,
+        lookup: Arc<PacketLookup>,
         tun_tx: impl IpSend + Clone,
         run: PreparedIncomingRun,
     ) -> Result<(), Error> {
@@ -1526,6 +1723,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                 lane,
                 peer_arc: run.peer_arc,
                 device,
+                lookup,
                 tun_tx,
             },
             first_slot,
@@ -1543,7 +1741,8 @@ impl<T: DeviceTransports> DeviceState<T> {
 
     /// Encrypt and send a bounded chunk of handshake-queued packets before newer TUN traffic.
     async fn flush_handshake_queue<U: UdpSend + 'static>(
-        device: Weak<RwLock<Self>>,
+        device: Weak<()>,
+        packet_lookup: Arc<PacketLookup>,
         context: OutgoingBatchContext<U>,
         first_lane: Arc<OrderedCompletions<WgKind>>,
         first_slot: u64,
@@ -1567,10 +1766,9 @@ impl<T: DeviceTransports> DeviceState<T> {
         wait_for_outgoing_slot(&first_lane, first_slot, pending).await;
 
         loop {
-            let Some(device_arc) = device.upgrade() else {
+            if device.upgrade().is_none() {
                 return Ok(());
-            };
-            let device_guard = device_arc.read().await;
+            }
             let mut peer_trace = PeerLockDiagnostic::waiting("handshake_queue_flush", peer_key);
             let mut pending_completions = PendingCompletions::Outgoing(pending);
             let mut peer = lock_peer_state_while_completing(
@@ -1594,7 +1792,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                 };
                 let prepared = peer.tunnel.prepare_queued_packet(packet);
                 if let Some(PreparedOutgoing::Ready(packet)) = prepared.as_ref() {
-                    Self::register_handshake_idx(&device_guard.peers_by_idx, packet, &peer_arc);
+                    packet_lookup.register_handshake_idx(packet, &peer_arc);
                     stop_after_chunk = true;
                 }
                 if prepared.is_none() {
@@ -1613,7 +1811,6 @@ impl<T: DeviceTransports> DeviceState<T> {
             }
             drop(peer);
             drop(peer_trace);
-            drop(device_guard);
 
             if jobs.is_empty() {
                 return Ok(());
@@ -1710,39 +1907,31 @@ impl<T: DeviceTransports> DeviceState<T> {
     /// Run periodic tunnel maintenance and send each peer's timer output in sequence.
     #[instrument(level = Level::TRACE, skip_all)]
     async fn handle_timers(
-        device: Weak<RwLock<Self>>,
+        handles: PacketTaskHandles,
+        index_table: IndexTable,
+        rate_limiter: Arc<RateLimiter>,
         udp: impl UdpSend,
         crypto: CryptoHandle,
         outgoing_order: Arc<OrderStore<WgKind>>,
     ) {
+        let PacketTaskHandles {
+            liveness: device,
+            lookup: packet_lookup,
+        } = handles;
         loop {
-            let peers = {
-                let Some(device_arc) = device.upgrade() else {
-                    break;
-                };
-                let peers = {
-                    let device_guard = device_arc.read().await;
-                    // Remove stale session indices. Once a session is stale it is dropped by
-                    // `update_session_timers`, and its associated index is freed from the table.
-                    device_guard
-                        .peers_by_idx
-                        .lock()
-                        .retain(|idx, _| device_guard.index_table.in_use(*idx));
+            if device.upgrade().is_none() {
+                break;
+            }
+            // Remove stale session indices. Once a session is stale it is dropped by
+            // `update_session_timers`, and its associated index is freed from the table.
+            packet_lookup.retain_live_indices(&index_table);
 
-                    // Keep resetting counts when a device has no peers, where per-peer timer
-                    // updates would otherwise never run.
-                    if let Some(rate_limiter) = device_guard.rate_limiter.as_ref() {
-                        rate_limiter.try_reset_count();
-                    }
+            // Keep resetting counts when a device has no peers, where per-peer timer updates
+            // would otherwise never run.
+            rate_limiter.try_reset_count();
+            let peers = packet_lookup.peers();
 
-                    device_guard.peers.values().cloned().collect::<Vec<_>>()
-                };
-                drop(device_arc);
-                peers
-            };
-
-            // The snapshot owns peer handles, so timer work does not keep a device read lock
-            // across peer waits or packet completions.
+            // This snapshot owns peer handles and does not retain lookup state during timer work.
             for peer in peers {
                 let peer_key = peer_order_key(&peer);
                 if outgoing_order.is_flushing(peer_key) {
@@ -1750,7 +1939,10 @@ impl<T: DeviceTransports> DeviceState<T> {
                 }
                 let mut peer_trace = PeerLockDiagnostic::waiting("timer", peer_key);
                 let mut p = lock_peer_state(&peer, "timer", peer_key, &mut peer_trace).await;
-                if outgoing_order.is_flushing(peer_key) || outgoing_order.available(peer_key) == 0 {
+                if !packet_lookup.contains_peer(&peer)
+                    || outgoing_order.is_flushing(peer_key)
+                    || outgoing_order.available(peer_key) == 0
+                {
                     // Leave due timers untouched until a bounded output slot is available.
                     continue;
                 }
@@ -1771,28 +1963,29 @@ impl<T: DeviceTransports> DeviceState<T> {
                             continue;
                         };
 
+                        if !packet_lookup.register_handshake_idx(&packet, &peer) {
+                            drop(p);
+                            drop(peer_trace);
+                            complete_outgoing_packet(
+                                OutgoingPeerContext {
+                                    crypto: crypto.clone(),
+                                    ordered: Arc::clone(&outgoing_order),
+                                    peer_arc: Arc::clone(&peer),
+                                    peer_key,
+                                    peer_addr: endpoint_addr,
+                                    udp: udp.clone(),
+                                },
+                                lane,
+                                slot,
+                                None,
+                                false,
+                            )
+                            .await;
+                            continue;
+                        }
+
                         drop(p);
                         drop(peer_trace);
-
-                        if matches!(&packet, WgKind::HandshakeInit(_) | WgKind::HandshakeResp(_)) {
-                            let Some(device_arc) = device.upgrade() else {
-                                return;
-                            };
-                            let device_guard = device_arc.read().await;
-                            let peer_is_current = device_guard
-                                .peers
-                                .values()
-                                .any(|configured| Arc::ptr_eq(configured, &peer));
-                            if peer_is_current {
-                                // Register sender_idx from timer-generated handshake packets.
-                                Self::register_handshake_idx(
-                                    &device_guard.peers_by_idx,
-                                    &packet,
-                                    &peer,
-                                );
-                            }
-                            drop(device_guard);
-                        }
 
                         // NOTE: we don't bother with triggering TunnelRecv DAITA events here.
                         complete_outgoing_packet(
@@ -1824,28 +2017,28 @@ impl<T: DeviceTransports> DeviceState<T> {
     /// Read from UDP socket, decapsulate, write to tunnel device
     #[instrument(level = Level::TRACE, skip_all)]
     async fn handle_incoming(
-        device: Weak<RwLock<Self>>,
+        handles: PacketTaskHandles,
+        responder: HandshakeResponder,
         mut tun_tx: impl IpSend + Clone,
         udp_tx: impl UdpSend + 'static,
         mut udp_rx: impl UdpRecv,
         mut packet_pool: PacketBufPool,
         crypto_order: CryptoOrderContext,
     ) -> Result<(), Error> {
+        let PacketTaskHandles {
+            liveness: device,
+            lookup: packet_lookup,
+        } = handles;
+        let HandshakeResponder {
+            private_key,
+            public_key,
+            rate_limiter,
+        } = responder;
         let CryptoOrderContext {
             crypto,
             incoming: incoming_order,
             outgoing: outgoing_order,
         } = crypto_order;
-        let (private_key, public_key, rate_limiter) = {
-            let Some(device) = device.upgrade() else {
-                return Ok(());
-            };
-            let device = device.read().await;
-
-            let (private_key, public_key) = device.key_pair.clone().expect("Key not set");
-            let rate_limiter = device.rate_limiter.clone().unwrap();
-            (private_key, public_key, rate_limiter)
-        };
 
         let mut udp_recv_buf = Default::default();
         let mut received_packets = Vec::new();
@@ -1928,6 +2121,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 crypto.clone(),
                                 Arc::clone(&incoming_order),
                                 device.clone(),
+                                Arc::clone(&packet_lookup),
                                 tun_tx.clone(),
                                 run,
                             )
@@ -1950,6 +2144,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                             crypto.clone(),
                             Arc::clone(&incoming_order),
                             device.clone(),
+                            Arc::clone(&packet_lookup),
                             tun_tx.clone(),
                             run,
                         )
@@ -1957,32 +2152,20 @@ impl<T: DeviceTransports> DeviceState<T> {
                     }
                 }
 
-                let Some(device_arc) = device.upgrade() else {
+                if device.upgrade().is_none() {
                     return Ok(());
-                };
+                }
 
-                let device_guard = device_arc.read().await;
-                let peers = &device_guard.peers;
                 let peer = match &parsed_packet {
                     WgKind::HandshakeInit(p) => parse_handshake_anon(&private_key, &public_key, p)
                         .ok()
-                        .and_then(|hh| peers.get(&x25519::PublicKey::from(hh.peer_static_public)))
-                        .cloned(),
-                    WgKind::HandshakeResp(p) => device_guard
-                        .peers_by_idx
-                        .lock()
-                        .get(&p.receiver_idx.get())
-                        .cloned(),
-                    WgKind::CookieReply(p) => device_guard
-                        .peers_by_idx
-                        .lock()
-                        .get(&p.receiver_idx.get())
-                        .cloned(),
-                    WgKind::Data(p) => device_guard
-                        .peers_by_idx
-                        .lock()
-                        .get(&p.header.receiver_idx.get())
-                        .cloned(),
+                        .and_then(|hh| {
+                            packet_lookup
+                                .peer_by_key(&x25519::PublicKey::from(hh.peer_static_public))
+                        }),
+                    WgKind::HandshakeResp(p) => packet_lookup.peer_by_index(p.receiver_idx.get()),
+                    WgKind::CookieReply(p) => packet_lookup.peer_by_index(p.receiver_idx.get()),
+                    WgKind::Data(p) => packet_lookup.peer_by_index(p.header.receiver_idx.get()),
                 };
                 let Some(peer_arc) = peer else { continue };
                 let peer_key = peer_order_key(&peer_arc);
@@ -1994,7 +2177,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                             eprintln!("pipeline stage=udp_data_arrival counter={counter}");
                             eprintln!("pipeline stage=incoming_peer_lock_wait counter={counter}");
                         }
-                        drop(device_guard);
                         let mut peer_trace =
                             PeerLockDiagnostic::waiting("incoming_prepare", peer_key);
                         let mut pending_completions = PendingCompletions::Incoming(
@@ -2009,6 +2191,9 @@ impl<T: DeviceTransports> DeviceState<T> {
                             &mut pending_completions,
                         )
                         .await?;
+                        if !packet_lookup.contains_peer(&peer_arc) {
+                            continue;
+                        }
                         if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
                             eprintln!(
                                 "pipeline stage=incoming_peer_lock_acquired counter={counter}"
@@ -2049,6 +2234,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                         crypto.clone(),
                                         Arc::clone(&incoming_order),
                                         device.clone(),
+                                        Arc::clone(&packet_lookup),
                                         tun_tx.clone(),
                                         incoming_runs
                                             .remove(&peer_key)
@@ -2061,7 +2247,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                     }
                     packet => {
                         drain_incoming_before_control(
-                            device_guard,
                             incoming_order.lane(peer_key),
                             &mut incoming_pending,
                         )
@@ -2081,6 +2266,9 @@ impl<T: DeviceTransports> DeviceState<T> {
                             &mut pending_completions,
                         )
                         .await?;
+                        if !packet_lookup.contains_peer(&peer_arc) {
+                            continue;
+                        }
                         let peer_endpoint = peer.endpoint().addr;
                         let result = peer.handle_incoming_packet(packet, addr);
                         match result {
@@ -2094,26 +2282,11 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 // bounded peer lane has no free sequence slot.
                                 drop(peer);
                                 drop(peer_trace);
-                                let Some(device_arc) = device.upgrade() else {
+                                if device.upgrade().is_none() {
                                     drop(flush_guard);
                                     return Ok(());
-                                };
-                                let peer_is_current = {
-                                    let device_guard = device_arc.read().await;
-                                    let peer_is_current = device_guard
-                                        .peers
-                                        .values()
-                                        .any(|configured| Arc::ptr_eq(configured, &peer_arc));
-                                    if peer_is_current {
-                                        Self::register_handshake_idx(
-                                            &device_guard.peers_by_idx,
-                                            &packet,
-                                            &peer_arc,
-                                        );
-                                    }
-                                    peer_is_current
-                                };
-                                if !peer_is_current {
+                                }
+                                if !packet_lookup.register_handshake_idx(&packet, &peer_arc) {
                                     drop(flush_guard);
                                     continue;
                                 }
@@ -2183,6 +2356,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 );
                                 Self::flush_handshake_queue(
                                     device.clone(),
+                                    Arc::clone(&packet_lookup),
                                     OutgoingBatchContext {
                                         peer: peer_context,
                                         send_many_buf: Arc::clone(&send_many_buf),
@@ -2216,16 +2390,12 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 );
                                 drop(peer);
                                 drop(peer_trace);
-                                let Some(device_arc) = device.upgrade() else {
+                                if device.upgrade().is_none() {
                                     return Ok(());
-                                };
-                                let routed_to_this_peer = {
-                                    let device_guard = device_arc.read().await;
-                                    device_guard
-                                        .peers_by_ip
-                                        .find(source)
-                                        .is_some_and(|owner| Arc::ptr_eq(owner, &peer_arc))
-                                };
+                                }
+                                let routed_to_this_peer = packet_lookup
+                                    .peer_by_ip(source)
+                                    .is_some_and(|owner| Arc::ptr_eq(&owner, &peer_arc));
                                 if !routed_to_this_peer {
                                     if cfg!(debug_assertions) {
                                         let unspecified =
@@ -2259,6 +2429,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                     crypto.clone(),
                     Arc::clone(&incoming_order),
                     device.clone(),
+                    Arc::clone(&packet_lookup),
                     tun_tx.clone(),
                     run,
                 )
@@ -2270,21 +2441,18 @@ impl<T: DeviceTransports> DeviceState<T> {
     /// Read from tunnel device, encapsulate, and write to UDP socket for the corresponding peer
     #[instrument(level = Level::TRACE, skip_all)]
     async fn handle_outgoing(
-        device: Weak<RwLock<Self>>,
+        handles: PacketTaskHandles,
+        mut tun_mtu: MtuWatcher,
         mut tun_rx: impl IpRecv,
         udp: impl UdpSend + 'static,
         mut packet_pool: PacketBufPool,
         crypto: CryptoHandle,
         outgoing_order: Arc<OrderStore<WgKind>>,
     ) -> Result<(), Error> {
-        let mut tun_mtu = {
-            let Some(device) = device.upgrade() else {
-                return Ok(());
-            };
-            let device = device.read().await;
-            device.tun_rx_mtu.clone()
-        };
-
+        let PacketTaskHandles {
+            liveness: device,
+            lookup: packet_lookup,
+        } = handles;
         let mut pending = PendingOutgoing::new();
         let send_many_buf = Arc::new(Mutex::new(Default::default()));
         loop {
@@ -2308,13 +2476,12 @@ impl<T: DeviceTransports> DeviceState<T> {
                         eprintln!("pipeline stage=tun_receive packets={}", packets.len());
                     }
 
-                    let Some(device_arc) = device.upgrade() else {
+                    if device.upgrade().is_none() {
                         return Ok(());
-                    };
-                    let device_guard = device_arc.read().await;
+                    }
                     let runs = group_by_key(packets.into_iter().filter_map(|packet| {
                         let dst_addr = packet.destination()?;
-                        let Some(peer_arc) = device_guard.peers_by_ip.find(dst_addr).cloned()
+                        let Some(peer_arc) = packet_lookup.peer_by_ip(dst_addr)
                         else {
                             if cfg!(debug_assertions) {
                                 tracing::trace!("Dropping packet with no routable peer");
@@ -2324,15 +2491,13 @@ impl<T: DeviceTransports> DeviceState<T> {
 
                         Some((peer_order_key(&peer_arc), peer_arc, packet))
                     }));
-                    drop(device_guard);
 
                     for (peer_key, peer_arc, packets) in runs {
                         let mut packets = packets.into_iter().peekable();
                         while packets.peek().is_some() {
-                            let Some(device_arc) = device.upgrade() else {
+                            if device.upgrade().is_none() {
                                 return Ok(());
-                            };
-                            let device_guard = device_arc.read().await;
+                            }
                             let mut peer_trace =
                                 PeerLockDiagnostic::waiting("outgoing_prepare", peer_key);
                             let mut pending_completions =
@@ -2370,7 +2535,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 let lane = outgoing_order.lane(peer_key);
                                 drop(peer);
                                 drop(peer_trace);
-                                drop(device_guard);
                                 if let Some(lane) = lane {
                                     if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
                                         eprintln!(
@@ -2409,11 +2573,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 };
 
                                 if let PreparedOutgoing::Ready(packet) = &prepared_packet {
-                                    Self::register_handshake_idx(
-                                        &device_guard.peers_by_idx,
-                                        packet,
-                                        &peer_arc,
-                                    );
+                                    packet_lookup.register_handshake_idx(packet, &peer_arc);
                                     handshake_offset = Some(prepared.len());
                                     flush_guard = Some(outgoing_order.begin_flush(peer_key));
                                 }
@@ -2428,7 +2588,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 .expect("the prepared run fits in the peer order window");
                             drop(peer);
                             drop(peer_trace);
-                            drop(device_guard);
 
                             let batch_count = prepared.len().div_ceil(CRYPTO_BATCH_SIZE);
                             while pending.len() + batch_count > CRYPTO_CHUNK_SIZE {
@@ -2474,6 +2633,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                             {
                                 Self::flush_handshake_queue(
                                     device.clone(),
+                                    Arc::clone(&packet_lookup),
                                     batch_context,
                                     lane,
                                     first_slot + offset as u64,
