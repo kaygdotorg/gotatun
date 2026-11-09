@@ -80,6 +80,8 @@ struct TunDeviceState {
     /// Task which monitors TUN device MTU. Aborted when dropped.
     _mtu_monitor: Task,
 
+    /// Whether this descriptor carries virtio-net headers (Linux offload path only).
+    #[cfg(target_os = "linux")]
     vnet_header: bool,
 
     #[cfg(target_os = "linux")]
@@ -170,14 +172,14 @@ impl TunDevice {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            Self::from_tun_device_with_vnet_header(tun, false)
+            Self::from_tun_device_with_vnet_header(tun)
         }
     }
 
     /// Construct with the virtio-header and offload capabilities known for this descriptor.
     fn from_tun_device_with_vnet_header(
         tun: tun::AsyncDevice,
-        vnet_header: bool,
+        #[cfg(target_os = "linux")] vnet_header: bool,
         #[cfg(target_os = "linux")] offloads: linux::TunOffloadState,
     ) -> Result<Self, Error> {
         #[cfg(target_os = "linux")]
@@ -215,6 +217,7 @@ impl TunDevice {
             state: Arc::new(TunDeviceState {
                 mtu: rx.into(),
                 _mtu_monitor: mtu_monitor,
+                #[cfg(target_os = "linux")]
                 vnet_header,
                 #[cfg(target_os = "linux")]
                 offloads,
