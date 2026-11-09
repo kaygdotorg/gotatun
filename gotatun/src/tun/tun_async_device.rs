@@ -250,7 +250,7 @@ impl IpSend for TunDevice {
     async fn send_many(&mut self, packets: &mut Vec<Packet<Ip>>) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         if self.state.vnet_header {
-            let disable_gso = std::env::var_os("GOTATUN_DIAG_DISABLE_TUN_GSO").is_some();
+            let disable_gso = crate::diag::disable_tun_gso();
             let frames = gso::coalesce_packets(
                 std::mem::take(packets),
                 self.state.offloads.tcp_tso && !disable_gso,

@@ -22,6 +22,9 @@
 mod crypto;
 #[cfg(feature = "device")]
 pub mod device;
+// Most switches guard device-only code; the TUN and UDP modules use the rest.
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
+mod diag;
 pub mod noise;
 pub mod packet;
 pub mod tun;

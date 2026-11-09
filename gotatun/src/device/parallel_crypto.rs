@@ -194,10 +194,10 @@ impl<T> OrderedCompletions<T> {
     /// lane's separate high and low water marks prevent mode flapping.
     pub(crate) fn should_force_worker(&self, packet_count: usize) -> bool {
         assert!(packet_count > 0, "a crypto dispatch run cannot be empty");
-        if std::env::var_os("GOTATUN_DIAG_FORCE_INLINE").is_some() {
+        if crate::diag::force_inline() {
             return false;
         }
-        if std::env::var_os("GOTATUN_DIAG_FORCE_WORKERS").is_some() {
+        if crate::diag::force_workers() {
             return true;
         }
         let mut state = self.state.lock();
@@ -263,8 +263,7 @@ impl<T> OrderedCompletions<T> {
         let end_slot = first_slot
             .checked_add(run_len as u64)
             .expect("a peer crypto sequence cannot wrap");
-        let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
-            || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some();
+        let diagnostic = crate::diag::pipeline() || crate::diag::send_queue();
         {
             let mut state = self.state.lock();
             assert!(
@@ -506,9 +505,7 @@ impl<T> OrderStore<T> {
             .entry(peer)
             .or_insert_with(|| Arc::new(OrderedCompletions::default()));
         let first_slot = lane.reserve_run(count)?;
-        if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
-            || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some()
-        {
+        if crate::diag::pipeline() || crate::diag::send_queue() {
             eprintln!(
                 "pipeline stage=ordered_lane_reserve peer={peer} lane={} first_slot={first_slot} packets={count}",
                 lane.lane_id
@@ -552,9 +549,7 @@ impl<T> OrderStore<T> {
             .get(&peer)
             .is_some_and(|current| Arc::ptr_eq(current, lane) && current.is_idle())
         {
-            if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
-                || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some()
-            {
+            if crate::diag::pipeline() || crate::diag::send_queue() {
                 eprintln!(
                     "pipeline stage=ordered_lane_retire peer={peer} lane={}",
                     lane.lane_id
@@ -729,9 +724,7 @@ impl CryptoHandle {
             .await
             .ok()?;
         static REPORTED_ENCRYPT_HANDOFF: AtomicBool = AtomicBool::new(false);
-        if std::env::var_os("GOTATUN_DIAG_FORCE_WORKERS").is_some()
-            && !REPORTED_ENCRYPT_HANDOFF.swap(true, Ordering::Relaxed)
-        {
+        if crate::diag::force_workers() && !REPORTED_ENCRYPT_HANDOFF.swap(true, Ordering::Relaxed) {
             eprintln!("diagnostic: encrypt run handed to crypto worker");
         }
         #[cfg(test)]
@@ -763,9 +756,7 @@ impl CryptoHandle {
             .await
             .ok()?;
         static REPORTED_DECRYPT_HANDOFF: AtomicBool = AtomicBool::new(false);
-        if std::env::var_os("GOTATUN_DIAG_FORCE_WORKERS").is_some()
-            && !REPORTED_DECRYPT_HANDOFF.swap(true, Ordering::Relaxed)
-        {
+        if crate::diag::force_workers() && !REPORTED_DECRYPT_HANDOFF.swap(true, Ordering::Relaxed) {
             eprintln!("diagnostic: decrypt run handed to crypto worker");
         }
         #[cfg(test)]
