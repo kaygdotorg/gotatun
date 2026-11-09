@@ -86,6 +86,7 @@ impl BufferedIpSend {
     fn new<I: IpSend>(capacity: usize, inner: Arc<Mutex<I>>, token: CancellationToken) -> Self {
         let (tx, mut rx) = mpsc::channel::<BufferedIpMessage>(capacity);
         let packet_slots = Arc::new(Semaphore::new(capacity));
+        let packet_slots_task = Arc::clone(&packet_slots);
 
         let drop_guard = token.clone().drop_guard();
 
@@ -95,7 +96,9 @@ impl BufferedIpSend {
                 .expect("Deadlock on IpSend. There must be no more than one IpSend active at any given time.");
 
             let mut refused: u64 = 0;
+            let mut depth = crate::diag::DepthReporter::new("tun_tx");
             while let Some(message) = rx.recv().await {
+                depth.sample(capacity - packet_slots_task.available_permits());
                 let diagnostic = crate::diag::PIPELINE.on();
                 let (result, refused_packets) = match message {
                     BufferedIpMessage::Single(packet, _permit) => {
@@ -309,7 +312,9 @@ impl<I: IpRecv> BufferedIpRecv<I> {
 
         let task = async move {
             let mut dropped: u64 = 0;
+            let mut depth = crate::diag::DepthReporter::new("tun_rx");
             loop {
+                depth.sample(tx.max_capacity() - tx.capacity());
                 match inner.recv(&mut pool).await {
                     Ok(packets) => {
                         for packet in packets {

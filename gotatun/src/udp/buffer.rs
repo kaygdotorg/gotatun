@@ -141,8 +141,10 @@ impl BufferedUdpSend {
     pub fn new(capacity: usize, udp_tx: impl UdpSend + 'static) -> Self {
         let (send_tx, mut send_rx) = mpsc::channel::<BufferedUdpMessage>(capacity);
         let packet_slots = Arc::new(Semaphore::new(capacity));
+        let packet_slots_task = Arc::clone(&packet_slots);
 
         let send_task = Task::spawn("buffered UDP send", async move {
+            let mut depth = crate::diag::DepthReporter::new("udp_tx");
             let mut buf = vec![];
             let max_packet_count = udp_tx.max_number_of_packets_to_send().max(1);
             let mut send_many_buf = Default::default();
@@ -154,6 +156,7 @@ impl BufferedUdpSend {
                 if count == 0 {
                     break;
                 }
+                depth.sample(capacity - packet_slots_task.available_permits());
 
                 for message in buf.drain(..) {
                     match message {
@@ -329,8 +332,10 @@ impl BufferedUdpReceive {
             let mut recv_many_buf = Default::default();
             let mut packet_bufs = vec![];
             let mut dropped: u64 = 0;
+            let mut depth = crate::diag::DepthReporter::new("udp_rx");
 
             loop {
+                depth.sample(recv_tx.max_capacity() - recv_tx.capacity());
                 // Read packets from the socket. Only a gone socket ends this task; a bad
                 // datagram is dropped, and what the batch delivered before it is forwarded.
                 if let Err(err) = udp_rx

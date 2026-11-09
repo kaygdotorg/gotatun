@@ -57,3 +57,48 @@ pub(crate) static TUN_SINGLE_SENDS: Switch = Switch::new("GOTATUN_DIAG_TUN_SINGL
 
 /// Send UDP datagrams one at a time instead of in batches.
 pub(crate) static UDP_SINGLE_SENDS: Switch = Switch::new("GOTATUN_DIAG_UDP_SINGLE_SENDS");
+
+/// Print each buffered stage's queue depth about ten times a second.
+pub(crate) static QUEUE_DEPTH: Switch = Switch::new("GOTATUN_DIAG_QUEUE_DEPTH");
+
+/// Reports how many packets wait in one buffered pipeline stage, for [`QUEUE_DEPTH`].
+///
+/// Each stage keeps one reporter and calls [`DepthReporter::sample`] whenever it dequeues. The
+/// reporter remembers the deepest queue it saw and prints one line per ~100 ms window:
+/// `queue_depth stage=<name> now=<packets> max=<packets>`. With the switch off a sample is one
+/// cached flag check, so the packet path pays nothing measurable.
+pub(crate) struct DepthReporter {
+    /// Short stage name printed on each line, for example `tun_tx`.
+    stage: &'static str,
+    /// Start of the current reporting window.
+    window_start: std::time::Instant,
+    /// Deepest queue seen in the current window.
+    max: usize,
+}
+
+impl DepthReporter {
+    /// Create a reporter for the stage called `stage`.
+    pub(crate) fn new(stage: &'static str) -> Self {
+        Self {
+            stage,
+            window_start: std::time::Instant::now(),
+            max: 0,
+        }
+    }
+
+    /// Record that `queued` packets are waiting right now, printing once per window.
+    pub(crate) fn sample(&mut self, queued: usize) {
+        if !QUEUE_DEPTH.on() {
+            return;
+        }
+        self.max = self.max.max(queued);
+        if self.window_start.elapsed() >= std::time::Duration::from_millis(100) {
+            eprintln!(
+                "queue_depth stage={} now={queued} max={}",
+                self.stage, self.max
+            );
+            self.max = 0;
+            self.window_start = std::time::Instant::now();
+        }
+    }
+}
