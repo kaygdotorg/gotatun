@@ -106,6 +106,8 @@ pub struct Tunn<R: RngCore + Send = StdRng> {
     session_counter: usize,
     /// Queue to store blocked packets.
     packet_queue: VecDeque<Packet>,
+    /// Packets dropped because `packet_queue` was full, since this tunnel was created.
+    queue_drops: u64,
 
     /// Keeps tabs on the expiring timers.
     timers: timers::Timers,
@@ -166,6 +168,7 @@ impl<R: RngCore + Send> Tunn<R> {
             rx_bytes: Default::default(),
 
             packet_queue: VecDeque::new(),
+            queue_drops: 0,
             timers: Timers::new(persistent_keepalive),
 
             rate_limiter,
@@ -652,9 +655,23 @@ impl<R: RngCore + Send> Tunn<R> {
     /// Push a packet to the back of the bounded queue, dropping it if the queue is full.
     fn queue_packet(&mut self, packet: Packet) {
         if self.packet_queue.len() < MAX_QUEUE_DEPTH {
-            // Drop if too many are already in queue
             self.packet_queue.push_back(packet);
+        } else {
+            // Drop when the queue is full, and say so: a full queue during a handshake means the
+            // sender outran the handshake, which used to happen silently (#260 round 2).
+            self.queue_drops += 1;
+            if self.queue_drops.is_power_of_two() {
+                tracing::warn!(
+                    "handshake queue full: dropped {} packets so far",
+                    self.queue_drops
+                );
+            }
         }
+    }
+
+    /// Packets dropped because the handshake queue was full, since this tunnel was created.
+    pub(crate) fn queue_drops(&self) -> u64 {
+        self.queue_drops
     }
 
     fn dequeue_packet(&mut self) -> Option<Packet> {
