@@ -14,25 +14,29 @@
 //!
 //! # Lock order
 //!
-//! Configuration owns the async device lock first. When changing a peer it then acquires that
-//! peer's state mutex, followed by the short-held synchronous packet-lookup write lock. Packet
-//! tasks clone handles from packet lookup and release its read lock before awaiting peer state;
-//! while holding a peer mutex they may briefly recheck routes or register an index, but never
-//! acquire the async device lock. Thus a configuration writer waiting for a peer cannot block a
-//! packet lookup needed by that peer holder.
+//! 1. Configuration takes the async device lock first. A peer update then takes that peer's
+//!    mutex and briefly writes the synchronous packet lookup. Peer insertion/removal updates the
+//!    lookup while holding the device lock. Packet tasks receive the lookup and a weak task-
+//!    liveness token, never a device-lock handle, so they cannot reacquire the async device lock.
+//! 2. Packet tasks snapshot a peer or route under packet lookup and release its synchronous
+//!    read guard before awaiting the peer mutex. While holding a peer mutex they may briefly
+//!    recheck packet lookup, read the flush marker, or reserve through the order-store map and
+//!    lane state. These nested locks are taken in the order peer, lookup/flush marker/order store,
+//!    then lane state. No synchronous lookup or lane guard crosses an await.
+//! 3. Producers reserve while holding peer state. If capacity is unavailable, they release peer
+//!    state and wait for delivery progress. A handshake flush keeps its marker set and its peer
+//!    mutex held through reservation, then releases both before crypto dispatch or I/O; TUN work
+//!    arriving during a flush stays queued behind that range.
+//! 4. Completion code releases lane state before waiting for the async delivery gate. The gate
+//!    may then acquire peer state for replay or send delivery. A producer holding peer state only
+//!    takes lane metadata synchronously and never waits for the delivery gate.
+//! 5. Timers snapshot peers from packet lookup and release it before taking peer state. They
+//!    reserve under that peer mutex, skip a peer with an active handshake flush, and hold no
+//!    device, peer, or lane lock while sleeping or waiting for output.
 //!
 //! Connection setup snapshots the key pair, rate limiter, index table, MTU watcher, and lookup
 //! handle before spawning tasks. Running packet and timer tasks never reacquire the async device
 //! lock, so reconfiguration can hold its write guard while stopping and joining them.
-//!
-//! Peer state serializes tunnel, replay, and timer mutation. A packet producer may synchronously
-//! take a flush marker or reserve through the order-store map and lane state while holding peer
-//! state, but it does not wait on the lane's async delivery mutex. Ordered completion releases lane metadata locks before
-//! invoking delivery; a receive callback may then acquire peer state while holding the lane's
-//! delivery gate. No lane metadata guard is held across peer acquisition, an await, or I/O, so the
-//! callback and producer paths do not form a cycle. Timer tasks snapshot peer handles from packet
-//! lookup, release lookup state, then acquire one peer and reserve a slot before releasing it;
-//! they hold neither the device lock nor lane metadata while sleeping or waiting for output.
 pub(crate) mod allowed_ips;
 mod builder;
 pub mod configure;
@@ -234,12 +238,24 @@ struct PacketLookup {
     state: parking_lot::RwLock<PacketLookupState>,
 }
 
-#[derive(Default)]
+/// All packet-facing indices protected by one short synchronous read/write lock.
 struct PacketLookupState {
     peers_by_key: HashMap<x25519::PublicKey, Arc<Mutex<PeerState>>>,
     peer_ids: HashSet<usize>,
     peers_by_ip: AllowedIps<Arc<Mutex<PeerState>>>,
     peers_by_idx: HashMap<u32, Arc<Mutex<PeerState>>>,
+}
+
+/// Create empty packet indices without requiring the peer handle type to be defaultable.
+impl Default for PacketLookupState {
+    fn default() -> Self {
+        Self {
+            peers_by_key: HashMap::new(),
+            peer_ids: HashSet::new(),
+            peers_by_ip: AllowedIps::new(),
+            peers_by_idx: HashMap::new(),
+        }
+    }
 }
 
 impl PacketLookup {
@@ -370,7 +386,7 @@ struct CryptoOrderContext {
 }
 
 /// Shared state needed to enqueue and release one bounded receive run.
-struct IncomingRunContext<D, TunTx> {
+struct IncomingRunContext<TunTx> {
     /// Shared worker handle used for each bounded run.
     crypto: CryptoHandle,
     /// Peer lanes that retain the receive sequence until TUN delivery.
@@ -381,15 +397,15 @@ struct IncomingRunContext<D, TunTx> {
     lane: Arc<OrderedCompletions<IncomingCompletion>>,
     /// Peer state updated only after ordered replay validation.
     peer_arc: Arc<Mutex<PeerState>>,
-    /// Weak lifetime check so a queued callback does not write after its device is dropped.
-    device: Weak<RwLock<D>>,
+    /// Weak lifetime check without giving a queued callback access to the device lock.
+    device: Weak<()>,
     /// Packet routes and session indices used without taking the async device lock.
     lookup: Arc<PacketLookup>,
     /// Tunnel writer cloned by each bounded delivery future.
     tun_tx: TunTx,
 }
 
-impl<D, TunTx: Clone> Clone for IncomingRunContext<D, TunTx> {
+impl<TunTx: Clone> Clone for IncomingRunContext<TunTx> {
     /// Clone the shared handles needed by another run without cloning device state.
     fn clone(&self) -> Self {
         Self {
@@ -842,6 +858,9 @@ pub(crate) struct DeviceState<T: DeviceTransports> {
     key_pair: Option<(x25519::StaticSecret, x25519::PublicKey)>,
     fwmark: Option<u32>,
 
+    /// Strong token used by packet tasks for a lifetime check without access to this device lock.
+    task_liveness: Arc<()>,
+
     tun_tx: Arc<Mutex<T::IpSend>>,
     /// The tun device reader.
     ///
@@ -966,6 +985,7 @@ impl<T: DeviceTransports> Connection<T> {
             .clone();
         let index_table = device.index_table.clone();
         let tun_rx_mtu = device.tun_rx_mtu.clone();
+        let task_liveness = Arc::downgrade(&device.task_liveness);
 
         let fatal_error = device.fatal_error.clone();
         let register_fatal_error = move |e| {
@@ -981,8 +1001,8 @@ impl<T: DeviceTransports> Connection<T> {
         // Start device tasks
         let outgoing = Task::spawn(
             "handle_outgoing",
-            DeviceState::handle_outgoing(
-                Arc::downgrade(&device_arc),
+            DeviceState::<T>::handle_outgoing(
+                task_liveness.clone(),
                 Arc::clone(&packet_lookup),
                 tun_rx_mtu,
                 buffered_ip_rx,
@@ -995,8 +1015,8 @@ impl<T: DeviceTransports> Connection<T> {
         );
         let timers = Task::spawn(
             "handle_timers",
-            DeviceState::handle_timers(
-                Arc::downgrade(&device_arc),
+            DeviceState::<T>::handle_timers(
+                task_liveness.clone(),
                 Arc::clone(&packet_lookup),
                 index_table,
                 rate_limiter.clone(),
@@ -1007,8 +1027,8 @@ impl<T: DeviceTransports> Connection<T> {
         );
         let incoming = Task::spawn(
             "handle_incoming",
-            DeviceState::handle_incoming(
-                Arc::downgrade(&device_arc),
+            DeviceState::<T>::handle_incoming(
+                task_liveness,
                 packet_lookup,
                 private_key,
                 public_key,
@@ -1372,7 +1392,7 @@ impl<T: DeviceTransports> DeviceState<T> {
     /// Finish a contiguous receive run while holding peer state only once, retaining its first slot for diagnostics.
     async fn deliver_incoming_run(
         first_slot: u64,
-        device: Weak<RwLock<Self>>,
+        device: Weak<()>,
         lookup: Arc<PacketLookup>,
         peer_arc: Arc<Mutex<PeerState>>,
         completions: Vec<Option<IncomingCompletion>>,
@@ -1436,7 +1456,7 @@ impl<T: DeviceTransports> DeviceState<T> {
             );
             let routed_to_this_peer = lookup
                 .peer_by_ip(source)
-                .is_some_and(|owner| Arc::ptr_eq(owner, &peer_arc));
+                .is_some_and(|owner| Arc::ptr_eq(&owner, &peer_arc));
             if !routed_to_this_peer {
                 if cfg!(debug_assertions) {
                     let unspecified = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into();
@@ -1500,7 +1520,7 @@ impl<T: DeviceTransports> DeviceState<T> {
     /// do not move a shallow queue off the inline path.
     fn enqueue_incoming_run<TunTx: IpSend + Clone>(
         pending: &mut PendingIncoming,
-        context: IncomingRunContext<Self, TunTx>,
+        context: IncomingRunContext<TunTx>,
         first_slot: u64,
         packets: Vec<(PreparedDecryption, std::net::SocketAddr)>,
     ) {
@@ -1613,7 +1633,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         pending: &mut PendingIncoming,
         crypto: CryptoHandle,
         ordered: Arc<OrderStore<IncomingCompletion>>,
-        device: Weak<RwLock<Self>>,
+        device: Weak<()>,
         lookup: Arc<PacketLookup>,
         tun_tx: impl IpSend + Clone,
         run: PreparedIncomingRun,
@@ -1695,7 +1715,7 @@ impl<T: DeviceTransports> DeviceState<T> {
 
     /// Encrypt and send a bounded chunk of handshake-queued packets before newer TUN traffic.
     async fn flush_handshake_queue<U: UdpSend + 'static>(
-        device: Weak<RwLock<Self>>,
+        device: Weak<()>,
         packet_lookup: Arc<PacketLookup>,
         context: OutgoingBatchContext<U>,
         first_lane: Arc<OrderedCompletions<WgKind>>,
@@ -1733,17 +1753,40 @@ impl<T: DeviceTransports> DeviceState<T> {
                 &mut pending_completions,
             )
             .await?;
+            drop(pending_completions);
             if !peer.tunnel.has_queued_packets() {
                 drop(flush_guard.take());
                 return Ok(());
             }
 
-            let mut jobs = Vec::with_capacity(CRYPTO_CHUNK_SIZE);
-            let mut stop_after_chunk = false;
-            for _ in 0..CRYPTO_CHUNK_SIZE {
-                let Some(packet) = peer.tunnel.take_queued_packet() else {
-                    break;
+            let queued_count = peer.tunnel.queued_packet_count();
+            let available = ordered.available(peer_key);
+            if available == 0 {
+                let lane = ordered.lane(peer_key);
+                drop(peer);
+                drop(peer_trace);
+                let Some(lane) = lane else {
+                    // The final completion can retire its idle lane between the capacity check
+                    // and this lookup. Recheck under peer state; the active flush marker remains.
+                    continue;
                 };
+                tokio::select! {
+                    _ = lane.wait_for_capacity() => {}
+                    _ = pending.next(), if !pending.is_empty() => {}
+                }
+                continue;
+            }
+
+            // Limit preparation to slots that can fit now. The peer mutex excludes every other
+            // slot producer until the exact prepared run is reserved below.
+            let run_limit = queued_count.min(CRYPTO_CHUNK_SIZE).min(available);
+            let mut jobs = Vec::with_capacity(run_limit);
+            let mut stop_after_chunk = false;
+            for _ in 0..run_limit {
+                let packet = peer
+                    .tunnel
+                    .take_queued_packet()
+                    .expect("the queued packet count remains stable while peer state is locked");
                 let prepared = peer.tunnel.prepare_queued_packet(packet);
                 if let Some(PreparedOutgoing::Ready(packet)) = prepared.as_ref() {
                     packet_lookup.register_handshake_idx(packet, &peer_arc);
@@ -1758,20 +1801,24 @@ impl<T: DeviceTransports> DeviceState<T> {
                 }
             }
 
+            if jobs.is_empty() {
+                return Ok(());
+            }
+
+            // Preparation assigns packet counters. Keep peer state and the flush marker until
+            // these packets own the matching contiguous sequence range, so a newer producer can
+            // neither take counters nor reserve earlier slots.
+            let (chunk_lane, first_slot) = ordered
+                .reserve_run(peer_key, jobs.len())
+                .expect("peer state keeps the prepared run's sequence capacity available");
+
             if stop_after_chunk || !peer.tunnel.has_queued_packets() {
-                // The queue's remaining packets already have a later handshake or lane ordering
-                // point, so newer TUN packets may return to the regular path now.
+                // The current run already owns its slots, so newer TUN reservations can follow it.
                 drop(flush_guard.take());
             }
             drop(peer);
             drop(peer_trace);
 
-            if jobs.is_empty() {
-                return Ok(());
-            }
-            let (chunk_lane, first_slot) = ordered
-                .reserve_run(peer_key, jobs.len())
-                .expect("the bounded queue drain fits within the peer order window");
             let chunk_last_slot = first_slot + jobs.len() as u64 - 1;
             let batch_count = jobs.len().div_ceil(CRYPTO_BATCH_SIZE);
             while pending.len() + batch_count > CRYPTO_CHUNK_SIZE {
@@ -1861,7 +1908,7 @@ impl<T: DeviceTransports> DeviceState<T> {
     /// Run periodic tunnel maintenance and send each peer's timer output in sequence.
     #[instrument(level = Level::TRACE, skip_all)]
     async fn handle_timers(
-        device: Weak<RwLock<Self>>,
+        device: Weak<()>,
         packet_lookup: Arc<PacketLookup>,
         index_table: IndexTable,
         rate_limiter: Arc<RateLimiter>,
@@ -1968,7 +2015,7 @@ impl<T: DeviceTransports> DeviceState<T> {
     /// Read from UDP socket, decapsulate, write to tunnel device
     #[instrument(level = Level::TRACE, skip_all)]
     async fn handle_incoming(
-        device: Weak<RwLock<Self>>,
+        device: Weak<()>,
         packet_lookup: Arc<PacketLookup>,
         private_key: x25519::StaticSecret,
         public_key: x25519::PublicKey,
@@ -2386,7 +2433,7 @@ impl<T: DeviceTransports> DeviceState<T> {
     /// Read from tunnel device, encapsulate, and write to UDP socket for the corresponding peer
     #[instrument(level = Level::TRACE, skip_all)]
     async fn handle_outgoing(
-        device: Weak<RwLock<Self>>,
+        device: Weak<()>,
         packet_lookup: Arc<PacketLookup>,
         mut tun_mtu: MtuWatcher,
         mut tun_rx: impl IpRecv,

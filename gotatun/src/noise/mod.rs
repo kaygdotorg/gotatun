@@ -347,6 +347,11 @@ impl<R: RngCore + Send> Tunn<R> {
         !self.packet_queue.is_empty()
     }
 
+    /// Return the queue length while peer state is locked, before reserving packet sequence slots.
+    pub(crate) fn queued_packet_count(&self) -> usize {
+        self.packet_queue.len()
+    }
+
     /// Select a receive session without running AEAD or mutating replay state.
     ///
     /// The caller sends `Decrypt` work to a worker and commits its replay counter only when its

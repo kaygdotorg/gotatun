@@ -310,18 +310,20 @@ async fn j369_control_drain_progresses_with_a_queued_device_writer() {
     alice.device.suspend().await;
     bob.device.suspend().await;
     let device = Arc::clone(&alice.device.inner);
-    let (peer, packet_lookup) = {
+    let (peer, packet_lookup, task_liveness) = {
         let state = device.read().await;
         (
             state.peers.values().next().unwrap().clone(),
             Arc::clone(&state.packet_lookup),
+            Arc::clone(&state.task_liveness),
         )
     };
     let held_peer = peer.lock().await;
     let lane = Arc::new(OrderedCompletions::default());
     let slot = lane.reserve_run(1).unwrap();
     let (tun, _tx, _rx) = mock::mock_tun();
-    let delivery_device = Arc::downgrade(&device);
+    let delivery_device = Arc::downgrade(&task_liveness);
+    let completion_peer = Arc::clone(&peer);
     let completion_lookup = Arc::clone(&packet_lookup);
     let mut incoming = PendingIncoming::new();
     let completion_lane = Arc::clone(&lane);
@@ -329,11 +331,11 @@ async fn j369_control_drain_progresses_with_a_queued_device_writer() {
         async move {
             completion_lane
                 .complete_run(slot, vec![None], |completions| {
-                    super::DeviceState::deliver_incoming_run(
+                    super::DeviceState::<mock::MockDeviceTransports>::deliver_incoming_run(
                         slot,
                         delivery_device.clone(),
                         completion_lookup.clone(),
-                        peer.clone(),
+                        completion_peer.clone(),
                         completions,
                         tun.clone(),
                     )
@@ -372,16 +374,16 @@ async fn j369_control_drain_progresses_with_a_queued_device_writer() {
 async fn j369_timer_output_survives_a_full_peer_window() {
     use super::parallel_crypto::{CryptoWorkers, MAX_PEER_CRYPTO_IN_FLIGHT, OrderStore};
     let (alice, bob, _eve) = mock::device_pair().await;
-    let udp = alice
-        .device
-        .inner
-        .read()
-        .await
-        .connection
-        .as_ref()
-        .unwrap()
-        .udp
-        .clone();
+    let (udp, packet_lookup, index_table, rate_limiter, task_liveness) = {
+        let state = alice.device.inner.read().await;
+        (
+            state.connection.as_ref().unwrap().udp.clone(),
+            Arc::clone(&state.packet_lookup),
+            state.index_table.clone(),
+            Arc::clone(state.rate_limiter.as_ref().unwrap()),
+            Arc::clone(&state.task_liveness),
+        )
+    };
     alice.device.suspend().await;
     bob.device.suspend().await;
     let peer = alice
@@ -400,8 +402,11 @@ async fn j369_timer_output_survives_a_full_peer_window() {
         .reserve_run(super::peer_order_key(&peer), MAX_PEER_CRYPTO_IN_FLIGHT)
         .unwrap();
     let workers = CryptoWorkers::with_worker_count(2).unwrap();
-    let timers = super::DeviceState::handle_timers(
-        Arc::downgrade(&alice.device.inner),
+    let timers = super::DeviceState::<mock::MockDeviceTransports>::handle_timers(
+        Arc::downgrade(&task_liveness),
+        packet_lookup,
+        index_table,
+        rate_limiter,
         udp,
         workers.handle(),
         order,
@@ -1290,31 +1295,32 @@ async fn test_device_pair(eavesdrop: impl AsyncFnOnce(MockEavesdropper) + Send) 
 
 /// Packet lookup progresses while configuration owns the device write lock and waits for a peer.
 #[tokio::test]
-async fn j380_packet_lookup_progresses_with_a_queued_device_writer() {
+async fn j380_packet_lookup_progresses_with_a_pending_delivery_reader() {
     use super::parallel_crypto::OrderedCompletions;
     let (alice, bob, _eve) = mock::device_pair().await;
     alice.device.suspend().await;
     bob.device.suspend().await;
     let device = Arc::clone(&alice.device.inner);
-    let (peer, packet_lookup) = {
+    let (peer, packet_lookup, task_liveness) = {
         let state = device.read().await;
         (
             state.peers.values().next().unwrap().clone(),
             Arc::clone(&state.packet_lookup),
+            Arc::clone(&state.task_liveness),
         )
     };
     let held_peer = peer.lock().await;
     let lane = Arc::new(OrderedCompletions::default());
     let slot = lane.reserve_run(1).unwrap();
     let (tun, _tx, _rx) = mock::mock_tun();
-    let delivery_device = Arc::downgrade(&device);
+    let delivery_device = Arc::downgrade(&task_liveness);
     let completion_peer = peer.clone();
     let completion_lookup = Arc::clone(&packet_lookup);
     let mut incoming = PendingIncoming::new();
     incoming.push(
         async move {
             lane.complete_run(slot, vec![None], |completions| {
-                super::DeviceState::deliver_incoming_run(
+                super::DeviceState::<mock::MockDeviceTransports>::deliver_incoming_run(
                     slot,
                     delivery_device.clone(),
                     completion_lookup.clone(),
@@ -1331,12 +1337,17 @@ async fn j380_packet_lookup_progresses_with_a_queued_device_writer() {
     assert!(futures::poll!(incoming.next()).is_pending());
     let writer_device = Arc::clone(&device);
     let writer_peer = Arc::clone(&peer);
+    let (writer_locked_tx, mut writer_locked_rx) = oneshot::channel();
     let mut writer = Box::pin(async move {
         let _device_guard = writer_device.write().await;
+        writer_locked_tx
+            .send(())
+            .expect("the test still observes the writer lock");
         let _peer_guard = writer_peer.lock().await;
     });
     // The configuration writer owns the device lock while it queues on the peer mutex.
     assert!(futures::poll!(writer.as_mut()).is_pending());
+    let writer_owns_device = writer_locked_rx.try_recv().is_ok();
     let route: std::net::IpAddr = "203.0.113.1".parse().unwrap();
     let lookup_progressed = packet_lookup
         .peer_by_ip(route)
@@ -1347,7 +1358,7 @@ async fn j380_packet_lookup_progresses_with_a_queued_device_writer() {
     alice.device.stop().await;
     bob.device.stop().await;
     assert!(
-        lookup_progressed,
-        "packet lookup must progress while a queued writer waits on the peer mutex"
+        writer_owns_device && lookup_progressed,
+        "packet lookup must progress while a writer holds the device lock and waits on the peer mutex"
     );
 }
