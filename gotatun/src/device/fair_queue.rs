@@ -274,8 +274,25 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{fair_schedule, fair_schedule_routed_batch, packet_flow_key};
+    use super::{
+        fair_schedule, fair_schedule_routed_batch, packet_flow_classification, packet_flow_key,
+    };
     use crate::packet::{Ip, Packet};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    /// Packet classification returns the destination alongside the key used for fair ordering.
+    #[test]
+    fn flow_classification_returns_destination_for_route_lookup() {
+        let packet = packet_v4(6, 0, 0, &[0x13, 0x88, 0x01, 0xbb, 1]);
+
+        let (destination, flow) = packet_flow_classification(&packet);
+
+        assert_eq!(
+            destination,
+            Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)))
+        );
+        assert_eq!(flow, packet_flow_key(&packet));
+    }
 
     /// A sparse flow gets service between packets from one bulk flow.
     #[test]
