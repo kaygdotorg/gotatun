@@ -96,7 +96,7 @@ impl BufferedIpSend {
 
             let mut refused: u64 = 0;
             while let Some(message) = rx.recv().await {
-                let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some();
+                let diagnostic = crate::diag::PIPELINE.on();
                 let (result, refused_packets) = match message {
                     BufferedIpMessage::Single(packet, _permit) => {
                         if diagnostic {
@@ -165,7 +165,7 @@ impl BufferedIpSend {
 
 impl IpSend for BufferedIpSend {
     async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
-        let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some();
+        let diagnostic = crate::diag::PIPELINE.on();
         if diagnostic {
             eprintln!(
                 "pipeline stage=tun_buffer_permit_wait packets=1 available={} mode=single",
@@ -190,7 +190,7 @@ impl IpSend for BufferedIpSend {
     }
 
     async fn send_many(&mut self, packets: &mut Vec<Packet<Ip>>) -> io::Result<()> {
-        if std::env::var_os("GOTATUN_DIAG_TUN_SINGLE_SENDS").is_some() {
+        if crate::diag::TUN_SINGLE_SENDS.on() {
             for packet in std::mem::take(packets) {
                 self.send(packet).await?;
             }
@@ -199,7 +199,7 @@ impl IpSend for BufferedIpSend {
 
         while !packets.is_empty() {
             let count = packets.len().min(self.packet_capacity);
-            let sequence_diagnostic = std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some();
+            let sequence_diagnostic = crate::diag::SEND_QUEUE.on();
             let sequence = sequence_diagnostic
                 .then(|| NEXT_DIAGNOSTIC_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed));
             if let Some(sequence) = sequence {
@@ -208,7 +208,7 @@ impl IpSend for BufferedIpSend {
                     self.packet_slots.available_permits()
                 );
             }
-            let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some();
+            let diagnostic = crate::diag::PIPELINE.on();
             if diagnostic {
                 eprintln!(
                     "pipeline stage=tun_buffer_permit_wait packets={count} available={} mode=batch",
