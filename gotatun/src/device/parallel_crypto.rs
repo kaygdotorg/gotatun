@@ -49,6 +49,21 @@ pub(crate) const CRYPTO_WORKER_BATCH_SIZE: usize = CRYPTO_CHUNK_SIZE;
 /// Smallest ready peer run worth offloading when another run can execute concurrently.
 pub(crate) const MIN_PARALLEL_RUN_SIZE: usize = 8;
 
+/// Hand a ready run of at least this many packets to a crypto worker, whatever the backlog.
+///
+/// Offloading lets the producer task go back to its socket or TUN read while a worker does the
+/// AEAD; done inline, the producer stops reading until the whole run is sealed or opened. Under
+/// bulk load, inline crypto finishes each run before the next read returns, so the backlog-based
+/// latch below never sees older work and the workers stay idle: on the #260 best-LAN host, with
+/// two Tokio workers per endpoint only about 60% busy, the 3a70a7d21 stack reached 3.92 / 3.64
+/// Gbit/s at 1 / 8 TCP flows, and forcing every run to a worker raised that to 4.37 / 4.23.
+///
+/// Forcing every run costs latency, though: a lone probe waits for a worker wake (idle p50
+/// 0.19 ms → 0.31 ms). Runs this large only come from batched reads (a TSO frame from the TUN is
+/// about 44 packets at MTU 1420; a GRO datagram about 27), which happen only when the link is
+/// busy. Pings, lone ACKs and other small runs stay inline, so the idle path keeps its latency.
+pub(crate) const BULK_RUN_SIZE: usize = 2 * MIN_PARALLEL_RUN_SIZE;
+
 /// Start parallel dispatch after half a worker chunk of older packets is queued for this peer.
 pub(crate) const PARALLEL_DISPATCH_HIGH_WATER: usize = CRYPTO_CHUNK_SIZE / 2;
 
@@ -112,6 +127,9 @@ struct AdaptiveDispatch {
 
 impl AdaptiveDispatch {
     /// Update this peer's hysteresis latch and select a worker only for useful batch sizes.
+    ///
+    /// A bulk-sized run ([`BULK_RUN_SIZE`]) always goes to a worker; smaller useful runs go only
+    /// while the latch reports a backlog.
     fn should_force_worker(&mut self, packet_count: usize, peer_backlog_packets: usize) -> bool {
         if self.parallel {
             if peer_backlog_packets <= PARALLEL_DISPATCH_LOW_WATER {
@@ -121,7 +139,7 @@ impl AdaptiveDispatch {
             self.parallel = true;
         }
 
-        self.parallel && packet_count >= MIN_PARALLEL_RUN_SIZE
+        packet_count >= BULK_RUN_SIZE || (self.parallel && packet_count >= MIN_PARALLEL_RUN_SIZE)
     }
 }
 
@@ -706,6 +724,8 @@ impl CryptoQueue {
 #[derive(Clone)]
 pub(crate) struct CryptoHandle {
     queue: Arc<CryptoQueue>,
+    /// Starts the pool's threads on the first real handoff.
+    threads: Arc<WorkerThreads>,
     worker_count: usize,
     active_batches: Arc<AtomicUsize>,
     serial: Arc<Mutex<()>>,
@@ -740,6 +760,10 @@ impl CryptoHandle {
             return Some(encrypt_run(run));
         }
 
+        if !self.threads.ensure_started() {
+            // No worker can run it: the pool stopped, or no thread could be spawned.
+            return Some(encrypt_run(run));
+        }
         let (result_tx, result_rx) = oneshot::channel();
         let active = ActiveBatch::enter_queued(&self.active_batches);
         self.queue
@@ -774,6 +798,10 @@ impl CryptoHandle {
             return Some(decrypt_run(run));
         }
 
+        if !self.threads.ensure_started() {
+            // No worker can run it: the pool stopped, or no thread could be spawned.
+            return Some(decrypt_run(run));
+        }
         let (result_tx, result_rx) = oneshot::channel();
         let active = ActiveBatch::enter_queued(&self.active_batches);
         self.queue
@@ -860,15 +888,138 @@ fn decrypt_run(run: Vec<(PreparedDecryption, SocketAddr)>) -> Vec<IncomingComple
         .collect()
 }
 
-/// Fixed process-local pool of blocking crypto workers.
+/// Lifecycle of a pool's worker threads, which start on the first handoff.
+enum PoolThreads {
+    /// No run has been handed off yet, so no thread exists.
+    NotStarted,
+    /// The threads that started. Spawn failures leave this shorter than the pool size.
+    Running(Vec<JoinHandle<()>>),
+    /// The pool was stopped. A later handoff must not start threads nobody would join.
+    Stopped,
+}
+
+/// The worker threads of one pool, shared by the owner and every [`CryptoHandle`].
+///
+/// Threads are started lazily by [`WorkerThreads::ensure_started`], called right before a run is
+/// queued. Most traffic is short runs that the caller encrypts inline, so an idle or low-rate
+/// device never pays for thread start-up and joins. Starting `available_parallelism()` threads
+/// per device at setup made each device-pair test spawn and join 32 threads on a 16-CPU VM, which
+/// pushed the 1 s test budgets over on loaded hosts (J380's timeout regressions, #260).
+struct WorkerThreads {
+    /// Queue the workers drain. Closing it makes every worker exit after its current job.
+    queue: Arc<CryptoQueue>,
+    /// Number of threads to start.
+    count: usize,
+    /// Current lifecycle state. The lock is held only while threads are started or taken.
+    state: Mutex<PoolThreads>,
+    /// Fast path for handoffs after start-up, so they never touch `state`.
+    started: AtomicBool,
+    /// Counts completed worker runs in tests.
+    #[cfg(test)]
+    completed_runs: Arc<AtomicUsize>,
+    /// Sends one notice when each test worker thread exits.
+    #[cfg(test)]
+    worker_exit_tx: Mutex<std::sync::mpsc::Sender<()>>,
+}
+
+impl WorkerThreads {
+    /// Start the threads unless they already run. Returns whether any worker can take a run.
+    ///
+    /// Returns `false` once the pool is stopped, or when not a single thread could be spawned;
+    /// the caller then runs the work inline. A partial spawn failure keeps the threads that did
+    /// start, so the pool degrades to fewer workers instead of failing the device.
+    fn ensure_started(&self) -> bool {
+        if self.started.load(Ordering::Acquire) {
+            return true;
+        }
+        let mut state = self.state.lock();
+        match &*state {
+            PoolThreads::Running(threads) => return !threads.is_empty(),
+            PoolThreads::Stopped => return false,
+            PoolThreads::NotStarted => {}
+        }
+        let mut threads = Vec::with_capacity(self.count);
+        for worker_index in 0..self.count {
+            match self.spawn_worker(worker_index) {
+                Ok(thread) => threads.push(thread),
+                Err(error) => {
+                    tracing::error!(
+                        "started {} of {} packet crypto workers: {error}",
+                        threads.len(),
+                        self.count
+                    );
+                    break;
+                }
+            }
+        }
+        let any = !threads.is_empty();
+        *state = PoolThreads::Running(threads);
+        // Publish only a usable pool on the fast path; an empty one keeps answering `false`.
+        self.started.store(any, Ordering::Release);
+        any
+    }
+
+    /// Spawn one worker that drains whole runs until the queue closes.
+    fn spawn_worker(&self, worker_index: usize) -> io::Result<JoinHandle<()>> {
+        let worker_queue = Arc::clone(&self.queue);
+        #[cfg(test)]
+        let completed_runs = Arc::clone(&self.completed_runs);
+        #[cfg(test)]
+        let worker_exit_tx = self.worker_exit_tx.lock().clone();
+        thread::Builder::new()
+            .name(format!("gotatun-crypto-{worker_index}"))
+            .spawn(move || {
+                while let Some(job) = worker_queue.pop() {
+                    #[cfg(test)]
+                    completed_runs.fetch_add(1, Ordering::Relaxed);
+                    match job {
+                        CryptoJob::Encrypt(run, result_sender, active) => {
+                            let _ = result_sender.send(encrypt_run(run));
+                            drop(active);
+                        }
+                        CryptoJob::Decrypt(run, result_sender, active) => {
+                            let _ = result_sender.send(decrypt_run(run));
+                            drop(active);
+                        }
+                    }
+                }
+                #[cfg(test)]
+                let _ = worker_exit_tx.send(());
+            })
+    }
+
+    /// Mark the pool stopped and hand back every started thread for joining.
+    ///
+    /// Call after closing the queue. From here on [`WorkerThreads::ensure_started`] refuses to
+    /// start threads, so none can be left running without a join.
+    fn take_for_join(&self) -> Vec<JoinHandle<()>> {
+        self.started.store(false, Ordering::Release);
+        match std::mem::replace(&mut *self.state.lock(), PoolThreads::Stopped) {
+            PoolThreads::Running(threads) => threads,
+            PoolThreads::NotStarted | PoolThreads::Stopped => Vec::new(),
+        }
+    }
+
+    /// Number of threads currently running, for tests.
+    #[cfg(test)]
+    fn running(&self) -> usize {
+        match &*self.state.lock() {
+            PoolThreads::Running(threads) => threads.len(),
+            PoolThreads::NotStarted | PoolThreads::Stopped => 0,
+        }
+    }
+}
+
+/// Process-local pool of blocking crypto workers, one pool per running connection.
 ///
 /// Each worker removes one complete contiguous run from the queue, performs its AEAD operations
 /// without per-packet handoffs, and immediately returns to the queue. The queue is bounded, and
-/// owner drop closes it so cloned handles cannot keep parked threads alive.
+/// owner drop closes it so cloned handles cannot keep parked threads alive. Threads start on the
+/// first handoff (see [`WorkerThreads`]); a pool that only ever runs inline starts none.
 pub(crate) struct CryptoWorkers {
     handle: CryptoHandle,
     queue: Arc<CryptoQueue>,
-    threads: Vec<JoinHandle<()>>,
+    threads: Arc<WorkerThreads>,
     #[cfg(test)]
     worker_count: usize,
     /// Receives one notice when each test worker thread has exited.
@@ -877,7 +1028,7 @@ pub(crate) struct CryptoWorkers {
 }
 
 impl CryptoWorkers {
-    /// Start one worker for every CPU available to this process.
+    /// Create a pool sized to the CPUs available to this process. No thread starts yet.
     pub(crate) fn new() -> io::Result<Self> {
         let worker_count = thread::available_parallelism()
             .map(NonZeroUsize::get)
@@ -885,7 +1036,10 @@ impl CryptoWorkers {
         Self::with_worker_count(worker_count)
     }
 
-    /// Start a fixed pool with an explicit size for focused measurements.
+    /// Create a pool with an explicit size for focused measurements. No thread starts yet.
+    ///
+    /// Kept fallible so callers do not change if start-up ever moves back here; today thread
+    /// spawn errors surface on the first handoff and fall back to inline crypto.
     pub(crate) fn with_worker_count(worker_count: usize) -> io::Result<Self> {
         assert!(
             worker_count > 0,
@@ -898,46 +1052,16 @@ impl CryptoWorkers {
         let worker_run_count = Arc::new(AtomicUsize::new(0));
         #[cfg(test)]
         let (worker_exit_tx, worker_exit_rx) = std::sync::mpsc::channel();
-        let mut threads = Vec::with_capacity(worker_count);
-
-        for worker_index in 0..worker_count {
-            let worker_queue = Arc::clone(&queue);
+        let threads = Arc::new(WorkerThreads {
+            queue: Arc::clone(&queue),
+            count: worker_count,
+            state: Mutex::new(PoolThreads::NotStarted),
+            started: AtomicBool::new(false),
             #[cfg(test)]
-            let completed_runs = Arc::clone(&worker_run_count);
+            completed_runs: Arc::clone(&worker_run_count),
             #[cfg(test)]
-            let worker_exit_tx = worker_exit_tx.clone();
-            let thread = thread::Builder::new()
-                .name(format!("gotatun-crypto-{worker_index}"))
-                .spawn(move || {
-                    while let Some(job) = worker_queue.pop() {
-                        #[cfg(test)]
-                        completed_runs.fetch_add(1, Ordering::Relaxed);
-                        match job {
-                            CryptoJob::Encrypt(run, result_sender, active) => {
-                                let _ = result_sender.send(encrypt_run(run));
-                                drop(active);
-                            }
-                            CryptoJob::Decrypt(run, result_sender, active) => {
-                                let _ = result_sender.send(decrypt_run(run));
-                                drop(active);
-                            }
-                        }
-                    }
-                    #[cfg(test)]
-                    let _ = worker_exit_tx.send(());
-                });
-
-            match thread {
-                Ok(thread) => threads.push(thread),
-                Err(error) => {
-                    queue.close();
-                    for thread in threads {
-                        let _ = thread.join();
-                    }
-                    return Err(error);
-                }
-            }
-        }
+            worker_exit_tx: Mutex::new(worker_exit_tx),
+        });
 
         #[cfg(test)]
         let handoff_count = Arc::new(AtomicUsize::new(0));
@@ -945,6 +1069,7 @@ impl CryptoWorkers {
         Ok(Self {
             handle: CryptoHandle {
                 queue: Arc::clone(&queue),
+                threads: Arc::clone(&threads),
                 worker_count,
                 active_batches,
                 serial: Arc::new(Mutex::new(())),
@@ -973,10 +1098,19 @@ impl CryptoWorkers {
         self.worker_count
     }
 
-    /// Close the job queue and join every worker.
-    pub(crate) async fn stop(mut self) {
+    /// Start the worker threads now, as the first handoff would, for tests about running workers.
+    #[cfg(test)]
+    pub(crate) fn start_threads(&self) -> bool {
+        self.threads.ensure_started()
+    }
+
+    /// Close the job queue and join every worker that started.
+    pub(crate) async fn stop(self) {
         self.queue.close();
-        let threads = std::mem::take(&mut self.threads);
+        let threads = self.threads.take_for_join();
+        if threads.is_empty() {
+            return;
+        }
 
         let join = tokio::task::spawn_blocking(move || {
             for thread in threads {
@@ -993,8 +1127,13 @@ impl CryptoWorkers {
 
 impl Drop for CryptoWorkers {
     /// Wake the worker threads even when orderly asynchronous shutdown cannot be awaited.
+    ///
+    /// The threads are detached rather than joined here, since drop cannot block the runtime.
+    /// They exit as soon as they see the closed queue. Marking the pool stopped keeps a handle
+    /// that outlives the owner from starting new ones.
     fn drop(&mut self) {
         self.queue.close();
+        drop(self.threads.take_for_join());
     }
 }
 
@@ -1821,6 +1960,8 @@ mod tests {
     #[test]
     fn j369_dropping_workers_closes_the_queue() {
         let workers = CryptoWorkers::with_worker_count(2).unwrap();
+        // Threads start on the first handoff; start them as a handoff would.
+        assert!(workers.start_threads());
         let queue = Arc::clone(&workers.queue);
         let worker_exit_rx = Arc::clone(&workers.worker_exit_rx);
         drop(workers);
@@ -1872,7 +2013,7 @@ mod tests {
     #[test]
     fn adaptive_dispatch_uses_distinct_high_and_low_watermarks() {
         let mut dispatch = super::AdaptiveDispatch::default();
-        assert!(!dispatch.should_force_worker(CRYPTO_CHUNK_SIZE, 0));
+        assert!(!dispatch.should_force_worker(super::BULK_RUN_SIZE - 1, 0));
         assert!(!dispatch.should_force_worker(
             MIN_PARALLEL_RUN_SIZE,
             super::PARALLEL_DISPATCH_HIGH_WATER - 1
@@ -1893,6 +2034,17 @@ mod tests {
             MIN_PARALLEL_RUN_SIZE,
             super::PARALLEL_DISPATCH_HIGH_WATER - 1
         ));
+    }
+
+    /// A bulk-sized run goes to a worker even with no backlog, so the producer keeps reading
+    /// while it is sealed or opened; smaller runs keep the inline path.
+    #[test]
+    fn bulk_runs_use_a_worker_without_backlog() {
+        let mut dispatch = super::AdaptiveDispatch::default();
+        assert!(dispatch.should_force_worker(super::BULK_RUN_SIZE, 0));
+        assert!(dispatch.should_force_worker(CRYPTO_CHUNK_SIZE, 0));
+        assert!(!dispatch.should_force_worker(1, 0));
+        assert!(!dispatch.should_force_worker(super::BULK_RUN_SIZE - 1, 0));
     }
 
     /// Backlog on one peer must not force a shallow peer out of its inline fast path.
@@ -2172,6 +2324,73 @@ mod tests {
         workers.stop().await;
     }
 
+    /// A pool whose runs all stay inline never starts a thread, so setup and stop stay cheap.
+    #[tokio::test]
+    async fn inline_only_pool_starts_no_worker_threads() {
+        let (mut sender, _) = established_tunnels();
+        let workers = CryptoWorkers::with_worker_count(4).expect("the worker pool is created");
+        let crypto = workers.handle();
+        assert_eq!(
+            workers.threads.running(),
+            0,
+            "creating a pool starts no thread"
+        );
+
+        let run = prepared_encryptions(&mut sender, 1)
+            .into_iter()
+            .map(|packet| Some(PreparedOutgoing::Encrypt(packet)))
+            .collect();
+        let results = crypto
+            .encrypt_run(run, false)
+            .await
+            .expect("an idle pool runs a short run inline");
+        black_box(results);
+
+        assert_eq!(crypto.handoff_count(), 0);
+        assert_eq!(workers.threads.running(), 0, "inline work starts no thread");
+        workers.stop().await;
+    }
+
+    /// The first handoff starts the whole pool, stop joins it, and nothing restarts it afterwards.
+    #[tokio::test]
+    async fn first_handoff_starts_the_pool_and_stop_retires_it() {
+        let (mut sender, _) = established_tunnels();
+        let workers = CryptoWorkers::with_worker_count(3).expect("the worker pool is created");
+        let crypto = workers.handle();
+        let threads = Arc::clone(&workers.threads);
+
+        let run = prepared_encryptions(&mut sender, super::CRYPTO_BATCH_SIZE)
+            .into_iter()
+            .map(|packet| Some(PreparedOutgoing::Encrypt(packet)))
+            .collect();
+        let results = crypto
+            .encrypt_run(run, true)
+            .await
+            .expect("a started worker returns the run");
+        black_box(results);
+        assert_eq!(crypto.handoff_count(), 1);
+        assert_eq!(
+            threads.running(),
+            3,
+            "the first handoff starts every worker"
+        );
+
+        workers.stop().await;
+        assert_eq!(threads.running(), 0, "stop takes every thread for joining");
+        assert!(
+            !threads.ensure_started(),
+            "a handle that outlives stop must not start unjoined threads"
+        );
+
+        // A late run on a surviving handle still completes, inline.
+        let late = prepared_encryptions(&mut sender, 1)
+            .into_iter()
+            .map(|packet| Some(PreparedOutgoing::Encrypt(packet)))
+            .collect();
+        assert!(crypto.encrypt_run(late, true).await.is_some());
+        assert_eq!(crypto.handoff_count(), 1, "the late run is not handed off");
+    }
+
     /// A worker takes one bounded contiguous run without packet-level queue jobs.
     #[tokio::test]
     async fn grouped_encryption_uses_one_bounded_worker_run() {
@@ -2281,9 +2500,43 @@ mod tests {
         );
     }
 
-    /// A lone full worker-sized run stays on the caller when no other run is ready.
+    /// A lone run below the bulk size stays on the caller when no other run is ready.
     #[tokio::test]
     async fn a_lone_encryption_run_uses_the_serial_fast_path() {
+        let (mut sender, _) = established_tunnels();
+        let packet_count = super::BULK_RUN_SIZE - 1;
+        let packets = prepared_encryptions(&mut sender, packet_count);
+        let workers = CryptoWorkers::with_worker_count(2).expect("the worker pool starts");
+        let crypto = workers.handle();
+        let lane = OrderedCompletions::<WgKind>::default();
+        let first_slot = lane
+            .reserve_run(packet_count)
+            .expect("the lone run fits the peer's ordered window");
+        let run = packets
+            .into_iter()
+            .map(|packet| Some(PreparedOutgoing::Encrypt(packet)))
+            .collect();
+        let force_worker = lane.should_force_worker(packet_count);
+
+        let results = crypto
+            .encrypt_run(run, force_worker)
+            .await
+            .expect("the serial fast path returns the packets");
+        lane.complete_run(first_slot, results, |results| async move {
+            black_box(results);
+            Ok::<_, ()>(())
+        })
+        .await
+        .expect("the ordered lane releases the lone run");
+
+        assert_eq!(crypto.handoff_count(), 0);
+        assert!(lane.is_idle());
+        workers.stop().await;
+    }
+
+    /// A lone bulk-sized run goes to a worker, so the producer can read on while it is sealed.
+    #[tokio::test]
+    async fn a_lone_bulk_encryption_run_uses_a_worker() {
         let (mut sender, _) = established_tunnels();
         let packet_count = super::CRYPTO_WORKER_BATCH_SIZE;
         let packets = prepared_encryptions(&mut sender, packet_count);
@@ -2302,7 +2555,7 @@ mod tests {
         let results = crypto
             .encrypt_run(run, force_worker)
             .await
-            .expect("the serial fast path returns the packet");
+            .expect("the worker returns the packets");
         lane.complete_run(first_slot, results, |results| async move {
             black_box(results);
             Ok::<_, ()>(())
@@ -2310,7 +2563,7 @@ mod tests {
         .await
         .expect("the ordered lane releases the lone run");
 
-        assert_eq!(crypto.handoff_count(), 0);
+        assert_eq!(crypto.handoff_count(), 1);
         assert!(lane.is_idle());
         workers.stop().await;
     }
