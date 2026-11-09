@@ -965,22 +965,29 @@ impl<T: DeviceTransports> Connection<T> {
             device.port = addr.port();
         }
 
+        // J461 EXPERIMENT ONLY (not for merge): override the TUN and UDP-receive queue capacities.
+        let j461 = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(MAX_PACKET_BUFS)
+        };
         let (buffered_ip_tx, buffered_ip_rx) = crate::tun::buffer::channel(
-            MAX_PACKET_BUFS,
+            j461("GOTATUN_J461_TUNQ"),
             pool.clone(),
             Arc::clone(&device.tun_tx),
             Arc::clone(&device.tun_rx),
         )
         .await;
 
-        let buffered_udp_tx = BufferedUdpSend::new(MAX_PACKET_BUFS, udp_tx.clone());
+        let buffered_udp_tx = BufferedUdpSend::new(j461("GOTATUN_J461_UDPTXQ"), udp_tx.clone());
 
         // Linux sockets already return recvmmsg/GRO batches here. Avoid queueing them across a
         // second worker handoff before packet processing.
         #[cfg(target_os = "linux")]
         let incoming_udp_rx = udp_rx;
         #[cfg(not(target_os = "linux"))]
-        let incoming_udp_rx = BufferedUdpReceive::new(MAX_PACKET_BUFS, udp_rx, pool.clone());
+        let incoming_udp_rx = BufferedUdpReceive::new(j461("GOTATUN_J461_UDPRXQ"), udp_rx, pool.clone());
 
         // Start DAITA/hooks tasks
         #[cfg(feature = "daita")]

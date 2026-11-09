@@ -216,8 +216,8 @@ async fn setup_device(args: Args) -> eyre::Result<Device<DefaultDeviceTransports
         .with_default_udp()
         // Use 7MB socket buffers. Empirically this seems to be more perfomant than the default OS
         // socket buffer sizes.
-        .udp_recv_buffer_size(7 * 1024 * 1024)
-        .udp_send_buffer_size(7 * 1024 * 1024)
+        .udp_recv_buffer_size(j461_sockbuf("GOTATUN_J461_RCVBUF"))
+        .udp_send_buffer_size(j461_sockbuf("GOTATUN_J461_SNDBUF"))
         .with_ip(tun)
         .build()
         .await
@@ -273,4 +273,12 @@ mod test {
         assert!(check_tun_name("utun-1").is_err());
         assert!(check_tun_name("utun123abc").is_err());
     }
+}
+
+/// J461 EXPERIMENT ONLY (not for merge): socket buffer size override, default 7 MiB.
+fn j461_sockbuf(name: &str) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(7 * 1024 * 1024)
 }
