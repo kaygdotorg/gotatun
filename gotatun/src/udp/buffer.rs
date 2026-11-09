@@ -63,9 +63,9 @@ async fn flush_udp_packets<U: UdpSend>(
     send_buf: &mut U::SendManyBuf,
     packets: &mut Vec<(Packet, SocketAddr)>,
 ) {
-    let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some();
+    let diagnostic = crate::diag::PIPELINE.on();
     let packet_count = packets.len();
-    if std::env::var_os("GOTATUN_DIAG_UDP_SINGLE_SENDS").is_some() {
+    if crate::diag::UDP_SINGLE_SENDS.on() {
         let mut sent = 0;
         for (packet, address) in packets.drain(..) {
             match udp_tx.send_to(packet, address).await {
@@ -242,7 +242,7 @@ impl UdpSend for BufferedUdpSend {
         }
         while !packets.is_empty() {
             let count = packets.len().min(self.packet_capacity);
-            let sequence_diagnostic = std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some();
+            let sequence_diagnostic = crate::diag::SEND_QUEUE.on();
             let sequence = sequence_diagnostic
                 .then(|| NEXT_DIAGNOSTIC_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed));
             if let Some(sequence) = sequence {
