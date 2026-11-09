@@ -587,6 +587,186 @@ async fn threaded_reverse_traffic_preserves_order_and_progress() {
     drop(tun_input_guards);
 }
 
+/// A rekey under sustained traffic must not stall either receive path (#260 round 2).
+///
+/// Alice floods Bob with batched data, keeping up to [`IN_FLIGHT`] packets outstanding the way a
+/// TCP sender keeps its window full, while Bob sends a small reverse packet every few
+/// milliseconds. Alice's sessions rekey every 200 ms. Each rekey ends with a control packet from
+/// Alice's UDP receive task (the keepalive after the handshake response). The bug: that receive
+/// task then drained the handshake queue itself, and the TUN task diverted the whole flood into
+/// that queue for as long as the drain ran, so the drain rarely finished. Meanwhile Bob's reverse
+/// packets were not received, and diverted packets beyond the 256-packet queue were dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rekey_under_sustained_traffic_keeps_both_receive_paths_moving() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    /// Session age after which Alice, the initiator, starts the next handshake.
+    const REKEY_AFTER: Duration = Duration::from_millis(200);
+    /// How long the flood runs after warm-up.
+    const RUN_FOR: Duration = Duration::from_secs(3);
+    /// Spacing of Bob's reverse packets.
+    const REVERSE_INTERVAL: Duration = Duration::from_millis(5);
+    /// Largest gap allowed between consecutive arrivals in either direction. About fifty reverse
+    /// intervals: generous for a loaded debug build, far below a stalled receive task.
+    const MAX_GAP: Duration = Duration::from_millis(250);
+    /// Data packets Alice may have sent that Bob has not yet received.
+    const IN_FLIGHT: usize = 1024;
+
+    let (alice, bob) = batched_device_pair().await;
+    let BatchedDevice {
+        _device: mut alice_device,
+        app_tx: alice_tx,
+        app_rx: mut alice_rx,
+        ..
+    } = alice;
+    let BatchedDevice {
+        _device: bob_device,
+        app_tx: bob_tx,
+        app_rx: mut bob_rx,
+        ..
+    } = bob;
+
+    // Short sessions apply from the first handshake on, so set them before any traffic.
+    let bob_key = alice_device.peers().await[0].peer.public_key;
+    let short_rekey = TimerParams {
+        rekey_after_time: REKEY_AFTER..=REKEY_AFTER,
+        ..TimerParams::default()
+    };
+    assert!(
+        alice_device
+            .modify_peer(&bob_key, |peer| {
+                peer.dangerously_set_timer_params(Some(short_rekey.clone()));
+            })
+            .await
+            .expect("the timer update reaches Alice's peer")
+    );
+
+    // Warm up both directions so the flood starts on an established session.
+    alice_tx
+        .send(mock::packet(b"rekey warm-up from Alice"))
+        .unwrap();
+    timeout(Duration::from_secs(5), bob_rx.recv())
+        .await
+        .expect("Alice's warm-up packet reaches Bob")
+        .expect("Bob's TUN stays open");
+    bob_tx
+        .send(mock::packet(b"rekey warm-up from Bob"))
+        .unwrap();
+    timeout(Duration::from_secs(5), alice_rx.recv())
+        .await
+        .expect("Bob's warm-up packet reaches Alice")
+        .expect("Alice's TUN stays open");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let forward_received = Arc::new(AtomicUsize::new(0));
+
+    let data_producer = {
+        let stop = Arc::clone(&stop);
+        let forward_received = Arc::clone(&forward_received);
+        let alice_tx = alice_tx.clone();
+        thread::Builder::new()
+            .name("rekey-flood".into())
+            .spawn(move || {
+                let mut sent = 0_usize;
+                while !stop.load(Ordering::Relaxed) {
+                    if sent - forward_received.load(Ordering::Relaxed) >= IN_FLIGHT {
+                        thread::yield_now();
+                        continue;
+                    }
+                    let mut payload = vec![0; 1200];
+                    payload[..8].copy_from_slice(&(sent as u64).to_be_bytes());
+                    if alice_tx.send(mock::packet(payload)).is_err() {
+                        break;
+                    }
+                    sent += 1;
+                }
+                sent
+            })
+            .expect("the flood thread starts")
+    };
+    let reverse_producer = {
+        let stop = Arc::clone(&stop);
+        let bob_tx = bob_tx.clone();
+        thread::Builder::new()
+            .name("rekey-reverse".into())
+            .spawn(move || {
+                let mut sent = 0_usize;
+                while !stop.load(Ordering::Relaxed) {
+                    if bob_tx.send(mock::packet(b"reverse probe")).is_err() {
+                        break;
+                    }
+                    sent += 1;
+                    // sleep: paces Bob's reverse probes at a fixed interval.
+                    thread::sleep(REVERSE_INTERVAL);
+                }
+                sent
+            })
+            .expect("the reverse thread starts")
+    };
+
+    let started = Instant::now();
+    let mut forward_last = started;
+    let mut reverse_last = started;
+    let mut forward_gap = Duration::ZERO;
+    let mut reverse_gap = Duration::ZERO;
+    let mut reverse_received = 0_usize;
+    let mut rekeys = 0_usize;
+    let mut last_handshake = None;
+    let mut poll_stats = tokio::time::interval(Duration::from_millis(20));
+    while started.elapsed() < RUN_FOR {
+        select! {
+            packet = bob_rx.recv() => {
+                packet.expect("Bob's TUN stays open during the flood");
+                forward_received.fetch_add(1, Ordering::Relaxed);
+                forward_gap = forward_gap.max(forward_last.elapsed());
+                forward_last = Instant::now();
+            }
+            packet = alice_rx.recv() => {
+                packet.expect("Alice's TUN stays open during the flood");
+                reverse_received += 1;
+                reverse_gap = reverse_gap.max(reverse_last.elapsed());
+                reverse_last = Instant::now();
+            }
+            _ = poll_stats.tick() => {
+                let age = alice_device.peers().await[0].stats.last_handshake;
+                if let (Some(previous), Some(age)) = (last_handshake, age)
+                    && age < previous
+                {
+                    rekeys += 1;
+                }
+                last_handshake = age;
+            }
+        }
+    }
+    forward_gap = forward_gap.max(forward_last.elapsed());
+    reverse_gap = reverse_gap.max(reverse_last.elapsed());
+    stop.store(true, Ordering::Relaxed);
+    let sent = data_producer.join().expect("the flood thread completes");
+    let reverse_sent = reverse_producer
+        .join()
+        .expect("the reverse thread completes");
+    let forward = forward_received.load(Ordering::Relaxed);
+    eprintln!(
+        "rekey flood: rekeys={rekeys} forward={forward}/{sent} reverse={reverse_received}/{reverse_sent} \
+         forward_gap={forward_gap:?} reverse_gap={reverse_gap:?}"
+    );
+
+    assert!(
+        rekeys >= 3,
+        "the flood must cross several rekeys to exercise the flush, saw {rekeys}"
+    );
+    assert!(
+        reverse_gap <= MAX_GAP,
+        "Alice's receive path stalled for {reverse_gap:?} across a rekey (limit {MAX_GAP:?})"
+    );
+    assert!(
+        forward_gap <= MAX_GAP,
+        "Bob stopped receiving the flood for {forward_gap:?} across a rekey (limit {MAX_GAP:?})"
+    );
+    drop((alice_tx, bob_tx, bob_device));
+}
+
 /// Assert that the expected number of packets is sent.
 /// We expect there to be [`packet_count`] data packets, one handshake init,
 /// one handshake resp, and one keepalive.
@@ -1245,6 +1425,15 @@ async fn force_handshake() {
 
 /// Helper method to test that packets can be sent from one [`Device`] to another.
 /// Use `eavesdrop` to sniff wireguard packets and assert things about the connection.
+/// Deadline for one device-pair exchange in [`test_device_pair`]: the handshake, every packet
+/// from [`mock::packets_of_every_size`], and shutdown.
+///
+/// This catches a hang, not a slow run. A quiet host needs about 0.15–0.5 s in a debug build, but
+/// on a loaded build VM even the unmodified base needed over 1 s, so the old 1 s deadline failed
+/// both base and candidate there (#260 comments 88702 and 88507). The tests' assertions on packet
+/// contents, indices, counts and sizes don't depend on this value.
+const DEVICE_PAIR_DEADLINE: Duration = Duration::from_secs(10);
+
 async fn test_device_pair(eavesdrop: impl AsyncFnOnce(MockEavesdropper) + Send) {
     let (mut alice, mut bob, eve) = mock::device_pair().await;
 
@@ -1252,7 +1441,8 @@ async fn test_device_pair(eavesdrop: impl AsyncFnOnce(MockEavesdropper) + Send) 
     let eavesdrop = async {
         select! {
             _ = eavesdrop(eve) => {}
-            _ = sleep(Duration::from_secs(1)) => panic!("eavesdrop timeout"),
+            // sleep: bounds the eavesdropper until both devices shut down; see DEVICE_PAIR_DEADLINE.
+            _ = sleep(DEVICE_PAIR_DEADLINE) => panic!("eavesdrop timeout"),
         }
     };
 
@@ -1281,7 +1471,8 @@ async fn test_device_pair(eavesdrop: impl AsyncFnOnce(MockEavesdropper) + Send) 
             _ = wait_for_packets => {},
             _ = send_packets => unreachable!(),
             _ = alice.app_rx.recv() => panic!("no data is sent from bob to alice"),
-            _ = sleep(Duration::from_secs(1)) => panic!("timeout"),
+            // sleep: bounds delivery of every test packet; see DEVICE_PAIR_DEADLINE.
+            _ = sleep(DEVICE_PAIR_DEADLINE) => panic!("timeout"),
         }
 
         // Shut down alice and bob after `wait_for_packets`
