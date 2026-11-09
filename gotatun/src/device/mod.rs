@@ -375,6 +375,27 @@ struct PreparedIncomingRun {
     packets: Vec<(PreparedDecryption, std::net::SocketAddr)>,
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Marks code running inside the UDP receive task, so tests can check what it never does.
+    static RECEIVE_TASK: ();
+}
+
+/// Handshake-queue drains that ran inside a UDP receive task, summed over this test binary.
+///
+/// The receive task must never drain (#260 round 2): a drain there blocks datagram processing for
+/// as long as it runs. Tests compare this counter before and after the traffic they drive.
+#[cfg(test)]
+static RECEIVE_TASK_DRAINS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Count a drain if it runs inside the UDP receive task (test builds only).
+#[cfg(test)]
+fn note_drain_task() {
+    if RECEIVE_TASK.try_with(|()| ()).is_ok() {
+        RECEIVE_TASK_DRAINS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Everything a running packet or timer task may use to reach shared device state.
 ///
 /// This is the type-level form of lock-order rule 1 in the module docs. A task gets a weak
@@ -1047,27 +1068,28 @@ impl<T: DeviceTransports> Connection<T> {
                 Arc::clone(&outgoing_order),
             ),
         );
-        let incoming = Task::spawn(
-            "handle_incoming",
-            DeviceState::<T>::handle_incoming(
-                handles,
-                HandshakeResponder {
-                    private_key,
-                    public_key,
-                    rate_limiter,
-                },
-                buffered_ip_tx.clone(),
-                buffered_udp_tx,
-                incoming_udp_rx,
-                pool.clone(),
-                CryptoOrderContext {
-                    crypto,
-                    incoming: incoming_order,
-                    outgoing: Arc::clone(&outgoing_order),
-                },
-            )
-            .map_err(register_fatal_error.clone()),
-        );
+        let incoming_task = DeviceState::<T>::handle_incoming(
+            handles,
+            HandshakeResponder {
+                private_key,
+                public_key,
+                rate_limiter,
+            },
+            buffered_ip_tx.clone(),
+            buffered_udp_tx,
+            incoming_udp_rx,
+            pool.clone(),
+            CryptoOrderContext {
+                crypto,
+                incoming: incoming_order,
+                outgoing: Arc::clone(&outgoing_order),
+            },
+        )
+        .map_err(register_fatal_error.clone());
+        // Test builds tag the receive task so tests can assert it never drains a queue.
+        #[cfg(test)]
+        let incoming_task = RECEIVE_TASK.scope((), incoming_task);
+        let incoming = Task::spawn("handle_incoming", incoming_task);
 
         debug_assert!(device.connection.is_none());
         device.connection = Some(Connection {
@@ -1750,6 +1772,8 @@ impl<T: DeviceTransports> DeviceState<T> {
         pending: &mut PendingOutgoing,
         flush_guard: parallel_crypto::FlushGuard<WgKind>,
     ) -> Result<(), Error> {
+        #[cfg(test)]
+        note_drain_task();
         let OutgoingBatchContext {
             peer:
                 OutgoingPeerContext {
