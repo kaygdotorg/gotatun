@@ -21,6 +21,8 @@
 
 #[cfg(feature = "device")]
 pub mod device;
+#[cfg(feature = "device")]
+mod diag;
 pub mod noise;
 pub mod tun;
 pub mod udp;
