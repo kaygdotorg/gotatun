@@ -39,7 +39,27 @@ class PerfAllCliTest(unittest.TestCase):
             "esac\n"
         )
         systemctl.chmod(0o755)
-        (state_dir / "allowed").write_text("0-5\n")
+        fake_id = bin_dir / "id"
+        fake_id.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ ${1:-} == -un ]]; then printf 'claude\\n'; else exec /usr/bin/id \"$@\"; fi\n"
+        )
+        fake_id.chmod(0o755)
+        taskset = bin_dir / "taskset"
+        taskset.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ ${1:-} == -pc ]]; then exit 0; fi\n"
+            "if [[ ${1:-} == -c ]]; then shift 2; exec \"$@\"; fi\n"
+            "exec /usr/bin/taskset \"$@\"\n"
+        )
+        taskset.chmod(0o755)
+        awk = bin_dir / "awk"
+        awk.write_text(
+            "#!/usr/bin/env bash\n"
+            "if [[ ${*: -1} == /proc/self/status && ${1:-} == /^Cpus_allowed_list:* ]]; then printf '0,5\\n'; else exec /usr/bin/awk \"$@\"; fi\n"
+        )
+        awk.chmod(0o755)
+        (state_dir / "allowed").write_text("1-3\n")
         (state_dir / "effective").write_text(f"{effective}\n")
         (state_dir / "dropins").write_text("")
         (cgroup / "cpuset.cpus").write_text(f"{cpuset}\n")
@@ -47,7 +67,7 @@ class PerfAllCliTest(unittest.TestCase):
         environment = os.environ.copy()
         environment["PATH"] = f"{bin_dir}{os.pathsep}{environment['PATH']}"
         environment["J88I_PERF_SLICE_CGROUP"] = str(cgroup)
-        environment["J88I_EXPECTED_PERF_CPUS"] = "0-5"
+        environment["J88I_EXPECTED_PERF_CPUS"] = "1-3"
         environment["J88I_TEST_SYSTEMD_STATE"] = str(state_dir)
         return environment
 
@@ -57,7 +77,7 @@ class PerfAllCliTest(unittest.TestCase):
         effective: str,
         *,
         cpuset: str = "0-5",
-        allowed: str = "0-5",
+        allowed: str = "",
         systemd_effective: str | None = None,
         workqueue_manifest: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
@@ -147,7 +167,7 @@ class PerfAllCliTest(unittest.TestCase):
                 "\"$@\"\n"
             )
             runner.chmod(0o755)
-            environment = self.fake_restore_environment(root, "0-5")
+            environment = self.fake_restore_environment(root, "1-3", cpuset="1-3")
             environment["PERF_RUN"] = str(runner)
             environment["PERF_RUN_CAPTURE"] = str(capture)
             environment["PERF_RUN_COUNT_FILE"] = str(count_file)
@@ -169,7 +189,7 @@ class PerfAllCliTest(unittest.TestCase):
                 ["--root", "--out", str(output / "receipts")],
             )
             self.assertIn("H2H_LAN_TPUT_SECONDS=10", capture.read_text().splitlines())
-            self.assertIn("cpuset.cpus.effective=0-5", (output / "cpuset-restoration.txt").read_text())
+            self.assertIn("cpuset.cpus.effective=1-3", (output / "cpuset-restoration.txt").read_text())
 
     def test_validation_resolves_smoke_helper_from_installed_kit_root(self) -> None:
         """D348 validation must find the helper copied beside the installed harness kit."""
@@ -204,7 +224,7 @@ class PerfAllCliTest(unittest.TestCase):
                 "\"$@\"\n"
             )
             runner.chmod(0o755)
-            environment = self.fake_restore_environment(root, "0-5")
+            environment = self.fake_restore_environment(root, "1-3", cpuset="1-3")
             environment["PERF_RUN"] = str(runner)
             environment["PERF_RUN_CAPTURE"] = str(capture)
             environment["PERF_RUN_COUNT_FILE"] = str(count_file)
@@ -284,7 +304,7 @@ class PerfAllCliTest(unittest.TestCase):
                 "\"$@\"\n"
             )
             runner.chmod(0o755)
-            environment = self.fake_restore_environment(root, "0-5")
+            environment = self.fake_restore_environment(root, "1-3", cpuset="1-3")
             environment["PERF_RUN"] = str(runner)
             environment["PERF_RUN_CAPTURE"] = str(capture)
             environment["PERF_RUN_COUNT_FILE"] = str(count_file)
@@ -308,6 +328,110 @@ class PerfAllCliTest(unittest.TestCase):
             self.assertEqual(result.returncode, 23, result.stderr)
             self.assertIn("wireguard-go\twireguard-go", (output / "rows.tsv").read_text())
 
+    def test_matrix_mode_passes_best_lan_configuration_to_perf_scope(self) -> None:
+        """The five-window matrix reaches perf-run with its exact LAN scenario and flow set."""
+        script = Path(__file__).parent / "base/perf-all.sh"
+        with tempfile.TemporaryDirectory(prefix="j88i-matrix-mode-") as temporary:
+            root = Path(temporary)
+            runner = root / "perf-run"
+            capture = root / "runner-args.txt"
+            count_file = root / "runner-count.txt"
+            binary = root / "gotatun"
+            binary.write_text("#!/usr/bin/env sh\nexit 0\n")
+            binary.chmod(0o755)
+            wg_binary = root / "wg"
+            wireguard_go_binary = root / "wireguard-go"
+            for reference_binary in (wg_binary, wireguard_go_binary):
+                reference_binary.write_text("#!/usr/bin/env sh\nexit 0\n")
+                reference_binary.chmod(0o755)
+            runner.write_text(
+                "#!/usr/bin/env bash\n"
+                "count=0\n"
+                "[[ ! -f $PERF_RUN_COUNT_FILE ]] || count=$(cat \"$PERF_RUN_COUNT_FILE\")\n"
+                "count=$((count + 1))\n"
+                "printf '%s\\n' \"$count\" > \"$PERF_RUN_COUNT_FILE\"\n"
+                "if ((count == 1)); then printf '%s\\n' \"$@\" > \"$PERF_RUN_CAPTURE\"; exit 23; fi\n"
+                "exit 0\n"
+            )
+            runner.chmod(0o755)
+            environment = self.fake_restore_environment(root, "1-3", cpuset="1-3")
+            environment["PERF_RUN"] = str(runner)
+            environment["PERF_RUN_CAPTURE"] = str(capture)
+            environment["PERF_RUN_COUNT_FILE"] = str(count_file)
+            output = root / "matrix-window"
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(script),
+                    "--matrix",
+                    "--scenario",
+                    "best-lan",
+                    "--tcp-flow",
+                    "1",
+                    "--tcp-flow",
+                    "8",
+                    "--calibration-status",
+                    "uncalibrated, owner-directed",
+                    "--label",
+                    "decomposition window 1",
+                    "--row",
+                    "kernel=kernel-plain",
+                    "--row",
+                    "wireguard-go=wireguard-go",
+                    "--row",
+                    "shipped=gotatun",
+                    "--binary",
+                    f"shipped={binary}",
+                    "--source",
+                    "shipped=84b7bb28e385d57dfb80493e78202898fad24d1e",
+                    "--wg-bin",
+                    str(wg_binary),
+                    "--wireguard-go-bin",
+                    str(wireguard_go_binary),
+                    "--out",
+                    str(output),
+                ],
+                capture_output=True,
+                text=True,
+                env=environment,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 23, result.stderr)
+            self.assertEqual(
+                (output / "rows.tsv").read_text(),
+                f"kernel\tkernel-plain\t\t\n"
+                f"wireguard-go\twireguard-go\t\t\n"
+                f"shipped\tgotatun\t{binary.resolve()}\t84b7bb28e385d57dfb80493e78202898fad24d1e\n",
+            )
+            captured = capture.read_text().splitlines()
+            self.assertIn("H2H_MATRIX_SCENARIO=best-lan", captured)
+            self.assertIn("H2H_MATRIX_LATENCY_PAYLOAD_BYTES=1392", captured)
+            self.assertIn("H2H_MATRIX_LOADED_LATENCY_INTERVAL_US=2500", captured)
+            self.assertIn("H2H_LAN_PING_COUNT=3600", captured)
+            self.assertIn(f"H2H_WG_BIN={wg_binary}", captured)
+            self.assertIn(f"H2H_WIREGUARD_GO_BIN={wireguard_go_binary}", captured)
+            self.assertIn("matrix", captured)
+
+    def test_best_lan_matrix_exits_before_wan_and_peer_scale_work(self) -> None:
+        """A best-LAN matrix row must stop after its LAN measurements."""
+        script = Path(__file__).parent / "base/cases/mesh.sh"
+        source = script.read_text()
+        lan_profile = source.index('profile lan "$LAT_COUNT" 1000 "$TPUT_S"')
+        scenario_guard = source.index('if [[ ${H2H_MATRIX_SCENARIO:-} == best-lan ]]', lan_profile)
+        scenario_exit = source.index("exit 0", scenario_guard)
+        wan_work = source.index("netem_set h2h-a a0 delay 99ms", scenario_exit)
+        peer_scale_work = source.index("elif [[ $SYSTEM == infraternal ]]", scenario_exit)
+
+        self.assertLess(lan_profile, scenario_guard)
+        self.assertLess(scenario_guard, scenario_exit)
+        self.assertLess(scenario_exit, wan_work)
+        self.assertLess(scenario_exit, peer_scale_work)
+        self.assertIn("LOADED_PING_INTERVAL=0.0025", source)
+        self.assertIn('loaded_ping_args+=(-s "$H2H_MATRIX_LATENCY_PAYLOAD_BYTES")', source)
+        self.assertIn('ping "${loaded_ping_args[@]}" "$PEER"', source)
+
     def test_hold_plan_uses_plain_kernel_wireguard_as_the_matched_mtu_baseline(self) -> None:
         """A counted cut hold must use the direct kernel row at the userspace MTU."""
         script = Path(__file__).parent / "base/perf-all.sh"
@@ -328,7 +452,7 @@ class PerfAllCliTest(unittest.TestCase):
                 binary.write_text("#!/usr/bin/env sh\\nexit 0\\n")
                 binary.chmod(0o755)
             output = root / "hold"
-            environment = self.fake_restore_environment(root, "0-5")
+            environment = self.fake_restore_environment(root, "1-3", cpuset="1-3")
             environment["PERF_RUN"] = str(runner)
 
             result = subprocess.run(
@@ -389,7 +513,7 @@ class PerfAllCliTest(unittest.TestCase):
             self.assertIn("kernel-plain) case_name=mesh-kernel-plain", runner_overlay.read_text())
             kernel_setup = mesh_case.read_text().split("start_kernel_plain() {", 1)[1].split("\n}\n", 1)[0]
             self.assertIn("ip -n h2h-a link add wgA type wireguard", kernel_setup)
-            self.assertIn('"$H2H_BIN/wg" set wgA', kernel_setup)
+            self.assertIn('"$WG_BIN" set wgA', kernel_setup)
             self.assertIn("mtu 1420", kernel_setup)
             self.assertNotIn("start_netbird", kernel_setup)
 

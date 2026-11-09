@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
-# Execute one D348 validation, calibration, hold or soak under the shared lock.
+# Execute one D348 validation, calibration, matrix row, hold or soak under the shared lock.
 set -euo pipefail
 
 kit=$1
@@ -348,6 +348,9 @@ case $mode in
         run_plan 1
         ;;
     calibration|hold)
+        run_plan 0
+        ;;
+    matrix)
         run_plan 0
         ;;
     soak)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: AGPL-3.0-only
-# Run one complete pinned R4b comparison inside a single perf-run lock.
+# Run one pinned R4b comparison or LAN matrix row inside a single perf-run lock.
 set -euo pipefail
 
 kit=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
@@ -15,7 +15,12 @@ taskset -pc "$housekeeping" "$$" >/dev/null
 mode=""
 label=""
 out=""
+scenario=""
+calibration_status=""
+wg_binary=""
+wireguard_go_binary=""
 rows=()
+tcp_flows=()
 declare -A binaries sources
 binary_count=0
 source_count=0
@@ -25,7 +30,8 @@ usage() {
 usage:
   perf-all.sh --validate [--out DIR]
   perf-all.sh --smoke --row TAG=gotatun|kernel|kernel-plain|wireguard-go [--binary TAG=PATH] [--source TAG=SHA] [--out DIR]
-  perf-all.sh --calibration --row control-a=gotatun --row control-b=gotatun --row control-c=gotatun [--binary TAG=PATH] [--out DIR]
+  perf-all.sh --calibration [--scenario best-lan --tcp-flow 1 --tcp-flow 8] --row control-a=gotatun --row control-b=gotatun --row control-c=gotatun [--binary TAG=PATH] [--out DIR]
+  perf-all.sh --matrix --scenario best-lan --tcp-flow 1 --tcp-flow 8 --calibration-status STATUS --row TAG=ENGINE ... [--binary TAG=PATH] [--source TAG=SHA] [--wg-bin PATH] [--wireguard-go-bin PATH] [--out DIR]
   perf-all.sh --hold --label CUT --row kernel-before=kernel-plain --row wireguard-go-before=wireguard-go \
     --row control-a=gotatun --row candidate-a=gotatun --row candidate-b=gotatun \
     --row control-b=gotatun --row wireguard-go-after=wireguard-go --row kernel-after=kernel-plain \
@@ -57,10 +63,21 @@ while (($#)); do
         --validate) set_mode validate ;;
         --smoke) set_mode smoke ;;
         --calibration) set_mode calibration ;;
+        --matrix) set_mode matrix ;;
         --hold) set_mode hold ;;
         --soak) set_mode soak ;;
         --label) (($# >= 2)) || { echo '--label needs a value' >&2; exit 2; }; label=$2; shift ;;
         --out) (($# >= 2)) || { echo '--out needs a value' >&2; exit 2; }; out=$2; shift ;;
+        --scenario) (($# >= 2)) || { echo '--scenario needs a value' >&2; exit 2; }; scenario=$2; shift ;;
+        --tcp-flow)
+            (($# >= 2)) || { echo '--tcp-flow needs a value' >&2; exit 2; }
+            [[ $2 == 1 || $2 == 8 ]] || { echo "unsupported LAN TCP flow count: $2" >&2; exit 2; }
+            tcp_flows+=("$2")
+            shift
+            ;;
+        --calibration-status) (($# >= 2)) || { echo '--calibration-status needs a value' >&2; exit 2; }; calibration_status=$2; shift ;;
+        --wg-bin) (($# >= 2)) || { echo '--wg-bin needs a path' >&2; exit 2; }; wg_binary=$2; shift ;;
+        --wireguard-go-bin) (($# >= 2)) || { echo '--wireguard-go-bin needs a path' >&2; exit 2; }; wireguard_go_binary=$2; shift ;;
         --row)
             (($# >= 2)) || { echo '--row needs a value' >&2; exit 2; }
             parse_pair "$2" tag engine
@@ -103,8 +120,9 @@ done
 
 [[ -n $mode ]] || { usage >&2; exit 2; }
 if [[ $mode == validate ]]; then
-    ((${#rows[@]} == 0 && binary_count == 0 && source_count == 0)) || {
-        echo '--validate does not take row, binary, or source options' >&2; exit 2;
+    ((${#rows[@]} == 0 && binary_count == 0 && source_count == 0 && ${#tcp_flows[@]} == 0)) && \
+        [[ -z $scenario && -z $calibration_status && -z $wg_binary && -z $wireguard_go_binary ]] || {
+        echo '--validate does not take row, binary, scenario, flow, or engine options' >&2; exit 2;
     }
 else
     ((${#rows[@]} > 0)) || { echo "$mode requires at least one --row" >&2; exit 2; }
@@ -138,6 +156,23 @@ case $mode in
         [[ -n ${sources[control-a]:-} && ${sources[control-a]} == "${sources[control-b]:-}" && \
            ${sources[control-a]} == "${sources[control-c]:-}" ]] || {
             echo 'all control rows need the same source SHA' >&2; exit 2;
+        }
+        if [[ -n $scenario || ${#tcp_flows[@]} -gt 0 ]]; then
+            [[ $scenario == best-lan && ${#tcp_flows[@]} == 2 && ${tcp_flows[0]} == 1 && ${tcp_flows[1]} == 8 ]] || {
+                echo 'matrix calibration requires --scenario best-lan --tcp-flow 1 --tcp-flow 8' >&2; exit 2;
+            }
+        fi
+        ;;
+    matrix)
+        [[ $scenario == best-lan ]] || { echo '--matrix currently requires --scenario best-lan' >&2; exit 2; }
+        [[ ${#tcp_flows[@]} == 2 && ${tcp_flows[0]} == 1 && ${tcp_flows[1]} == 8 ]] || {
+            echo '--matrix requires --tcp-flow 1 --tcp-flow 8 in order' >&2; exit 2;
+        }
+        [[ -n $label && $calibration_status == 'uncalibrated, owner-directed' ]] || {
+            echo '--matrix requires --label and --calibration-status "uncalibrated, owner-directed"' >&2; exit 2;
+        }
+        [[ -n $wg_binary && -n $wireguard_go_binary ]] || {
+            echo '--matrix requires --wg-bin and --wireguard-go-bin' >&2; exit 2;
         }
         ;;
     hold)
@@ -177,6 +212,50 @@ case $mode in
         ;;
 esac
 
+if [[ $mode != matrix && $mode != calibration ]]; then
+    [[ -z $scenario && ${#tcp_flows[@]} -eq 0 && -z $calibration_status && \
+       -z $wg_binary && -z $wireguard_go_binary ]] || {
+        echo "scenario, flow, calibration-status, and engine-binary options are only valid for matrix/calibration" >&2
+        exit 2
+    }
+fi
+if [[ $mode == calibration ]]; then
+    [[ -z $calibration_status && -z $wg_binary && -z $wireguard_go_binary ]] || {
+        echo '--calibration does not take calibration-status or engine-binary options' >&2
+        exit 2
+    }
+fi
+
+if [[ -n $wg_binary && ! -x $wg_binary ]]; then
+    echo "WireGuard CLI is not executable: $wg_binary" >&2
+    exit 2
+fi
+if [[ $mode == matrix ]]; then
+    has_kernel=0
+    has_wireguard_go=0
+    has_gotatun=0
+    for row in "${rows[@]}"; do
+        tag=${row%%=*}
+        engine=${row#*=}
+        case $engine in
+            kernel-plain) has_kernel=1 ;;
+            wireguard-go) has_wireguard_go=1 ;;
+            gotatun)
+                has_gotatun=1
+                [[ -n ${sources[$tag]:-} ]] || { echo "matrix row $tag needs a source SHA" >&2; exit 2; }
+                ;;
+        esac
+    done
+    ((has_kernel && has_wireguard_go && has_gotatun)) || {
+        echo '--matrix needs plain-kernel, wireguard-go, and GotaTun rows' >&2
+        exit 2
+    }
+fi
+if [[ -n $wireguard_go_binary && ! -x $wireguard_go_binary ]]; then
+    echo "wireguard-go binary is not executable: $wireguard_go_binary" >&2
+    exit 2
+fi
+
 for row in "${rows[@]}"; do
     tag=${row%%=*}
     engine=${row#*=}
@@ -209,9 +288,22 @@ if [[ $mode == validate ]]; then
     run_env+=(H2H_LAN_TPUT_SECONDS=10)
 fi
 [[ -z ${H2H_ETHTOOL_BIN:-} ]] || run_env+=("H2H_ETHTOOL_BIN=$H2H_ETHTOOL_BIN")
-if [[ $mode == calibration && -z ${H2H_LAN_PING_COUNT:-} ]]; then
+if [[ ( $mode == calibration || $mode == matrix ) && -z ${H2H_LAN_PING_COUNT:-} ]]; then
     H2H_LAN_PING_COUNT=3600
 fi
+if [[ -n $scenario ]]; then
+    run_env+=("H2H_MATRIX_SCENARIO=$scenario")
+fi
+if [[ $scenario == best-lan ]]; then
+    run_env+=(H2H_MATRIX_LATENCY_PAYLOAD_BYTES=1392 H2H_MATRIX_LOADED_LATENCY_INTERVAL_US=2500)
+fi
+if ((${#tcp_flows[@]})); then
+    flow_csv=$(IFS=,; printf '%s' "${tcp_flows[*]}")
+    run_env+=("H2H_MATRIX_TCP_FLOWS=$flow_csv")
+fi
+[[ -z $calibration_status ]] || run_env+=("H2H_CALIBRATION_STATUS=$calibration_status")
+[[ -z $wg_binary ]] || run_env+=("H2H_WG_BIN=$wg_binary")
+[[ -z $wireguard_go_binary ]] || run_env+=("H2H_WIREGUARD_GO_BIN=$wireguard_go_binary")
 if [[ -n ${H2H_LAN_PING_COUNT:-} ]]; then
     # perf-run enters a sudo scope, so measured overrides must be command env assignments.
     run_env+=("H2H_LAN_PING_COUNT=$H2H_LAN_PING_COUNT")

@@ -26,6 +26,28 @@ TPUT_S=$(h2h_lan_tput_duration 10 2)
 WAN_TPUT_S=$(dur 20 4)
 IDLE_S=$(dur 15 3)
 GOTATUN_BIN=${H2H_GOTATUN_BIN:-$H2H_BIN/gotatun}
+WG_BIN=${H2H_WG_BIN:-$H2H_BIN/wg}
+WIREGUARD_GO_BIN=${H2H_WIREGUARD_GO_BIN:-$H2H_BIN/wireguard-go}
+LOADED_PING_INTERVAL=0.005
+LAN_FLOW_COUNTS=(1 8)
+if [[ -n ${H2H_MATRIX_TCP_FLOWS:-} ]]; then
+    IFS=, read -r -a LAN_FLOW_COUNTS <<< "$H2H_MATRIX_TCP_FLOWS"
+    ((${#LAN_FLOW_COUNTS[@]} > 0)) || die 'matrix flow list is empty'
+    for flow in "${LAN_FLOW_COUNTS[@]}"; do
+        [[ $flow == 1 || $flow == 8 ]] || die "unsupported matrix flow count: $flow"
+    done
+fi
+case ${H2H_MATRIX_SCENARIO:-} in
+    "") ;;
+    best-lan)
+        [[ ${H2H_MATRIX_LATENCY_PAYLOAD_BYTES:-} == 1392 ]] || die 'best-lan matrix requires a 1,392-byte ICMP payload'
+        case ${H2H_MATRIX_LOADED_LATENCY_INTERVAL_US:-} in
+            2500) LOADED_PING_INTERVAL=0.0025 ;;
+            *) die 'best-lan matrix requires 2,500 us loaded-latency spacing' ;;
+        esac
+        ;;
+    *) die "unsupported matrix scenario: $H2H_MATRIX_SCENARIO" ;;
+esac
 
 record_memcg() {
     local tag=$1 rel path
@@ -180,9 +202,9 @@ start_wireguard_go() {
     python3 -I "$H2H_KIT/lib/gotatun_uapi.py" keys "$D/keys"
     START=$("$H" now)
     H2H_SCOPE_LOG="$D/a/daemon.log" spawn_sandboxed WG_A_PID "$A_PID" \
-        env WG_PROCESS_FOREGROUND=1 LOG_LEVEL=error "$H2H_BIN/wireguard-go" wgA
+        env WG_PROCESS_FOREGROUND=1 LOG_LEVEL=error "$WIREGUARD_GO_BIN" wgA
     H2H_SCOPE_LOG="$D/b/daemon.log" spawn_sandboxed WG_B_PID "$B_PID" \
-        env WG_PROCESS_FOREGROUND=1 LOG_LEVEL=error "$H2H_BIN/wireguard-go" wgB
+        env WG_PROCESS_FOREGROUND=1 LOG_LEVEL=error "$WIREGUARD_GO_BIN" wgB
     wait_for 20 nsenter -t "$WG_A_PID" -m -- test -S /var/run/wireguard/wgA.sock \
         || die "wireguard-go a UAPI socket did not appear: $(tail -c 600 "$D/a/daemon.log")"
     wait_for 20 nsenter -t "$WG_B_PID" -m -- test -S /var/run/wireguard/wgB.sock \
@@ -306,16 +328,16 @@ start_kernel_plain() {
     ip -n h2h-a link set wgA mtu 1420 up
     ip -n h2h-b addr add 10.66.0.2/24 dev wgB
     ip -n h2h-b link set wgB mtu 1420 up
-    ip netns exec h2h-a "$H2H_BIN/wg" set wgA \
+    ip netns exec h2h-a "$WG_BIN" set wgA \
         private-key "$D/keys/a.wg.private" listen-port 51820 \
         peer "$(cat "$D/keys/b.wg.public")" endpoint 10.220.0.2:51821 \
         allowed-ips 10.66.0.2/32
-    ip netns exec h2h-b "$H2H_BIN/wg" set wgB \
+    ip netns exec h2h-b "$WG_BIN" set wgB \
         private-key "$D/keys/b.wg.private" listen-port 51821 \
         peer "$(cat "$D/keys/a.wg.public")" endpoint 10.220.0.1:51820 \
         allowed-ips 10.66.0.1/32
-    ip netns exec h2h-a "$H2H_BIN/wg" show wgA
-    ip netns exec h2h-b "$H2H_BIN/wg" show wgB
+    ip netns exec h2h-a "$WG_BIN" show wgA
+    ip netns exec h2h-b "$WG_BIN" show wgB
     rm -f "$D/keys/"*.private "$D/keys/"*.public "$D/keys/"*.wg.private "$D/keys/"*.wg.public
     TUN_A=wgA
     TUN_B=wgB
@@ -367,10 +389,14 @@ profile() { # profile <tag> <lat-count> <lat-interval-us> <tput-seconds>
     local tag=$1 count=$2 interval=$3 secs=$4 size flows ping_pid tput_pid
     local ping_client tput_client ping_raw ping_status_file tput_file tput_tmp tput_err
     local ping_status tput_status audit_status
+    local -a loaded_ping_args=(-D -O -n -i "$LOADED_PING_INTERVAL" -c "$count")
+    if [[ ${H2H_MATRIX_SCENARIO:-} == best-lan ]]; then
+        loaded_ping_args+=(-s "$H2H_MATRIX_LATENCY_PAYLOAD_BYTES")
+    fi
     for size in 64 512 1400; do
         measure "lat-$tag-$size" in_ns h2h-a "$H" net-lat --to "$PEER:5201" --size "$size" --count "$count" --interval-us "$interval"
     done
-    for flows in 1 8; do
+    for flows in "${LAN_FLOW_COUNTS[@]}"; do
         ping_raw="$H2H_RESULTS/$H2H_CASE/icmp-$tag-$flows.raw"
         ping_status_file="$H2H_RESULTS/$H2H_CASE/icmp-$tag-$flows.exit"
         tput_file="$H2H_RESULTS/$H2H_CASE/tput-$tag-$flows.json"
@@ -381,7 +407,7 @@ profile() { # profile <tag> <lat-count> <lat-interval-us> <tput-seconds>
         H2H_SCOPE_PAUSE=1 \
             H2H_SCOPE_LOG="$D/icmp-scope-$tag-$flows.log" \
             H2H_SCOPE_STDOUT="$ping_raw" H2H_SCOPE_STDERR="$ping_raw" \
-            spawn_in_ns ping_pid h2h-a ping -D -O -n -i 0.005 -c "$count" "$PEER"
+            spawn_in_ns ping_pid h2h-a ping "${loaded_ping_args[@]}" "$PEER"
         ping_client=$H2H_SCOPE_CLIENT_PID
         H2H_SCOPE_PAUSE=1 \
             H2H_SCOPE_LOG="$D/tput-scope-$tag-$flows.log" \
@@ -510,6 +536,14 @@ else
     profile lan "$LAT_COUNT" 1000 "$TPUT_S"
     measure mem-after-load "$H" proc-mem --pids "$WATCH"
 
+    if [[ ${H2H_MATRIX_SCENARIO:-} == best-lan ]]; then
+        flow_json=$(printf '%s\n' "${LAN_FLOW_COUNTS[@]}" | paste -sd, -)
+        note matrix-scenario "{\"id\":\"best-lan\",\"tcp_flows\":[${flow_json}]}"
+        log 'best-lan complete; skipping WAN, loss, and peer-scale workloads'
+        log done
+        exit 0
+    fi
+
     netem_set h2h-a a0 delay 99ms
     netem_set h2h-b b0 delay 99ms
     sleep 2
@@ -540,8 +574,8 @@ elif [[ $SYSTEM == infraternal ]]; then
         nspid=$A_PID
         [[ $x == b ]] && nspid=$B_PID
         python3 -I "$H2H_KIT/lib/peer_scale.py" kernel-config --count 1000 --start 0 --output "$D/peers-$x.conf"
-        nsenter -t "$nspid" -n -- "$H2H_BIN/wg" setconf infraternal0 "$D/peers-$x.conf"
-        test "$(nsenter -t "$nspid" -n -- "$H2H_BIN/wg" show infraternal0 peers | wc -l)" -eq 1000 \
+        nsenter -t "$nspid" -n -- "$WG_BIN" setconf infraternal0 "$D/peers-$x.conf"
+        test "$(nsenter -t "$nspid" -n -- "$WG_BIN" show infraternal0 peers | wc -l)" -eq 1000 \
             || die "kernel WireGuard peer count is not 1,000 on $x"
     done
     sleep 2
