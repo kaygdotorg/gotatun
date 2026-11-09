@@ -237,8 +237,11 @@ pub fn packets_of_every_size() -> impl ExactSizeIterator<Item = Packet<Ip>> + Cl
     })
 }
 
+/// Transport types used by the paired test devices.
+pub type MockDeviceTransports = (UdpChannelFactory, MockTun, MockTun);
+
 pub struct MockDevice {
-    pub device: Device<(UdpChannelFactory, MockTun, MockTun)>,
+    pub device: Device<MockDeviceTransports>,
     pub app_tx: MockAppTx,
     pub app_rx: MockAppRx,
     pub source_ipv4_override: Arc<Mutex<Option<Ipv4Addr>>>,
