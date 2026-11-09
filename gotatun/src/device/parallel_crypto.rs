@@ -477,7 +477,15 @@ impl<T> OrderedCompletions<T> {
 pub(crate) struct OrderStore<T> {
     lanes: Mutex<BTreeMap<usize, Arc<OrderedCompletions<T>>>>,
     flushing: Mutex<std::collections::BTreeSet<usize>>,
+    #[cfg(test)]
+    /// Test-only barrier for arranging a producer at a lane reservation boundary.
+    reserve_hook: Mutex<Option<ReserveHook>>,
 }
+
+/// Test callback run at the start of every [`OrderStore::reserve_run`], given the peer key and
+/// the requested slot count. It runs with no store lock held, so it may block.
+#[cfg(test)]
+type ReserveHook = Arc<dyn Fn(usize, usize) + Send + Sync>;
 
 impl<T> Default for OrderStore<T> {
     /// Create a store without any per-peer lanes or active queue drains.
@@ -485,6 +493,8 @@ impl<T> Default for OrderStore<T> {
         Self {
             lanes: Mutex::new(BTreeMap::new()),
             flushing: Mutex::new(std::collections::BTreeSet::new()),
+            #[cfg(test)]
+            reserve_hook: Mutex::new(None),
         }
     }
 }
@@ -501,6 +511,13 @@ impl<T> OrderStore<T> {
         peer: usize,
         count: usize,
     ) -> Option<(Arc<OrderedCompletions<T>>, u64)> {
+        #[cfg(test)]
+        let hook = { self.reserve_hook.lock().clone() };
+        #[cfg(test)]
+        if let Some(hook) = hook {
+            hook(peer, count);
+        }
+
         let mut lanes = self.lanes.lock();
         let lane = lanes
             .entry(peer)
@@ -515,6 +532,12 @@ impl<T> OrderStore<T> {
             );
         }
         Some((Arc::clone(lane), first_slot))
+    }
+
+    /// Pause one reservation in tests to arrange a producer race at a precise sequence boundary.
+    #[cfg(test)]
+    pub(crate) fn set_reserve_hook(&self, hook: ReserveHook) {
+        *self.reserve_hook.lock() = Some(hook);
     }
 
     /// Return the active lane for a peer when it has outstanding ordered work.
@@ -987,6 +1010,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::future::Future;
     use std::hint::black_box;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -997,7 +1021,8 @@ mod tests {
 
     use super::{
         CRYPTO_BATCH_SIZE, CRYPTO_CHUNK_SIZE, CRYPTO_WORKER_BATCH_SIZE, CryptoWorkers,
-        IncomingCompletion, MAX_PEER_CRYPTO_IN_FLIGHT, MIN_PARALLEL_RUN_SIZE, OrderedCompletions,
+        IncomingCompletion, MAX_PEER_CRYPTO_IN_FLIGHT, MIN_PARALLEL_RUN_SIZE, OrderStore,
+        OrderedCompletions,
     };
     use crate::noise::index_table::IndexTable;
     use crate::noise::rate_limiter::RateLimiter;
@@ -1006,7 +1031,81 @@ mod tests {
         TunnResult,
     };
     use crate::packet::{Packet, WgKind};
+    use crate::udp::UdpSend;
     use crate::x25519;
+
+    /// Accept UDP output immediately so ordering tests never need a live receive loop.
+    #[derive(Clone)]
+    struct ImmediateUdp;
+
+    impl UdpSend for ImmediateUdp {
+        type SendManyBuf = ();
+
+        /// Complete delivery without introducing transport backpressure into a lane test.
+        async fn send_to(
+            &self,
+            _packet: Packet,
+            _destination: std::net::SocketAddr,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Hold ordered UDP sends so an interleaving test can reserve the next packet first.
+    #[derive(Clone)]
+    struct GatedUdp {
+        sent_counters: Arc<Mutex<Vec<u64>>>,
+        send_gate: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl GatedUdp {
+        /// Create a recorder whose sends remain parked until the test releases them.
+        fn new() -> Self {
+            Self {
+                sent_counters: Arc::new(Mutex::new(Vec::new())),
+                send_gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            }
+        }
+
+        /// Allow the ordered queue run to finish its captured sends.
+        fn release_sends(&self, count: usize) {
+            self.send_gate.add_permits(count);
+        }
+
+        /// Copy counters in the order the transport accepted each packet.
+        fn sent_counters(&self) -> Vec<u64> {
+            self.sent_counters.lock().unwrap().clone()
+        }
+    }
+
+    impl UdpSend for GatedUdp {
+        type SendManyBuf = ();
+
+        /// Record one encrypted counter and wait until ordered delivery is released.
+        async fn send_to(
+            &self,
+            packet: Packet,
+            _destination: std::net::SocketAddr,
+        ) -> std::io::Result<()> {
+            let packet = packet
+                .try_into_wg()
+                .expect("the queued data packet is valid WireGuard output");
+            let WgKind::Data(packet) = packet else {
+                panic!("the queued run contains only data packets");
+            };
+            self.sent_counters
+                .lock()
+                .unwrap()
+                .push(packet.header.counter.get());
+            self.send_gate
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("the test releases the ordered send gate")
+                .forget();
+            Ok(())
+        }
+    }
 
     /// Size of each inner packet used by the crypto-stage profile.
     const PROFILE_PACKET_BYTES: usize = 1380;
@@ -2734,5 +2833,374 @@ mod tests {
         drop(crypto);
         workers.stop().await;
         (elapsed, latencies)
+    }
+    /// Reserve a final handshake chunk while its peer and producer marker still exclude TUN work.
+    #[tokio::test]
+    async fn j380_final_handshake_chunk_survives_a_concurrent_tun_reservation() {
+        use crate::device::tests::mock;
+        use crate::device::{
+            DeviceState, OutgoingBatchContext, OutgoingPeerContext, PendingOutgoing,
+        };
+        let (alice, bob, _eve) = mock::device_pair().await;
+        alice.device.suspend().await;
+        bob.device.suspend().await;
+        let device = Arc::clone(&alice.device.inner);
+        let task_liveness = Arc::clone(&device.read().await.task_liveness);
+        let (peer, packet_lookup) = {
+            let state = device.read().await;
+            (
+                state.peers.values().next().unwrap().clone(),
+                Arc::clone(&state.packet_lookup),
+            )
+        };
+        let peer_key = crate::device::peer_order_key(&peer);
+        let peer_addr;
+        {
+            let mut guard = peer.lock().await;
+            peer_addr = guard.endpoint().addr.unwrap();
+            guard.tunnel = established_tunnels().0;
+            for _ in 0..64 {
+                guard
+                    .tunnel
+                    .queue_outgoing_packet(mock::packet(b"queued").into(), None);
+            }
+        }
+        let order = Arc::new(OrderStore::default());
+        let (lane, slot) = order.reserve(peer_key).unwrap();
+        lane.complete_run(slot, vec![None], |_| async { Ok::<_, ()>(()) })
+            .await
+            .unwrap();
+        let flush_guard = order.begin_flush(peer_key);
+        let workers = CryptoWorkers::with_worker_count(2).unwrap();
+        let context = OutgoingBatchContext {
+            peer: OutgoingPeerContext {
+                crypto: workers.handle(),
+                ordered: Arc::clone(&order),
+                peer_arc: Arc::clone(&peer),
+                peer_key,
+                peer_addr,
+                udp: ImmediateUdp,
+            },
+            send_many_buf: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let (reserve_started_tx, reserve_started_rx) = mpsc::channel();
+        let (release_reserve_tx, release_reserve_rx) = mpsc::channel();
+        let release_reserve_rx = Arc::new(Mutex::new(release_reserve_rx));
+        let paused_once = Arc::new(AtomicBool::new(false));
+        let hook_release_rx = Arc::clone(&release_reserve_rx);
+        let hook_paused_once = Arc::clone(&paused_once);
+        order.set_reserve_hook(Arc::new(move |hook_peer, count| {
+            if hook_peer == peer_key && !hook_paused_once.swap(true, Ordering::AcqRel) {
+                reserve_started_tx
+                    .send(count)
+                    .expect("the sequence test is waiting for reservation");
+                hook_release_rx
+                    .lock()
+                    .expect("the reservation gate is not poisoned")
+                    .recv()
+                    .expect("the sequence test releases the reservation gate");
+            }
+        }));
+
+        let flush_device = Arc::downgrade(&task_liveness);
+        let flush_lane = Arc::clone(&lane);
+        let flush_lookup = Arc::clone(&packet_lookup);
+        let flush = thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    DeviceState::<mock::MockDeviceTransports>::flush_handshake_queue(
+                        flush_device,
+                        flush_lookup,
+                        context,
+                        flush_lane,
+                        slot,
+                        &mut PendingOutgoing::new(),
+                        flush_guard,
+                    )
+                    .await
+                })
+        });
+
+        let reserved_count = reserve_started_rx.recv_timeout(Duration::from_secs(5)).ok();
+        let marker_held = order.is_flushing(peer_key);
+        let peer_held = peer.try_lock().is_err();
+
+        // A separate producer runtime fills the lane if the flush has exposed its reservation
+        // gap. Two bounded runs reproduce both the full-window panic and slot-order inversion.
+        let producer_order = Arc::clone(&order);
+        let producer_peer = Arc::clone(&peer);
+        let producer = thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    if let Ok(_peer_guard) = producer_peer.try_lock()
+                        && !producer_order.is_flushing(peer_key)
+                    {
+                        let first = producer_order
+                            .reserve_run(peer_key, CRYPTO_CHUNK_SIZE)
+                            .expect("the first TUN run fits in an empty peer lane");
+                        let second = producer_order
+                            .reserve_run(peer_key, CRYPTO_CHUNK_SIZE)
+                            .expect("the second TUN run fills the peer lane");
+                        return Some((first, second));
+                    }
+                    None
+                })
+        });
+        let producer_reservation = producer.join().unwrap();
+        let _ = release_reserve_tx.send(());
+        let result = flush.join();
+        let (next_slot, next_delivered, in_flight) = {
+            let state = lane.state.lock();
+            (state.next_slot, state.next_delivered, state.in_flight)
+        };
+        workers.stop().await;
+        alice.device.stop().await;
+        bob.device.stop().await;
+        assert_eq!(reserved_count, Some(CRYPTO_CHUNK_SIZE));
+        assert!(
+            marker_held,
+            "the flush marker must remain set until the queued run owns slots"
+        );
+        assert!(
+            peer_held,
+            "the flush must retain peer exclusion during reservation"
+        );
+        assert!(
+            producer_reservation.is_none(),
+            "a TUN producer must not reserve ahead of the older handshake chunk"
+        );
+        assert_eq!(
+            next_slot,
+            (CRYPTO_CHUNK_SIZE + 1) as u64,
+            "the TUN producer must not advance the peer counter before the queued run"
+        );
+        assert_eq!(next_delivered, next_slot);
+        assert_eq!(in_flight, 0);
+        assert!(result.is_ok(), "the real final-chunk flush must finish");
+    }
+
+    /// A newer packet cannot reserve its counter before the queued handshake run owns its slots.
+    #[tokio::test]
+    async fn j380_handshake_queue_counter_order_matches_sequence_slots() {
+        use crate::device::tests::mock;
+        use crate::device::{
+            DeviceState, OutgoingBatchContext, OutgoingPeerContext, PendingOutgoing,
+        };
+
+        let (alice, bob, _eve) = mock::device_pair().await;
+        alice.device.suspend().await;
+        bob.device.suspend().await;
+        let device = Arc::clone(&alice.device.inner);
+        let task_liveness = Arc::clone(&device.read().await.task_liveness);
+        let (peer, packet_lookup) = {
+            let state = device.read().await;
+            (
+                state.peers.values().next().unwrap().clone(),
+                Arc::clone(&state.packet_lookup),
+            )
+        };
+        let peer_key = crate::device::peer_order_key(&peer);
+        let peer_addr;
+        {
+            let mut guard = peer.lock().await;
+            peer_addr = guard.endpoint().addr.unwrap();
+            guard.tunnel = established_tunnels().0;
+            for _ in 0..CRYPTO_CHUNK_SIZE {
+                guard
+                    .tunnel
+                    .queue_outgoing_packet(mock::packet(b"queued").into(), None);
+            }
+        }
+
+        let order = Arc::new(OrderStore::default());
+        let (lane, first_slot) = order.reserve(peer_key).unwrap();
+        lane.complete_run(first_slot, vec![None], |_| async { Ok::<_, ()>(()) })
+            .await
+            .unwrap();
+        let flush_guard = order.begin_flush(peer_key);
+        let workers = CryptoWorkers::with_worker_count(2).unwrap();
+        let udp = GatedUdp::new();
+        let context = OutgoingBatchContext {
+            peer: OutgoingPeerContext {
+                crypto: workers.handle(),
+                ordered: Arc::clone(&order),
+                peer_arc: Arc::clone(&peer),
+                peer_key,
+                peer_addr,
+                udp: udp.clone(),
+            },
+            send_many_buf: Arc::new(tokio::sync::Mutex::new(())),
+        };
+
+        let (reserve_started_tx, reserve_started_rx) = mpsc::channel();
+        let (release_reserve_tx, release_reserve_rx) = mpsc::channel();
+        let release_reserve_rx = Arc::new(Mutex::new(release_reserve_rx));
+        let paused_once = Arc::new(AtomicBool::new(false));
+        let hook_release_rx = Arc::clone(&release_reserve_rx);
+        let hook_paused_once = Arc::clone(&paused_once);
+        order.set_reserve_hook(Arc::new(move |hook_peer, count| {
+            if hook_peer == peer_key && !hook_paused_once.swap(true, Ordering::AcqRel) {
+                reserve_started_tx
+                    .send(count)
+                    .expect("the counter-order test is waiting for reservation");
+                hook_release_rx
+                    .lock()
+                    .expect("the reservation gate is not poisoned")
+                    .recv()
+                    .expect("the counter-order test releases the reservation gate");
+            }
+        }));
+
+        let flush_device = Arc::downgrade(&task_liveness);
+        let flush_lane = Arc::clone(&lane);
+        let flush_lookup = Arc::clone(&packet_lookup);
+        let flush = thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    DeviceState::<mock::MockDeviceTransports>::flush_handshake_queue(
+                        flush_device,
+                        flush_lookup,
+                        context,
+                        flush_lane,
+                        first_slot,
+                        &mut PendingOutgoing::new(),
+                        flush_guard,
+                    )
+                    .await
+                })
+        });
+
+        let reserved_count = reserve_started_rx.recv_timeout(Duration::from_secs(5)).ok();
+        let marker_held = order.is_flushing(peer_key);
+        let peer_held = peer.try_lock().is_err();
+        let (producer_attempt_tx, producer_attempt_rx) = mpsc::channel();
+        let (producer_result_tx, producer_result_rx) = mpsc::channel();
+        let producer_order = Arc::clone(&order);
+        let producer_peer = Arc::clone(&peer);
+        let producer = thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let early_peer = match producer_peer.try_lock() {
+                        Ok(peer) if !producer_order.is_flushing(peer_key) => Some(peer),
+                        Ok(peer) => {
+                            drop(peer);
+                            None
+                        }
+                        Err(_) => None,
+                    };
+                    producer_attempt_tx
+                        .send(early_peer.is_some())
+                        .expect("the counter-order test checks whether the producer overtook");
+                    let mut peer = match early_peer {
+                        Some(peer) => peer,
+                        None => producer_peer.lock().await,
+                    };
+                    assert!(
+                        !producer_order.is_flushing(peer_key),
+                        "the bounded queued run releases its marker before a TUN producer proceeds"
+                    );
+                    let prepared = peer
+                        .tunnel
+                        .prepare_outgoing_packet(mock::packet(b"newer").into(), None)
+                        .expect("the established tunnel prepares the newer packet");
+                    let (_, slot) = producer_order
+                        .reserve_run(peer_key, 1)
+                        .expect("the queued run leaves room for one later packet");
+                    drop(peer);
+                    let packet = match prepared {
+                        PreparedOutgoing::Encrypt(packet) => packet.encrypt(),
+                        PreparedOutgoing::Ready(packet) => packet,
+                    };
+                    let WgKind::Data(packet) = packet else {
+                        panic!("the established tunnel prepares a data packet");
+                    };
+                    producer_result_tx
+                        .send((slot, packet.header.counter.get()))
+                        .expect("the main test checks the producer's slot and counter");
+                })
+        });
+
+        let producer_overtook = producer_attempt_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the producer reaches the peer lock boundary");
+        let early_producer_result = if producer_overtook {
+            // On the old path this lets the producer claim the earlier slot before the flush.
+            Some(
+                producer_result_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("the producer reserves before the paused flush resumes"),
+            )
+        } else {
+            None
+        };
+        let _ = release_reserve_tx.send(());
+        let (producer_slot, producer_counter) = early_producer_result.unwrap_or_else(|| {
+            producer_result_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the producer reserves after the queue run")
+        });
+
+        udp.release_sends(CRYPTO_CHUNK_SIZE);
+        lane.complete_run(producer_slot, vec![None], |_| async { Ok::<_, ()>(()) })
+            .await
+            .unwrap();
+        let flush_result = flush.join();
+        producer.join().unwrap();
+        let sent_counters = udp.sent_counters();
+        let (next_slot, next_delivered, in_flight) = {
+            let state = lane.state.lock();
+            (state.next_slot, state.next_delivered, state.in_flight)
+        };
+        workers.stop().await;
+        alice.device.stop().await;
+        bob.device.stop().await;
+
+        assert_eq!(reserved_count, Some(CRYPTO_CHUNK_SIZE));
+        assert_eq!(
+            producer_slot,
+            (CRYPTO_CHUNK_SIZE + 1) as u64,
+            "counter {producer_counter} must reserve a slot after all queued counters"
+        );
+        assert!(
+            !producer_overtook,
+            "the TUN producer waits for the older queue run"
+        );
+        assert!(
+            marker_held,
+            "the queue marker remains set during reservation"
+        );
+        assert!(
+            peer_held,
+            "peer state remains held through sequence reservation"
+        );
+        assert_eq!(sent_counters.len(), CRYPTO_CHUNK_SIZE);
+        assert!(
+            sent_counters.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "queued packet counters stay contiguous in sequence-slot order"
+        );
+        assert_eq!(
+            producer_counter,
+            sent_counters.last().unwrap() + 1,
+            "the next TUN counter follows the queued handshake counters"
+        );
+        assert_eq!(next_slot, (CRYPTO_CHUNK_SIZE + 2) as u64);
+        assert_eq!(next_delivered, next_slot);
+        assert_eq!(in_flight, 0);
+        assert!(
+            flush_result.is_ok(),
+            "the real final-chunk flush must finish"
+        );
     }
 }
