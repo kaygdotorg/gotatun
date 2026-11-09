@@ -342,6 +342,16 @@ impl<R: RngCore + Send> Tunn<R> {
         self.dequeue_packet()
     }
 
+    /// Whether a current session exists that queued packets could be encrypted with.
+    ///
+    /// The session may still refuse a packet (for example, past its message limit). In that case
+    /// [`Tunn::prepare_queued_packet`] puts the packet back and starts a handshake.
+    pub(crate) fn has_current_session(&self) -> bool {
+        self.sessions
+            .as_ref()
+            .is_some_and(|sessions| sessions[self.current % N_SESSIONS].is_some())
+    }
+
     /// Whether packets remain queued after the most recent bounded flush chunk.
     pub(crate) fn has_queued_packets(&self) -> bool {
         !self.packet_queue.is_empty()

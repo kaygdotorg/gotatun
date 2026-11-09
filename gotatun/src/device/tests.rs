@@ -406,6 +406,7 @@ async fn j369_timer_output_survives_a_full_peer_window() {
         super::PacketTaskHandles {
             liveness: Arc::downgrade(&task_liveness),
             lookup: packet_lookup,
+            flush_requests: Arc::default(),
         },
         index_table,
         rate_limiter,
