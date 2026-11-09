@@ -1784,12 +1784,34 @@ impl<T: DeviceTransports> DeviceState<T> {
                 return Ok(());
             }
 
-            let mut jobs = Vec::with_capacity(CRYPTO_CHUNK_SIZE);
-            let mut stop_after_chunk = false;
-            for _ in 0..CRYPTO_CHUNK_SIZE {
-                let Some(packet) = peer.tunnel.take_queued_packet() else {
-                    break;
+            let queued_count = peer.tunnel.queued_packet_count();
+            let available = ordered.available(peer_key);
+            if available == 0 {
+                let lane = ordered.lane(peer_key);
+                drop(peer);
+                drop(peer_trace);
+                let Some(lane) = lane else {
+                    // The final completion can retire its idle lane between the capacity check
+                    // and this lookup. Recheck under peer state; the active flush marker remains.
+                    continue;
                 };
+                tokio::select! {
+                    _ = lane.wait_for_capacity() => {}
+                    _ = pending.next(), if !pending.is_empty() => {}
+                }
+                continue;
+            }
+
+            // Limit preparation to slots that can fit now. The peer mutex excludes every other
+            // slot producer until the exact prepared run is reserved below.
+            let run_limit = queued_count.min(CRYPTO_CHUNK_SIZE).min(available);
+            let mut jobs = Vec::with_capacity(run_limit);
+            let mut stop_after_chunk = false;
+            for _ in 0..run_limit {
+                let packet = peer
+                    .tunnel
+                    .take_queued_packet()
+                    .expect("the queued packet count remains stable while peer state is locked");
                 let prepared = peer.tunnel.prepare_queued_packet(packet);
                 if let Some(PreparedOutgoing::Ready(packet)) = prepared.as_ref() {
                     packet_lookup.register_handshake_idx(packet, &peer_arc);
@@ -1804,20 +1826,24 @@ impl<T: DeviceTransports> DeviceState<T> {
                 }
             }
 
+            if jobs.is_empty() {
+                return Ok(());
+            }
+
+            // Preparation assigns packet counters. Keep peer state and the flush marker until
+            // these packets own the matching contiguous sequence range, so a newer producer can
+            // neither take counters nor reserve earlier slots.
+            let (chunk_lane, first_slot) = ordered
+                .reserve_run(peer_key, jobs.len())
+                .expect("peer state keeps the prepared run's sequence capacity available");
+
             if stop_after_chunk || !peer.tunnel.has_queued_packets() {
-                // The queue's remaining packets already have a later handshake or lane ordering
-                // point, so newer TUN packets may return to the regular path now.
+                // The current run already owns its slots, so newer TUN reservations can follow it.
                 drop(flush_guard.take());
             }
             drop(peer);
             drop(peer_trace);
 
-            if jobs.is_empty() {
-                return Ok(());
-            }
-            let (chunk_lane, first_slot) = ordered
-                .reserve_run(peer_key, jobs.len())
-                .expect("the bounded queue drain fits within the peer order window");
             let chunk_last_slot = first_slot + jobs.len() as u64 - 1;
             let batch_count = jobs.len().div_ceil(CRYPTO_BATCH_SIZE);
             while pending.len() + batch_count > CRYPTO_CHUNK_SIZE {
