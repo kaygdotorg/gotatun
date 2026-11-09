@@ -117,146 +117,70 @@ impl CoalescedFrame {
     }
 }
 
-/// Most flows that can each have a GSO frame under construction at once.
+/// Coalesce only adjacent, compatible packets and preserve their input order.
 ///
-/// One TUN write batch rarely holds more than a few flows; past this bound a new flow's packets
-/// are simply not coalesced with later ones. Lookups scan this many keys per packet.
-const MAX_OPEN_FLOWS: usize = 16;
-
-/// Addresses and ports that identify a TCP or UDP flow, used to find its open GSO group.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FlowKey {
-    ip_version: IpVersion,
-    protocol: TransportProtocol,
-    /// Source then destination address; IPv4 uses the first 8 bytes.
-    addresses: [u8; 32],
-    /// Source then destination port.
-    ports: [u8; 4],
-}
-
-/// Read a packet's flow key from the header offsets in its metadata.
-fn flow_key(bytes: &[u8], metadata: PacketMetadata) -> Option<FlowKey> {
-    let address_range = match metadata.ip_version {
-        IpVersion::V4 => 12..20,
-        IpVersion::V6 => 8..40,
-    };
-    let source = bytes.get(address_range)?;
-    let mut addresses = [0; 32];
-    addresses[..source.len()].copy_from_slice(source);
-    let ports = bytes
-        .get(metadata.ip_header_len..metadata.ip_header_len + 4)?
-        .try_into()
-        .ok()?;
-    Some(FlowKey {
-        ip_version: metadata.ip_version,
-        protocol: metadata.protocol,
-        addresses,
-        ports,
-    })
-}
-
-/// Packets of one flow collected for one GSO frame.
-struct GsoGroup {
-    packets: Vec<Packet<Ip>>,
-    first: PacketMetadata,
-    last: PacketMetadata,
-    payload_len: usize,
-}
-
-/// One future TUN frame, in output order.
-enum Slot {
-    /// A packet written on its own.
-    Single(Packet<Ip>),
-    /// Packets of one flow that may become one GSO frame.
-    Group(GsoGroup),
-}
-
-/// Coalesce compatible packets of each flow, keeping every flow's packets in input order.
-///
-/// Each flow has at most one open group. A packet joins its flow's open group when the group can
-/// take it: matching normalized headers, contiguous TCP sequence numbers, or full-sized UDP
-/// datagrams before the last, within Linux's 64-segment and 64-KiB limits. Packets of other flows
-/// in between do not end the group, so interleaved flows still produce full frames (#260: with
-/// only adjacent packets joined, the receiver wrote 30.5 KB per TUN write at 8 flows against
-/// 43.4 KB for the reference engine).
-///
-/// Frames come out in the order their first packet arrived. A packet that cannot join its flow's
-/// group closes that group, so later packets of the flow land in later frames and the flow's
-/// order holds. Packets of different flows may change places, which TCP and UDP allow. A packet
-/// with unsupported headers closes every open group, since its flow is unknown. Refused offloads
-/// stay as individual `GSO_NONE` frames.
+/// TCP groups require matching normalized headers and contiguous sequence numbers. UDP-L4 groups
+/// require matching normalized headers and full-sized datagrams before the final datagram. Each
+/// output GSO frame is bounded by Linux's 64-segment and 64-KiB limits; unsupported headers and
+/// refused offloads stay as individual `GSO_NONE` frames.
 pub(super) fn coalesce_packets(
     packets: Vec<Packet<Ip>>,
     tcp_tso: bool,
     udp_uso: bool,
 ) -> Vec<CoalescedFrame> {
-    let mut slots: Vec<Slot> = Vec::with_capacity(packets.len());
-    let mut open: Vec<(FlowKey, usize)> = Vec::new();
+    let mut pending = packets.into_iter().peekable();
+    let mut frames = Vec::with_capacity(pending.size_hint().0);
 
-    for packet in packets {
-        let Some((metadata, key)) = packet_metadata(packet.as_bytes())
-            .and_then(|metadata| Some((metadata, flow_key(packet.as_bytes(), metadata)?)))
-        else {
-            open.clear();
-            slots.push(Slot::Single(packet));
+    while let Some(first) = pending.next() {
+        let Some(first_metadata) = packet_metadata(first.as_bytes()) else {
+            frames.push(single_frame(first));
             continue;
         };
-        let open_index = open.iter().position(|(open_key, _)| *open_key == key);
-        let offload_enabled = match metadata.protocol {
+        let offload_enabled = match first_metadata.protocol {
             TransportProtocol::Tcp => tcp_tso,
             TransportProtocol::Udp => udp_uso,
         };
         if !offload_enabled {
-            if let Some(index) = open_index {
-                open.swap_remove(index);
-            }
-            slots.push(Slot::Single(packet));
+            frames.push(single_frame(first));
             continue;
         }
 
-        if let Some(index) = open_index {
-            let Slot::Group(group) = &mut slots[open[index].1] else {
-                unreachable!("open flows point at groups");
+        let mut group = vec![first];
+        let mut last_metadata = first_metadata;
+        let mut group_payload_len = first_metadata.payload_len;
+        while group.len() < MAX_GSO_SEGMENTS {
+            let Some(next) = pending.peek() else {
+                break;
             };
-            if can_append(
-                group.packets[0].as_bytes(),
-                group.first,
-                group.last,
-                packet.as_bytes(),
-                metadata,
-                group.payload_len,
-                group.packets.len(),
+            let Some(next_metadata) = packet_metadata(next.as_bytes()) else {
+                break;
+            };
+            if !can_append(
+                group[0].as_bytes(),
+                first_metadata,
+                last_metadata,
+                next.as_bytes(),
+                next_metadata,
+                group_payload_len,
+                group.len(),
             ) {
-                group.payload_len += metadata.payload_len;
-                group.last = metadata;
-                group.packets.push(packet);
-                continue;
+                break;
             }
-            // Later packets of this flow must follow this one, so its old group closes.
-            open.swap_remove(index);
+
+            let next = pending.next().expect("peeked packet remains available");
+            group_payload_len += next_metadata.payload_len;
+            last_metadata = next_metadata;
+            group.push(next);
         }
 
-        slots.push(Slot::Group(GsoGroup {
-            packets: vec![packet],
-            first: metadata,
-            last: metadata,
-            payload_len: metadata.payload_len,
-        }));
-        if open.len() < MAX_OPEN_FLOWS {
-            open.push((key, slots.len() - 1));
+        if group.len() == 1 {
+            frames.push(single_frame(group.pop().expect("one packet is present")));
+        } else {
+            frames.push(gso_frame(group, first_metadata, group_payload_len));
         }
     }
 
-    slots
-        .into_iter()
-        .map(|slot| match slot {
-            Slot::Single(packet) => single_frame(packet),
-            Slot::Group(mut group) if group.packets.len() == 1 => {
-                single_frame(group.packets.pop().expect("one packet is present"))
-            }
-            Slot::Group(group) => gso_frame(group.packets, group.first, group.payload_len),
-        })
-        .collect()
+    frames
 }
 
 /// Parse a direct TCP or UDP packet without accepting IP fragments or extension headers.
@@ -1531,9 +1455,9 @@ mod tests {
         assert_eq!(*writes.lock().unwrap(), 1);
     }
 
-    /// Interleaved flows each coalesce into their own frame; no frame mixes flows.
+    /// Interleaved flows retain input order and do not coalesce across one another.
     #[test]
-    fn interleaved_tcp_flows_coalesce_per_flow() {
+    fn interleaved_tcp_flows_keep_order_without_cross_flow_coalescing() {
         let packets = vec![
             ipv4_tcp(1, 1000, b"first"),
             ipv4_tcp(2, 2000, b"other"),
@@ -1542,38 +1466,10 @@ mod tests {
 
         let frames = coalesce_packets(packets, true, false);
 
-        assert_eq!(frames.len(), 2);
-        let flow_one: Vec<Vec<u8>> = segments(&frames[0])
-            .iter()
-            .map(ipv4_tcp_packet_payload)
-            .collect();
-        assert_eq!(flow_one, [b"first".to_vec(), b"later".to_vec()]);
+        assert_eq!(frames.len(), 3);
+        assert_eq!(ipv4_tcp_payload(&frames[0]).as_slice(), b"first");
         assert_eq!(ipv4_tcp_payload(&frames[1]).as_slice(), b"other");
-    }
-
-    /// A packet that cannot join its flow's group closes it, so the flow keeps its order even
-    /// when a later packet would fit the older group.
-    #[test]
-    fn a_packet_that_cannot_join_closes_its_flows_group() {
-        let packets = vec![
-            ipv4_tcp(1, 1000, b"first"),
-            ipv4_tcp(1, 3000, b"gap"),
-            ipv4_tcp(2, 2000, b"other"),
-            ipv4_tcp(1, 1005, b"later"),
-        ];
-
-        let frames = coalesce_packets(packets, true, false);
-
-        let payloads: Vec<Vec<u8>> = frames.iter().map(|frame| ipv4_tcp_payload(frame)).collect();
-        assert_eq!(
-            payloads,
-            [
-                b"first".to_vec(),
-                b"gap".to_vec(),
-                b"other".to_vec(),
-                b"later".to_vec()
-            ]
-        );
+        assert_eq!(ipv4_tcp_payload(&frames[2]).as_slice(), b"later");
     }
 
     /// IPv4 options and IPv6 extension headers remain unchanged as single TUN packets.
