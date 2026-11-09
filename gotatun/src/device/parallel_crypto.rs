@@ -568,14 +568,17 @@ impl<T> OrderStore<T> {
             .map_or(MAX_PEER_CRYPTO_IN_FLIGHT, |lane| lane.available())
     }
 
-    /// Mark the short handshake queue drain that keeps newer tunnel packets behind it.
-    pub(crate) fn begin_flush(self: &Arc<Self>, peer: usize) -> FlushGuard<T> {
-        let inserted = self.flushing.lock().insert(peer);
-        assert!(inserted, "a peer's outgoing queue is already being drained");
-        FlushGuard {
+    /// Mark a handshake-queue drain for this peer, unless one is already marked.
+    ///
+    /// While the marker is held, timers skip the peer and a TUN run for it is queued behind the
+    /// drain instead of being prepared. Only the TUN task drains (see `FlushRequests` in
+    /// `device`), so in production a second marker can't be requested while one is held. `None`
+    /// means a drain is already running; its holder keeps newer packets behind it.
+    pub(crate) fn try_begin_flush(self: &Arc<Self>, peer: usize) -> Option<FlushGuard<T>> {
+        self.flushing.lock().insert(peer).then(|| FlushGuard {
             store: Arc::clone(self),
             peer,
-        }
+        })
     }
 
     /// Whether outgoing data for this peer must wait behind its handshake queue.
@@ -3118,7 +3121,9 @@ mod tests {
         lane.complete_run(slot, vec![None], |_| async { Ok::<_, ()>(()) })
             .await
             .unwrap();
-        let flush_guard = order.begin_flush(peer_key);
+        let flush_guard = order
+            .try_begin_flush(peer_key)
+            .expect("no other drain is marked");
         let workers = CryptoWorkers::with_worker_count(2).unwrap();
         let context = OutgoingBatchContext {
             peer: OutgoingPeerContext {
@@ -3163,8 +3168,7 @@ mod tests {
                         flush_device,
                         flush_lookup,
                         context,
-                        flush_lane,
-                        slot,
+                        Some((flush_lane, slot)),
                         &mut PendingOutgoing::new(),
                         flush_guard,
                     )
@@ -3271,7 +3275,9 @@ mod tests {
         lane.complete_run(first_slot, vec![None], |_| async { Ok::<_, ()>(()) })
             .await
             .unwrap();
-        let flush_guard = order.begin_flush(peer_key);
+        let flush_guard = order
+            .try_begin_flush(peer_key)
+            .expect("no other drain is marked");
         let workers = CryptoWorkers::with_worker_count(2).unwrap();
         let udp = GatedUdp::new();
         let context = OutgoingBatchContext {
@@ -3318,8 +3324,7 @@ mod tests {
                         flush_device,
                         flush_lookup,
                         context,
-                        flush_lane,
-                        first_slot,
+                        Some((flush_lane, first_slot)),
                         &mut PendingOutgoing::new(),
                         flush_guard,
                     )

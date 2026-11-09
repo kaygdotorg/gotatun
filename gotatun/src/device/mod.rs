@@ -24,9 +24,12 @@
 //!    lane state. These nested locks are taken in the order peer, lookup/flush marker/order store,
 //!    then lane state. No synchronous lookup or lane guard crosses an await.
 //! 3. Producers reserve while holding peer state. If capacity is unavailable, they release peer
-//!    state and wait for delivery progress. A handshake flush keeps its marker set and its peer
-//!    mutex held through reservation, then releases both before crypto dispatch or I/O; TUN work
-//!    arriving during a flush stays queued behind that range.
+//!    state and wait for delivery progress. Only the TUN task drains a peer's handshake queue: it
+//!    drains before preparing any newer run for that peer, and when the UDP receive task posts a
+//!    request (`FlushRequests`). The receive task never drains and never waits on a drain. A
+//!    drain keeps its marker set and its peer mutex held through each run's reservation, then
+//!    releases both before crypto dispatch or I/O. While it runs, the TUN task reads nothing,
+//!    so the queue it empties cannot grow and the drain is bounded by the queue limit.
 //! 4. Completion code releases lane state before waiting for the async delivery gate. The gate
 //!    may then acquire peer state for replay or send delivery. A producer holding peer state only
 //!    takes lane metadata synchronously and never waits for the delivery gate.
@@ -388,6 +391,78 @@ struct PacketTaskHandles {
     liveness: Weak<()>,
     /// Peer, route and session-index maps. Never hold one of its guards across an await.
     lookup: Arc<PacketLookup>,
+    /// Asks the TUN task to drain a peer's handshake queue. Only that task ever drains one.
+    flush_requests: Arc<FlushRequests>,
+}
+
+/// Peers whose handshake queue the TUN task should drain, posted by the UDP receive task.
+///
+/// Draining belongs to the TUN task alone (lock-order rule 3 in the module docs). The task that
+/// reads the TUN is the only one that adds data packets behind a drain, so while it drains,
+/// nothing can grow the queue it is emptying: each drain is bounded by the tunnel's queue limit.
+/// When the drain ran in the UDP receive task instead, the TUN task kept queueing a full-rate
+/// flood behind it, and receive processing stopped until the flood paused (#260 round 2).
+///
+/// Posting never waits, so the receive path stays free of the drain. A peer appears at most once,
+/// so the list is bounded by the peer count.
+#[derive(Default)]
+struct FlushRequests {
+    /// Requested peers, each at most once, by lane key.
+    peers: parking_lot::Mutex<Vec<(usize, Arc<Mutex<PeerState>>)>>,
+    /// Wakes the TUN task. A wake sent while it is busy is kept for its next wait.
+    wake: tokio::sync::Notify,
+}
+
+impl FlushRequests {
+    /// Ask the TUN task to drain this peer's queue soon. Returns at once.
+    fn request(&self, peer_key: usize, peer: &Arc<Mutex<PeerState>>) {
+        {
+            let mut peers = self.peers.lock();
+            if !peers.iter().any(|(key, _)| *key == peer_key) {
+                peers.push((peer_key, Arc::clone(peer)));
+            }
+        }
+        self.wake.notify_one();
+    }
+
+    /// Take every pending request, leaving the list empty.
+    fn take(&self) -> Vec<(usize, Arc<Mutex<PeerState>>)> {
+        std::mem::take(&mut *self.peers.lock())
+    }
+}
+
+/// Handles one TUN task shares across every peer's outgoing runs.
+struct OutgoingShared<U: UdpSend> {
+    /// Worker pool handle for packet encryption.
+    crypto: CryptoHandle,
+    /// Per-peer ordered lanes for outgoing packets.
+    ordered: Arc<OrderStore<WgKind>>,
+    /// UDP writer for encrypted packets.
+    udp: U,
+    /// Reusable UDP batch buffer.
+    send_many_buf: Arc<Mutex<U::SendManyBuf>>,
+}
+
+impl<U: UdpSend + Clone> OutgoingShared<U> {
+    /// Build the run context for one peer and destination.
+    fn batch_context(
+        &self,
+        peer_key: usize,
+        peer_arc: &Arc<Mutex<PeerState>>,
+        peer_addr: std::net::SocketAddr,
+    ) -> OutgoingBatchContext<U> {
+        OutgoingBatchContext {
+            peer: OutgoingPeerContext {
+                crypto: self.crypto.clone(),
+                ordered: Arc::clone(&self.ordered),
+                peer_arc: Arc::clone(peer_arc),
+                peer_key,
+                peer_addr,
+                udp: self.udp.clone(),
+            },
+            send_many_buf: Arc::clone(&self.send_many_buf),
+        }
+    }
 }
 
 /// Device identity used by the UDP receive task to answer handshakes and rate-limit them.
@@ -1009,6 +1084,7 @@ impl<T: DeviceTransports> Connection<T> {
         let handles = PacketTaskHandles {
             liveness: Arc::downgrade(&device.task_liveness),
             lookup: Arc::clone(&device.packet_lookup),
+            flush_requests: Arc::default(),
         };
 
         let fatal_error = device.fatal_error.clone();
@@ -1740,13 +1816,17 @@ impl<T: DeviceTransports> DeviceState<T> {
         Ok(())
     }
 
-    /// Encrypt and send a bounded chunk of handshake-queued packets before newer TUN traffic.
+    /// Encrypt and send handshake-queued packets, in bounded runs, before newer TUN traffic.
+    ///
+    /// Runs in the TUN task only (see `FlushRequests`). `first` names a control packet's slot to
+    /// wait for before the first run, as when the TUN task itself has just sent a handshake
+    /// initiation. `flush_guard` must already be held; it is released once the queue is empty, or
+    /// once a run has to stop (no usable session).
     async fn flush_handshake_queue<U: UdpSend + 'static>(
         device: Weak<()>,
         packet_lookup: Arc<PacketLookup>,
         context: OutgoingBatchContext<U>,
-        first_lane: Arc<OrderedCompletions<WgKind>>,
-        first_slot: u64,
+        first: Option<(Arc<OrderedCompletions<WgKind>>, u64)>,
         pending: &mut PendingOutgoing,
         flush_guard: parallel_crypto::FlushGuard<WgKind>,
     ) -> Result<(), Error> {
@@ -1764,7 +1844,10 @@ impl<T: DeviceTransports> DeviceState<T> {
         } = context;
         let mut flush_guard = Some(flush_guard);
 
-        wait_for_outgoing_slot(&first_lane, first_slot, pending).await;
+        // A drain that follows a control packet starts after that packet has been delivered.
+        if let Some((first_lane, first_slot)) = first {
+            wait_for_outgoing_slot(&first_lane, first_slot, pending).await;
+        }
 
         loop {
             if device.upgrade().is_none() {
@@ -1879,6 +1962,52 @@ impl<T: DeviceTransports> DeviceState<T> {
         }
     }
 
+    /// Drain one peer's handshake queue from the TUN task, ahead of any newer TUN packet.
+    ///
+    /// Call only from the TUN task, the single drainer. Does nothing when the queue is empty, no
+    /// session exists yet, or another drain holds the marker. Otherwise it marks the drain under
+    /// peer state, then runs [`DeviceState::flush_handshake_queue`], which keeps peer state and
+    /// the marker through each run's slot reservation.
+    async fn drain_queued_packets<U: UdpSend + Clone + 'static>(
+        device: Weak<()>,
+        packet_lookup: Arc<PacketLookup>,
+        shared: &OutgoingShared<U>,
+        peer_key: usize,
+        peer_arc: &Arc<Mutex<PeerState>>,
+        pending: &mut PendingOutgoing,
+    ) -> Result<(), Error> {
+        let mut peer_trace = PeerLockDiagnostic::waiting("handshake_queue_drain", peer_key);
+        let mut pending_completions = PendingCompletions::Outgoing(pending);
+        let peer = lock_peer_state_while_completing(
+            peer_arc,
+            "handshake_queue_drain",
+            peer_key,
+            &mut peer_trace,
+            &mut pending_completions,
+        )
+        .await?;
+        if !peer.tunnel.has_queued_packets() || !peer.tunnel.has_current_session() {
+            return Ok(());
+        }
+        let Some(peer_addr) = peer.endpoint().addr else {
+            return Ok(());
+        };
+        let Some(flush_guard) = shared.ordered.try_begin_flush(peer_key) else {
+            return Ok(());
+        };
+        drop(peer);
+        drop(peer_trace);
+        Self::flush_handshake_queue(
+            device,
+            packet_lookup,
+            shared.batch_context(peer_key, peer_arc, peer_addr),
+            None,
+            pending,
+            flush_guard,
+        )
+        .await
+    }
+
     /// Add one outgoing packet to a bounded future set without waiting for a larger batch.
     fn enqueue_outgoing_packet<U: UdpSend + 'static>(
         pending: &mut PendingOutgoing,
@@ -1944,6 +2073,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         let PacketTaskHandles {
             liveness: device,
             lookup: packet_lookup,
+            flush_requests: _,
         } = handles;
         loop {
             if device.upgrade().is_none() {
@@ -2055,6 +2185,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         let PacketTaskHandles {
             liveness: device,
             lookup: packet_lookup,
+            flush_requests,
         } = handles;
         let HandshakeResponder {
             private_key,
@@ -2071,7 +2202,6 @@ impl<T: DeviceTransports> DeviceState<T> {
         let mut received_packets = Vec::new();
         let mut incoming_pending = PendingIncoming::new();
         let mut outgoing_pending = PendingOutgoing::new();
-        let send_many_buf = Arc::new(Mutex::new(Default::default()));
 
         // Idle memory release. One timer for the task's lifetime, re-armed once per period,
         // and polled only when the socket has nothing to read (`biased` polls the receive
@@ -2304,17 +2434,18 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 drop(peer_trace);
                             }
                             TunnResult::WriteToNetwork(packet) => {
-                                let flush_guard = outgoing_order.begin_flush(peer_key);
-                                // Keep later TUN packets behind this control packet while its
-                                // bounded peer lane has no free sequence slot.
+                                // A handshake message or the keepalive after one. If it made a
+                                // session usable for packets queued during the handshake, the TUN
+                                // task drains them. This task only asks, and never waits on that
+                                // drain (see `FlushRequests`).
+                                let drain_queue = peer.tunnel.has_queued_packets()
+                                    && peer.tunnel.has_current_session();
                                 drop(peer);
                                 drop(peer_trace);
                                 if device.upgrade().is_none() {
-                                    drop(flush_guard);
                                     return Ok(());
                                 }
                                 if !packet_lookup.register_handshake_idx(&packet, &peer_arc) {
-                                    drop(flush_guard);
                                     continue;
                                 }
                                 let (lane, slot) = loop {
@@ -2357,7 +2488,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                                         }
                                     }
                                 };
-                                let first_lane = Arc::clone(&lane);
 
                                 while outgoing_pending.len() >= CRYPTO_CHUNK_SIZE {
                                     outgoing_pending
@@ -2365,35 +2495,24 @@ impl<T: DeviceTransports> DeviceState<T> {
                                         .await
                                         .expect("a full outgoing chunk has a completion future");
                                 }
-                                let peer_context = OutgoingPeerContext {
-                                    crypto: crypto.clone(),
-                                    ordered: Arc::clone(&outgoing_order),
-                                    peer_arc: Arc::clone(&peer_arc),
-                                    peer_key,
-                                    peer_addr: addr,
-                                    udp: udp_tx.clone(),
-                                };
                                 Self::enqueue_outgoing_packet(
                                     &mut outgoing_pending,
-                                    peer_context.clone(),
+                                    OutgoingPeerContext {
+                                        crypto: crypto.clone(),
+                                        ordered: Arc::clone(&outgoing_order),
+                                        peer_arc: Arc::clone(&peer_arc),
+                                        peer_key,
+                                        peer_addr: addr,
+                                        udp: udp_tx.clone(),
+                                    },
                                     lane,
                                     slot,
                                     Some(PreparedOutgoing::Ready(packet)),
                                     true,
                                 );
-                                Self::flush_handshake_queue(
-                                    device.clone(),
-                                    Arc::clone(&packet_lookup),
-                                    OutgoingBatchContext {
-                                        peer: peer_context,
-                                        send_many_buf: Arc::clone(&send_many_buf),
-                                    },
-                                    first_lane,
-                                    slot,
-                                    &mut outgoing_pending,
-                                    flush_guard,
-                                )
-                                .await?;
+                                if drain_queue {
+                                    flush_requests.request(peer_key, &peer_arc);
+                                }
                             }
                             #[cfg_attr(not(feature = "daita"), expect(unused_mut))]
                             TunnResult::WriteToTunnel(mut packet) => {
@@ -2479,15 +2598,38 @@ impl<T: DeviceTransports> DeviceState<T> {
         let PacketTaskHandles {
             liveness: device,
             lookup: packet_lookup,
+            flush_requests,
         } = handles;
         let mut pending = PendingOutgoing::new();
         let send_many_buf = Arc::new(Mutex::new(Default::default()));
+        let shared = OutgoingShared {
+            crypto: crypto.clone(),
+            ordered: Arc::clone(&outgoing_order),
+            udp: udp.clone(),
+            send_many_buf: Arc::clone(&send_many_buf),
+        };
         loop {
             tokio::select! {
                 completed = pending.next(), if !pending.is_empty() => {
                     let _ = completed;
                     if crate::diag::PIPELINE.on() {
                         eprintln!("pipeline stage=outgoing_pending_complete remaining={}", pending.len());
+                    }
+                }
+                () = flush_requests.wake.notified() => {
+                    for (peer_key, peer_arc) in flush_requests.take() {
+                        if device.upgrade().is_none() {
+                            return Ok(());
+                        }
+                        Self::drain_queued_packets(
+                            device.clone(),
+                            Arc::clone(&packet_lookup),
+                            &shared,
+                            peer_key,
+                            &peer_arc,
+                            &mut pending,
+                        )
+                        .await?;
                     }
                 }
                 packets = tun_rx.recv(&mut packet_pool) => {
@@ -2521,6 +2663,9 @@ impl<T: DeviceTransports> DeviceState<T> {
 
                     for (peer_key, peer_arc, packets) in runs {
                         let mut packets = packets.into_iter().peekable();
+                        // Drain at most once per run, so a session that refuses queued packets
+                        // sends this run through the normal queueing path instead of looping.
+                        let mut drained_queue = false;
                         while packets.peek().is_some() {
                             if device.upgrade().is_none() {
                                 return Ok(());
@@ -2555,6 +2700,28 @@ impl<T: DeviceTransports> DeviceState<T> {
                                         .queue_outgoing_packet(packet, Some(&mut tun_mtu));
                                 }
                                 break;
+                            }
+
+                            // Packets queued during a handshake leave before this newer run. This
+                            // task is the only drainer (see `FlushRequests`), so nothing grows
+                            // the queue while the drain runs.
+                            if !drained_queue
+                                && peer.tunnel.has_queued_packets()
+                                && peer.tunnel.has_current_session()
+                            {
+                                drained_queue = true;
+                                drop(peer);
+                                drop(peer_trace);
+                                Self::drain_queued_packets(
+                                    device.clone(),
+                                    Arc::clone(&packet_lookup),
+                                    &shared,
+                                    peer_key,
+                                    &peer_arc,
+                                    &mut pending,
+                                )
+                                .await?;
+                                continue;
                             }
 
                             let available = outgoing_order.available(peer_key);
@@ -2602,7 +2769,9 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 if let PreparedOutgoing::Ready(packet) = &prepared_packet {
                                     packet_lookup.register_handshake_idx(packet, &peer_arc);
                                     handshake_offset = Some(prepared.len());
-                                    flush_guard = Some(outgoing_order.begin_flush(peer_key));
+                                    // Peer state is held and this task is the only drainer, so
+                                    // no other marker can exist for this peer.
+                                    flush_guard = outgoing_order.try_begin_flush(peer_key);
                                 }
                                 prepared.push(Some(prepared_packet));
                                 if handshake_offset.is_some() {
@@ -2662,8 +2831,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                     device.clone(),
                                     Arc::clone(&packet_lookup),
                                     batch_context,
-                                    lane,
-                                    first_slot + offset as u64,
+                                    Some((lane, first_slot + offset as u64)),
                                     &mut pending,
                                     flush_guard,
                                 )
