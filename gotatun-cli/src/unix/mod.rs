@@ -211,13 +211,19 @@ async fn setup_device(args: Args) -> eyre::Result<Device<DefaultDeviceTransports
     let uapi = UapiServer::default_unix_socket(&tun_name, socket_uid, socket_gid)
         .context("Failed to create UAPI unix socket")?;
 
-    let dev = DeviceBuilder::new()
+    let builder = DeviceBuilder::new()
         .with_uapi(uapi)
         .with_default_udp()
         // Use 7MB socket buffers. Empirically this seems to be more perfomant than the default OS
         // socket buffer sizes.
-        .udp_recv_buffer_size(7 * 1024 * 1024)
-        .udp_send_buffer_size(7 * 1024 * 1024)
+        .udp_send_buffer_size(7 * 1024 * 1024);
+    // macOS keeps its default receive buffer (`net.inet.udp.recvspace`, 768 KiB). A 7 MiB one
+    // let ~55 ms of packets queue in the kernel ahead of the slower utun write, so loaded p99
+    // rose to 44 ms under one TCP flow; the default drops the excess early and TCP backs off
+    // (#260, J461: p99 ~10 ms at the same goodput).
+    #[cfg(not(target_os = "macos"))]
+    let builder = builder.udp_recv_buffer_size(7 * 1024 * 1024);
+    let dev = builder
         .with_ip(tun)
         .build()
         .await
