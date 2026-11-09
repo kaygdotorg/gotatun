@@ -4,15 +4,15 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-//! Batched UDP I/O for macOS, behind the `macos-batch-io` feature (#260, owner 2026-11-09).
+//! Batched UDP sends for macOS, behind the `macos-batch-io` feature (#260, owner 2026-11-09).
 //!
 //! # Why
 //!
-//! On macOS each WireGuard datagram used to cost one `sendto` and one `recvfrom` system call.
-//! A J421 profile on the Mac VM put the send call alone at 37–42% of the sending engine's CPU,
-//! while encryption was 3%. Darwin's kernel has two calls that move many datagrams per trap,
-//! `sendmsg_x` and `recvmsg_x`. libsystem_kernel exports them, but they are not public API,
-//! so this module treats them as optional:
+//! On macOS each WireGuard datagram used to cost one `sendto` system call. A J421 profile on
+//! the Mac VM put that call alone at 37–42% of the sending engine's CPU, while encryption was
+//! 3%. Darwin's kernel can send many datagrams per trap with `sendmsg_x`. libsystem_kernel
+//! exports it (and its sibling `recvmsg_x`), but neither is public API, so this module treats
+//! them as optional:
 //!
 //! - It looks them up with `dlsym` once per process, so a system without them still links
 //!   and runs.
@@ -24,7 +24,15 @@
 //!   process, and the batch it was handling goes out one packet at a time.
 //!
 //! The path chosen is logged once per process. When batching is off, this module behaves like
-//! the generic Unix implementation: one `sendto`/`recvfrom` per datagram.
+//! the generic Unix implementation: one `sendto` per datagram.
+//!
+//! # Receives stay one datagram per call
+//!
+//! J434 also tried `recvmsg_x` for receiving, with a fixed 32 and with a count that follows
+//! arrivals. In both `sample` profiles on the Mac VM it cost more than `recvfrom` in every
+//! one of 8 comparisons (for example 896 against 359 samples on the ACK side of one TCP
+//! flow, 1276 against 858 on the data side). So receives use `recvfrom`, and `recvmsg_x`
+//! serves only as the harmless probe.
 //!
 //! # Error semantics
 //!
@@ -66,20 +74,14 @@ use crate::{
 /// 1420-byte packets without holding the send task in one call for long.
 pub(crate) const SEND_BATCH: usize = 64;
 
-/// Most datagrams read by one `recvmsg_x` call.
-///
-/// Each slot holds one pool buffer (4 KiB), so this bounds the receive buffers parked in
-/// [`RecvManyBuf`] at 128 KiB per socket.
-pub(crate) const RECV_BATCH: usize = 32;
-
 /// The environment variable that turns batching off at runtime.
 const BATCH_ENV: &str = "GOTATUN_MACOS_BATCH_UDP";
 
 /// One message header for `sendmsg_x`/`recvmsg_x`: Darwin's `struct msghdr_x`.
 ///
 /// This is `struct msghdr` plus a trailing `msg_datalen`, which `recvmsg_x` sets to the
-/// number of bytes received into that message. `sendmsg_x` ignores `msg_datalen`. The layout
-/// is checked at bind time by the probe call (see [`probe_socket`]).
+/// number of bytes received into that message. `sendmsg_x` ignores `msg_datalen`. The probe
+/// (see [`probe_socket`]) passes this layout to the kernel at bind time.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct MsghdrX {
@@ -95,7 +97,7 @@ struct MsghdrX {
     msg_control: *mut c_void,
     /// Length of `msg_control`.
     msg_controllen: libc::socklen_t,
-    /// Flags on a received message. Not used: see [`recv_batch`] on truncation.
+    /// Flags on a received message. Unused here.
     msg_flags: c_int,
     /// Bytes received into this message (receive only).
     msg_datalen: usize,
@@ -123,7 +125,7 @@ type MsgXFn = unsafe extern "C" fn(c_int, *const MsghdrX, c_uint, c_int) -> isiz
 pub(crate) struct BatchFns {
     /// `sendmsg_x`: send many datagrams, returns how many went out.
     send: MsgXFn,
-    /// `recvmsg_x`: receive many datagrams, returns how many arrived.
+    /// `recvmsg_x`: receive many datagrams. Used only by the bind-time probe.
     recv: MsgXFn,
 }
 
@@ -156,7 +158,7 @@ impl BatchState {
         };
         if fns.is_some() {
             log_choice_once(format_args!(
-                "macOS UDP: batched sendmsg_x/recvmsg_x (send {SEND_BATCH}, receive {RECV_BATCH})"
+                "macOS UDP: batched sendmsg_x (up to {SEND_BATCH} datagrams per call)"
             ));
         } else if !batching_wanted() {
             log_choice_once(format_args!(
@@ -423,40 +425,9 @@ fn send_batch(
     usize::try_from(ret).map_err(|_| io::Error::last_os_error())
 }
 
-/// Reusable receive-side buffer: pool buffers waiting for the next `recvmsg_x` call, and the
-/// space for their source addresses.
-///
-/// Datagrams are received straight into pool buffers, so a received packet costs no copy.
-/// Unused buffers stay here between calls, so the receive task does not ask the pool for
-/// [`RECV_BATCH`] buffers on every wakeup.
-pub struct RecvManyBuf {
-    /// Empty pool buffers, at full length, ready to receive into.
-    spares: Vec<Packet>,
-    /// Source address slots, one per spare.
-    names: Box<[libc::sockaddr_storage; RECV_BATCH]>,
-}
-
-impl Default for RecvManyBuf {
-    fn default() -> Self {
-        Self {
-            spares: Vec::with_capacity(RECV_BATCH),
-            // SAFETY: an all-zero `sockaddr_storage` is a valid (AF_UNSPEC) value.
-            names: Box::new(unsafe { mem::zeroed() }),
-        }
-    }
-}
-
-/// What `recvmsg_x` reported for one message.
-#[derive(Clone, Copy, Default)]
-struct Received {
-    /// Bytes written into the buffer.
-    len: usize,
-    /// Size of the source address the kernel wrote.
-    namelen: libc::socklen_t,
-}
-
+/// Receives stay one `recvfrom` per datagram: batching them measured slower (module docs).
 impl UdpRecv for super::UdpSocket {
-    type RecvManyBuf = RecvManyBuf;
+    type RecvManyBuf = ();
 
     async fn recv_from(&mut self, pool: &mut PacketBufPool) -> io::Result<(Packet, SocketAddr)> {
         let mut buf = pool.get();
@@ -465,140 +436,6 @@ impl UdpRecv for super::UdpSocket {
         let src = self.map_src(src);
         Ok((buf, src))
     }
-
-    async fn recv_many_from(
-        &mut self,
-        recv_buf: &mut RecvManyBuf,
-        pool: &mut PacketBufPool,
-        packets: &mut Vec<(Packet, SocketAddr)>,
-    ) -> io::Result<()> {
-        let Some(fns) = self.inner.batch.active() else {
-            let (packet, src) = self.recv_from(pool).await?;
-            packets.push((packet, src));
-            return Ok(());
-        };
-
-        while recv_buf.spares.len() < RECV_BATCH {
-            recv_buf.spares.push(pool.get());
-        }
-        let mut received = [Received::default(); RECV_BATCH];
-        let fd = self.socket().as_raw_fd();
-        let RecvManyBuf { spares, names } = recv_buf;
-        let result = self
-            .socket()
-            .async_io(Interest::READABLE, || {
-                recv_batch(fns, fd, spares, names, &mut received)
-            })
-            .await;
-
-        let count = match result {
-            Ok(count) => count,
-            Err(err) if is_unsupported(&err) => {
-                self.inner.batch.disable(&err);
-                let (packet, src) = self.recv_from(pool).await?;
-                packets.push((packet, src));
-                return Ok(());
-            }
-            Err(err) => return Err(err),
-        };
-
-        let map_ipv4_to_ipv6 = self.map_ipv4_to_ipv6;
-        for (i, (mut packet, info)) in recv_buf.spares.drain(..count).zip(received).enumerate() {
-            let Some(src) = source_addr(&recv_buf.names[i], info.namelen) else {
-                tracing::trace!("macOS UDP: datagram without an IP source");
-                continue;
-            };
-            packet.truncate(info.len);
-            packets.push((packet, super::map_src_addr(map_ipv4_to_ipv6, src)));
-        }
-        Ok(())
-    }
-}
-
-/// Decode the source address `recvmsg_x` wrote into `name`, or `None` if it is not IPv4/IPv6
-/// or shorter than its family requires.
-fn source_addr(name: &libc::sockaddr_storage, len: libc::socklen_t) -> Option<SocketAddr> {
-    let len = usize::try_from(len).ok()?;
-    match c_int::from(name.ss_family) {
-        libc::AF_INET if len >= mem::size_of::<libc::sockaddr_in>() => {
-            // SAFETY: the family says this storage holds a `sockaddr_in`, which is smaller
-            // than and alignment-compatible with `sockaddr_storage`.
-            let sin = unsafe { &*std::ptr::from_ref(name).cast::<libc::sockaddr_in>() };
-            let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-            Some(SocketAddr::from((ip, u16::from_be(sin.sin_port))))
-        }
-        libc::AF_INET6 if len >= mem::size_of::<libc::sockaddr_in6>() => {
-            // SAFETY: as above, for `sockaddr_in6`.
-            let sin6 = unsafe { &*std::ptr::from_ref(name).cast::<libc::sockaddr_in6>() };
-            let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
-            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
-                ip,
-                u16::from_be(sin6.sin6_port),
-                sin6.sin6_flowinfo,
-                sin6.sin6_scope_id,
-            )))
-        }
-        _ => None,
-    }
-}
-
-/// One non-blocking `recvmsg_x` call into `spares`. Returns how many datagrams arrived and
-/// records each one's length and source size in `received`.
-///
-/// A datagram longer than its pool buffer arrives cut to the buffer, exactly as with
-/// `recvfrom`: on macOS 26.5 `recvmsg_x` reports neither `MSG_TRUNC` nor a longer
-/// `msg_datalen` for it (J434 measured this), so it cannot be told apart here. Such a datagram
-/// cannot be a valid WireGuard message and fails authentication further up.
-fn recv_batch(
-    fns: BatchFns,
-    fd: c_int,
-    spares: &mut [Packet],
-    names: &mut [libc::sockaddr_storage; RECV_BATCH],
-    received: &mut [Received; RECV_BATCH],
-) -> io::Result<usize> {
-    let count = spares.len().min(RECV_BATCH);
-    let mut iovs = [libc::iovec {
-        iov_base: std::ptr::null_mut(),
-        iov_len: 0,
-    }; RECV_BATCH];
-    let mut headers = [MsghdrX::EMPTY; RECV_BATCH];
-    for (i, (packet, name)) in spares
-        .iter_mut()
-        .zip(names.iter_mut())
-        .take(count)
-        .enumerate()
-    {
-        iovs[i] = libc::iovec {
-            iov_base: packet.as_mut_ptr().cast(),
-            iov_len: packet.len(),
-        };
-        headers[i] = MsghdrX {
-            msg_name: std::ptr::from_mut(name).cast(),
-            msg_namelen: socklen_of::<libc::sockaddr_storage>(),
-            msg_iov: &mut iovs[i],
-            msg_iovlen: 1,
-            ..MsghdrX::EMPTY
-        };
-    }
-    let count_arg = c_uint::try_from(count).expect("batch size fits in u_int");
-    // SAFETY: `count` headers are initialised; each points at a live, writable pool buffer and
-    // a live `sockaddr_storage`, all exclusively borrowed for the duration of this call.
-    let ret = unsafe { (fns.recv)(fd, headers.as_mut_ptr(), count_arg, libc::MSG_DONTWAIT) };
-    let got = usize::try_from(ret).map_err(|_| io::Error::last_os_error())?;
-    let got = got.min(count);
-    for ((slot, header), packet) in received
-        .iter_mut()
-        .zip(&headers)
-        .zip(spares.iter())
-        .take(got)
-    {
-        // Never trust a length beyond the buffer we offered.
-        *slot = Received {
-            len: header.msg_datalen.min(packet.len()),
-            namelen: header.msg_namelen,
-        };
-    }
-    Ok(got)
 }
 
 #[cfg(test)]
@@ -631,10 +468,10 @@ mod tests {
         Packet::from_bytes(format!("datagram {i:03}").as_bytes().into())
     }
 
-    /// Send `n` numbered datagrams from `tx` to `rx` with `send_many_to`, then read them all
-    /// with `recv_many_from`, check every one arrived intact and in order, and return how
-    /// many receive calls that took.
-    async fn round_trip(tx: &UdpSocket, rx: &mut UdpSocket, n: usize) -> usize {
+    /// Send `n` numbered datagrams from `tx` to `rx` with `send_many_to` in runs of the
+    /// socket's maximum, then read them all with `recv_from` and check every one arrived intact,
+    /// from `tx`, and in order.
+    async fn round_trip(tx: &UdpSocket, rx: &mut UdpSocket, n: usize) {
         let dest = rx.local_addr().unwrap();
         let mut send_buf = SendManyBuf::default();
         let max = tx.max_number_of_packets_to_send();
@@ -646,31 +483,37 @@ mod tests {
         }
 
         let mut pool = PacketBufPool::new(4);
-        let mut recv_buf = RecvManyBuf::default();
         let mut got = vec![];
-        let mut calls = 0;
         while got.len() < n {
-            let mut out = vec![];
-            timeout(
-                Duration::from_secs(2),
-                rx.recv_many_from(&mut recv_buf, &mut pool, &mut out),
-            )
-            .await
-            .expect("datagrams arrive")
-            .unwrap();
-            calls += 1;
-            for (packet, src) in out {
-                assert_eq!(src, tx.local_addr().unwrap());
-                let text = std::str::from_utf8(&packet).unwrap();
-                got.push(
-                    text.trim_start_matches("datagram ")
-                        .parse::<usize>()
-                        .unwrap(),
-                );
-            }
+            let (packet, src) = timeout(Duration::from_secs(2), rx.recv_from(&mut pool))
+                .await
+                .expect("datagrams arrive")
+                .unwrap();
+            assert_eq!(src, tx.local_addr().unwrap());
+            got.push(number(&packet));
         }
         assert_eq!(got, (0..n).collect::<Vec<_>>());
-        calls
+    }
+
+    /// The number in a datagram made by [`payload`].
+    fn number(bytes: &[u8]) -> usize {
+        let text = std::str::from_utf8(bytes).unwrap();
+        text.trim_start_matches("datagram ").parse().unwrap()
+    }
+
+    /// `sendmsg_x` calls made through [`counting_send`].
+    static COUNTED_SENDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// The real `sendmsg_x`, counted, so a test can prove it sent many datagrams per call.
+    unsafe extern "C" fn counting_send(
+        fd: c_int,
+        headers: *const MsghdrX,
+        count: c_uint,
+        flags: c_int,
+    ) -> isize {
+        COUNTED_SENDS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: the caller's arguments are passed through unchanged.
+        unsafe { (resolve().unwrap().send)(fd, headers, count, flags) }
     }
 
     fn loopback_v4() -> SocketAddr {
@@ -702,26 +545,47 @@ mod tests {
 
     #[tokio::test]
     async fn batched_round_trip_delivers_every_datagram_in_order() {
-        let fns = resolve();
-        let tx = bind_with(loopback_v4(), fns);
-        let mut rx = bind_with(loopback_v4(), fns);
+        let real = resolve().unwrap();
+        let fns = BatchFns {
+            send: counting_send,
+            recv: real.recv,
+        };
+        let tx = bind_with(loopback_v4(), Some(fns));
+        let mut rx = bind_with(loopback_v4(), None);
         assert_eq!(tx.max_number_of_packets_to_send(), SEND_BATCH);
-        let calls = round_trip(&tx, &mut rx, 3 * SEND_BATCH + 5).await;
+        let n = 3 * SEND_BATCH + 5;
+        round_trip(&tx, &mut rx, n).await;
+        let calls = COUNTED_SENDS.load(Ordering::Relaxed);
         assert!(
-            calls < 3 * SEND_BATCH + 5,
-            "recvmsg_x must return more than one datagram per call ({calls} calls)"
+            (4..n / 4).contains(&calls),
+            "sendmsg_x must carry many datagrams per call ({calls} calls for {n})"
         );
     }
 
     /// The owner's condition: when the probe fails, the socket falls back to one datagram per
-    /// call and still delivers everything.
+    /// call and still delivers everything. A failed probe leaves no batch call to make, so
+    /// every datagram goes through `sendto`.
     #[tokio::test]
     async fn failed_probe_falls_back_to_one_datagram_per_call() {
         let tx = bind_with(loopback_v4(), None);
         let mut rx = bind_with(loopback_v4(), None);
+        assert!(tx.inner.batch.active().is_none());
         assert_eq!(tx.max_number_of_packets_to_send(), 1);
-        let calls = round_trip(&tx, &mut rx, 40).await;
-        assert_eq!(calls, 40, "the fallback reads one datagram per call");
+        round_trip(&tx, &mut rx, 40).await;
+        // A caller that ignores the maximum still gets every datagram, one call each.
+        let dest = rx.local_addr().unwrap();
+        let mut batch: Vec<_> = (0..10).map(|i| (payload(i), dest)).collect();
+        tx.send_many_to(&mut SendManyBuf::default(), &mut batch)
+            .await
+            .unwrap();
+        let mut pool = PacketBufPool::new(4);
+        for i in 0..10 {
+            let (packet, _) = timeout(Duration::from_secs(2), rx.recv_from(&mut pool))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(number(&packet), i);
+        }
     }
 
     #[tokio::test]
@@ -807,12 +671,7 @@ mod tests {
         let mut buf = [0u8; 64];
         let mut got = vec![];
         while let Ok(Ok(n)) = timeout(Duration::from_millis(300), rx.recv(&mut buf)).await {
-            let text = std::str::from_utf8(&buf[..n]).unwrap();
-            got.push(
-                text.trim_start_matches("datagram ")
-                    .parse::<usize>()
-                    .unwrap(),
-            );
+            got.push(number(&buf[..n]));
         }
         let mut first_seen = got.clone();
         let mut seen = std::collections::HashSet::new();
@@ -825,39 +684,38 @@ mod tests {
         );
     }
 
+    /// Batched sends to IPv6 destinations arrive intact and in order.
     #[tokio::test]
-    async fn batched_receive_reports_ipv6_sources() {
-        let fns = resolve();
-        let tx = bind_with((Ipv6Addr::LOCALHOST, 0).into(), fns);
-        let mut rx = bind_with((Ipv6Addr::LOCALHOST, 0).into(), fns);
-        round_trip(&tx, &mut rx, 20).await;
+    async fn batched_send_over_ipv6() {
+        let tx = bind_with((Ipv6Addr::LOCALHOST, 0).into(), resolve());
+        let mut rx = bind_with((Ipv6Addr::LOCALHOST, 0).into(), None);
+        round_trip(&tx, &mut rx, 70).await;
     }
 
-    /// A datagram longer than a pool buffer arrives cut to the buffer, as on the per-packet
-    /// path, and does not disturb the datagram after it.
+    /// A dual-stack socket maps IPv4 destinations to IPv6 before a batched send.
     #[tokio::test]
-    async fn oversized_datagram_is_cut_like_recvfrom_and_the_next_is_intact() {
-        let mut rx = bind_with(loopback_v4(), resolve());
-        let tx = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+    async fn batched_send_from_dual_stack_reaches_ipv4() {
+        let opts = SockOpt {
+            only_v6: Some(false),
+            ..SockOpt::default()
+        };
+        let dual = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0).into(), opts).unwrap();
+        assert!(dual.inner.batch.active().is_some(), "the probe passes here");
+        let rx = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
         let dest = rx.local_addr().unwrap();
-        tx.send_to(&[7u8; 6000], dest).await.unwrap();
-        tx.send_to(b"small", dest).await.unwrap();
-        let mut pool = PacketBufPool::new(4);
-        let mut recv_buf = RecvManyBuf::default();
-        let mut out = vec![];
-        while out.len() < 2 {
-            timeout(
-                Duration::from_secs(2),
-                rx.recv_many_from(&mut recv_buf, &mut pool, &mut out),
-            )
+        let mut batch: Vec<_> = (0..5).map(|i| (payload(i), dest)).collect();
+        dual.send_many_to(&mut SendManyBuf::default(), &mut batch)
             .await
-            .unwrap()
             .unwrap();
+        let mut buf = [0u8; 64];
+        for i in 0..5 {
+            let n = timeout(Duration::from_secs(2), rx.recv(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(number(&buf[..n]), i);
         }
-        assert_eq!(out.len(), 2);
-        assert_eq!(&out[0].0[..], &[7u8; 4096][..]);
-        assert_eq!(&out[1].0[..], b"small");
     }
 }

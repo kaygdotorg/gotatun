@@ -32,7 +32,7 @@ use super::{UdpRecv, UdpTransportFactory, UdpTransportFactoryParams};
 )))]
 mod generic;
 
-/// Batched `sendmsg_x`/`recvmsg_x` implementations for macOS, with a per-packet fallback.
+/// Batched `sendmsg_x` sends for macOS, with a per-packet fallback.
 /// Opt-in through the `macos-batch-io` feature; see the module docs.
 #[cfg(all(target_os = "macos", feature = "macos-batch-io"))]
 mod macos;
@@ -108,7 +108,7 @@ struct UdpSocketState {
     udp_gso_supported: bool,
     #[cfg(target_os = "linux")]
     udp_gso_disabled: AtomicBool,
-    /// Whether this socket batches with `sendmsg_x`/`recvmsg_x`, decided at bind.
+    /// Whether this socket batches its sends with `sendmsg_x`, decided at bind.
     #[cfg(all(target_os = "macos", feature = "macos-batch-io"))]
     batch: macos::BatchState,
 }
@@ -355,13 +355,7 @@ fn force_send_buffer_size(_: &socket2::Socket, _: usize) -> io::Result<()> {
 }
 
 #[cfg(test)]
-#[cfg_attr(
-    all(
-        target_vendor = "apple",
-        not(all(target_os = "macos", feature = "macos-batch-io"))
-    ),
-    expect(clippy::let_unit_value)
-)]
+#[cfg_attr(target_vendor = "apple", expect(clippy::let_unit_value))]
 mod tests {
     use bytes::BytesMut;
     use tokio::time::timeout;
