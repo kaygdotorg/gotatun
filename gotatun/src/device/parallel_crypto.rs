@@ -478,8 +478,13 @@ pub(crate) struct OrderStore<T> {
     flushing: Mutex<std::collections::BTreeSet<usize>>,
     #[cfg(test)]
     /// Test-only barrier for arranging a producer at a lane reservation boundary.
-    reserve_hook: Mutex<Option<Arc<dyn Fn(usize, usize) + Send + Sync>>>,
+    reserve_hook: Mutex<Option<ReserveHook>>,
 }
+
+/// Test callback run at the start of every [`OrderStore::reserve_run`], given the peer key and
+/// the requested slot count. It runs with no store lock held, so it may block.
+#[cfg(test)]
+type ReserveHook = Arc<dyn Fn(usize, usize) + Send + Sync>;
 
 impl<T> Default for OrderStore<T> {
     /// Create a store without any per-peer lanes or active queue drains.
@@ -528,7 +533,7 @@ impl<T> OrderStore<T> {
 
     /// Pause one reservation in tests to arrange a producer race at a precise sequence boundary.
     #[cfg(test)]
-    pub(crate) fn set_reserve_hook(&self, hook: Arc<dyn Fn(usize, usize) + Send + Sync>) {
+    pub(crate) fn set_reserve_hook(&self, hook: ReserveHook) {
         *self.reserve_hook.lock() = Some(hook);
     }
 
@@ -2871,7 +2876,7 @@ mod tests {
                 peer_addr,
                 udp: ImmediateUdp,
             },
-            send_many_buf: Arc::new(tokio::sync::Mutex::new(Default::default())),
+            send_many_buf: Arc::new(tokio::sync::Mutex::new(())),
         };
         let (reserve_started_tx, reserve_started_rx) = mpsc::channel();
         let (release_reserve_tx, release_reserve_rx) = mpsc::channel();
@@ -2928,16 +2933,16 @@ mod tests {
                 .build()
                 .unwrap()
                 .block_on(async move {
-                    if let Ok(_peer_guard) = producer_peer.try_lock() {
-                        if !producer_order.is_flushing(peer_key) {
-                            let first = producer_order
-                                .reserve_run(peer_key, CRYPTO_CHUNK_SIZE)
-                                .expect("the first TUN run fits in an empty peer lane");
-                            let second = producer_order
-                                .reserve_run(peer_key, CRYPTO_CHUNK_SIZE)
-                                .expect("the second TUN run fills the peer lane");
-                            return Some((first, second));
-                        }
+                    if let Ok(_peer_guard) = producer_peer.try_lock()
+                        && !producer_order.is_flushing(peer_key)
+                    {
+                        let first = producer_order
+                            .reserve_run(peer_key, CRYPTO_CHUNK_SIZE)
+                            .expect("the first TUN run fits in an empty peer lane");
+                        let second = producer_order
+                            .reserve_run(peer_key, CRYPTO_CHUNK_SIZE)
+                            .expect("the second TUN run fills the peer lane");
+                        return Some((first, second));
                     }
                     None
                 })
@@ -3025,7 +3030,7 @@ mod tests {
                 peer_addr,
                 udp: udp.clone(),
             },
-            send_many_buf: Arc::new(tokio::sync::Mutex::new(Default::default())),
+            send_many_buf: Arc::new(tokio::sync::Mutex::new(())),
         };
 
         let (reserve_started_tx, reserve_started_rx) = mpsc::channel();

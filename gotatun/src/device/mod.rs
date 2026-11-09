@@ -375,6 +375,31 @@ struct PreparedIncomingRun {
     packets: Vec<(PreparedDecryption, std::net::SocketAddr)>,
 }
 
+/// Everything a running packet or timer task may use to reach shared device state.
+///
+/// This is the type-level form of lock-order rule 1 in the module docs. A task gets a weak
+/// liveness token and the synchronous packet lookup, and nothing that can reach the async
+/// device lock. Configuration can therefore hold the device write lock while it stops and joins
+/// these tasks, and a task waiting on peer state can never sit behind a queued configuration
+/// writer (J380 P1 on #260).
+#[derive(Clone)]
+struct PacketTaskHandles {
+    /// Upgrades only while the device still exists. Tasks stop once this fails.
+    liveness: Weak<()>,
+    /// Peer, route and session-index maps. Never hold one of its guards across an await.
+    lookup: Arc<PacketLookup>,
+}
+
+/// Device identity used by the UDP receive task to answer handshakes and rate-limit them.
+struct HandshakeResponder {
+    /// The device's static private key.
+    private_key: x25519::StaticSecret,
+    /// The public key matching `private_key`.
+    public_key: x25519::PublicKey,
+    /// Shared handshake rate limiter. Timers reset its counters.
+    rate_limiter: Arc<RateLimiter>,
+}
+
 /// Crypto stages and peer-order lanes shared by the UDP receive task.
 struct CryptoOrderContext {
     /// Shared worker handle used by both packet directions.
@@ -973,7 +998,6 @@ impl<T: DeviceTransports> Connection<T> {
         let crypto = crypto_workers.handle();
         let outgoing_order = Arc::new(OrderStore::default());
         let incoming_order = Arc::new(OrderStore::default());
-        let packet_lookup = Arc::clone(&device.packet_lookup);
         let (private_key, public_key) = device.key_pair.clone().expect("Key not set");
         let rate_limiter = device
             .rate_limiter
@@ -982,7 +1006,10 @@ impl<T: DeviceTransports> Connection<T> {
             .clone();
         let index_table = device.index_table.clone();
         let tun_rx_mtu = device.tun_rx_mtu.clone();
-        let task_liveness = Arc::downgrade(&device.task_liveness);
+        let handles = PacketTaskHandles {
+            liveness: Arc::downgrade(&device.task_liveness),
+            lookup: Arc::clone(&device.packet_lookup),
+        };
 
         let fatal_error = device.fatal_error.clone();
         let register_fatal_error = move |e| {
@@ -999,8 +1026,7 @@ impl<T: DeviceTransports> Connection<T> {
         let outgoing = Task::spawn(
             "handle_outgoing",
             DeviceState::<T>::handle_outgoing(
-                task_liveness.clone(),
-                Arc::clone(&packet_lookup),
+                handles.clone(),
                 tun_rx_mtu,
                 buffered_ip_rx,
                 buffered_udp_tx.clone(),
@@ -1013,8 +1039,7 @@ impl<T: DeviceTransports> Connection<T> {
         let timers = Task::spawn(
             "handle_timers",
             DeviceState::<T>::handle_timers(
-                task_liveness.clone(),
-                Arc::clone(&packet_lookup),
+                handles.clone(),
                 index_table,
                 rate_limiter.clone(),
                 buffered_udp_tx.clone(),
@@ -1025,11 +1050,12 @@ impl<T: DeviceTransports> Connection<T> {
         let incoming = Task::spawn(
             "handle_incoming",
             DeviceState::<T>::handle_incoming(
-                task_liveness,
-                packet_lookup,
-                private_key,
-                public_key,
-                rate_limiter,
+                handles,
+                HandshakeResponder {
+                    private_key,
+                    public_key,
+                    rate_limiter,
+                },
                 buffered_ip_tx.clone(),
                 buffered_udp_tx,
                 incoming_udp_rx,
@@ -1748,7 +1774,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                 &mut pending_completions,
             )
             .await?;
-            drop(pending_completions);
             if !peer.tunnel.has_queued_packets() {
                 drop(flush_guard.take());
                 return Ok(());
@@ -1903,14 +1928,17 @@ impl<T: DeviceTransports> DeviceState<T> {
     /// Run periodic tunnel maintenance and send each peer's timer output in sequence.
     #[instrument(level = Level::TRACE, skip_all)]
     async fn handle_timers(
-        device: Weak<()>,
-        packet_lookup: Arc<PacketLookup>,
+        handles: PacketTaskHandles,
         index_table: IndexTable,
         rate_limiter: Arc<RateLimiter>,
         udp: impl UdpSend,
         crypto: CryptoHandle,
         outgoing_order: Arc<OrderStore<WgKind>>,
     ) {
+        let PacketTaskHandles {
+            liveness: device,
+            lookup: packet_lookup,
+        } = handles;
         loop {
             if device.upgrade().is_none() {
                 break;
@@ -2010,17 +2038,23 @@ impl<T: DeviceTransports> DeviceState<T> {
     /// Read from UDP socket, decapsulate, write to tunnel device
     #[instrument(level = Level::TRACE, skip_all)]
     async fn handle_incoming(
-        device: Weak<()>,
-        packet_lookup: Arc<PacketLookup>,
-        private_key: x25519::StaticSecret,
-        public_key: x25519::PublicKey,
-        rate_limiter: Arc<RateLimiter>,
+        handles: PacketTaskHandles,
+        responder: HandshakeResponder,
         mut tun_tx: impl IpSend + Clone,
         udp_tx: impl UdpSend + 'static,
         mut udp_rx: impl UdpRecv,
         mut packet_pool: PacketBufPool,
         crypto_order: CryptoOrderContext,
     ) -> Result<(), Error> {
+        let PacketTaskHandles {
+            liveness: device,
+            lookup: packet_lookup,
+        } = handles;
+        let HandshakeResponder {
+            private_key,
+            public_key,
+            rate_limiter,
+        } = responder;
         let CryptoOrderContext {
             crypto,
             incoming: incoming_order,
@@ -2428,8 +2462,7 @@ impl<T: DeviceTransports> DeviceState<T> {
     /// Read from tunnel device, encapsulate, and write to UDP socket for the corresponding peer
     #[instrument(level = Level::TRACE, skip_all)]
     async fn handle_outgoing(
-        device: Weak<()>,
-        packet_lookup: Arc<PacketLookup>,
+        handles: PacketTaskHandles,
         mut tun_mtu: MtuWatcher,
         mut tun_rx: impl IpRecv,
         udp: impl UdpSend + 'static,
@@ -2437,6 +2470,10 @@ impl<T: DeviceTransports> DeviceState<T> {
         crypto: CryptoHandle,
         outgoing_order: Arc<OrderStore<WgKind>>,
     ) -> Result<(), Error> {
+        let PacketTaskHandles {
+            liveness: device,
+            lookup: packet_lookup,
+        } = handles;
         let mut pending = PendingOutgoing::new();
         let send_many_buf = Arc::new(Mutex::new(Default::default()));
         loop {

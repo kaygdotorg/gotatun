@@ -403,8 +403,10 @@ async fn j369_timer_output_survives_a_full_peer_window() {
         .unwrap();
     let workers = CryptoWorkers::with_worker_count(2).unwrap();
     let timers = super::DeviceState::<mock::MockDeviceTransports>::handle_timers(
-        Arc::downgrade(&task_liveness),
-        packet_lookup,
+        super::PacketTaskHandles {
+            liveness: Arc::downgrade(&task_liveness),
+            lookup: packet_lookup,
+        },
         index_table,
         rate_limiter,
         udp,
