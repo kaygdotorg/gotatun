@@ -379,7 +379,7 @@ where
     let mut flow_indices: HashMap<(usize, F), usize> = HashMap::new();
     let mut packet_count = 0;
 
-    for (peer, flow, packet) in batch {
+    for (peer, flow, packet) in packets {
         let peer_index = match peer_indices.entry(peer) {
             std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
             std::collections::hash_map::Entry::Vacant(entry) => {
