@@ -192,17 +192,17 @@ pub fn checksum_tcp_with_skip<H: IntoBytes + Immutable>(header: H, tcp: &Tcp) ->
 /// Each chunk adds at most 2 × (2³² − 1), so the accumulator cannot overflow below 2³⁰ chunks
 /// (8 GiB), far above the 64 KiB IP packet limit.
 fn checksum_payload(bytes: &[u8]) -> u32 {
-    let mut chunks = bytes.chunks_exact(8);
+    let (chunks, tail) = bytes.as_chunks::<8>();
     let mut acc: u64 = 0;
-    for chunk in &mut chunks {
-        let value = u64::from_ne_bytes(chunk.try_into().expect("chunks_exact yields 8 bytes"));
+    for chunk in chunks {
+        let value = u64::from_ne_bytes(*chunk);
         acc += (value & 0xffff_ffff) + (value >> 32);
     }
-    let mut words = chunks.remainder().chunks_exact(2);
-    for word in &mut words {
-        acc += u64::from(u16::from_ne_bytes([word[0], word[1]]));
+    let (words, odd) = tail.as_chunks::<2>();
+    for word in words {
+        acc += u64::from(u16::from_ne_bytes(*word));
     }
-    if let [b] = words.remainder() {
+    if let [b] = odd {
         // Zero-pad if odd number of bytes. Every word above started at an even offset, so this
         // byte is the high half of its big-endian word.
         acc += u64::from(u16::from_ne_bytes([*b, 0]));
@@ -263,13 +263,13 @@ mod tests {
     /// as the reference the fast version must match exactly.
     fn reference_sum(bytes: &[u8], skip_word_index: Option<usize>) -> u32 {
         let mut sum = 0u32;
-        let mut words = bytes.chunks_exact(2);
-        for (i, w) in (&mut words).enumerate() {
+        let (words, odd) = bytes.as_chunks::<2>();
+        for (i, w) in words.iter().enumerate() {
             if Some(i) != skip_word_index {
-                sum += u32::from(u16::from_be_bytes([w[0], w[1]]));
+                sum += u32::from(u16::from_be_bytes(*w));
             }
         }
-        if let [b] = words.remainder() {
+        if let [b] = odd {
             sum += u32::from(u16::from_be_bytes([*b, 0]));
         }
         sum
