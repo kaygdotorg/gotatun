@@ -519,10 +519,8 @@ struct PeerLockDiagnostic {
 impl PeerLockDiagnostic {
     /// Begin tracing one peer-state mutex wait.
     fn waiting(operation: &'static str, peer_key: usize) -> Self {
-        let enabled = *PEER_LOCK_DIAGNOSTICS_ENABLED.get_or_init(|| {
-            std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
-                || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some()
-        });
+        let enabled = *PEER_LOCK_DIAGNOSTICS_ENABLED
+            .get_or_init(|| crate::diag::PIPELINE.on() || crate::diag::SEND_QUEUE.on());
         let id = NEXT_PEER_LOCK_DIAGNOSTIC_ID.fetch_add(1, Ordering::Relaxed);
         if enabled {
             eprintln!("peer_lock wait id={id} operation={operation} peer={peer_key}");
@@ -755,8 +753,7 @@ async fn complete_outgoing_batch<U: UdpSend + 'static>(
         send_many_buf,
     } = context;
     let count = prepared.len();
-    let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
-        || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some();
+    let diagnostic = crate::diag::PIPELINE.on() || crate::diag::SEND_QUEUE.on();
     if diagnostic {
         eprintln!(
             "pipeline stage=encrypt_start first_slot={first_slot} packets={count} dispatch={}",
@@ -1439,8 +1436,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         completions: Vec<Option<IncomingCompletion>>,
         mut tun_tx: impl IpSend,
     ) -> Result<(), Error> {
-        let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
-            || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some();
+        let diagnostic = crate::diag::PIPELINE.on() || crate::diag::SEND_QUEUE.on();
         let completion_count = completions.len();
         if diagnostic {
             eprintln!(
@@ -1521,7 +1517,7 @@ impl<T: DeviceTransports> DeviceState<T> {
             );
             eprintln!("pipeline stage=tun_queue_send_start packets={tunnel_packet_count}");
         }
-        let sequence_diagnostic = std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some();
+        let sequence_diagnostic = crate::diag::SEND_QUEUE.on();
         if sequence_diagnostic && tunnel_packet_count > 1 {
             eprintln!(
                 "ordered_tun_send_many_start slots={first_slot}..{} packets={tunnel_packet_count}",
@@ -1594,8 +1590,8 @@ impl<T: DeviceTransports> DeviceState<T> {
             let tun_tx = tun_tx.clone();
             pending.push(
                 async move {
-                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
-                        || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some()
+                    if crate::diag::PIPELINE.on()
+                        || crate::diag::SEND_QUEUE.on()
                     {
                         eprintln!(
                             "pipeline stage=decrypt_start first_slot={batch_first_slot} packets={batch_len} worker={force_worker}"
@@ -1611,8 +1607,8 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 .count()
                         })
                         .unwrap_or_default();
-                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
-                        || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some()
+                    if crate::diag::PIPELINE.on()
+                        || crate::diag::SEND_QUEUE.on()
                     {
                         eprintln!(
                             "pipeline stage=decrypt_complete first_slot={batch_first_slot} packets={batch_len} verified={verified_count} worker={force_worker}"
@@ -1649,8 +1645,8 @@ impl<T: DeviceTransports> DeviceState<T> {
                             },
                         )
                         .await;
-                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
-                        || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some()
+                    if crate::diag::PIPELINE.on()
+                        || crate::diag::SEND_QUEUE.on()
                     {
                         eprintln!(
                             "pipeline stage=ordered_complete first_slot={batch_first_slot} packets={batch_len} success={}",
@@ -1682,8 +1678,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         if run.packets.is_empty() {
             return Ok(());
         }
-        let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
-            || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some();
+        let diagnostic = crate::diag::PIPELINE.on() || crate::diag::SEND_QUEUE.on();
         let packet_count = run.packets.len();
         let batch_count = run.packets.len().div_ceil(CRYPTO_BATCH_SIZE);
         if diagnostic {
@@ -2114,7 +2109,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                     &mut packet_pool,
                     &mut received_packets,
                 ) => {
-                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                    if crate::diag::PIPELINE.on() {
                         eprintln!(
                             "pipeline stage=udp_receive packets={} error={}",
                             received_packets.len(),
@@ -2214,7 +2209,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                 match parsed_packet {
                     WgKind::Data(packet) => {
                         let counter = packet.header.counter.get();
-                        if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                        if crate::diag::PIPELINE.on() {
                             eprintln!("pipeline stage=udp_data_arrival counter={counter}");
                             eprintln!("pipeline stage=incoming_peer_lock_wait counter={counter}");
                         }
@@ -2235,7 +2230,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                         if !packet_lookup.contains_peer(&peer_arc) {
                             continue;
                         }
-                        if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                        if crate::diag::PIPELINE.on() {
                             eprintln!(
                                 "pipeline stage=incoming_peer_lock_acquired counter={counter}"
                             );
@@ -2243,7 +2238,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                         match peer.prepare_incoming_data(packet) {
                             crate::noise::PreparedIncoming::Immediate(result) => {
                                 // The serial data path also discarded packets without a session.
-                                if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                if crate::diag::PIPELINE.on() {
                                     eprintln!(
                                         "pipeline stage=incoming_prepare_immediate counter={counter}"
                                     );
@@ -2251,7 +2246,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 drop(result);
                             }
                             crate::noise::PreparedIncoming::Decrypt { packet } => {
-                                if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                if crate::diag::PIPELINE.on() {
                                     eprintln!(
                                         "pipeline stage=incoming_prepare_decrypt counter={counter}"
                                     );
@@ -2333,7 +2328,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 }
                                 let (lane, slot) = loop {
                                     if let Some(reserved) = outgoing_order.reserve(peer_key) {
-                                        if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                        if crate::diag::PIPELINE.on() {
                                             eprintln!(
                                                 "pipeline stage=control_slot_reserved peer={peer_key} slot={} pending={}",
                                                 reserved.1,
@@ -2345,7 +2340,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                     let Some(lane) = outgoing_order.lane(peer_key) else {
                                         continue;
                                     };
-                                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                    if crate::diag::PIPELINE.on() {
                                         eprintln!(
                                             "pipeline stage=control_slot_wait peer={peer_key} available={} pending={}",
                                             lane.available(),
@@ -2354,7 +2349,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                     }
                                     tokio::select! {
                                         _ = lane.wait_for_capacity() => {
-                                            if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                            if crate::diag::PIPELINE.on() {
                                                 eprintln!(
                                                     "pipeline stage=control_slot_capacity_wake peer={peer_key} available={}",
                                                     lane.available()
@@ -2362,7 +2357,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                             }
                                         }
                                         _ = outgoing_pending.next(), if !outgoing_pending.is_empty() => {
-                                            if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                            if crate::diag::PIPELINE.on() {
                                                 eprintln!(
                                                     "pipeline stage=control_slot_pending_wake peer={peer_key} available={}",
                                                     lane.available()
@@ -2449,14 +2444,14 @@ impl<T: DeviceTransports> DeviceState<T> {
                                     continue;
                                 }
 
-                                if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                if crate::diag::PIPELINE.on() {
                                     eprintln!("pipeline stage=incoming_control_tun_send_wait");
                                 }
                                 if let Err(e) = tun_tx.send(packet).await {
                                     tracing::trace!("buffered_tun_send.send failed");
                                     return Err(Error::IoError(e));
                                 }
-                                if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                if crate::diag::PIPELINE.on() {
                                     eprintln!("pipeline stage=incoming_control_tun_send_done");
                                 }
                             }
@@ -2500,7 +2495,7 @@ impl<T: DeviceTransports> DeviceState<T> {
             tokio::select! {
                 completed = pending.next(), if !pending.is_empty() => {
                     let _ = completed;
-                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                    if crate::diag::PIPELINE.on() {
                         eprintln!("pipeline stage=outgoing_pending_complete remaining={}", pending.len());
                     }
                 }
@@ -2513,7 +2508,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                         }
                     };
                     let packets = packets.collect::<Vec<_>>();
-                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                    if crate::diag::PIPELINE.on() {
                         eprintln!("pipeline stage=tun_receive packets={}", packets.len());
                     }
 
@@ -2577,7 +2572,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 drop(peer);
                                 drop(peer_trace);
                                 if let Some(lane) = lane {
-                                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                    if crate::diag::PIPELINE.on() {
                                         eprintln!(
                                             "pipeline stage=outgoing_slot_wait peer={peer_key} pending={}",
                                             pending.len()
@@ -2632,7 +2627,7 @@ impl<T: DeviceTransports> DeviceState<T> {
 
                             let batch_count = prepared.len().div_ceil(CRYPTO_BATCH_SIZE);
                             while pending.len() + batch_count > CRYPTO_CHUNK_SIZE {
-                                if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                if crate::diag::PIPELINE.on() {
                                     eprintln!(
                                         "pipeline stage=outgoing_pending_wait peer={peer_key} pending={} batches={batch_count}",
                                         pending.len()
@@ -2642,7 +2637,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                     .next()
                                     .await
                                     .expect("a full outgoing run has a completion future");
-                                if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                if crate::diag::PIPELINE.on() {
                                     eprintln!(
                                         "pipeline stage=outgoing_pending_wake peer={peer_key} pending={}",
                                         pending.len()
