@@ -2464,16 +2464,23 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 // drain (see `FlushRequests`).
                                 let drain_queue = peer.tunnel.has_queued_packets()
                                     && peer.tunnel.has_current_session();
+                                if !packet_lookup.register_handshake_idx(&packet, &peer_arc) {
+                                    continue;
+                                }
+                                // Reserve while peer state is held, as every slot producer does
+                                // (lock-order rule 3): a producer that checked capacity under the
+                                // peer mutex can then rely on it until its own reservation. J433
+                                // P1 (#260 88824): this task reserving without peer state could
+                                // take the last slot between another producer's check and its
+                                // reservation.
+                                let mut reserved = outgoing_order.reserve(peer_key);
                                 drop(peer);
                                 drop(peer_trace);
                                 if device.upgrade().is_none() {
                                     return Ok(());
                                 }
-                                if !packet_lookup.register_handshake_idx(&packet, &peer_arc) {
-                                    continue;
-                                }
                                 let (lane, slot) = loop {
-                                    if let Some(reserved) = outgoing_order.reserve(peer_key) {
+                                    if let Some(reserved) = reserved.take() {
                                         if crate::diag::PIPELINE.on() {
                                             eprintln!(
                                                 "pipeline stage=control_slot_reserved peer={peer_key} slot={} pending={}",
@@ -2483,34 +2490,38 @@ impl<T: DeviceTransports> DeviceState<T> {
                                         }
                                         break reserved;
                                     }
-                                    let Some(lane) = outgoing_order.lane(peer_key) else {
-                                        continue;
-                                    };
-                                    if crate::diag::PIPELINE.on() {
-                                        eprintln!(
-                                            "pipeline stage=control_slot_wait peer={peer_key} available={} pending={}",
-                                            lane.available(),
-                                            outgoing_pending.len()
-                                        );
-                                    }
-                                    tokio::select! {
-                                        _ = lane.wait_for_capacity() => {
-                                            if crate::diag::PIPELINE.on() {
-                                                eprintln!(
-                                                    "pipeline stage=control_slot_capacity_wake peer={peer_key} available={}",
-                                                    lane.available()
-                                                );
-                                            }
+                                    // The window is full: wait for delivery progress without peer
+                                    // state, then retry the reservation under it.
+                                    if let Some(lane) = outgoing_order.lane(peer_key) {
+                                        if crate::diag::PIPELINE.on() {
+                                            eprintln!(
+                                                "pipeline stage=control_slot_wait peer={peer_key} available={} pending={}",
+                                                lane.available(),
+                                                outgoing_pending.len()
+                                            );
                                         }
-                                        _ = outgoing_pending.next(), if !outgoing_pending.is_empty() => {
-                                            if crate::diag::PIPELINE.on() {
-                                                eprintln!(
-                                                    "pipeline stage=control_slot_pending_wake peer={peer_key} available={}",
-                                                    lane.available()
-                                                );
-                                            }
+                                        tokio::select! {
+                                            _ = lane.wait_for_capacity() => {}
+                                            _ = outgoing_pending.next(), if !outgoing_pending.is_empty() => {}
                                         }
                                     }
+                                    let mut peer_trace = PeerLockDiagnostic::waiting(
+                                        "incoming_control_reserve",
+                                        peer_key,
+                                    );
+                                    let mut pending_completions = PendingCompletions::Incoming(
+                                        &mut incoming_pending,
+                                        &mut outgoing_pending,
+                                    );
+                                    let _peer = lock_peer_state_while_completing(
+                                        &peer_arc,
+                                        "incoming_control_reserve",
+                                        peer_key,
+                                        &mut peer_trace,
+                                        &mut pending_completions,
+                                    )
+                                    .await?;
+                                    reserved = outgoing_order.reserve(peer_key);
                                 };
 
                                 while outgoing_pending.len() >= CRYPTO_CHUNK_SIZE {
