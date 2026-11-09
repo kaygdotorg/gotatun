@@ -177,33 +177,62 @@ pub fn checksum_tcp_with_skip<H: IntoBytes + Immutable>(header: H, tcp: &Tcp) ->
     finalize_csum(sum)
 }
 
+/// One's-complement sum of `bytes` read as big-endian 16-bit words, folded to 16 bits.
+///
+/// A trailing odd byte is padded with a zero byte, as RFC 1071 asks. The result is returned as
+/// a `u32` so callers can add several partial sums before [`finalize_csum`] folds them.
+///
+/// This runs for every segment of every TSO frame the TUN hands us, so it is on the sender's
+/// hot path (#260: about 4% of the sending endpoint's CPU before this change). It adds 8-byte
+/// chunks in native byte order into a 64-bit accumulator and swaps the bytes once at the end:
+/// the one's-complement sum does not depend on byte order (RFC 1071 section 2(B)), so this
+/// gives exactly the big-endian word sum. The plain chunk loop is safe code that the compiler
+/// vectorises on its own; it needs no intrinsics and no `unsafe`.
+///
+/// Each chunk adds at most 2 × (2³² − 1), so the accumulator cannot overflow below 2³⁰ chunks
+/// (8 GiB), far above the 64 KiB IP packet limit.
 fn checksum_payload(bytes: &[u8]) -> u32 {
-    let (words, rest) = <[big_endian::U16]>::ref_from_prefix(bytes).unwrap();
-
-    let mut sum: u32 = words.iter().map(|w| u32::from(w.get())).sum();
-    if let [b] = rest {
-        // Zero-pad if odd number of bytes
-        sum += u32::from(u16::from_be_bytes([*b, 0]));
+    let mut chunks = bytes.chunks_exact(8);
+    let mut acc: u64 = 0;
+    for chunk in &mut chunks {
+        let value = u64::from_ne_bytes(chunk.try_into().expect("chunks_exact yields 8 bytes"));
+        acc += (value & 0xffff_ffff) + (value >> 32);
+    }
+    let mut words = chunks.remainder().chunks_exact(2);
+    for word in &mut words {
+        acc += u64::from(u16::from_ne_bytes([word[0], word[1]]));
+    }
+    if let [b] = words.remainder() {
+        // Zero-pad if odd number of bytes. Every word above started at an even offset, so this
+        // byte is the high half of its big-endian word.
+        acc += u64::from(u16::from_ne_bytes([*b, 0]));
     }
 
-    sum
+    // End-around carry folding keeps a nonzero sum nonzero, so folding early gives the same
+    // 16-bit value as folding once at the end.
+    let mut folded = (acc & 0xffff_ffff) + (acc >> 32);
+    while folded >> 16 != 0 {
+        folded = (folded & 0xffff) + (folded >> 16);
+    }
+    let folded = u16::try_from(folded).expect("folded to 16 bits");
+    u32::from(if cfg!(target_endian = "little") {
+        folded.swap_bytes()
+    } else {
+        folded
+    })
 }
 
+/// Like [`checksum_payload`], but leaves out the 16-bit word at `skip_word_index`.
+///
+/// Used to sum a header whose checksum field still holds an old value. The two slices around the
+/// skipped word both start at even offsets, so their sums add up to the sum without it. An index
+/// past the last whole word skips nothing.
 fn checksum_payload_with_skip(bytes: &[u8], skip_word_index: usize) -> u32 {
-    let (words, rest) = <[big_endian::U16]>::ref_from_prefix(bytes).unwrap();
-
-    let mut sum: u32 = words
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != skip_word_index)
-        .map(|(_, w)| u32::from(w.get()))
-        .sum();
-    if let [b] = rest {
-        // Zero-pad if odd number of bytes
-        sum += u32::from(u16::from_be_bytes([*b, 0]));
+    let start = skip_word_index * 2;
+    match bytes.get(start + 2..) {
+        Some(after) => checksum_payload(&bytes[..start]) + checksum_payload(after),
+        None => checksum_payload(bytes),
     }
-
-    sum
 }
 
 fn finalize_csum(mut sum: u32) -> u16 {
@@ -228,5 +257,63 @@ mod tests {
         header.header_checksum = checksum(&[header.as_bytes()]).into();
         assert_eq!(header.header_checksum.get(), 0xAF18);
         assert_eq!(checksum(&[header.as_bytes()]), 0);
+    }
+
+    /// The word-at-a-time sum this module used before the chunked version (#260); kept here
+    /// as the reference the fast version must match exactly.
+    fn reference_sum(bytes: &[u8], skip_word_index: Option<usize>) -> u32 {
+        let mut sum = 0u32;
+        let mut words = bytes.chunks_exact(2);
+        for (i, w) in (&mut words).enumerate() {
+            if Some(i) != skip_word_index {
+                sum += u32::from(u16::from_be_bytes([w[0], w[1]]));
+            }
+        }
+        if let [b] = words.remainder() {
+            sum += u32::from(u16::from_be_bytes([*b, 0]));
+        }
+        sum
+    }
+
+    /// Deterministic test bytes; no extra dependency for randomness.
+    fn pseudo_random_bytes(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
+    /// The chunked sum gives exactly the old checksum for every length, odd tails, the
+    /// all-0xff and all-zero edge cases, and every skipped-word position.
+    #[test]
+    fn chunked_sum_matches_the_word_at_a_time_reference() {
+        let mut inputs: Vec<Vec<u8>> = (0..300)
+            .map(|len| pseudo_random_bytes(len, len as u64))
+            .collect();
+        inputs.push(pseudo_random_bytes(65_535, 7));
+        inputs.push(pseudo_random_bytes(65_534, 8));
+        inputs.push(vec![0xff; 65_535]);
+        inputs.push(vec![0; 1500]);
+        for bytes in &inputs {
+            assert_eq!(
+                finalize_csum(checksum_payload(bytes)),
+                finalize_csum(reference_sum(bytes, None)),
+                "length {}",
+                bytes.len()
+            );
+            for skip in [0, 1, 5, 8, 9, bytes.len() / 2, bytes.len() / 2 + 3] {
+                assert_eq!(
+                    finalize_csum(checksum_payload_with_skip(bytes, skip)),
+                    finalize_csum(reference_sum(bytes, Some(skip))),
+                    "length {} skip {skip}",
+                    bytes.len()
+                );
+            }
+        }
     }
 }
