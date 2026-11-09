@@ -73,11 +73,14 @@ pub trait IpSend: Send + Sync + 'static {
 /// Invalid input and data errors describe a single refused frame, so they must not stop later
 /// packets in the same buffered batch.
 pub(crate) fn is_fatal_tun_error(err: &io::Error) -> bool {
+    // A closed descriptor means the device is gone on every Unix, macOS's utun included.
+    #[cfg(unix)]
+    if err.raw_os_error() == Some(libc::EBADF) {
+        return true;
+    }
+
     #[cfg(target_os = "linux")]
-    if matches!(
-        err.raw_os_error(),
-        Some(libc::EBADF) | Some(libc::EBADFD) | Some(libc::ENODEV)
-    ) {
+    if matches!(err.raw_os_error(), Some(libc::EBADFD) | Some(libc::ENODEV)) {
         return true;
     }
 
