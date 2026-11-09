@@ -24,7 +24,6 @@ mod virtio;
 use bytes::BytesMut;
 use tokio::{sync::watch, time::sleep};
 use tun::AbstractDevice;
-#[cfg(target_os = "linux")]
 use zerocopy::IntoBytes;
 
 use crate::{
