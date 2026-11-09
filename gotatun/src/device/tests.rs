@@ -1569,3 +1569,182 @@ async fn j380_packet_lookup_progresses_with_a_pending_delivery_reader() {
         "packet lookup must progress while a writer holds the device lock and waits on the peer mutex"
     );
 }
+
+/// J433 review (#260): a handshake that reaches the receive task while the send task is draining
+/// the same peer's handshake queue must not stop the receive task.
+///
+/// `handle_outgoing` sets the peer's flush marker when it prepares a handshake initiation and keeps
+/// it across the awaits in `flush_handshake_queue`, with the peer mutex released. A handshake
+/// initiation (or response) from the peer handled by `handle_incoming` in that window calls
+/// `begin_flush` again for the same peer without checking `is_flushing`, and `begin_flush` asserts.
+/// This holds the marker the way the send task does, then delivers one valid initiation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn j433_incoming_handshake_during_an_outgoing_flush_keeps_receiving() {
+    use super::parallel_crypto::{CryptoWorkers, OrderStore};
+    use crate::packet::WgKind;
+    use crate::udp::UdpSend;
+
+    let (alice, bob, _eve) = mock::device_pair().await;
+    alice.device.suspend().await;
+    bob.device.suspend().await;
+    let (peer, lookup, liveness, key_pair, rate_limiter, (udp_tx, udp_rx)) = {
+        let mut state = alice.device.inner.write().await;
+        let socket = state.open_listen_socket().await.unwrap();
+        (
+            state.peers.values().next().unwrap().clone(),
+            Arc::clone(&state.packet_lookup),
+            Arc::clone(&state.task_liveness),
+            state.key_pair.clone().unwrap(),
+            Arc::clone(state.rate_limiter.as_ref().unwrap()),
+            socket,
+        )
+    };
+    let (bob_udp_tx, _bob_udp_rx, init) = {
+        let mut state = bob.device.inner.write().await;
+        let (tx, rx) = state.open_listen_socket().await.unwrap();
+        let bob_peer = state.peers.values().next().unwrap().clone();
+        let init = bob_peer
+            .lock()
+            .await
+            .tunnel
+            .format_handshake_initiation(false)
+            .expect("a fresh peer can initiate");
+        (tx, rx, init)
+    };
+
+    let outgoing_order = Arc::new(OrderStore::default());
+    // The send task is inside `flush_handshake_queue` for this peer.
+    let _send_task_flush = outgoing_order
+        .try_begin_flush(super::peer_order_key(&peer))
+        .expect("no drain is marked yet");
+    let workers = CryptoWorkers::with_worker_count(2).unwrap();
+    let (tun, _app_tx, _app_rx) = mock::mock_tun();
+    let incoming = tokio::spawn(
+        super::DeviceState::<mock::MockDeviceTransports>::handle_incoming(
+            super::PacketTaskHandles {
+                liveness: Arc::downgrade(&liveness),
+                lookup,
+                flush_requests: Arc::default(),
+            },
+            super::HandshakeResponder {
+                private_key: key_pair.0,
+                public_key: key_pair.1,
+                rate_limiter,
+            },
+            tun,
+            udp_tx,
+            udp_rx,
+            PacketBufPool::new_lazy(64),
+            super::CryptoOrderContext {
+                crypto: workers.handle(),
+                incoming: Arc::new(OrderStore::default()),
+                outgoing: Arc::clone(&outgoing_order),
+            },
+        ),
+    );
+    bob_udp_tx
+        .send_to(
+            WgKind::from(init).into(),
+            (Ipv4Addr::new(10, 0, 0, 1), 51820).into(),
+        )
+        .await
+        .unwrap();
+
+    let outcome = timeout(Duration::from_secs(2), incoming).await;
+    let panicked = match outcome {
+        Ok(Err(error)) if error.is_panic() => {
+            let payload = error.into_panic();
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|m| m.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            eprintln!("J433 receive task panicked: {message}");
+            true
+        }
+        Ok(other) => {
+            eprintln!("J433 receive task ended: {other:?}");
+            false
+        }
+        Err(_) => {
+            eprintln!("J433 receive task still running after the handshake (expected)");
+            false
+        }
+    };
+    workers.stop().await;
+    assert!(
+        !panicked,
+        "the receive task must survive a peer handshake during the send task's queue flush"
+    );
+}
+
+/// J433 review (#260): both peers start sending at once, so both prepare a handshake
+/// initiation on the send path while the other side's initiation arrives. Counts rounds in which
+/// either direction does not deliver and any task panic. Run alone (`--ignored --exact`) because
+/// it installs a process-wide panic hook. `J433_ROUNDS` sets the round count (default 300).
+#[test]
+#[ignore = "J433 stress: run alone"]
+fn j433_simultaneous_first_traffic_stress() {
+    let panics: Arc<StdMutex<Vec<String>>> = Arc::default();
+    let hook_panics = Arc::clone(&panics);
+    std::panic::set_hook(Box::new(move |info| {
+        hook_panics.lock().unwrap().push(info.to_string());
+    }));
+    let rounds: usize = std::env::var("J433_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut stalled = 0;
+    for round in 0..rounds {
+        let ok = runtime.block_on(async {
+            let (mut alice, mut bob, _eve) = mock::device_pair().await;
+            let a = mock::packet(b"alice-to-bob");
+            let b = mock::packet(b"bob-to-alice");
+            let (alice_tx, bob_tx) = (alice.app_tx.clone(), bob.app_tx.clone());
+            let send_a = tokio::spawn(async move { alice_tx.send(a).await });
+            let send_b = tokio::spawn(async move { bob_tx.send(b).await });
+            let _ = join!(send_a, send_b);
+            let got_b = timeout(Duration::from_secs(3), bob.app_rx.recv())
+                .await
+                .is_ok();
+            let got_a = timeout(Duration::from_secs(3), alice.app_rx.recv())
+                .await
+                .is_ok();
+            // Second exchange after the handshake settles: a dead receive task shows up here.
+            alice.app_tx.send(mock::packet(b"again-ab")).await;
+            bob.app_tx.send(mock::packet(b"again-ba")).await;
+            let again_b = timeout(Duration::from_secs(3), bob.app_rx.recv())
+                .await
+                .is_ok();
+            let again_a = timeout(Duration::from_secs(3), alice.app_rx.recv())
+                .await
+                .is_ok();
+            alice.device.stop().await;
+            bob.device.stop().await;
+            got_a && got_b && again_a && again_b
+        });
+        if !ok {
+            stalled += 1;
+            eprintln!("J433 round {round}: a direction did not deliver");
+        }
+    }
+    let panics = panics.lock().unwrap().clone();
+    let _ = std::panic::take_hook();
+    eprintln!(
+        "J433 stress: rounds={rounds} stalled={stalled} panics={}",
+        panics.len()
+    );
+    for p in panics.iter().take(5) {
+        eprintln!("J433 panic: {p}");
+    }
+    assert!(
+        stalled == 0 && panics.is_empty(),
+        "stalled={stalled} panics={}",
+        panics.len()
+    );
+}
