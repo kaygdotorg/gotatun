@@ -597,6 +597,12 @@ async fn threaded_reverse_traffic_preserves_order_and_progress() {
 /// task then drained the handshake queue itself, and the TUN task diverted the whole flood into
 /// that queue for as long as the drain ran, so the drain rarely finished. Meanwhile Bob's reverse
 /// packets were not received, and diverted packets beyond the 256-packet queue were dropped.
+///
+/// Whether the in-memory transports reach that livelock depends on relative speeds, so the test
+/// also asserts the invariant itself: across every rekey, the receive task never runs a drain.
+/// The perf-VM rekey test on #260 measures the real-rate effect. Skipped under `mock_instant`,
+/// which freezes the timers that trigger rekeys.
+#[cfg(not(feature = "mock_instant"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rekey_under_sustained_traffic_keeps_both_receive_paths_moving() {
     use std::sync::atomic::AtomicBool;
@@ -706,6 +712,7 @@ async fn rekey_under_sustained_traffic_keeps_both_receive_paths_moving() {
             .expect("the reverse thread starts")
     };
 
+    let drains_before = super::RECEIVE_TASK_DRAINS.load(Ordering::Relaxed);
     let started = Instant::now();
     let mut forward_last = started;
     let mut reverse_last = started;
@@ -748,14 +755,20 @@ async fn rekey_under_sustained_traffic_keeps_both_receive_paths_moving() {
         .join()
         .expect("the reverse thread completes");
     let forward = forward_received.load(Ordering::Relaxed);
+    let receive_task_drains = super::RECEIVE_TASK_DRAINS.load(Ordering::Relaxed) - drains_before;
     eprintln!(
         "rekey flood: rekeys={rekeys} forward={forward}/{sent} reverse={reverse_received}/{reverse_sent} \
-         forward_gap={forward_gap:?} reverse_gap={reverse_gap:?}"
+         forward_gap={forward_gap:?} reverse_gap={reverse_gap:?} receive_task_drains={receive_task_drains}"
     );
 
     assert!(
         rekeys >= 3,
         "the flood must cross several rekeys to exercise the flush, saw {rekeys}"
+    );
+    assert_eq!(
+        receive_task_drains, 0,
+        "the UDP receive task drained the handshake queue {receive_task_drains} times across \
+         {rekeys} rekeys; a drain there blocks datagram processing"
     );
     assert!(
         reverse_gap <= MAX_GAP,
