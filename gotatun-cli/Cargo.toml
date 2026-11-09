@@ -58,3 +58,5 @@ mimalloc = ["dep:mimalloc"]
 # Use the `ring` crate as the AEAD backend. Combine with
 # `--no-default-features` to avoid also pulling in `aws-lc-rs`.
 ring = ["gotatun/ring"]
+# macOS only: batched UDP I/O with a runtime fallback. See `gotatun`'s feature of the same name.
+macos-batch-io = ["gotatun/macos-batch-io"]

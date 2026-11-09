@@ -24,8 +24,18 @@ use std::{
 use super::{UdpRecv, UdpTransportFactory, UdpTransportFactoryParams};
 
 /// Implementations of [`super::UdpSend`]/[`super::UdpRecv`] for all targets
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "windows",
+    all(target_os = "macos", feature = "macos-batch-io")
+)))]
 mod generic;
+
+/// Batched `sendmsg_x`/`recvmsg_x` implementations for macOS, with a per-packet fallback.
+/// Opt-in through the `macos-batch-io` feature; see the module docs.
+#[cfg(all(target_os = "macos", feature = "macos-batch-io"))]
+mod macos;
 
 /// Implementations of [`super::UdpSend`]/[`super::UdpRecv`] for linux
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -98,6 +108,9 @@ struct UdpSocketState {
     udp_gso_supported: bool,
     #[cfg(target_os = "linux")]
     udp_gso_disabled: AtomicBool,
+    /// Whether this socket batches with `sendmsg_x`/`recvmsg_x`, decided at bind.
+    #[cfg(all(target_os = "macos", feature = "macos-batch-io"))]
+    batch: macos::BatchState,
 }
 
 /// Options set on the socket created by [`UdpSocket::bind`].
@@ -175,6 +188,8 @@ impl UdpSocket {
 
         #[cfg(target_os = "linux")]
         let udp_gso_supported = getsockopt(&udp_sock, sockopt::UdpGsoSegment).is_ok();
+        #[cfg(all(target_os = "macos", feature = "macos-batch-io"))]
+        let batch = macos::BatchState::for_socket(&udp_sock);
 
         let inner = tokio::net::UdpSocket::from_std(udp_sock.into())?;
 
@@ -185,6 +200,8 @@ impl UdpSocket {
                 udp_gso_supported,
                 #[cfg(target_os = "linux")]
                 udp_gso_disabled: AtomicBool::new(false),
+                #[cfg(all(target_os = "macos", feature = "macos-batch-io"))]
+                batch,
             }),
             map_ipv4_to_ipv6: addr.is_ipv6() && opts.only_v6 == Some(false),
         })
@@ -338,7 +355,13 @@ fn force_send_buffer_size(_: &socket2::Socket, _: usize) -> io::Result<()> {
 }
 
 #[cfg(test)]
-#[cfg_attr(target_vendor = "apple", expect(clippy::let_unit_value))]
+#[cfg_attr(
+    all(
+        target_vendor = "apple",
+        not(all(target_os = "macos", feature = "macos-batch-io"))
+    ),
+    expect(clippy::let_unit_value)
+)]
 mod tests {
     use bytes::BytesMut;
     use tokio::time::timeout;

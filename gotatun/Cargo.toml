@@ -121,6 +121,11 @@ device = ["tokio/net", "socket"]
 socket = ["dep:socket2", "tokio/net"]
 pcap = ["dep:pcap-file"]
 tun = ["dep:tun", "dep:wintun-bindings"]
+# macOS only: batch UDP sends and receives with the private `sendmsg_x`/`recvmsg_x`
+# calls, probed at runtime with a per-packet fallback (#260). Off by default; the
+# owner decides before any App Store build. `GOTATUN_MACOS_BATCH_UDP=0` turns it
+# off at runtime.
+macos-batch-io = ["socket"]
 # UDP GRO appears to be broken on Windows.
 # In some cases it fails to return UDP_COALESCED_INFO
 windows-gro = []
