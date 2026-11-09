@@ -670,6 +670,7 @@ impl<R: RngCore + Send> Tunn<R> {
     }
 
     /// Packets dropped because the handshake queue was full, since this tunnel was created.
+    #[cfg(test)]
     pub(crate) fn queue_drops(&self) -> u64 {
         self.queue_drops
     }
