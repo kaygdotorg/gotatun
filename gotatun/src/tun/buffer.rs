@@ -74,67 +74,6 @@ enum BufferedIpMessage {
     Batch(Vec<Packet<Ip>>, OwnedSemaphorePermit, Option<u64>),
 }
 
-/// The most packets the TUN writer joins into one device write call.
-///
-/// The writer takes a run from the queue, then also takes every run already waiting behind it,
-/// up to this bound, and hands them to the device in one call. The device coalesces adjacent
-/// segments of a flow into one large frame, so a joined write produces fewer, larger frames than
-/// writing each run on its own. Each frame is one write syscall and one trip through the kernel
-/// receive path, and TCP sends fewer ACKs when it receives larger frames (#260).
-///
-/// Joining happens only when the writer is behind; an idle writer still writes each run as
-/// soon as it arrives, so this adds no wait. The bound is four full decrypt batches. That is
-/// more than five full 64 KiB frames, and keeps one write call short.
-const MAX_MERGED_PACKETS: usize = 256;
-
-/// The runs the TUN writer joins into its next device write.
-#[derive(Default)]
-struct PendingWrite {
-    /// Packets in queue order.
-    packets: Vec<Packet<Ip>>,
-    /// Queue slots of these packets, released after the write.
-    permits: Vec<OwnedSemaphorePermit>,
-    /// Number of queued messages joined; used only by diagnostics.
-    runs: usize,
-    /// Whether any joined message was a run. A lone single packet keeps the device's
-    /// single-packet path; anything else goes through its batch path.
-    batched: bool,
-    /// Diagnostic run ids, present only when send-queue diagnostics are on.
-    sequences: Vec<u64>,
-}
-
-impl PendingWrite {
-    /// Append one queued message, keeping the queue order of its packets.
-    fn absorb(&mut self, message: BufferedIpMessage) {
-        self.runs += 1;
-        match message {
-            BufferedIpMessage::Single(packet, permit) => {
-                self.packets.push(packet);
-                self.permits.push(permit);
-            }
-            BufferedIpMessage::Batch(mut packets, permit, sequence) => {
-                self.batched = true;
-                if self.packets.is_empty() {
-                    std::mem::swap(&mut self.packets, &mut packets);
-                } else {
-                    self.packets.append(&mut packets);
-                }
-                self.permits.push(permit);
-                self.sequences.extend(sequence);
-            }
-        }
-    }
-
-    /// Drop the written packets and release their queue slots.
-    fn clear(&mut self) {
-        self.packets.clear();
-        self.permits.clear();
-        self.runs = 0;
-        self.batched = false;
-        self.sequences.clear();
-    }
-}
-
 impl BufferedIpSend {
     /// Create a [`BufferedIpSend`] with `capacity`.
     ///
@@ -156,42 +95,37 @@ impl BufferedIpSend {
                 .expect("Deadlock on IpSend. There must be no more than one IpSend active at any given time.");
 
             let mut refused: u64 = 0;
-            let mut pending = PendingWrite::default();
             while let Some(message) = rx.recv().await {
                 let diagnostic = crate::diag::pipeline();
-                pending.absorb(message);
-                // Take every run that is already queued, so the device coalesces them together.
-                while pending.packets.len() < MAX_MERGED_PACKETS {
-                    let Ok(next) = rx.try_recv() else {
-                        break;
-                    };
-                    pending.absorb(next);
-                }
-                let refused_packets = pending.packets.len() as u64;
-                for sequence in &pending.sequences {
-                    eprintln!("send_many dequeue direction=tun sequence={sequence}");
-                }
-                if diagnostic {
-                    eprintln!(
-                        "pipeline stage=tun_buffer_dequeue runs={} packets={refused_packets}",
-                        pending.runs
-                    );
-                }
-                let result = if !pending.batched && pending.packets.len() == 1 {
-                    let packet = pending.packets.pop().expect("one packet is queued");
-                    inner.send(packet).await
-                } else {
-                    inner.send_many(&mut pending.packets).await
+                let (result, refused_packets) = match message {
+                    BufferedIpMessage::Single(packet, _permit) => {
+                        if diagnostic {
+                            eprintln!("pipeline stage=tun_buffer_dequeue mode=single packets=1");
+                        }
+                        (inner.send(packet).await, 1)
+                    }
+                    BufferedIpMessage::Batch(mut packets, _permit, sequence) => {
+                        let batch_len = packets.len() as u64;
+                        if let Some(sequence) = sequence {
+                            eprintln!(
+                                "send_many dequeue direction=tun sequence={sequence} packets={batch_len}"
+                            );
+                        }
+                        if diagnostic {
+                            eprintln!(
+                                "pipeline stage=tun_buffer_dequeue mode=batch packets={batch_len}"
+                            );
+                        }
+                        let result = inner.send_many(&mut packets).await;
+                        if let Some(sequence) = sequence {
+                            eprintln!(
+                                "send_many complete direction=tun sequence={sequence} packets={batch_len} success={}",
+                                result.is_ok()
+                            );
+                        }
+                        (result, batch_len)
+                    }
                 };
-                for sequence in &pending.sequences {
-                    eprintln!(
-                        "send_many complete direction=tun sequence={sequence} success={}",
-                        result.is_ok()
-                    );
-                }
-                // Free the queue slots only after the write, as before: they bound packets that
-                // are queued or being written.
-                pending.clear();
                 if diagnostic {
                     eprintln!(
                         "pipeline stage=tun_device_write packets={refused_packets} success={}",
@@ -528,67 +462,6 @@ mod tests {
             [1, 2, 3]
         );
         assert!(single_rx.try_recv().is_err());
-    }
-
-    /// Records each device call like [`RecordingIpSend`], but holds the first batch write until
-    /// the test opens the gate, so later runs queue up behind it.
-    struct GatedIpSend {
-        gate: Option<tokio::sync::oneshot::Receiver<()>>,
-        batches: mpsc::UnboundedSender<Vec<u16>>,
-    }
-
-    impl IpSend for GatedIpSend {
-        async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
-            self.send_many(&mut vec![packet]).await
-        }
-
-        async fn send_many(&mut self, packets: &mut Vec<Packet<Ip>>) -> io::Result<()> {
-            let ids = packets.iter().map(packet_id).collect();
-            self.batches
-                .send(ids)
-                .expect("the test receiver remains open");
-            packets.clear();
-            if let Some(gate) = self.gate.take() {
-                gate.await.expect("the test opens the gate");
-            }
-            Ok(())
-        }
-    }
-
-    /// The next device call recorded by [`GatedIpSend`], failing the test after one second.
-    async fn next_batch(rx: &mut mpsc::UnboundedReceiver<Vec<u16>>) -> Vec<u16> {
-        tokio::time::timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("the device call must happen")
-            .expect("the test sender remains open")
-    }
-
-    /// Runs that queue while the writer is busy reach the device together, in queue order, so
-    /// the device can coalesce them into larger frames.
-    #[tokio::test]
-    async fn runs_queued_behind_a_busy_write_are_joined_in_order() {
-        let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
-        let (open, gate) = tokio::sync::oneshot::channel();
-        let inner = Arc::new(Mutex::new(GatedIpSend {
-            gate: Some(gate),
-            batches: batch_tx,
-        }));
-        let mut send = BufferedIpSend::new(16, inner, CancellationToken::new());
-
-        send.send_many(&mut vec![packet(64, 1), packet(64, 2)])
-            .await
-            .unwrap();
-        assert_eq!(next_batch(&mut batch_rx).await, [1, 2]);
-
-        // The writer now waits on the gate; these runs queue behind it.
-        send.send_many(&mut vec![packet(64, 3), packet(64, 4)])
-            .await
-            .unwrap();
-        send.send(packet(64, 5)).await.unwrap();
-        send.send_many(&mut vec![packet(64, 6)]).await.unwrap();
-        open.send(()).unwrap();
-
-        assert_eq!(next_batch(&mut batch_rx).await, [3, 4, 5, 6]);
     }
 
     /// A run larger than the packet budget is split without waiting for impossible permits.
