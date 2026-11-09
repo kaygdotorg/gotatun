@@ -165,6 +165,42 @@ pub enum Error {
     /// The device has no active connection, e.g. because it is suspended
     #[error("The device has no active connection")]
     NotConnected,
+
+    /// A packet or timer task panicked. The device no longer moves packets and must be rebuilt.
+    #[error("device task {task} panicked: {message}")]
+    TaskPanicked {
+        /// Name of the task that panicked.
+        task: &'static str,
+        /// The panic message.
+        message: String,
+    },
+
+    /// The packet pipeline hit a failure it cannot recover from, such as a stopped UDP send task
+    /// or a broken slot-reservation invariant. The device must be rebuilt.
+    #[error("packet pipeline failed: {0}")]
+    PipelineFailed(String),
+}
+
+/// Run one packet or timer task, turning a panic into [`Error::TaskPanicked`].
+///
+/// Without this, a panicking task ends quietly: `Task` only logs it, and the device stays "up"
+/// with no receive or send path (J433 P2-1 on #260). The error goes to the device's fatal-error
+/// channel, so [`Device::wait`] returns it and the infraternal agent rebuilds the interface.
+///
+/// Unwind safety: after a panic the whole connection is treated as failed, and no state the task
+/// held is used to move packets again.
+async fn fatal_on_panic<F>(task: &'static str, future: F) -> Result<(), Error>
+where
+    F: std::future::Future<Output = Result<(), Error>>,
+{
+    match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = crate::task::panic_message(&*payload);
+            tracing::error!("device task {task} panicked: {message}");
+            Err(Error::TaskPanicked { task, message })
+        }
+    }
 }
 
 /// Futures that finish one outgoing worker result and release it through the peer's order lane.
@@ -768,6 +804,7 @@ async fn complete_outgoing_packet<U: UdpSend>(
         .complete_run_traced("outgoing", peer_key, slot, packets, |mut packets| {
             #[cfg(feature = "daita")]
             let peer_arc = Arc::clone(&peer_arc);
+            let failure_store = Arc::clone(&ordered);
             let udp = udp.clone();
             async move {
                 let Some(packet) = packets.pop().flatten() else {
@@ -800,10 +837,14 @@ async fn complete_outgoing_packet<U: UdpSend>(
                 #[cfg(not(feature = "daita"))]
                 let packet = Some(packet);
 
-                if let Some(packet) = packet
-                    && udp.send_to(packet.into(), peer_addr).await.is_err()
-                {
-                    tracing::trace!("udp.send_to failed");
+                if let Some(packet) = packet {
+                    match udp.send_to(packet.into(), peer_addr).await {
+                        Err(err) if crate::udp::is_fatal_udp_error(&err) => {
+                            failure_store.fail(format!("UDP send failed: {err}"));
+                        }
+                        Err(_) => tracing::trace!("udp.send_to failed"),
+                        Ok(()) => {}
+                    }
                 }
                 Ok::<(), ()>(())
             }
@@ -864,6 +905,7 @@ async fn complete_outgoing_batch<U: UdpSend + 'static>(
     let _ = lane
         .complete_run_traced("outgoing", peer_key, first_slot, packets, |packets| {
             let peer_arc = Arc::clone(&peer_arc);
+            let ordered = Arc::clone(&ordered);
             let udp = udp.clone();
             let send_many_buf = Arc::clone(&send_many_buf);
             async move {
@@ -934,8 +976,12 @@ async fn complete_outgoing_batch<U: UdpSend + 'static>(
                                 result.is_ok()
                             );
                         }
-                        if result.is_err() {
-                            tracing::trace!("udp.send_to failed");
+                        match result {
+                            Err(err) if crate::udp::is_fatal_udp_error(&err) => {
+                                ordered.fail(format!("UDP send failed: {err}"));
+                            }
+                            Err(_) => tracing::trace!("udp.send_to failed"),
+                            Ok(()) => {}
                         }
                     }
                     _ => {
@@ -947,8 +993,12 @@ async fn complete_outgoing_batch<U: UdpSend + 'static>(
                                 result.is_ok()
                             );
                         }
-                        if result.is_err() {
-                            tracing::trace!("udp.send_many_to failed");
+                        match result {
+                            Err(err) if crate::udp::is_fatal_udp_error(&err) => {
+                                ordered.fail(format!("UDP send failed: {err}"));
+                            }
+                            Err(_) => tracing::trace!("udp.send_many_to failed"),
+                            Ok(()) => {}
                         }
                     }
                 }
@@ -1120,46 +1170,59 @@ impl<T: DeviceTransports> Connection<T> {
         };
 
         // Start device tasks
+        // Each packet and timer task fails the device when it panics or errors (`fatal_on_panic`),
+        // so `Device::wait` reports it and the owner can rebuild the interface.
         let outgoing = Task::spawn(
             "handle_outgoing",
-            DeviceState::<T>::handle_outgoing(
-                handles.clone(),
-                tun_rx_mtu,
-                buffered_ip_rx,
-                buffered_udp_tx.clone(),
-                pool.clone(),
-                crypto.clone(),
-                Arc::clone(&outgoing_order),
+            fatal_on_panic(
+                "handle_outgoing",
+                DeviceState::<T>::handle_outgoing(
+                    handles.clone(),
+                    tun_rx_mtu,
+                    buffered_ip_rx,
+                    buffered_udp_tx.clone(),
+                    pool.clone(),
+                    crypto.clone(),
+                    Arc::clone(&outgoing_order),
+                ),
             )
             .map_err(register_fatal_error.clone()),
         );
         let timers = Task::spawn(
             "handle_timers",
-            DeviceState::<T>::handle_timers(
-                handles.clone(),
-                index_table,
-                rate_limiter.clone(),
-                buffered_udp_tx.clone(),
-                crypto.clone(),
-                Arc::clone(&outgoing_order),
-            ),
+            fatal_on_panic(
+                "handle_timers",
+                DeviceState::<T>::handle_timers(
+                    handles.clone(),
+                    index_table,
+                    rate_limiter.clone(),
+                    buffered_udp_tx.clone(),
+                    crypto.clone(),
+                    Arc::clone(&outgoing_order),
+                )
+                .map(Ok::<(), Error>),
+            )
+            .map_err(register_fatal_error.clone()),
         );
-        let incoming_task = DeviceState::<T>::handle_incoming(
-            handles,
-            HandshakeResponder {
-                private_key,
-                public_key,
-                rate_limiter,
-            },
-            buffered_ip_tx.clone(),
-            buffered_udp_tx,
-            incoming_udp_rx,
-            pool.clone(),
-            CryptoOrderContext {
-                crypto,
-                incoming: incoming_order,
-                outgoing: Arc::clone(&outgoing_order),
-            },
+        let incoming_task = fatal_on_panic(
+            "handle_incoming",
+            DeviceState::<T>::handle_incoming(
+                handles,
+                HandshakeResponder {
+                    private_key,
+                    public_key,
+                    rate_limiter,
+                },
+                buffered_ip_tx.clone(),
+                buffered_udp_tx,
+                incoming_udp_rx,
+                pool.clone(),
+                CryptoOrderContext {
+                    crypto,
+                    incoming: incoming_order,
+                    outgoing: Arc::clone(&outgoing_order),
+                },
+            ),
         )
         .map_err(register_fatal_error.clone());
         // Test builds tag the receive task so tests can assert it never drains a queue.
@@ -1941,9 +2004,15 @@ impl<T: DeviceTransports> DeviceState<T> {
             // Preparation assigns packet counters. Keep peer state and the flush marker until
             // these packets own the matching contiguous sequence range, so a newer producer can
             // neither take counters nor reserve earlier slots.
-            let (chunk_lane, first_slot) = ordered
-                .reserve_run(peer_key, jobs.len())
-                .expect("peer state keeps the prepared run's sequence capacity available");
+            // Every producer reserves under peer state (lock-order rule 3), so the capacity checked
+            // above is still there. If that invariant ever breaks, fail the device visibly: these
+            // packets already own counters and cannot be reordered or dropped silently.
+            let (chunk_lane, first_slot) =
+                ordered.reserve_run(peer_key, jobs.len()).ok_or_else(|| {
+                    Error::PipelineFailed(
+                        "a handshake-queue run lost its checked sequence capacity".into(),
+                    )
+                })?;
 
             if stop_after_chunk || !peer.tunnel.has_queued_packets() {
                 // The current run already owns its slots, so newer TUN reservations can follow it.
@@ -2245,6 +2314,9 @@ impl<T: DeviceTransports> DeviceState<T> {
                     if let Some(result) = completed {
                         result?;
                     }
+                }
+                reason = outgoing_order.failed() => {
+                    return Err(Error::PipelineFailed(reason));
                 }
                 completed = outgoing_pending.next(), if !outgoing_pending.is_empty() => {
                     let _ = completed;
@@ -2651,6 +2723,9 @@ impl<T: DeviceTransports> DeviceState<T> {
                         eprintln!("pipeline stage=outgoing_pending_complete remaining={}", pending.len());
                     }
                 }
+                reason = outgoing_order.failed() => {
+                    return Err(Error::PipelineFailed(reason));
+                }
                 () = flush_requests.wake.notified() => {
                     for (peer_key, peer_arc) in flush_requests.take() {
                         if device.upgrade().is_none() {
@@ -2814,9 +2889,16 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 }
                             }
 
+                            // Capacity was checked under this peer mutex and every producer reserves
+                            // under it (lock-order rule 3). A broken invariant fails the device
+                            // visibly instead of panicking the TUN task.
                             let (lane, first_slot) = outgoing_order
                                 .reserve_run(peer_key, prepared.len())
-                                .expect("the prepared run fits in the peer order window");
+                                .ok_or_else(|| {
+                                    Error::PipelineFailed(
+                                        "a TUN run lost its checked sequence capacity".into(),
+                                    )
+                                })?;
                             drop(peer);
                             drop(peer_trace);
 

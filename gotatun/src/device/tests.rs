@@ -1748,3 +1748,56 @@ fn j433_simultaneous_first_traffic_stress() {
         panics.len()
     );
 }
+
+/// A panicking packet task becomes a fatal device error instead of ending quietly (J433 P2-1).
+#[tokio::test]
+async fn a_panicking_packet_task_reports_a_fatal_error() {
+    let outcome = super::fatal_on_panic("handle_incoming", async {
+        panic!("peer input broke an invariant");
+    })
+    .await;
+    match outcome {
+        Err(super::Error::TaskPanicked { task, message }) => {
+            assert_eq!(task, "handle_incoming");
+            assert!(
+                message.contains("peer input broke an invariant"),
+                "{message}"
+            );
+        }
+        other => panic!("expected TaskPanicked, got {other:?}"),
+    }
+    assert!(
+        super::fatal_on_panic("handle_outgoing", async { Ok(()) })
+            .await
+            .is_ok(),
+        "a task that ends normally stays Ok"
+    );
+}
+
+/// A completion's fatal failure wakes the packet tasks, and the first reason wins (J433 P2-1).
+#[tokio::test]
+async fn a_pipeline_failure_wakes_waiters_with_the_first_reason() {
+    use super::parallel_crypto::OrderStore;
+    use crate::packet::WgKind;
+
+    let order = Arc::new(OrderStore::<WgKind>::default());
+    let waiter = {
+        let order = Arc::clone(&order);
+        tokio::spawn(async move { order.failed().await })
+    };
+    tokio::task::yield_now().await;
+    order.fail("UDP send failed: first".into());
+    order.fail("UDP send failed: second".into());
+    let reason = timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("a waiting task wakes on failure")
+        .expect("the waiter does not panic");
+    assert_eq!(reason, "UDP send failed: first");
+    // A task that starts waiting after the failure sees it at once.
+    assert_eq!(
+        timeout(Duration::from_secs(1), order.failed())
+            .await
+            .expect("a late waiter sees the recorded failure"),
+        "UDP send failed: first"
+    );
+}

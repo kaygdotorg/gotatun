@@ -10,12 +10,26 @@
 // SPDX-License-Identifier: MPL-2.0
 #![cfg(any(feature = "device", feature = "tun"))]
 
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use tokio::task::JoinHandle;
+
+/// Best-effort text of a panic payload, for logs and fatal device errors.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
 
 /// A wrapper around [`JoinHandle`] that.
 /// - Aborts the task on Drop.
 /// - If the task returns an `Err`, logs it.
+/// - If the task panics, logs the panic at error level when it happens, not only when the task
+///   is stopped. Device tasks that must also fail the device wrap their future first (see
+///   `fatal_on_panic` in `device`).
 pub struct Task {
     name: &'static str,
 
@@ -56,8 +70,13 @@ impl Task {
         O: TaskOutput,
     {
         let handle = tokio::spawn(async move {
-            let output = fut.await;
-            TaskOutput::handle(output, name);
+            // Unwind safety: a panicking task is over; nothing it owned is used afterwards.
+            match AssertUnwindSafe(fut).catch_unwind().await {
+                Ok(output) => TaskOutput::handle(output, name),
+                Err(payload) => {
+                    tracing::error!("task {name:?} panicked: {}", panic_message(&*payload));
+                }
+            }
         });
 
         Task {

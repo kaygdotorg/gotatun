@@ -494,6 +494,11 @@ impl<T> OrderedCompletions<T> {
 pub(crate) struct OrderStore<T> {
     lanes: Mutex<BTreeMap<usize, Arc<OrderedCompletions<T>>>>,
     flushing: Mutex<std::collections::BTreeSet<usize>>,
+    /// First fatal failure reported by a completion, for the packet tasks to turn into a device
+    /// error (see [`OrderStore::fail`]).
+    failure: Mutex<Option<String>>,
+    /// Wakes the packet tasks once `failure` is set.
+    failed: Notify,
     #[cfg(test)]
     /// Test-only barrier for arranging a producer at a lane reservation boundary.
     reserve_hook: Mutex<Option<ReserveHook>>,
@@ -510,6 +515,8 @@ impl<T> Default for OrderStore<T> {
         Self {
             lanes: Mutex::new(BTreeMap::new()),
             flushing: Mutex::new(std::collections::BTreeSet::new()),
+            failure: Mutex::new(None),
+            failed: Notify::new(),
             #[cfg(test)]
             reserve_hook: Mutex::new(None),
         }
@@ -579,6 +586,37 @@ impl<T> OrderStore<T> {
             store: Arc::clone(self),
             peer,
         })
+    }
+
+    /// Record a failure that leaves the connection unable to move packets, such as a stopped UDP
+    /// send task, and wake the packet tasks so they end with a fatal device error.
+    ///
+    /// Completion futures cannot return errors to their owner (their output is `()`), so they
+    /// report here. The first reason wins; later ones are only logged.
+    pub(crate) fn fail(&self, reason: String) {
+        let mut failure = self.failure.lock();
+        if failure.is_none() {
+            tracing::error!("packet pipeline failed: {reason}");
+            *failure = Some(reason);
+            drop(failure);
+            self.failed.notify_waiters();
+            self.failed.notify_one();
+        } else {
+            tracing::debug!("further packet pipeline failure: {reason}");
+        }
+    }
+
+    /// Wait until [`OrderStore::fail`] records a failure, and return its reason.
+    pub(crate) async fn failed(&self) -> String {
+        loop {
+            let notified = self.failed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(reason) = self.failure.lock().clone() {
+                return reason;
+            }
+            notified.await;
+        }
     }
 
     /// Whether outgoing data for this peer must wait behind its handshake queue.
