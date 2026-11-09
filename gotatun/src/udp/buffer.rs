@@ -116,6 +116,26 @@ async fn flush_udp_packets<U: UdpSend>(
     }
 }
 
+/// Send a bounded run in as few transport calls as its maximum batch size allows.
+async fn flush_udp_run<U: UdpSend>(
+    udp_tx: &U,
+    send_buf: &mut U::SendManyBuf,
+    packets: Vec<(Packet, SocketAddr)>,
+    max_packet_count: usize,
+) {
+    if packets.len() <= max_packet_count {
+        let mut packets = packets;
+        flush_udp_packets(udp_tx, send_buf, &mut packets).await;
+        return;
+    }
+
+    let mut packets = packets.into_iter();
+    while packets.len() > 0 {
+        let mut batch = packets.by_ref().take(max_packet_count).collect::<Vec<_>>();
+        flush_udp_packets(udp_tx, send_buf, &mut batch).await;
+    }
+}
+
 impl BufferedUdpSend {
     /// Wrap a [`UdpSend`] into a [`BufferedUdpSend`] with `capacity`.
     pub fn new(capacity: usize, udp_tx: impl UdpSend + 'static) -> Self {
@@ -126,10 +146,8 @@ impl BufferedUdpSend {
             let mut buf = vec![];
             let max_packet_count = udp_tx.max_number_of_packets_to_send().max(1);
             let mut send_many_buf = Default::default();
-            let mut pending = Vec::with_capacity(max_packet_count);
-            // Queue slots of every packet taken this round; freed once the round is sent.
-            let mut permits = Vec::with_capacity(max_packet_count);
-            let mut sequences = Vec::new();
+            let mut singles = Vec::with_capacity(max_packet_count);
+            let mut single_permits = Vec::with_capacity(max_packet_count);
 
             loop {
                 let count = send_rx.recv_many(&mut buf, max_packet_count).await;
@@ -137,47 +155,46 @@ impl BufferedUdpSend {
                     break;
                 }
 
-                // Every datagram taken this round, single or part of a run, joins one send
-                // batch in queue order. A batch ends at the transport's size limit or when the
-                // address family changes, so a lone one-datagram run no longer costs its own
-                // syscall when others are queued with it (#260).
                 for message in buf.drain(..) {
-                    let packets = match message {
+                    match message {
                         BufferedUdpMessage::Single(packet, addr, permit) => {
-                            permits.push(permit);
-                            vec![(packet, addr)]
+                            if singles.first().is_some_and(|(_, first_addr)| {
+                                matches!(first_addr, SocketAddr::V4(..))
+                                    != matches!(addr, SocketAddr::V4(..))
+                            }) {
+                                flush_udp_packets(&udp_tx, &mut send_many_buf, &mut singles).await;
+                                single_permits.clear();
+                            }
+                            singles.push((packet, addr));
+                            single_permits.push(permit);
+                            if singles.len() == max_packet_count {
+                                flush_udp_packets(&udp_tx, &mut send_many_buf, &mut singles).await;
+                                single_permits.clear();
+                            }
                         }
                         BufferedUdpMessage::Batch(packets, permit, sequence) => {
+                            let packet_count = packets.len();
                             if let Some(sequence) = sequence {
                                 eprintln!(
-                                    "send_many dequeue direction=udp sequence={sequence} packets={}",
-                                    packets.len()
+                                    "send_many dequeue direction=udp sequence={sequence} packets={packet_count}"
                                 );
-                                sequences.push(sequence);
                             }
-                            permits.push(permit);
-                            packets
-                        }
-                    };
-                    for (packet, addr) in packets {
-                        if pending.first().is_some_and(|(_, first_addr)| {
-                            matches!(first_addr, SocketAddr::V4(..))
-                                != matches!(addr, SocketAddr::V4(..))
-                        }) {
-                            flush_udp_packets(&udp_tx, &mut send_many_buf, &mut pending).await;
-                        }
-                        pending.push((packet, addr));
-                        if pending.len() == max_packet_count {
-                            flush_udp_packets(&udp_tx, &mut send_many_buf, &mut pending).await;
+                            flush_udp_packets(&udp_tx, &mut send_many_buf, &mut singles).await;
+                            single_permits.clear();
+                            flush_udp_run(&udp_tx, &mut send_many_buf, packets, max_packet_count)
+                                .await;
+                            if let Some(sequence) = sequence {
+                                eprintln!(
+                                    "send_many complete direction=udp sequence={sequence} packets={packet_count}"
+                                );
+                            }
+                            drop(permit);
                         }
                     }
                 }
 
-                flush_udp_packets(&udp_tx, &mut send_many_buf, &mut pending).await;
-                permits.clear();
-                for sequence in sequences.drain(..) {
-                    eprintln!("send_many complete direction=udp sequence={sequence}");
-                }
+                flush_udp_packets(&udp_tx, &mut send_many_buf, &mut singles).await;
+                single_permits.clear();
             }
         });
 
@@ -418,99 +435,6 @@ mod test {
             Packet::from_bytes(bytes::BytesMut::from(payload)),
             "127.0.0.1:51820".parse().unwrap(),
         )
-    }
-
-    /// Records every transport call as the list of payloads it carried, holding the first call
-    /// until the test opens the gate so later messages queue up behind it.
-    #[derive(Clone)]
-    struct GatedCallRecorder {
-        calls: mpsc::UnboundedSender<Vec<Vec<u8>>>,
-        gate: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
-    }
-
-    impl GatedCallRecorder {
-        /// Record one call, then wait on the gate if it is still closed.
-        async fn record(&self, payloads: Vec<Vec<u8>>) {
-            self.calls
-                .send(payloads)
-                .expect("the test receiver remains open");
-            let gate = self.gate.lock().unwrap().take();
-            if let Some(gate) = gate {
-                gate.await.expect("the test opens the gate");
-            }
-        }
-    }
-
-    impl UdpSend for GatedCallRecorder {
-        type SendManyBuf = ();
-
-        async fn send_to(&self, packet: Packet, _destination: SocketAddr) -> io::Result<()> {
-            self.record(vec![packet.as_bytes().to_vec()]).await;
-            Ok(())
-        }
-
-        fn max_number_of_packets_to_send(&self) -> usize {
-            64
-        }
-
-        async fn send_many_to(
-            &self,
-            _send_buf: &mut (),
-            packets: &mut Vec<(Packet, SocketAddr)>,
-        ) -> io::Result<()> {
-            let payloads = packets
-                .drain(..)
-                .map(|(p, _)| p.as_bytes().to_vec())
-                .collect();
-            self.record(payloads).await;
-            Ok(())
-        }
-    }
-
-    /// Runs and single datagrams that queue while a send is in progress go out in one
-    /// transport call, in queue order, instead of one call per queued message.
-    #[tokio::test]
-    async fn queued_runs_and_singles_share_one_send_call() {
-        let (calls_tx, mut calls_rx) = mpsc::unbounded_channel();
-        let (open, gate) = tokio::sync::oneshot::channel();
-        let send = BufferedUdpSend::new(
-            16,
-            GatedCallRecorder {
-                calls: calls_tx,
-                gate: Arc::new(std::sync::Mutex::new(Some(gate))),
-            },
-        );
-        let address: SocketAddr = "127.0.0.1:51820".parse().unwrap();
-        let packet = |payload: &[u8]| (Packet::from_bytes(bytes::BytesMut::from(payload)), address);
-        let next_call = async |rx: &mut mpsc::UnboundedReceiver<Vec<Vec<u8>>>| {
-            tokio::time::timeout(Duration::from_secs(1), rx.recv())
-                .await
-                .expect("the transport call must happen")
-                .expect("the test sender remains open")
-        };
-
-        send.send_many_to(&mut (), &mut vec![packet(b"a"), packet(b"b")])
-            .await
-            .unwrap();
-        assert_eq!(
-            next_call(&mut calls_rx).await,
-            [b"a".to_vec(), b"b".to_vec()]
-        );
-
-        // The send task now waits on the gate; these queue behind it.
-        send.send_many_to(&mut (), &mut vec![packet(b"c")])
-            .await
-            .unwrap();
-        send.send_to(packet(b"d").0, address).await.unwrap();
-        send.send_many_to(&mut (), &mut vec![packet(b"e")])
-            .await
-            .unwrap();
-        open.send(()).unwrap();
-
-        assert_eq!(
-            next_call(&mut calls_rx).await,
-            [b"c".to_vec(), b"d".to_vec(), b"e".to_vec()]
-        );
     }
 
     /// A run larger than the buffer capacity is split without waiting for impossible permits.
