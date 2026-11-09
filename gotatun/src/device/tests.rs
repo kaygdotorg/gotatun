@@ -756,14 +756,24 @@ async fn rekey_under_sustained_traffic_keeps_both_receive_paths_moving() {
         .expect("the reverse thread completes");
     let forward = forward_received.load(Ordering::Relaxed);
     let receive_task_drains = super::RECEIVE_TASK_DRAINS.load(Ordering::Relaxed) - drains_before;
+    let mut queue_drops = 0;
+    for device in [&alice_device.inner, &bob_device.inner] {
+        let peer = device.read().await.peers.values().next().unwrap().clone();
+        queue_drops += peer.lock().await.tunnel.queue_drops();
+    }
     eprintln!(
         "rekey flood: rekeys={rekeys} forward={forward}/{sent} reverse={reverse_received}/{reverse_sent} \
-         forward_gap={forward_gap:?} reverse_gap={reverse_gap:?} receive_task_drains={receive_task_drains}"
+         forward_gap={forward_gap:?} reverse_gap={reverse_gap:?} receive_task_drains={receive_task_drains} \
+         queue_drops={queue_drops}"
     );
 
     assert!(
         rekeys >= 3,
         "the flood must cross several rekeys to exercise the flush, saw {rekeys}"
+    );
+    assert_eq!(
+        queue_drops, 0,
+        "packets were dropped at the 256-packet handshake queue bound across {rekeys} rekeys"
     );
     assert_eq!(
         receive_task_drains, 0,
