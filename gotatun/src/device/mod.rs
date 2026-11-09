@@ -1985,8 +1985,12 @@ impl<T: DeviceTransports> DeviceState<T> {
                     .expect("the queued packet count remains stable while peer state is locked");
                 let prepared = peer.tunnel.prepare_queued_packet(packet);
                 if let Some(PreparedOutgoing::Ready(packet)) = prepared.as_ref() {
-                    packet_lookup.register_handshake_idx(packet, &peer_arc);
                     stop_after_chunk = true;
+                    if !packet_lookup.register_handshake_idx(packet, &peer_arc) {
+                        // The peer was removed: keep the slot, send nothing (J433 P3-1).
+                        jobs.push(None);
+                        break;
+                    }
                 }
                 if prepared.is_none() {
                     stop_after_chunk = true;
@@ -2792,6 +2796,11 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 &mut pending_completions,
                             )
                             .await?;
+                            // The peer may have been removed between the route lookup and this
+                            // lock; send nothing to a removed (possibly revoked) peer. J433 P3-1.
+                            if !packet_lookup.contains_peer(&peer_arc) {
+                                break;
+                            }
                             let Some(peer_addr) = peer.endpoint().addr else {
                                 tracing::error!("No endpoint");
                                 break;
@@ -2877,7 +2886,12 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 };
 
                                 if let PreparedOutgoing::Ready(packet) = &prepared_packet {
-                                    packet_lookup.register_handshake_idx(packet, &peer_arc);
+                                    if !packet_lookup.register_handshake_idx(packet, &peer_arc) {
+                                        // Removed since the check above (removal holds the device
+                                        // lock, not this mutex): its initiation is not sent.
+                                        prepared.push(None);
+                                        break;
+                                    }
                                     handshake_offset = Some(prepared.len());
                                     // Peer state is held and this task is the only drainer, so
                                     // no other marker can exist for this peer.
