@@ -22,6 +22,8 @@
 mod crypto;
 #[cfg(feature = "device")]
 pub mod device;
+#[cfg(feature = "device")]
+mod diag;
 pub mod noise;
 pub mod packet;
 pub mod tun;
