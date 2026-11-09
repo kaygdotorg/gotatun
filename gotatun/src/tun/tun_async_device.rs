@@ -20,8 +20,6 @@ mod tso;
 #[cfg(target_os = "linux")]
 mod virtio;
 
-#[cfg(target_os = "linux")]
-use bytes::BytesMut;
 use tokio::{sync::watch, time::sleep};
 use tun::AbstractDevice;
 #[cfg(target_os = "linux")]
@@ -44,6 +42,23 @@ const MAX_TUN_PACKET_LEN: usize = 40 + u16::MAX as usize;
 
 #[cfg(target_os = "linux")]
 const MAX_TUN_FRAME_LEN: usize = virtio::VirtioNetHeader::LEN + MAX_TUN_PACKET_LEN;
+
+/// Frame-sized read buffers each TUN device keeps for reuse.
+///
+/// Reads land straight in one of these, so a 64 KiB TSO frame is never copied before it is cut
+/// into segments. A buffer comes back as soon as its frame is segmented, which happens before the
+/// next read, so two cover the reader without a fresh allocation; each costs about 64 KiB of
+/// memory while retained.
+#[cfg(target_os = "linux")]
+const TUN_FRAME_BUFFERS: usize = 2;
+
+/// Frames up to this many bytes are copied into an ordinary packet buffer.
+///
+/// Such a frame (a lone ACK, a ping, any non-TSO packet) travels on through encryption and the
+/// UDP queue, possibly for a while. Copying a few bytes is cheaper than letting it hold a 64 KiB
+/// frame buffer that the next read then has to allocate again. Matches the default pool buffer.
+#[cfg(target_os = "linux")]
+const SMALL_TUN_FRAME_LEN: usize = 4096;
 
 /// Error from [`TunDevice`].
 #[derive(Debug, thiserror::Error)]
@@ -86,8 +101,9 @@ struct TunDeviceState {
     #[cfg(target_os = "linux")]
     offloads: linux::TunOffloadState,
 
+    /// Reusable frame-sized buffers that TUN reads land in; see [`TUN_FRAME_BUFFERS`].
     #[cfg(target_os = "linux")]
-    read_buf: tokio::sync::Mutex<BytesMut>,
+    frame_pool: PacketBufPool<MAX_TUN_FRAME_LEN>,
 }
 
 impl TunDevice {
@@ -220,7 +236,7 @@ impl TunDevice {
                 #[cfg(target_os = "linux")]
                 offloads,
                 #[cfg(target_os = "linux")]
-                read_buf: tokio::sync::Mutex::new(BytesMut::zeroed(MAX_TUN_FRAME_LEN)),
+                frame_pool: PacketBufPool::new_lazy(TUN_FRAME_BUFFERS),
             }),
         })
     }
@@ -320,21 +336,26 @@ impl IpRecv for TunDevice {
         &'a mut self,
         pool: &mut PacketBufPool,
     ) -> io::Result<impl Iterator<Item = Packet<Ip>> + 'a> {
-        let mut read_buf = self.state.read_buf.lock().await;
-        let n = self.tun.recv(&mut read_buf).await?;
-        if n > read_buf.len() {
+        let mut frame = self.state.frame_pool.get();
+        let n = self.tun.recv(&mut frame).await?;
+        if n > frame.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "TUN read exceeded the receive buffer",
             ));
         }
+        frame.truncate(n);
 
-        // Keep one oversized scratch allocation per TUN device. The packet pool still owns the
-        // returned packet, so its lifetime is independent of the next read into this buffer.
-        let mut packet = pool.get();
-        packet.buf_mut().clear();
-        packet.buf_mut().extend_from_slice(&read_buf[..n]);
-        drop(read_buf);
+        // A large frame is segmented in place and its buffer returns to the frame pool. A small
+        // one moves to an ordinary packet buffer; see SMALL_TUN_FRAME_LEN.
+        let packet = if n <= SMALL_TUN_FRAME_LEN {
+            let mut packet = pool.get();
+            packet.buf_mut().clear();
+            packet.buf_mut().extend_from_slice(&frame);
+            packet
+        } else {
+            frame
+        };
 
         if self.state.vnet_header {
             tso::new_tso_iter_from_vnet(packet)
