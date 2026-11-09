@@ -364,24 +364,11 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
 
         existing_peer.update_allowed_ips(clear_allowed_ips, add_allowed_ips);
 
-        // Update device.peers_by_ip by clearing all entries that refer to this peer and
-        // adding them again.
-        let mut remove_list = vec![];
-        for (peer, ip_network) in self.device.peers_by_ip.iter() {
-            if Arc::ptr_eq(&existing_peer_arc, peer) {
-                remove_list.push(ip_network);
-            }
-        }
-        for network in remove_list {
-            self.device.peers_by_ip.remove_network(network);
-        }
-        for allowed_ip in existing_peer.allowed_ips() {
-            self.device.peers_by_ip.insert(
-                allowed_ip.network(),
-                allowed_ip.prefix(),
-                Arc::clone(&existing_peer_arc),
-            );
-        }
+        // Peer state is locked before the synchronous route index, matching packet-side
+        // revalidation and keeping a configuration writer from holding the index while waiting.
+        self.device
+            .packet_lookup
+            .replace_allowed_ips(&existing_peer_arc, existing_peer.allowed_ips());
 
         true
     }
