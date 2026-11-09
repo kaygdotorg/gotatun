@@ -1437,8 +1437,6 @@ async fn force_handshake() {
     ));
 }
 
-/// Helper method to test that packets can be sent from one [`Device`] to another.
-/// Use `eavesdrop` to sniff wireguard packets and assert things about the connection.
 /// Deadline for one device-pair exchange in [`test_device_pair`]: the handshake, every packet
 /// from [`mock::packets_of_every_size`], and shutdown.
 ///
@@ -1448,6 +1446,8 @@ async fn force_handshake() {
 /// contents, indices, counts and sizes don't depend on this value.
 const DEVICE_PAIR_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Helper method to test that packets can be sent from one [`Device`] to another.
+/// Use `eavesdrop` to sniff wireguard packets and assert things about the connection.
 async fn test_device_pair(eavesdrop: impl AsyncFnOnce(MockEavesdropper) + Send) {
     let (mut alice, mut bob, eve) = mock::device_pair().await;
 
