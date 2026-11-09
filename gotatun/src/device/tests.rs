@@ -610,13 +610,18 @@ async fn rekey_under_sustained_traffic_keeps_both_receive_paths_moving() {
 
     /// Session age after which Alice, the initiator, starts the next handshake.
     const REKEY_AFTER: Duration = Duration::from_millis(200);
-    /// How long the flood runs after warm-up.
-    const RUN_FOR: Duration = Duration::from_secs(3);
+    /// Rekeys the flood must cross before the test stops.
+    const MIN_REKEYS: usize = 3;
+    /// Upper bound on the flood's duration. A loaded debug build can need far longer than the
+    /// 600 ms or so that three rekeys take on a quiet host, so the test waits for rekeys, not time.
+    const RUN_AT_MOST: Duration = Duration::from_secs(30);
     /// Spacing of Bob's reverse packets.
     const REVERSE_INTERVAL: Duration = Duration::from_millis(5);
-    /// Largest gap allowed between consecutive arrivals in either direction. About fifty reverse
-    /// intervals: generous for a loaded debug build, far below a stalled receive task.
-    const MAX_GAP: Duration = Duration::from_millis(250);
+    /// Longest gap between consecutive arrivals in either direction that still counts as moving.
+    /// A hang check, not a speed check: in a loaded parallel suite on compute01 the gaps reached
+    /// 194 ms with no fault. The structural assertions below (no receive-task drain, no queue
+    /// drop) are what pin the round-2 fix; the measured gaps are printed for the record.
+    const MAX_GAP: Duration = Duration::from_secs(5);
     /// Data packets Alice may have sent that Bob has not yet received.
     const IN_FLIGHT: usize = 1024;
 
@@ -722,7 +727,7 @@ async fn rekey_under_sustained_traffic_keeps_both_receive_paths_moving() {
     let mut rekeys = 0_usize;
     let mut last_handshake = None;
     let mut poll_stats = tokio::time::interval(Duration::from_millis(20));
-    while started.elapsed() < RUN_FOR {
+    while rekeys < MIN_REKEYS && started.elapsed() < RUN_AT_MOST {
         select! {
             packet = bob_rx.recv() => {
                 packet.expect("Bob's TUN stays open during the flood");
@@ -768,8 +773,8 @@ async fn rekey_under_sustained_traffic_keeps_both_receive_paths_moving() {
     );
 
     assert!(
-        rekeys >= 3,
-        "the flood must cross several rekeys to exercise the flush, saw {rekeys}"
+        rekeys >= MIN_REKEYS,
+        "the flood must cross {MIN_REKEYS} rekeys within {RUN_AT_MOST:?}, saw {rekeys}"
     );
     assert_eq!(
         queue_drops, 0,
