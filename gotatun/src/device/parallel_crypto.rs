@@ -49,6 +49,21 @@ pub(crate) const CRYPTO_WORKER_BATCH_SIZE: usize = CRYPTO_CHUNK_SIZE;
 /// Smallest ready peer run worth offloading when another run can execute concurrently.
 pub(crate) const MIN_PARALLEL_RUN_SIZE: usize = 8;
 
+/// Hand a ready run of at least this many packets to a crypto worker, whatever the backlog.
+///
+/// Offloading lets the producer task go back to its socket or TUN read while a worker does the
+/// AEAD; done inline, the producer stops reading until the whole run is sealed or opened. Under
+/// bulk load, inline crypto finishes each run before the next read returns, so the backlog-based
+/// latch below never sees older work and the workers stay idle: on the #260 best-LAN host, with
+/// two Tokio workers per endpoint only about 60% busy, the 3a70a7d21 stack reached 3.92 / 3.64
+/// Gbit/s at 1 / 8 TCP flows, and forcing every run to a worker raised that to 4.37 / 4.23.
+///
+/// Forcing every run costs latency, though: a lone probe waits for a worker wake (idle p50
+/// 0.19 ms → 0.31 ms). Runs this large only come from batched reads (a TSO frame from the TUN is
+/// about 44 packets at MTU 1420; a GRO datagram about 27), which happen only when the link is
+/// busy. Pings, lone ACKs and other small runs stay inline, so the idle path keeps its latency.
+pub(crate) const BULK_RUN_SIZE: usize = 2 * MIN_PARALLEL_RUN_SIZE;
+
 /// Start parallel dispatch after half a worker chunk of older packets is queued for this peer.
 pub(crate) const PARALLEL_DISPATCH_HIGH_WATER: usize = CRYPTO_CHUNK_SIZE / 2;
 
@@ -112,6 +127,9 @@ struct AdaptiveDispatch {
 
 impl AdaptiveDispatch {
     /// Update this peer's hysteresis latch and select a worker only for useful batch sizes.
+    ///
+    /// A bulk-sized run ([`BULK_RUN_SIZE`]) always goes to a worker; smaller useful runs go only
+    /// while the latch reports a backlog.
     fn should_force_worker(&mut self, packet_count: usize, peer_backlog_packets: usize) -> bool {
         if self.parallel {
             if peer_backlog_packets <= PARALLEL_DISPATCH_LOW_WATER {
@@ -121,7 +139,7 @@ impl AdaptiveDispatch {
             self.parallel = true;
         }
 
-        self.parallel && packet_count >= MIN_PARALLEL_RUN_SIZE
+        packet_count >= BULK_RUN_SIZE || (self.parallel && packet_count >= MIN_PARALLEL_RUN_SIZE)
     }
 }
 
@@ -1546,7 +1564,7 @@ mod tests {
     #[test]
     fn adaptive_dispatch_uses_distinct_high_and_low_watermarks() {
         let mut dispatch = super::AdaptiveDispatch::default();
-        assert!(!dispatch.should_force_worker(CRYPTO_CHUNK_SIZE, 0));
+        assert!(!dispatch.should_force_worker(super::BULK_RUN_SIZE - 1, 0));
         assert!(!dispatch.should_force_worker(
             MIN_PARALLEL_RUN_SIZE,
             super::PARALLEL_DISPATCH_HIGH_WATER - 1
@@ -1567,6 +1585,17 @@ mod tests {
             MIN_PARALLEL_RUN_SIZE,
             super::PARALLEL_DISPATCH_HIGH_WATER - 1
         ));
+    }
+
+    /// A bulk-sized run goes to a worker even with no backlog, so the producer keeps reading
+    /// while it is sealed or opened; smaller runs keep the inline path.
+    #[test]
+    fn bulk_runs_use_a_worker_without_backlog() {
+        let mut dispatch = super::AdaptiveDispatch::default();
+        assert!(dispatch.should_force_worker(super::BULK_RUN_SIZE, 0));
+        assert!(dispatch.should_force_worker(CRYPTO_CHUNK_SIZE, 0));
+        assert!(!dispatch.should_force_worker(1, 0));
+        assert!(!dispatch.should_force_worker(super::BULK_RUN_SIZE - 1, 0));
     }
 
     /// Backlog on one peer must not force a shallow peer out of its inline fast path.
@@ -1955,9 +1984,43 @@ mod tests {
         );
     }
 
-    /// A lone full worker-sized run stays on the caller when no other run is ready.
+    /// A lone run below the bulk size stays on the caller when no other run is ready.
     #[tokio::test]
     async fn a_lone_encryption_run_uses_the_serial_fast_path() {
+        let (mut sender, _) = established_tunnels();
+        let packet_count = super::BULK_RUN_SIZE - 1;
+        let packets = prepared_encryptions(&mut sender, packet_count);
+        let workers = CryptoWorkers::with_worker_count(2).expect("the worker pool starts");
+        let crypto = workers.handle();
+        let lane = OrderedCompletions::<WgKind>::default();
+        let first_slot = lane
+            .reserve_run(packet_count)
+            .expect("the lone run fits the peer's ordered window");
+        let run = packets
+            .into_iter()
+            .map(|packet| Some(PreparedOutgoing::Encrypt(packet)))
+            .collect();
+        let force_worker = lane.should_force_worker(packet_count);
+
+        let results = crypto
+            .encrypt_run(run, force_worker)
+            .await
+            .expect("the serial fast path returns the packets");
+        lane.complete_run(first_slot, results, |results| async move {
+            black_box(results);
+            Ok::<_, ()>(())
+        })
+        .await
+        .expect("the ordered lane releases the lone run");
+
+        assert_eq!(crypto.handoff_count(), 0);
+        assert!(lane.is_idle());
+        workers.stop().await;
+    }
+
+    /// A lone bulk-sized run goes to a worker, so the producer can read on while it is sealed.
+    #[tokio::test]
+    async fn a_lone_bulk_encryption_run_uses_a_worker() {
         let (mut sender, _) = established_tunnels();
         let packet_count = super::CRYPTO_WORKER_BATCH_SIZE;
         let packets = prepared_encryptions(&mut sender, packet_count);
@@ -1976,7 +2039,7 @@ mod tests {
         let results = crypto
             .encrypt_run(run, force_worker)
             .await
-            .expect("the serial fast path returns the packet");
+            .expect("the worker returns the packets");
         lane.complete_run(first_slot, results, |results| async move {
             black_box(results);
             Ok::<_, ()>(())
@@ -1984,7 +2047,7 @@ mod tests {
         .await
         .expect("the ordered lane releases the lone run");
 
-        assert_eq!(crypto.handoff_count(), 0);
+        assert_eq!(crypto.handoff_count(), 1);
         assert!(lane.is_idle());
         workers.stop().await;
     }
