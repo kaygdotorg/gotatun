@@ -1816,3 +1816,107 @@ async fn a_pipeline_failure_wakes_waiters_with_the_first_reason() {
         "UDP send failed: first"
     );
 }
+
+
+/// Give Alice's peer a current session by a manual handshake with Bob, queue
+/// `QUEUED` packets behind it, optionally remove the peer, then run the TUN task's drain. Returns
+/// how many datagrams reached Bob's UDP socket.
+async fn drain_after_manual_handshake(remove_peer: bool) -> usize {
+    use super::parallel_crypto::{CryptoWorkers, OrderStore};
+    use crate::noise::TunnResult;
+    use crate::packet::WgKind;
+    use crate::udp::UdpRecv;
+
+    const QUEUED: usize = 8;
+    let (alice, bob, _eve) = mock::device_pair().await;
+    alice.device.suspend().await;
+    bob.device.suspend().await;
+    let (peer_pub, peer, lookup, liveness, (udp_tx, _udp_rx)) = {
+        let mut state = alice.device.inner.write().await;
+        let socket = state.open_listen_socket().await.unwrap();
+        let (key, peer) = state
+            .peers
+            .iter()
+            .next()
+            .map(|(k, v)| (*k, v.clone()))
+            .unwrap();
+        (
+            key,
+            peer,
+            Arc::clone(&state.packet_lookup),
+            Arc::clone(&state.task_liveness),
+            socket,
+        )
+    };
+    let (_bob_tx, mut bob_rx, bob_peer) = {
+        let mut state = bob.device.inner.write().await;
+        let (tx, rx) = state.open_listen_socket().await.unwrap();
+        (tx, rx, state.peers.values().next().unwrap().clone())
+    };
+    {
+        let mut a = peer.lock().await;
+        let mut b = bob_peer.lock().await;
+        let init = a.tunnel.format_handshake_initiation(false).unwrap();
+        let TunnResult::WriteToNetwork(resp) = b.tunnel.handle_incoming_packet(WgKind::from(init))
+        else {
+            panic!("Bob answers Alice's initiation");
+        };
+        let TunnResult::WriteToNetwork(_keepalive) = a.tunnel.handle_incoming_packet(resp) else {
+            panic!("Alice completes the handshake");
+        };
+        assert!(a.tunnel.has_current_session());
+        for i in 0..QUEUED {
+            a.tunnel
+                .queue_outgoing_packet(mock::packet(format!("queued {i}")).into(), None);
+        }
+        assert_eq!(a.tunnel.queued_packet_count(), QUEUED);
+    }
+    if remove_peer {
+        // The receive task posted the drain request; configuration removes the peer before the
+        // TUN task gets to it (removal holds the device lock, not the peer mutex).
+        let mut state = alice.device.inner.write().await;
+        assert!(state.remove_peer(&peer_pub).await.is_some());
+        assert!(!lookup.contains_peer(&peer));
+    }
+    let workers = CryptoWorkers::with_worker_count(2).unwrap();
+    let shared = super::OutgoingShared {
+        crypto: workers.handle(),
+        ordered: Arc::new(OrderStore::default()),
+        udp: udp_tx.clone(),
+        send_many_buf: Arc::new(Mutex::new(())),
+    };
+    let mut pending = PendingOutgoing::new();
+    super::DeviceState::<mock::MockDeviceTransports>::drain_queued_packets(
+        Arc::downgrade(&liveness),
+        lookup,
+        &shared,
+        super::peer_order_key(&peer),
+        &peer,
+        &mut pending,
+    )
+    .await
+    .expect("the drain runs");
+    while pending.next().await.is_some() {}
+    let mut pool = PacketBufPool::new_lazy(64);
+    let mut received = 0;
+    while timeout(Duration::from_millis(300), bob_rx.recv_from(&mut pool))
+        .await
+        .is_ok()
+    {
+        received += 1;
+    }
+    workers.stop().await;
+    received
+}
+
+/// A drain the receive task requested must send nothing once the peer is removed, the same rule
+/// J433 P3-1 added to the TUN run path. Red before J469 (J466 P3-A, #260): the removed peer's
+/// queue, sealed with its old session, still went to its last endpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drain_requested_before_peer_removal_sends_nothing() {
+    let kept = drain_after_manual_handshake(false).await;
+    let removed = drain_after_manual_handshake(true).await;
+    eprintln!("drain: peer kept -> {kept} datagrams, peer removed -> {removed} datagrams");
+    assert_eq!(kept, 8, "control: a live peer's queue is drained");
+    assert_eq!(removed, 0, "a removed peer's handshake queue was sent");
+}
