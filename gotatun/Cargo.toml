@@ -121,6 +121,8 @@ device = ["tokio/net", "socket"]
 socket = ["dep:socket2", "tokio/net"]
 pcap = ["dep:pcap-file"]
 tun = ["dep:tun", "dep:wintun-bindings"]
+# macOS only: use bounded UDP batches when the runtime supports sendmsg_x.
+macos-batch-io = ["socket"]
 # UDP GRO appears to be broken on Windows.
 # In some cases it fails to return UDP_COALESCED_INFO
 windows-gro = []
