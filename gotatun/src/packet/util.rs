@@ -316,4 +316,98 @@ mod tests {
             }
         }
     }
+
+    /// J466 review: the pre-2ce84c1 implementation, verbatim from 1e3674b.
+    fn j466_old_payload(bytes: &[u8]) -> u32 {
+        let (words, rest) = <[big_endian::U16]>::ref_from_prefix(bytes).unwrap();
+
+        let mut sum: u32 = words.iter().map(|w| u32::from(w.get())).sum();
+        if let [b] = rest {
+            // Zero-pad if odd number of bytes
+            sum += u32::from(u16::from_be_bytes([*b, 0]));
+        }
+
+        sum
+    }
+
+    /// J466 review: the pre-2ce84c1 skip variant, verbatim from 1e3674b.
+    fn j466_old_payload_with_skip(bytes: &[u8], skip_word_index: usize) -> u32 {
+        let (words, rest) = <[big_endian::U16]>::ref_from_prefix(bytes).unwrap();
+
+        let mut sum: u32 = words
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != skip_word_index)
+            .map(|(_, w)| u32::from(w.get()))
+            .sum();
+        if let [b] = rest {
+            // Zero-pad if odd number of bytes
+            sum += u32::from(u16::from_be_bytes([*b, 0]));
+        }
+
+        sum
+    }
+
+    /// J466 review: random differential fuzz of old vs new (lengths, alignment, skip, slice
+    /// composition, carry-heavy fills). `J466_CSUM_ITERS` (default 1,000,000), `J466_CSUM_SEED`.
+    #[test]
+    #[ignore = "J466 fuzz: run with --release"]
+    fn j466_checksum_differential_fuzz() {
+        let iters: u64 = std::env::var("J466_CSUM_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
+        let mut st: u64 = std::env::var("J466_CSUM_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0x5eed_1234_abcd_0466);
+        let mut rnd = move || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; st };
+        let mut buf = vec![0u8; 65_535 + 16];
+        let (mut odd, mut multi, mut bytes_total) = (0u64, 0u64, 0u64);
+        // Exhaustive: every 1- and 2-byte input, every 3-byte input with a fixed middle byte set.
+        for a in 0..=255u8 {
+            assert_eq!(finalize_csum(checksum_payload(&[a])), finalize_csum(j466_old_payload(&[a])));
+            for b in 0..=255u8 {
+                let x = [a, b];
+                assert_eq!(finalize_csum(checksum_payload(&x)), finalize_csum(j466_old_payload(&x)));
+                for c in [0u8, 1, 0x7f, 0x80, 0xfe, 0xff] {
+                    let y = [a, c, b];
+                    assert_eq!(finalize_csum(checksum_payload(&y)), finalize_csum(j466_old_payload(&y)));
+                }
+            }
+        }
+        for it in 0..iters {
+            let r = rnd();
+            let len = match r % 100 {
+                0..=49 => (rnd() % 65) as usize,
+                50..=79 => (rnd() % 1601) as usize,
+                80..=94 => (rnd() % 9001) as usize,
+                _ => (rnd() % 65_536) as usize,
+            };
+            let off = (rnd() % 8) as usize;
+            let fill = rnd() % 6;
+            for (i, byte) in buf[off..off + len].iter_mut().enumerate() {
+                *byte = match fill {
+                    0 => 0xff,
+                    1 => 0x00,
+                    2 => if i % 2 == 0 { 0xff } else { 0x00 },
+                    3 => if rnd() % 16 == 0 { rnd() as u8 } else { 0xff },
+                    _ => rnd() as u8,
+                };
+            }
+            let b = &buf[off..off + len];
+            bytes_total += len as u64;
+            odd += (len % 2) as u64;
+            assert_eq!(finalize_csum(checksum_payload(b)), finalize_csum(j466_old_payload(b)),
+                "iter {it} len {len} off {off} fill {fill}");
+            let skip = (rnd() % (len as u64 / 2 + 3)) as usize;
+            assert_eq!(finalize_csum(checksum_payload_with_skip(b, skip)),
+                finalize_csum(j466_old_payload_with_skip(b, skip)),
+                "iter {it} len {len} off {off} skip {skip}");
+            // Callers add several partial sums (pseudo-header + segment, `checksum(&[..])`).
+            if len > 0 && it % 4 == 0 {
+                multi += 1;
+                let cut1 = (rnd() % (len as u64 + 1)) as usize;
+                let cut2 = cut1 + (rnd() % ((len - cut1) as u64 + 1)) as usize;
+                let parts = [&b[..cut1], &b[cut1..cut2], &b[cut2..]];
+                let old: u32 = parts.iter().map(|p| j466_old_payload(p)).sum();
+                assert_eq!(checksum(&parts), finalize_csum(old), "iter {it} cuts {cut1}/{cut2}");
+            }
+        }
+        eprintln!("J466 checksum fuzz: iters={iters} odd_len={odd} multi_slice={multi} bytes={bytes_total} mismatches=0");
+    }
 }

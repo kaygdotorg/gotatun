@@ -60,6 +60,11 @@ struct BatchedDevice {
     observed_input: Arc<StdMutex<Vec<Vec<u8>>>>,
 }
 
+/// J466 review: per-16-packet delay for `BatchedTun` writes, in microseconds (0 = off).
+static J466_SLOW_TUN_US: AtomicUsize = AtomicUsize::new(0);
+/// J466 review: `BatchedTun` writes so far, to apply the slow-TUN delay every 16 packets.
+static J466_TUN_WRITES: AtomicUsize = AtomicUsize::new(0);
+
 /// Packet channels and the observed input record returned by a fake TUN endpoint.
 type BatchedTunChannels = (
     BatchedTun,
@@ -83,6 +88,12 @@ fn batched_tun() -> BatchedTunChannels {
 
 impl IpSend for BatchedTun {
     async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
+        // J466 review: an optional slow TUN writer (microseconds per 16 packets).
+        let slow = J466_SLOW_TUN_US.load(Ordering::Relaxed);
+        if slow > 0 && J466_TUN_WRITES.fetch_add(1, Ordering::Relaxed) % 16 == 0 {
+            // sleep: J466 slow-TUN mode models a TUN writer that cannot keep up.
+            sleep(Duration::from_micros(slow as u64)).await;
+        }
         self.tun_to_app_tx
             .send(packet)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "test TUN receiver closed"))
@@ -1815,4 +1826,284 @@ async fn a_pipeline_failure_wakes_waiters_with_the_first_reason() {
             .expect("a late waiter sees the recorded failure"),
         "UDP send failed: first"
     );
+}
+
+/// J466 review helper: give Alice's peer a current session by a manual handshake with Bob, queue
+/// `QUEUED` packets behind it, optionally remove the peer, then run the TUN task's drain. Returns
+/// how many datagrams reached Bob's UDP socket.
+async fn j466_drain_scenario(remove_peer: bool) -> usize {
+    use super::parallel_crypto::{CryptoWorkers, OrderStore};
+    use crate::noise::TunnResult;
+    use crate::packet::WgKind;
+    use crate::udp::UdpRecv;
+
+    const QUEUED: usize = 8;
+    let (alice, bob, _eve) = mock::device_pair().await;
+    alice.device.suspend().await;
+    bob.device.suspend().await;
+    let (peer_pub, peer, lookup, liveness, (udp_tx, _udp_rx)) = {
+        let mut state = alice.device.inner.write().await;
+        let socket = state.open_listen_socket().await.unwrap();
+        let (key, peer) = state
+            .peers
+            .iter()
+            .next()
+            .map(|(k, v)| (*k, v.clone()))
+            .unwrap();
+        (
+            key,
+            peer,
+            Arc::clone(&state.packet_lookup),
+            Arc::clone(&state.task_liveness),
+            socket,
+        )
+    };
+    let (_bob_tx, mut bob_rx, bob_peer) = {
+        let mut state = bob.device.inner.write().await;
+        let (tx, rx) = state.open_listen_socket().await.unwrap();
+        (tx, rx, state.peers.values().next().unwrap().clone())
+    };
+    {
+        let mut a = peer.lock().await;
+        let mut b = bob_peer.lock().await;
+        let init = a.tunnel.format_handshake_initiation(false).unwrap();
+        let TunnResult::WriteToNetwork(resp) = b.tunnel.handle_incoming_packet(WgKind::from(init))
+        else {
+            panic!("Bob answers Alice's initiation");
+        };
+        let TunnResult::WriteToNetwork(_keepalive) = a.tunnel.handle_incoming_packet(resp) else {
+            panic!("Alice completes the handshake");
+        };
+        assert!(a.tunnel.has_current_session());
+        for i in 0..QUEUED {
+            a.tunnel
+                .queue_outgoing_packet(mock::packet(format!("queued {i}")).into(), None);
+        }
+        assert_eq!(a.tunnel.queued_packet_count(), QUEUED);
+    }
+    if remove_peer {
+        // The receive task posted the drain request; configuration removes the peer before the
+        // TUN task gets to it (removal holds the device lock, not the peer mutex).
+        let mut state = alice.device.inner.write().await;
+        assert!(state.remove_peer(&peer_pub).await.is_some());
+        assert!(!lookup.contains_peer(&peer));
+    }
+    let workers = CryptoWorkers::with_worker_count(2).unwrap();
+    let shared = super::OutgoingShared {
+        crypto: workers.handle(),
+        ordered: Arc::new(OrderStore::default()),
+        udp: udp_tx.clone(),
+        send_many_buf: Arc::new(Mutex::new(Default::default())),
+    };
+    let mut pending = PendingOutgoing::new();
+    super::DeviceState::<mock::MockDeviceTransports>::drain_queued_packets(
+        Arc::downgrade(&liveness),
+        lookup,
+        &shared,
+        super::peer_order_key(&peer),
+        &peer,
+        &mut pending,
+    )
+    .await
+    .expect("the drain runs");
+    while pending.next().await.is_some() {}
+    let mut pool = PacketBufPool::new_lazy(64);
+    let mut received = 0;
+    while timeout(Duration::from_millis(300), bob_rx.recv_from(&mut pool))
+        .await
+        .is_ok()
+    {
+        received += 1;
+    }
+    workers.stop().await;
+    received
+}
+
+/// J466 review (#260): a drain the receive task requested must send nothing once the peer is
+/// removed, the same rule J433 P3-1 added to the TUN run path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn j466_a_drain_after_peer_removal_sends_nothing() {
+    let kept = j466_drain_scenario(false).await;
+    let removed = j466_drain_scenario(true).await;
+    eprintln!("J466 drain: peer kept -> {kept} datagrams, peer removed -> {removed} datagrams");
+    assert_eq!(kept, 8, "control: a live peer's queue is drained");
+    assert_eq!(removed, 0, "a removed peer's handshake queue was sent");
+}
+
+/// J466 review (#260): 8 flows each way while handshakes are forced by `Tunn::reset`, which makes
+/// the TUN task drain a real queue under load. Checks, per direction: strict per-flow order, no
+/// duplicates, no stall, and (forward, Alice-only resets) exact loss accounting:
+/// `sent == received + queue_drops + cleared_by_reset`.
+///
+/// Env: `J466_MODE` = `alice` (default) or `both` (both peers reset at once: simultaneous
+/// initiation); `J466_SECS` (default 10); `J466_RESET_MS` (default 150); `J466_SLOW_TUN_US`
+/// (default 0); `J466_PACE_US` per-flow pacing (default 300).
+#[cfg(not(feature = "mock_instant"))]
+#[test]
+#[ignore = "J466 stress: run alone"]
+fn j466_eight_flow_forced_handshakes_keep_order_and_count() {
+    use std::collections::HashMap as Map;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Instant;
+
+    const FLOWS: u64 = 8;
+    let env = |k: &str, d: u64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let both = std::env::var("J466_MODE").is_ok_and(|m| m == "both");
+    let secs = env("J466_SECS", 10);
+    let reset_ms = env("J466_RESET_MS", 150);
+    let pace_us = env("J466_PACE_US", 300);
+    J466_SLOW_TUN_US.store(env("J466_SLOW_TUN_US", 0) as usize, Ordering::Relaxed);
+
+    let panics: Arc<StdMutex<Vec<String>>> = Arc::default();
+    let hook_panics = Arc::clone(&panics);
+    std::panic::set_hook(Box::new(move |info| {
+        hook_panics.lock().unwrap().push(info.to_string());
+    }));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let report = runtime.block_on(async move {
+        let (alice, bob) = batched_device_pair().await;
+        let BatchedDevice { _device: alice_device, app_tx: alice_tx, app_rx: mut alice_rx, .. } = alice;
+        let BatchedDevice { _device: bob_device, app_tx: bob_tx, app_rx: mut bob_rx, .. } = bob;
+        let alice_peer = alice_device.inner.read().await.peers.values().next().unwrap().clone();
+        let bob_peer = bob_device.inner.read().await.peers.values().next().unwrap().clone();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let spawn_flows = |tx: mpsc::UnboundedSender<Packet<Ip>>, dir: u64| {
+            (0..FLOWS)
+                .map(|flow| {
+                    let stop = Arc::clone(&stop);
+                    let tx = tx.clone();
+                    thread::spawn(move || {
+                        let mut seq = 0_u64;
+                        while !stop.load(Ordering::Relaxed) {
+                            let mut payload = vec![0; 600];
+                            payload[..8].copy_from_slice(&(dir * 100 + flow).to_be_bytes());
+                            payload[8..16].copy_from_slice(&seq.to_be_bytes());
+                            if tx.send(mock::packet(payload)).is_err() {
+                                break;
+                            }
+                            seq += 1;
+                            // sleep: paces each flow so the run measures order, not saturation.
+                            thread::sleep(Duration::from_micros(pace_us));
+                        }
+                        seq
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        // Both directions start cold at once: simultaneous first initiation.
+        let fwd = spawn_flows(alice_tx.clone(), 1);
+        let rev = spawn_flows(bob_tx.clone(), 2);
+
+        #[derive(Default)]
+        struct Dir {
+            last: Map<u64, u64>,
+            received: u64,
+            reorder: u64,
+            dup_or_back: u64,
+            gap: Duration,
+        }
+        fn note(d: &mut Dir, bytes: &[u8]) {
+            let payload = &bytes[crate::packet::Ipv4Header::LEN..];
+            let flow = u64::from_be_bytes(payload[..8].try_into().unwrap());
+            let seq = u64::from_be_bytes(payload[8..16].try_into().unwrap());
+            d.received += 1;
+            match d.last.get(&flow) {
+                Some(&last) if seq == last => d.dup_or_back += 1,
+                Some(&last) if seq < last => {
+                    d.reorder += 1;
+                    d.dup_or_back += 1;
+                }
+                _ => {
+                    d.last.insert(flow, seq);
+                }
+            }
+        }
+        let (mut f, mut r) = (Dir::default(), Dir::default());
+        let mut cleared = [0_u64; 2];
+        let mut resets = 0;
+        let started = Instant::now();
+        let (mut f_last, mut r_last) = (started, started);
+        let mut reset_tick = tokio::time::interval(Duration::from_millis(reset_ms));
+        reset_tick.tick().await;
+        let run_for = Duration::from_secs(secs);
+        let drain_until = |s: &Instant| s.elapsed() < run_for + Duration::from_secs(3);
+        while drain_until(&started) {
+            if started.elapsed() >= run_for {
+                stop.store(true, Ordering::Relaxed);
+            }
+            select! {
+                p = bob_rx.recv() => {
+                    let p = p.expect("Bob's TUN stays open");
+                    note(&mut f, p.as_bytes());
+                    f.gap = f.gap.max(f_last.elapsed());
+                    f_last = Instant::now();
+                }
+                p = alice_rx.recv() => {
+                    let p = p.expect("Alice's TUN stays open");
+                    note(&mut r, p.as_bytes());
+                    r.gap = r.gap.max(r_last.elapsed());
+                    r_last = Instant::now();
+                }
+                _ = reset_tick.tick(), if started.elapsed() < run_for => {
+                    // Lock both first so a "both" reset is simultaneous.
+                    let mut a = alice_peer.lock().await;
+                    let mut b = if both { Some(bob_peer.lock().await) } else { None };
+                    cleared[0] += a.tunnel.queued_packet_count() as u64;
+                    a.tunnel.reset();
+                    if let Some(b) = b.as_mut() {
+                        cleared[1] += b.tunnel.queued_packet_count() as u64;
+                        b.tunnel.reset();
+                    }
+                    resets += 1;
+                }
+            }
+        }
+        let f_sent: u64 = fwd.into_iter().map(|h| h.join().unwrap()).sum();
+        let r_sent: u64 = rev.into_iter().map(|h| h.join().unwrap()).sum();
+        let a_drops = alice_peer.lock().await.tunnel.queue_drops();
+        let b_drops = bob_peer.lock().await.tunnel.queue_drops();
+        let receive_drains = super::RECEIVE_TASK_DRAINS.load(Ordering::Relaxed);
+        drop((alice_tx, bob_tx, alice_device, bob_device));
+        (both, resets, f_sent, r_sent, f, r, a_drops, b_drops, cleared, receive_drains)
+    });
+    let (both, resets, f_sent, r_sent, f, r, a_drops, b_drops, cleared, receive_drains) = report;
+    let panics = panics.lock().unwrap().clone();
+    let _ = std::panic::take_hook();
+    let f_lost = f_sent - f.received.min(f_sent);
+    let r_lost = r_sent - r.received.min(r_sent);
+    eprintln!(
+        "J466 8-flow: mode={} resets={resets} slow_tun_us={} | fwd sent={f_sent} recv={} lost={f_lost} \
+         (alice queue_drops={a_drops} cleared={}) reorder={} dup_or_back={} max_gap={:?} | rev sent={r_sent} \
+         recv={} lost={r_lost} (bob queue_drops={b_drops} cleared={}) reorder={} dup_or_back={} max_gap={:?} | \
+         receive_task_drains={receive_drains} panics={}",
+        if both { "both" } else { "alice" },
+        J466_SLOW_TUN_US.load(Ordering::Relaxed),
+        f.received, cleared[0], f.reorder, f.dup_or_back, f.gap,
+        r.received, cleared[1], r.reorder, r.dup_or_back, r.gap,
+        panics.len()
+    );
+    for p in panics.iter().take(5) {
+        eprintln!("J466 panic: {p}");
+    }
+    assert!(panics.is_empty(), "task panics: {}", panics.len());
+    assert_eq!(receive_drains, 0, "the receive task drained a queue");
+    assert_eq!((f.dup_or_back, r.dup_or_back), (0, 0), "order or duplicate violation");
+    assert!(f.gap < Duration::from_secs(5) && r.gap < Duration::from_secs(5), "a direction stalled");
+    if !both {
+        assert_eq!(
+            f_lost,
+            a_drops + cleared[0],
+            "forward losses not explained by queue drops and reset-cleared queues"
+        );
+    }
 }
