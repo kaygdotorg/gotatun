@@ -1968,7 +1968,10 @@ impl<T: DeviceTransports> DeviceState<T> {
                 &mut pending_completions,
             )
             .await?;
-            if !peer.tunnel.has_queued_packets() {
+            // Each run rechecks under the peer lock, since this loop releases the peer between
+            // runs and removal takes only the device lock: a peer removed mid-drain sends nothing
+            // more (J466 P3-A). Its queue goes away with its state.
+            if !peer.tunnel.has_queued_packets() || !packet_lookup.contains_peer(&peer_arc) {
                 drop(flush_guard.take());
                 return Ok(());
             }
@@ -2102,6 +2105,11 @@ impl<T: DeviceTransports> DeviceState<T> {
         )
         .await?;
         if !peer.tunnel.has_queued_packets() || !peer.tunnel.has_current_session() {
+            return Ok(());
+        }
+        // The receive task may have requested this drain before configuration removed the peer;
+        // send nothing to a removed (possibly revoked) peer, as on the TUN run path (J466 P3-A).
+        if !packet_lookup.contains_peer(peer_arc) {
             return Ok(());
         }
         let Some(peer_addr) = peer.endpoint().addr else {
