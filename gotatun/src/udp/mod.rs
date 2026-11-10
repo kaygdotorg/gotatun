@@ -68,6 +68,9 @@ pub struct UdpTransportFactoryParams {
 /// Treating those as fatal let a single bad datagram stop a whole direction of traffic (#260).
 #[cfg_attr(not(feature = "device"), allow(dead_code))]
 pub(crate) fn is_fatal_udp_error(err: &io::Error) -> bool {
+    // ENODEV means the interface the socket is bound to is gone, so every later call fails too.
+    // A send to a scoped IPv6 peer whose interface vanished can also return it (J466 P3-B); that
+    // stays fatal because a remote peer cannot choose our scope ids.
     #[cfg(unix)]
     if matches!(
         err.raw_os_error(),
