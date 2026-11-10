@@ -2031,6 +2031,10 @@ fn j466_eight_flow_forced_handshakes_keep_order_and_count() {
         let (mut f, mut r) = (Dir::default(), Dir::default());
         let mut cleared = [0_u64; 2];
         let mut resets = 0;
+        // Time from each reset to the next forward arrival; resets with none before the next.
+        let mut recover: Vec<Duration> = Vec::new();
+        let mut unrecovered = 0_u64;
+        let mut last_reset: Option<Instant> = None;
         let started = Instant::now();
         let (mut f_last, mut r_last) = (started, started);
         let mut reset_tick = tokio::time::interval(Duration::from_millis(reset_ms));
@@ -2045,6 +2049,7 @@ fn j466_eight_flow_forced_handshakes_keep_order_and_count() {
                 p = bob_rx.recv() => {
                     let p = p.expect("Bob's TUN stays open");
                     note(&mut f, p.as_bytes());
+                    if let Some(t) = last_reset.take() { recover.push(t.elapsed()); }
                     f.gap = f.gap.max(f_last.elapsed());
                     f_last = Instant::now();
                 }
@@ -2054,7 +2059,11 @@ fn j466_eight_flow_forced_handshakes_keep_order_and_count() {
                     r.gap = r.gap.max(r_last.elapsed());
                     r_last = Instant::now();
                 }
+                // Wakes the loop so it ends even when nothing arrives.
+                _ = sleep(Duration::from_millis(50)) => {}
                 _ = reset_tick.tick(), if started.elapsed() < run_for => {
+                    if let Some(t) = last_reset.take() { unrecovered += 1; let _ = t; }
+                    last_reset = Some(Instant::now());
                     // Lock both first so a "both" reset is simultaneous.
                     let mut a = alice_peer.lock().await;
                     let mut b = if both { Some(bob_peer.lock().await) } else { None };
@@ -2073,6 +2082,9 @@ fn j466_eight_flow_forced_handshakes_keep_order_and_count() {
         let a_drops = alice_peer.lock().await.tunnel.queue_drops();
         let b_drops = bob_peer.lock().await.tunnel.queue_drops();
         let receive_drains = super::RECEIVE_TASK_DRAINS.load(Ordering::Relaxed);
+        recover.sort();
+        let q = |p: f64| recover.get(((recover.len() as f64 - 1.0) * p) as usize).copied().unwrap_or_default();
+        eprintln!("J466 recovery: n={} unrecovered={unrecovered} p50={:?} p90={:?} max={:?}", recover.len(), q(0.5), q(0.9), q(1.0));
         drop((alice_tx, bob_tx, alice_device, bob_device));
         (both, resets, f_sent, r_sent, f, r, a_drops, b_drops, cleared, receive_drains)
     });
