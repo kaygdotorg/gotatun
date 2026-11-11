@@ -455,6 +455,7 @@ impl UdpRecv for super::UdpSocket {
 #[cfg(test)]
 mod tests {
     use std::{
+        future::Future,
         net::{Ipv4Addr, Ipv6Addr},
         sync::{
             Arc,
@@ -470,6 +471,57 @@ mod tests {
         packet::PacketBufPool,
         udp::socket::{SockOpt, UdpSocket, UdpSocketState},
     };
+
+    /// Darwin's numeric QoS values used to prove that socket I/O raises its runtime thread.
+    const TEST_QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+    const TEST_QOS_CLASS_BACKGROUND: u32 = 0x09;
+
+    /// Darwin APIs that inspect and set the current test thread's QoS class.
+    unsafe extern "C" {
+        /// Set the current test thread's scheduling class.
+        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: c_int) -> c_int;
+        /// Read one thread's scheduling class into the supplied output values.
+        fn pthread_get_qos_class_np(
+            thread: libc::pthread_t,
+            qos_class: *mut u32,
+            relative_priority: *mut c_int,
+        ) -> c_int;
+    }
+
+    /// Set the current test thread's QoS class so the promotion assertion starts from a lower one.
+    fn set_test_thread_qos_class(qos_class: u32) {
+        // SAFETY: the call changes only the current test thread's scheduling class.
+        let result = unsafe { pthread_set_qos_class_self_np(qos_class, 0) };
+        assert_eq!(result, 0, "set test thread QoS class");
+    }
+
+    /// Return the current test thread's QoS class for the promotion assertions.
+    fn test_thread_qos_class() -> u32 {
+        let mut qos_class = 0;
+        let mut relative_priority = 0;
+        // SAFETY: the outputs are valid writable integers and pthread_self identifies this thread.
+        let result = unsafe {
+            pthread_get_qos_class_np(libc::pthread_self(), &mut qos_class, &mut relative_priority)
+        };
+        assert_eq!(result, 0, "get test thread QoS class");
+        qos_class
+    }
+
+    /// Run a socket-I/O test on a fresh Tokio thread so its QoS cache starts empty.
+    fn run_on_fresh_test_runtime(future: impl Future<Output = ()> + Send + 'static) {
+        std::thread::Builder::new()
+            .name("gotatun-macos-qos-test".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build test runtime");
+                runtime.block_on(future);
+            })
+            .expect("spawn isolated test thread")
+            .join()
+            .expect("isolated test thread completes");
+    }
 
     /// Bind a socket with the exact private-call state selected by the test.
     fn bind_with(address: SocketAddr, fns: Option<BatchFns>) -> UdpSocket {
@@ -558,6 +610,56 @@ mod tests {
             && resolve().is_some_and(|fns| probe_socket(fns, socket.socket().as_raw_fd()).is_ok());
         let expected = if supported { SEND_BATCH } else { 1 };
         assert_eq!(socket.max_number_of_packets_to_send(), expected);
+    }
+
+    /// Sending a UDP batch raises its Tokio runtime thread to user-interactive QoS.
+    #[test]
+    fn udp_batch_send_promotes_runtime_thread_to_user_interactive_qos() {
+        run_on_fresh_test_runtime(async {
+            let tx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0).into(), SockOpt::default())
+                .expect("bind send socket");
+            let rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0).into(), SockOpt::default())
+                .expect("bind receive socket");
+            let destination = rx.local_addr().expect("receive address");
+            let mut packets: Vec<_> = (0..4).map(|index| (payload(index), destination)).collect();
+
+            set_test_thread_qos_class(TEST_QOS_CLASS_BACKGROUND);
+            tx.send_many_to(&mut SendManyBuf::default(), &mut packets)
+                .await
+                .expect("send UDP batch");
+
+            assert_eq!(
+                test_thread_qos_class(),
+                TEST_QOS_CLASS_USER_INTERACTIVE,
+                "the packet sender must run at user-interactive QoS"
+            );
+        });
+    }
+
+    /// Receiving a UDP datagram raises its Tokio runtime thread to user-interactive QoS.
+    #[test]
+    fn udp_receive_promotes_runtime_thread_to_user_interactive_qos() {
+        run_on_fresh_test_runtime(async {
+            let mut rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0).into(), SockOpt::default())
+                .expect("bind receive socket");
+            let tx = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("bind send socket");
+            let destination = rx.local_addr().expect("receive address");
+            tx.send_to(b"packet", destination)
+                .await
+                .expect("send UDP datagram");
+            let mut pool = PacketBufPool::new(1);
+
+            set_test_thread_qos_class(TEST_QOS_CLASS_BACKGROUND);
+            rx.recv_from(&mut pool).await.expect("receive UDP datagram");
+
+            assert_eq!(
+                test_thread_qos_class(),
+                TEST_QOS_CLASS_USER_INTERACTIVE,
+                "the packet receiver must run at user-interactive QoS"
+            );
+        });
     }
 
     /// A process started with the runtime switch off keeps the ordinary per-datagram path.
