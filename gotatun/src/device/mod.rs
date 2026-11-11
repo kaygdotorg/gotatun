@@ -121,15 +121,13 @@ const PIPELINE_BUFS: usize = MACOS_PIPELINE_BUFS;
 #[cfg(not(target_os = "macos"))]
 const PIPELINE_BUFS: usize = MAX_PACKET_BUFS;
 
-/// Bound the macOS outbound UDP queue to 32 packets.
+/// Bound the macOS outbound UDP backlog to one 64-packet send batch.
 ///
-/// The measured 64-packet cap brought median Mac-send p99 to 2.918 ms at one flow, still 0.616 ms
-/// above the target; at eight flows it was 1.508 ms lower. Halving the packet bound tests whether
-/// a smaller queue closes the one-flow gap without losing throughput or CPU and memory leads. At
-/// 0.35 Gbit/s, 32 full-size packets represent about 0.9 ms of payload. The separately measured
-/// TUN and receive queues remain at 512 packets (#260, J461c).
+/// At the measured 0.32 Gbit/s Mac-send goodput, 64 full-size packets hold about 2.3 ms of
+/// payload. This cap targets the loaded p99 regression while the TUN and receive queues keep
+/// their separately measured 512-packet burst capacity (#260, J461c).
 #[cfg(target_os = "macos")]
-const UDP_SEND_BUFS: usize = 32;
+const UDP_SEND_BUFS: usize = 64;
 
 /// Keep the existing outbound UDP capacity on Linux and other non-macOS targets.
 #[cfg(not(target_os = "macos"))]
