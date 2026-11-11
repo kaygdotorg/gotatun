@@ -649,6 +649,42 @@ mod tests {
         assert_eq!(packet_number(&buffer[..length]), 1);
     }
 
+    /// A batch sender on a separate thread delivers packets in FIFO order.
+    #[tokio::test]
+    async fn batched_send_runs_on_independent_sender_thread() {
+        let Some(real) = resolve() else {
+            return;
+        };
+        let tx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0).into(), SockOpt::default())
+            .expect("bind send socket");
+        let Some(worker) = tx.inner.batch.send_worker.as_ref() else {
+            return;
+        };
+        assert_ne!(worker.thread.thread().id(), std::thread::current().id());
+        let calls = worker.calls.load(Ordering::Relaxed);
+
+        let receiver = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind receiver");
+        let destination = receiver.local_addr().expect("receiver address");
+        let mut packets = vec![(payload(0), destination), (payload(1), destination)];
+        tx.send_many_to(&mut SendManyBuf::default(), &mut packets)
+            .await
+            .expect("send through the independent worker");
+        assert!(packets.is_empty());
+        assert_eq!(worker.calls.load(Ordering::Relaxed), calls + 1);
+
+        let mut buffer = [0u8; 64];
+        for index in 0..2 {
+            let length = timeout(Duration::from_secs(2), receiver.recv(&mut buffer))
+                .await
+                .expect("packet arrives")
+                .expect("receive packet");
+            assert_eq!(packet_number(&buffer[..length]), index);
+        }
+        let _ = real;
+    }
+
     /// A batch to IPv6 loopback carries every packet in order.
     #[tokio::test]
     async fn batched_send_over_ipv6() {
