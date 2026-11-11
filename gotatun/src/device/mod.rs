@@ -1611,7 +1611,11 @@ impl<T: DeviceTransports> DeviceState<T> {
         n
     }
 
-    /// Finish a contiguous receive run while holding peer state only once, retaining its first slot for diagnostics.
+    /// Finish a contiguous receive run while holding peer state only for tunnel bookkeeping.
+    ///
+    /// Parsing inner IP headers and checking their routes use independent state, so they run after
+    /// the peer lock is released. This keeps the shared WireGuard session lock focused on replay
+    /// and endpoint updates while preserving the ordered delivery callback.
     async fn deliver_incoming_run(
         first_slot: u64,
         device: Weak<()>,
@@ -1641,11 +1645,11 @@ impl<T: DeviceTransports> DeviceState<T> {
             eprintln!("pipeline stage=incoming_delivery_peer_lock_acquired");
         }
         let mut tunnel_result_count = 0;
-        let mut empty_packet_count = 0;
-        let mut malformed_packet_count = 0;
-        let mut rejected_source_count = 0;
-        let mut tun_packets = Vec::with_capacity(completions.len());
+        let mut completed_packets = Vec::with_capacity(completions.len());
+        let peer_endpoint = peer.endpoint().addr;
 
+        // The peer lock protects the WireGuard session and replay window. Keep only the work that
+        // mutates that state here; packet parsing and route lookup do not need the session lock.
         for completion in completions.into_iter().flatten() {
             let result = peer.complete_incoming_data(completion.result, completion.addr);
             #[cfg_attr(not(feature = "daita"), expect(unused_mut))]
@@ -1661,6 +1665,19 @@ impl<T: DeviceTransports> DeviceState<T> {
                     None => continue,
                 }
             }
+
+            completed_packets.push(packet);
+        }
+
+        drop(peer);
+        drop(peer_trace);
+
+        let mut empty_packet_count = 0;
+        let mut malformed_packet_count = 0;
+        let mut rejected_source_count = 0;
+        let mut tun_packets = Vec::with_capacity(completed_packets.len());
+
+        for packet in completed_packets {
 
             if packet.is_empty() {
                 empty_packet_count += 1;
@@ -1683,7 +1700,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                     let unspecified = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into();
                     tracing::warn!(
                         "peer at {} is not allowed to send us packets from: {source}",
-                        peer.endpoint().addr.unwrap_or(unspecified)
+                        peer_endpoint.unwrap_or(unspecified)
                     );
                 }
                 rejected_source_count += 1;
@@ -1692,8 +1709,6 @@ impl<T: DeviceTransports> DeviceState<T> {
             tun_packets.push(packet);
         }
 
-        drop(peer);
-        drop(peer_trace);
         let tunnel_packet_count = tun_packets.len();
         if diagnostic {
             eprintln!(
