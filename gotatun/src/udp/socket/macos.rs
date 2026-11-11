@@ -116,6 +116,8 @@ struct SendBatchRequest {
     fns: BatchFns,
     /// Socket descriptor kept alive by the sending socket until its request completes.
     fd: c_int,
+    /// Keeps the socket and its descriptor alive until the worker leaves the blocking syscall.
+    socket_state: Arc<super::UdpSocketState>,
     /// The ordered packet list returned to the async caller after the syscall.
     packets: Vec<(Packet, SocketAddr)>,
     /// Mapped destinations returned so the caller can reuse their allocation.
@@ -155,7 +157,7 @@ struct SendWorker {
 impl SendWorker {
     /// Start a single OS thread that sends each batch then returns its packet buffers.
     fn new() -> io::Result<Self> {
-        let (sender, mut receiver) = mpsc::channel(1);
+        let (sender, mut receiver) = mpsc::channel::<SendBatchRequest>(1);
         #[cfg(test)]
         let calls = Arc::new(AtomicUsize::new(0));
         #[cfg(test)]
@@ -175,6 +177,8 @@ impl SendWorker {
                         )
                     }))
                     .unwrap_or_else(|_| Err(io::Error::other("macOS UDP send worker panicked")));
+                    // The raw fd is safe to release only after the synchronous syscall returns.
+                    drop(request.socket_state);
                     let _ = request.response.send(SendBatchResponse {
                         result,
                         packets: request.packets,
@@ -195,6 +199,7 @@ impl SendWorker {
     async fn send_batch(
         &self,
         socket: &tokio::net::UdpSocket,
+        socket_state: &Arc<super::UdpSocketState>,
         fns: BatchFns,
         fd: c_int,
         packets: &mut Vec<(Packet, SocketAddr)>,
@@ -208,6 +213,7 @@ impl SendWorker {
             let request = SendBatchRequest {
                 fns,
                 fd,
+                socket_state: Arc::clone(&socket_state),
                 packets: std::mem::take(packets),
                 targets: std::mem::take(targets),
                 start,
@@ -502,6 +508,7 @@ impl UdpSend for super::UdpSocket {
                 worker
                     .send_batch(
                         self.socket(),
+                        &self.inner,
                         fns,
                         self.socket().as_raw_fd(),
                         &mut pending,
@@ -635,7 +642,7 @@ mod tests {
         net::{Ipv4Addr, Ipv6Addr},
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -675,6 +682,26 @@ mod tests {
             .trim_start_matches("packet ")
             .parse()
             .expect("test payload contains a number")
+    }
+
+    /// The test send callback has reached its syscall.
+    static BLOCKING_SEND_STARTED: AtomicBool = AtomicBool::new(false);
+
+    /// Lets the test finish the callback after canceling its async caller.
+    static RELEASE_BLOCKING_SEND: AtomicBool = AtomicBool::new(false);
+
+    /// Hold one worker syscall so the caller can be canceled while its socket is still in use.
+    unsafe extern "C" fn hold_send_until_released(
+        _: c_int,
+        _: *const MsghdrX,
+        count: c_uint,
+        _: c_int,
+    ) -> isize {
+        BLOCKING_SEND_STARTED.store(true, Ordering::Release);
+        while !RELEASE_BLOCKING_SEND.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        count as isize
     }
 
     /// Send numbered packets in the socket's advertised run sizes and verify every receive.
@@ -859,6 +886,58 @@ mod tests {
                 .expect("receive packet");
             assert_eq!(packet_number(&buffer[..length]), index);
         }
+    }
+
+    /// A canceled send keeps its raw socket descriptor alive until the worker finishes.
+    #[tokio::test]
+    async fn canceled_batch_keeps_socket_alive_until_worker_finishes() {
+        let Some(real) = resolve() else {
+            return;
+        };
+        BLOCKING_SEND_STARTED.store(false, Ordering::Release);
+        RELEASE_BLOCKING_SEND.store(false, Ordering::Release);
+
+        let mut tx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0).into(), SockOpt::default())
+            .expect("bind send socket");
+        let state = Arc::get_mut(&mut tx.inner).expect("new socket has one owner");
+        if state.batch.send_worker.is_none() {
+            return;
+        }
+        state.batch.fns = Some(BatchFns {
+            send: hold_send_until_released,
+            recv: real.recv,
+        });
+        let socket = Arc::downgrade(&tx.inner);
+
+        let send = tokio::spawn(async move {
+            let destination = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+            let mut packets = vec![(payload(0), destination)];
+            tx.send_many_to(&mut SendManyBuf::default(), &mut packets)
+                .await
+        });
+        timeout(Duration::from_secs(2), async {
+            while !BLOCKING_SEND_STARTED.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker reaches the blocking syscall");
+
+        send.abort();
+        let _ = send.await;
+        let socket_was_kept = socket.upgrade().is_some();
+        RELEASE_BLOCKING_SEND.store(true, Ordering::Release);
+        timeout(Duration::from_secs(2), async {
+            while socket.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker releases the socket after finishing");
+        assert!(
+            socket_was_kept,
+            "worker must keep its raw fd valid after cancellation"
+        );
     }
 
     /// A batch to IPv6 loopback carries every packet in order.
