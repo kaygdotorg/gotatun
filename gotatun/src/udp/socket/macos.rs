@@ -41,7 +41,7 @@ use crate::{
 ///
 /// This caps the time spent in one syscall and the temporary header arrays while amortizing the
 /// trap cost across a useful run. The queue remains separately bounded by the device pipeline.
-pub(crate) const SEND_BATCH: usize = 64;
+pub(crate) const SEND_BATCH: usize = 32;
 
 /// Runtime switch for falling back to one datagram per socket send.
 const BATCH_ENV: &str = "GOTATUN_MACOS_BATCH_UDP";
@@ -599,6 +599,10 @@ mod tests {
         flags: c_int,
     ) -> isize {
         COUNTED_SENDS.fetch_add(1, Ordering::Relaxed);
+        MAX_COUNTED_BATCH.fetch_max(
+            usize::try_from(count).expect("the batch count fits usize"),
+            Ordering::Relaxed,
+        );
         let Some(fns) = resolve() else {
             // SAFETY: `__error` returns this thread's errno slot on macOS.
             unsafe { *libc::__error() = libc::ENOSYS };
@@ -606,6 +610,32 @@ mod tests {
         };
         // SAFETY: the test forwards the live arguments unchanged to the resolved call.
         unsafe { (fns.send)(fd, headers, count, flags) }
+    }
+
+    /// Largest packet count observed in a private send call by the batching tests.
+    static MAX_COUNTED_BATCH: AtomicUsize = AtomicUsize::new(0);
+
+    /// Bound one private syscall to 32 datagrams while delivering a larger run in order.
+    #[tokio::test]
+    async fn private_send_runs_are_capped_at_32_datagrams() {
+        let Some(real) = resolve() else {
+            return;
+        };
+        let tx = bind_with(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Some(BatchFns {
+                send: counting_send,
+                recv: real.recv,
+            }),
+        );
+        let mut rx = bind_with((Ipv4Addr::LOCALHOST, 0).into(), None);
+        MAX_COUNTED_BATCH.store(0, Ordering::Relaxed);
+        round_trip(&tx, &mut rx, 128).await;
+        assert_eq!(
+            MAX_COUNTED_BATCH.load(Ordering::Relaxed),
+            32,
+            "one private send call must not contain more than 32 datagrams"
+        );
     }
 
     /// One unconnected socket can send each message to its own IPv4 destination in one syscall.
