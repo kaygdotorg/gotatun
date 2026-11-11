@@ -85,7 +85,7 @@ struct TunDeviceState {
     vnet_header: bool,
 
     #[cfg(target_os = "linux")]
-    offloads: linux::TunOffloadState,
+    send_workers: linux::TunWriteWorkers,
 
     #[cfg(target_os = "linux")]
     read_buf: tokio::sync::Mutex<BytesMut>,
@@ -192,6 +192,8 @@ impl TunDevice {
 
         let tun = Arc::new(tun);
         let tun_weak = Arc::downgrade(&tun);
+        #[cfg(target_os = "linux")]
+        let send_workers = linux::TunWriteWorkers::new(Arc::clone(&tun), vnet_header, offloads);
 
         // Poll for changes to the MTU of the TUN device.
         // TODO: use the OS-specific event-driven patterns that exist instead of polling
@@ -220,7 +222,7 @@ impl TunDevice {
                 #[cfg(target_os = "linux")]
                 vnet_header,
                 #[cfg(target_os = "linux")]
-                offloads,
+                send_workers,
                 #[cfg(target_os = "linux")]
                 read_buf: tokio::sync::Mutex::new(BytesMut::zeroed(MAX_TUN_FRAME_LEN)),
             }),
@@ -228,6 +230,7 @@ impl TunDevice {
     }
 
     /// Write one raw IP packet when the descriptor does not use virtio headers.
+    #[cfg(not(target_os = "linux"))]
     async fn write_ip_packet(&self, packet: Packet<Ip>) -> io::Result<()> {
         self.tun.send(packet.as_bytes()).await?;
         Ok(())
@@ -239,60 +242,88 @@ impl TunDevice {
     }
 }
 
+/// Write one lane's packet run, preserving GSO fallback and fatal-device error handling.
+#[cfg(target_os = "linux")]
+async fn write_tun_packets(
+    tun: &tun::AsyncDevice,
+    vnet_header: bool,
+    offloads: linux::TunOffloadState,
+    packets: &mut Vec<Packet<Ip>>,
+) -> io::Result<()> {
+    if vnet_header {
+        let disable_gso = std::env::var_os("GOTATUN_DIAG_DISABLE_TUN_GSO").is_some();
+        let frames = gso::coalesce_packets(
+            std::mem::take(packets),
+            offloads.tcp_tso && !disable_gso,
+            offloads.udp_uso && !disable_gso,
+        );
+        let mut first_error = None;
+        for frame in frames {
+            let result = gso::write_frame_with_fallback(frame, |frame_bytes| async move {
+                tun.send(frame_bytes.as_bytes()).await.map(|_| ())
+            })
+            .await;
+            match result {
+                Ok(()) => {}
+                Err(error) => {
+                    if is_fatal_tun_error(&error) {
+                        return Err(error);
+                    }
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        return first_error.map_or(Ok(()), Err);
+    }
+
+    let mut first_error = None;
+    for packet in packets.drain(..) {
+        if let Err(error) = tun.send(packet.as_bytes()).await.map(|_| ()) {
+            if is_fatal_tun_error(&error) {
+                return Err(error);
+            }
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 impl IpSend for TunDevice {
     async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
         #[cfg(target_os = "linux")]
-        if self.state.vnet_header {
+        {
             let mut packets = vec![packet];
             return self.send_many(&mut packets).await;
         }
+        #[cfg(not(target_os = "linux"))]
         self.write_ip_packet(packet).await
     }
 
     async fn send_many(&mut self, packets: &mut Vec<Packet<Ip>>) -> io::Result<()> {
         #[cfg(target_os = "linux")]
-        if self.state.vnet_header {
-            let disable_gso = std::env::var_os("GOTATUN_DIAG_DISABLE_TUN_GSO").is_some();
-            let frames = gso::coalesce_packets(
-                std::mem::take(packets),
-                self.state.offloads.tcp_tso && !disable_gso,
-                self.state.offloads.udp_uso && !disable_gso,
-            );
+        {
+            return self.state.send_workers.send_many(packets).await;
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
             let mut first_error = None;
-            let tun = self.tun.as_ref();
-            for frame in frames {
-                let result = gso::write_frame_with_fallback(frame, |frame_bytes| async move {
-                    tun.send(frame_bytes.as_bytes()).await.map(|_| ())
-                })
-                .await;
-                match result {
-                    Ok(()) => {}
-                    Err(error) => {
-                        let fatal = is_fatal_tun_error(&error);
-                        if fatal {
-                            return Err(error);
-                        }
-                        if first_error.is_none() {
-                            first_error = Some(error);
-                        }
+            for packet in packets.drain(..) {
+                if let Err(error) = self.write_ip_packet(packet).await {
+                    if is_fatal_tun_error(&error) {
+                        return Err(error);
+                    }
+                    if first_error.is_none() {
+                        first_error = Some(error);
                     }
                 }
             }
-            return first_error.map_or(Ok(()), Err);
+            first_error.map_or(Ok(()), Err)
         }
-
-        let mut first_error = None;
-        for packet in packets.drain(..) {
-            if let Err(error) = self.write_ip_packet(packet).await {
-                if is_fatal_tun_error(&error) {
-                    return Err(error);
-                }
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        first_error.map_or(Ok(()), Err)
     }
 }
 

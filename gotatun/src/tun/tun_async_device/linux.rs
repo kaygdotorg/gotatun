@@ -7,9 +7,229 @@
 //! Linux-specific TUN setup and software fallback policy.
 
 use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     io,
+    net::IpAddr,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
 };
+
+use crate::packet::{Ip, Packet};
+use crate::task::Task;
+use crate::tun::is_fatal_tun_error;
+use tokio::sync::{mpsc, oneshot};
+use zerocopy::IntoBytes;
+
+/// Number of writers used to measure concurrent TUN injection without changing the interface.
+const TUN_WRITE_WORKERS: usize = 2;
+
+/// Bounds batch descriptors waiting at each TUN writer; packet buffers remain bounded upstream.
+const TUN_WRITE_QUEUE_CAPACITY: usize = 8;
+
+/// A flow identity that stays constant for packets that must retain FIFO order in one TUN lane.
+#[derive(Debug, Hash, PartialEq, Eq)]
+enum TunFlowPart {
+    /// The transport ports distinguish TCP and UDP flows sharing the same IP addresses.
+    Ports(u16, u16),
+    /// IPv4 fragments use their datagram identifier because later fragments have no ports.
+    Fragment(u16),
+    /// Other protocols and IPv6 packets with extension headers share a network-protocol lane.
+    Protocol,
+}
+
+/// The fields used to route an inner IP flow to one writer without reading packet payloads.
+#[derive(Debug, Hash, PartialEq, Eq)]
+struct TunFlowKey {
+    source: IpAddr,
+    destination: IpAddr,
+    protocol: u8,
+    part: TunFlowPart,
+}
+
+/// Read a stable flow key from a validated IP packet without allocating.
+fn flow_key(packet: &Packet<Ip>) -> Option<TunFlowKey> {
+    let bytes = packet.as_bytes();
+    let source = packet.source()?;
+    let destination = packet.destination()?;
+    let version = packet.header.version();
+
+    let (protocol, transport_offset, fragment) = match version {
+        4 => {
+            let protocol = *bytes.get(9)?;
+            let identification = u16::from_be_bytes(bytes.get(4..6)?.try_into().ok()?);
+            let fragment = u16::from_be_bytes(bytes.get(6..8)?.try_into().ok()?);
+            let is_fragment = fragment & 0x3fff != 0;
+            let transport_offset = usize::from(bytes[0] & 0x0f) * 4;
+            (
+                protocol,
+                Some(transport_offset),
+                is_fragment.then_some(identification),
+            )
+        }
+        6 => (*bytes.get(6)?, Some(40), None),
+        _ => return None,
+    };
+
+    let part = if let Some(identification) = fragment {
+        TunFlowPart::Fragment(identification)
+    } else if matches!(protocol, 6 | 17) {
+        transport_offset
+            .and_then(|offset| bytes.get(offset..offset.saturating_add(4)))
+            .map(|ports| {
+                TunFlowPart::Ports(
+                    u16::from_be_bytes([ports[0], ports[1]]),
+                    u16::from_be_bytes([ports[2], ports[3]]),
+                )
+            })
+            .unwrap_or(TunFlowPart::Protocol)
+    } else {
+        TunFlowPart::Protocol
+    };
+
+    Some(TunFlowKey {
+        source,
+        destination,
+        protocol,
+        part,
+    })
+}
+
+/// Select one writer lane for a flow; one lane always receives its packets in input order.
+fn flow_shard(packet: &Packet<Ip>, worker_count: usize) -> usize {
+    if worker_count <= 1 {
+        return 0;
+    }
+    let Some(key) = flow_key(packet) else {
+        return 0;
+    };
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish() as usize % worker_count
+}
+
+/// Partition packets by stable flow while keeping each lane's original packet order.
+fn partition_packets(packets: Vec<Packet<Ip>>, worker_count: usize) -> Vec<Vec<Packet<Ip>>> {
+    let worker_count = worker_count.max(1);
+    let mut shards = (0..worker_count).map(|_| Vec::new()).collect::<Vec<_>>();
+    for packet in packets {
+        let shard = flow_shard(&packet, worker_count);
+        shards[shard].push(packet);
+    }
+    shards
+}
+
+/// One ordered batch and its completion result for a TUN writer.
+struct TunWriteRequest {
+    packets: Vec<Packet<Ip>>,
+    completion: oneshot::Sender<io::Result<()>>,
+}
+
+/// Fixed writer lanes that send different inner flows through the same Linux TUN descriptor.
+pub(super) struct TunWriteWorkers {
+    senders: Vec<mpsc::Sender<TunWriteRequest>>,
+    /// Aborted when the last `TunDevice` owner drops its state.
+    _tasks: Vec<Task>,
+}
+
+impl TunWriteWorkers {
+    /// Start two FIFO writer tasks sharing `tun`; each flow stays assigned to one task.
+    pub(super) fn new(
+        tun: std::sync::Arc<tun::AsyncDevice>,
+        vnet_header: bool,
+        offloads: TunOffloadState,
+    ) -> Self {
+        let mut senders = Vec::with_capacity(TUN_WRITE_WORKERS);
+        let mut tasks = Vec::with_capacity(TUN_WRITE_WORKERS);
+        for _ in 0..TUN_WRITE_WORKERS {
+            let (sender, mut receiver) = mpsc::channel::<TunWriteRequest>(TUN_WRITE_QUEUE_CAPACITY);
+            let tun = std::sync::Arc::clone(&tun);
+            let task = Task::spawn("tun write worker", async move {
+                while let Some(request) = receiver.recv().await {
+                    let mut packets = request.packets;
+                    let result =
+                        super::write_tun_packets(&tun, vnet_header, offloads, &mut packets).await;
+                    let _ = request.completion.send(result);
+                }
+            });
+            senders.push(sender);
+            tasks.push(task);
+        }
+        Self {
+            senders,
+            _tasks: tasks,
+        }
+    }
+
+    /// Send a run and wait until every selected writer has finished it.
+    pub(super) async fn send_many(&self, packets: &mut Vec<Packet<Ip>>) -> io::Result<()> {
+        if packets.is_empty() {
+            return Ok(());
+        }
+        send_partitioned(&self.senders, std::mem::take(packets)).await
+    }
+}
+
+/// Dispatch a packet run and await every lane so upstream bounds cover queued and active writes.
+async fn send_partitioned(
+    senders: &[mpsc::Sender<TunWriteRequest>],
+    packets: Vec<Packet<Ip>>,
+) -> io::Result<()> {
+    if senders.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "no TUN write workers are available",
+        ));
+    }
+
+    let mut pending = Vec::with_capacity(senders.len());
+    let mut first_error = None;
+    for (sender, packets) in senders
+        .iter()
+        .zip(partition_packets(packets, senders.len()))
+    {
+        if packets.is_empty() {
+            continue;
+        }
+        let (completion, result) = oneshot::channel();
+        if sender
+            .send(TunWriteRequest {
+                packets,
+                completion,
+            })
+            .await
+            .is_ok()
+        {
+            pending.push(result);
+        } else if first_error.is_none() {
+            first_error = Some(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "TUN write worker stopped",
+            ));
+        }
+    }
+
+    let mut fatal_error = None;
+    for result in pending {
+        let result = match result.await {
+            Ok(result) => result,
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "TUN write worker stopped before completing its batch",
+            )),
+        };
+        if let Err(error) = result {
+            if is_fatal_tun_error(&error) {
+                if fatal_error.is_none() {
+                    fatal_error = Some(error);
+                }
+            } else if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+
+    fatal_error.or(first_error).map_or(Ok(()), Err)
+}
 
 pub(super) fn create_tun_with_vnet_fallback(
     config: &mut tun::Configuration,
@@ -185,7 +405,127 @@ fn interface_request(name: &str) -> io::Result<libc::ifreq> {
 #[cfg(test)]
 mod tests {
     use super::open_with_vnet_fallback;
+    use crate::packet::{Ip, Packet};
+    use bytes::BytesMut;
     use std::fs::File;
+    use zerocopy::IntoBytes;
+
+    /// Build a small IPv4 UDP packet whose source port identifies its inner flow.
+    fn udp_packet(source_port: u16, identification: u16, marker: u8) -> Packet<Ip> {
+        let mut bytes = BytesMut::zeroed(36);
+        bytes[0] = 0x45;
+        let total_len = bytes.len() as u16;
+        bytes[2..4].copy_from_slice(&total_len.to_be_bytes());
+        bytes[4..6].copy_from_slice(&identification.to_be_bytes());
+        bytes[9] = 17;
+        bytes[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        bytes[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        bytes[20..22].copy_from_slice(&source_port.to_be_bytes());
+        bytes[22..24].copy_from_slice(&53_u16.to_be_bytes());
+        bytes[24..26].copy_from_slice(&16_u16.to_be_bytes());
+        bytes[28] = marker;
+        Packet::from_bytes(bytes)
+            .try_into_ip()
+            .expect("the test packet has an IPv4 header")
+    }
+
+    /// Build a fragment with the same IPv4 identification and endpoints.
+    fn ipv4_fragment(offset: u16, more_fragments: bool, identification: u16) -> Packet<Ip> {
+        let mut bytes: Packet<[u8]> = udp_packet(9000, identification, 0).into();
+        {
+            let bytes = bytes.buf_mut();
+            let flags = offset | if more_fragments { 0x2000 } else { 0 };
+            bytes[6..8].copy_from_slice(&flags.to_be_bytes());
+            if offset != 0 {
+                bytes[20..24].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+            }
+        }
+        bytes
+            .try_into_ip()
+            .expect("the fragment still has an IPv4 header")
+    }
+
+    /// `id` remains a test-only marker after packets are split into writer lanes.
+    fn packet_id(packet: &Packet<Ip>) -> u16 {
+        let bytes = packet.as_bytes();
+        u16::from_be_bytes([bytes[4], bytes[5]])
+    }
+
+    #[test]
+    fn tun_writer_shard_uses_the_full_udp_flow_and_ignores_packet_contents() {
+        let first = udp_packet(12_000, 1, 0x11);
+        let later = udp_packet(12_000, 2, 0x22);
+        let other_flow = udp_packet(12_001, 3, 0x33);
+
+        assert_eq!(super::flow_key(&first), super::flow_key(&later));
+        assert_ne!(super::flow_key(&first), super::flow_key(&other_flow));
+        assert_eq!(super::flow_shard(&first, 4), super::flow_shard(&later, 4));
+    }
+
+    #[test]
+    fn tun_writer_partition_keeps_each_flow_in_fifo_order() {
+        let first = udp_packet(12_000, 1, 0x11);
+        let other_source_port = (12_001..13_000)
+            .find(|port| {
+                let packet = udp_packet(*port, 2, 0x22);
+                super::flow_shard(&packet, 2) != super::flow_shard(&first, 2)
+            })
+            .expect("the deterministic flow hash distributes the test ports");
+        let later = udp_packet(12_000, 3, 0x33);
+        let packets = vec![first, udp_packet(other_source_port, 2, 0x22), later];
+
+        let shards = super::partition_packets(packets, 2);
+        let first_lane = super::flow_shard(&udp_packet(12_000, 4, 0x44), 2);
+        let ids = shards[first_lane].iter().map(packet_id).collect::<Vec<_>>();
+
+        assert_eq!(ids, [1, 3]);
+    }
+
+    #[test]
+    fn tun_writer_keeps_all_ipv4_fragments_in_one_lane() {
+        let first = ipv4_fragment(0, true, 7);
+        let later = ipv4_fragment(1, false, 7);
+
+        assert_eq!(super::flow_key(&first), super::flow_key(&later));
+        assert_eq!(super::flow_shard(&first, 4), super::flow_shard(&later, 4));
+    }
+
+    #[tokio::test]
+    async fn tun_writer_dispatch_waits_for_the_selected_lane_to_finish() {
+        use tokio::sync::{mpsc, oneshot};
+
+        let packet = udp_packet(12_000, 1, 0x11);
+        let lane = super::flow_shard(&packet, 2);
+        let (first_tx, first_rx) = mpsc::channel::<super::TunWriteRequest>(1);
+        let (second_tx, second_rx) = mpsc::channel::<super::TunWriteRequest>(1);
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let mut selected_rx = if lane == 0 { first_rx } else { second_rx };
+        let worker = tokio::spawn(async move {
+            let request = selected_rx
+                .recv()
+                .await
+                .expect("the selected lane receives the packet");
+            let ids = request.packets.iter().map(packet_id).collect::<Vec<_>>();
+            started_tx
+                .send(ids)
+                .expect("the test is waiting for this lane");
+            release_rx.await.expect("the test releases the writer");
+            request
+                .completion
+                .send(Ok(()))
+                .expect("the dispatch waits for the writer result");
+        });
+        let senders = [first_tx, second_tx];
+        let dispatch =
+            tokio::spawn(async move { super::send_partitioned(&senders, vec![packet]).await });
+
+        assert_eq!(started_rx.await.unwrap(), [1]);
+        assert!(!dispatch.is_finished());
+        release_tx.send(()).unwrap();
+        dispatch.await.unwrap().unwrap();
+        worker.await.unwrap();
+    }
 
     #[test]
     fn tx_queue_len_only_ever_grows() {
