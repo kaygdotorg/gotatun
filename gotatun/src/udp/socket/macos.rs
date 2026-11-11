@@ -18,6 +18,7 @@
 //! window, and this bound limits that retry to one small run.
 
 use std::{
+    cell::Cell,
     ffi::{CStr, c_int, c_uint, c_void},
     io,
     mem::{self, MaybeUninit},
@@ -42,6 +43,45 @@ use crate::{
 /// This caps the time spent in one syscall and the temporary header arrays while amortizing the
 /// trap cost across a useful run. The queue remains separately bounded by the device pipeline.
 pub(crate) const SEND_BATCH: usize = 64;
+
+/// Darwin's scheduling class for UDP threads that should wake promptly for packet I/O.
+const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+
+/// Whether this thread has already attempted the optional UDP I/O QoS promotion.
+///
+/// Tokio workers can run unrelated tasks after packet work, so this only changes the existing
+/// thread's class and never creates or reserves another worker. Remembering the attempt keeps the
+/// receive hot path to a thread-local check after its first datagram.
+thread_local! {
+    static PACKET_IO_QOS_ATTEMPTED: Cell<bool> = const { Cell::new(false) };
+}
+
+unsafe extern "C" {
+    /// Set the current thread's Darwin scheduling class without changing other threads.
+    fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: c_int) -> c_int;
+}
+
+/// Raise the existing Tokio worker to user-interactive QoS once before it performs UDP I/O.
+///
+/// A failed promotion leaves the socket path at the operating system's default class. It never
+/// prevents a packet from being sent or received, and the thread-local flag prevents retries from
+/// adding a syscall to each packet.
+fn promote_packet_io_thread() {
+    PACKET_IO_QOS_ATTEMPTED.with(|attempted| {
+        if attempted.replace(true) {
+            return;
+        }
+
+        // SAFETY: this Darwin API changes only the calling thread's scheduling class.
+        let result = unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+        if result != 0 {
+            tracing::debug!(
+                error_code = result,
+                "macOS UDP: thread QoS promotion failed; continuing with the default class"
+            );
+        }
+    });
+}
 
 /// Runtime switch for falling back to one datagram per socket send.
 const BATCH_ENV: &str = "GOTATUN_MACOS_BATCH_UDP";
@@ -279,6 +319,7 @@ impl UdpSend for super::UdpSocket {
 
     /// Send one datagram through Tokio's ordinary per-datagram path.
     async fn send_to(&self, packet: Packet, destination: SocketAddr) -> io::Result<()> {
+        promote_packet_io_thread();
         self.send_one(&packet, destination).await
     }
 
@@ -312,6 +353,7 @@ impl UdpSend for super::UdpSocket {
             ));
         }
 
+        promote_packet_io_thread();
         send_buf.targets.clear();
         let mut first_error = None;
         if self.inner.batch.active().is_none() {
@@ -445,6 +487,7 @@ impl UdpRecv for super::UdpSocket {
 
     /// Receive one datagram and map dual-stack sources back to IPv4 when needed.
     async fn recv_from(&mut self, pool: &mut PacketBufPool) -> io::Result<(Packet, SocketAddr)> {
+        promote_packet_io_thread();
         let mut buffer = pool.get();
         let (received, source) = self.socket().recv_from(&mut buffer).await?;
         buffer.truncate(received);
@@ -473,13 +516,11 @@ mod tests {
     };
 
     /// Darwin's numeric QoS values used to prove that socket I/O raises its runtime thread.
-    const TEST_QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+    const TEST_QOS_CLASS_USER_INTERACTIVE: u32 = QOS_CLASS_USER_INTERACTIVE;
     const TEST_QOS_CLASS_BACKGROUND: u32 = 0x09;
 
     /// Darwin APIs that inspect and set the current test thread's QoS class.
     unsafe extern "C" {
-        /// Set the current test thread's scheduling class.
-        fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: c_int) -> c_int;
         /// Read one thread's scheduling class into the supplied output values.
         fn pthread_get_qos_class_np(
             thread: libc::pthread_t,
