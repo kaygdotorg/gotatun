@@ -19,12 +19,12 @@ use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread::{self, JoinHandle};
 
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 
 use crate::noise::errors::WireGuardError;
@@ -73,7 +73,7 @@ pub(crate) const PARALLEL_DISPATCH_LOW_WATER: usize = MIN_PARALLEL_RUN_SIZE;
 /// Maximum outstanding completion slots for one peer and one direction.
 pub(crate) const MAX_PEER_CRYPTO_IN_FLIGHT: usize = 128;
 
-/// Bound on worker runs waiting in the shared queue. Every run is already full when submitted;
+/// Bound on worker runs waiting across all queue shards. Every run is already full when submitted;
 /// workers never wait to fill it, so a short packet cannot be held behind a packet-count target.
 pub(crate) const MAX_QUEUED_CRYPTO_JOBS: usize = 128;
 
@@ -669,15 +669,31 @@ enum CryptoJob {
     ),
 }
 
-/// Bounded work queue shared by the fixed crypto worker set.
+/// Bounded handoff queues shared by the fixed crypto worker set.
 ///
-/// Workers park on the condition variable while the queue is empty. The mutex protects only the
-/// queue metadata; a worker releases it before processing a run.
+/// Producers spread complete runs across per-worker shards. Any worker can steal from another
+/// shard, so a busy or panicked owner does not strand queued work. Workers park with an unpark
+/// token while every shard is empty; the global semaphore still bounds all queued runs together.
 struct CryptoQueue {
-    state: Mutex<CryptoQueueState>,
-    ready: Condvar,
+    /// Per-worker run queues; worker startup may activate only a prefix after a spawn failure.
+    shards: Vec<CryptoQueueShard>,
+    /// Parked worker handles used to wake thieves without a shared notification lock.
+    worker_threads: Vec<OnceLock<thread::Thread>>,
+    /// Number of shards that have a worker after lazy startup finishes.
+    active_worker_count: AtomicUsize,
+    /// Round-robin cursor for spreading producer handoffs across active workers.
+    next_worker_shard: AtomicUsize,
+    /// Whether shutdown has closed every shard to new work.
+    closed: AtomicBool,
     queued_slots: Arc<Semaphore>,
+    /// Number of queued runs across every shard, excluding runs already being processed.
     queued_jobs: AtomicUsize,
+}
+
+/// One worker-owned queue shard, which other workers may drain when it has work.
+struct CryptoQueueShard {
+    /// Jobs and the shutdown flag for this shard.
+    state: Mutex<CryptoQueueState>,
 }
 
 /// Queue metadata protected only while runs are added, removed, or the pool closes.
@@ -693,26 +709,69 @@ struct QueuedCryptoJob {
 }
 
 impl CryptoQueue {
-    /// Create an empty queue with a fixed number of pending worker-run slots.
-    fn new(capacity: usize) -> Self {
+    /// Create empty per-worker shards with one global limit for pending worker runs.
+    fn new(capacity: usize, worker_count: usize) -> Self {
+        assert!(
+            worker_count > 0,
+            "the crypto queue needs at least one worker"
+        );
+        let shard_capacity = capacity.div_ceil(worker_count);
         Self {
-            state: Mutex::new(CryptoQueueState {
-                jobs: VecDeque::with_capacity(capacity),
-                closed: false,
-            }),
-            ready: Condvar::new(),
+            shards: (0..worker_count)
+                .map(|_| CryptoQueueShard {
+                    state: Mutex::new(CryptoQueueState {
+                        jobs: VecDeque::with_capacity(shard_capacity),
+                        closed: false,
+                    }),
+                })
+                .collect(),
+            worker_threads: (0..worker_count).map(|_| OnceLock::new()).collect(),
+            active_worker_count: AtomicUsize::new(worker_count),
+            next_worker_shard: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
             queued_slots: Arc::new(Semaphore::new(capacity)),
             queued_jobs: AtomicUsize::new(0),
         }
     }
 
-    /// Enqueue one complete run under one queue lock and wake one parked worker.
+    /// Use only workers that started successfully, preserving inline fallback after spawn failure.
+    fn set_active_worker_count(&self, worker_count: usize) {
+        assert!(worker_count <= self.shards.len());
+        self.active_worker_count
+            .store(worker_count, Ordering::Release);
+        self.wake_workers();
+    }
+
+    /// Choose a shard in round-robin order among workers that started successfully.
+    fn next_worker_shard(&self) -> usize {
+        let worker_count = self.active_worker_count.load(Ordering::Acquire);
+        assert!(worker_count > 0, "crypto jobs need a started worker");
+        self.next_worker_shard.fetch_add(1, Ordering::Relaxed) % worker_count
+    }
+
+    /// Register a worker's park handle before it waits for its first run.
+    fn register_worker(&self, worker_index: usize) {
+        let _ = self.worker_threads[worker_index].set(thread::current());
+    }
+
+    /// Wake started workers so they can take queued work from any shard.
+    fn wake_workers(&self) {
+        let worker_count = self.active_worker_count.load(Ordering::Acquire);
+        for worker in self.worker_threads.iter().take(worker_count) {
+            if let Some(thread) = worker.get() {
+                thread.unpark();
+            }
+        }
+    }
+
+    /// Enqueue one complete run in a shard and wake workers that can drain it.
     async fn push(&self, job: CryptoJob) -> Result<(), ()> {
         let permit = Arc::clone(&self.queued_slots)
             .acquire_owned()
             .await
             .map_err(|_| ())?;
-        let mut state = self.state.lock();
+        let shard_index = self.next_worker_shard();
+        let mut state = self.shards[shard_index].state.lock();
         if state.closed {
             return Err(());
         }
@@ -720,44 +779,64 @@ impl CryptoQueue {
             job,
             _permit: permit,
         });
-        self.queued_jobs.fetch_add(1, Ordering::Release);
-        self.ready.notify_one();
+        let queued_jobs = self.queued_jobs.fetch_add(1, Ordering::Release) + 1;
+        drop(state);
+        if crate::diag::PIPELINE.on() {
+            eprintln!(
+                "pipeline mono_ns={} stage=crypto_queue_push queued_jobs={queued_jobs}",
+                crate::diag::pipeline_timestamp_ns()
+            );
+        }
+        self.wake_workers();
         Ok(())
     }
 
-    /// Take one worker chunk, briefly spinning before parking when the queue remains empty.
-    fn pop(&self) -> Option<CryptoJob> {
-        let mut state = self.state.lock();
+    /// Take one run from the worker's own shard or steal another shard's queued work.
+    fn pop(&self, worker_index: usize) -> Option<CryptoJob> {
         loop {
-            if let Some(QueuedCryptoJob { job, _permit }) = state.jobs.pop_front() {
-                self.queued_jobs.fetch_sub(1, Ordering::Relaxed);
-                drop(state);
-                drop(_permit);
-                return Some(job);
+            let worker_count = self.active_worker_count.load(Ordering::Acquire);
+            for offset in 0..worker_count {
+                let shard_index = (worker_index + offset) % worker_count;
+                let mut state = self.shards[shard_index].state.lock();
+                if let Some(QueuedCryptoJob { job, _permit }) = state.jobs.pop_front() {
+                    let queued_jobs = self.queued_jobs.fetch_sub(1, Ordering::Relaxed) - 1;
+                    drop(state);
+                    drop(_permit);
+                    if crate::diag::PIPELINE.on() {
+                        eprintln!(
+                            "pipeline mono_ns={} stage=crypto_queue_pop queued_jobs={queued_jobs}",
+                            crate::diag::pipeline_timestamp_ns()
+                        );
+                    }
+                    return Some(job);
+                }
             }
-            if state.closed {
+            if self.closed.load(Ordering::Acquire) && self.queued_jobs.load(Ordering::Acquire) == 0
+            {
                 return None;
             }
 
-            drop(state);
             for _ in 0..WORKER_SPIN_COUNT {
                 if self.queued_jobs.load(Ordering::Acquire) > 0 {
                     break;
                 }
                 std::hint::spin_loop();
             }
-
-            state = self.state.lock();
-            if state.jobs.is_empty() && !state.closed {
-                self.ready.wait(&mut state);
+            if self.queued_jobs.load(Ordering::Acquire) == 0 && !self.closed.load(Ordering::Acquire)
+            {
+                // `unpark` retains a token if a producer wins this race and wakes us before park.
+                thread::park();
             }
         }
     }
 
-    /// Stop accepting work and wake parked workers so they can drain and exit.
+    /// Close every shard and wake parked workers so they can drain and exit.
     fn close(&self) {
-        self.state.lock().closed = true;
-        self.ready.notify_all();
+        for shard in &self.shards {
+            shard.state.lock().closed = true;
+        }
+        self.closed.store(true, Ordering::Release);
+        self.wake_workers();
     }
 }
 
@@ -994,13 +1073,14 @@ impl WorkerThreads {
             }
         }
         let any = !threads.is_empty();
+        self.queue.set_active_worker_count(threads.len());
         *state = PoolThreads::Running(threads);
         // Publish only a usable pool on the fast path; an empty one keeps answering `false`.
         self.started.store(any, Ordering::Release);
         any
     }
 
-    /// Spawn one worker that drains whole runs until the queue closes.
+    /// Spawn one worker that drains or steals whole runs until the queue closes.
     fn spawn_worker(&self, worker_index: usize) -> io::Result<JoinHandle<()>> {
         let worker_queue = Arc::clone(&self.queue);
         #[cfg(test)]
@@ -1010,7 +1090,8 @@ impl WorkerThreads {
         thread::Builder::new()
             .name(format!("gotatun-crypto-{worker_index}"))
             .spawn(move || {
-                while let Some(job) = worker_queue.pop() {
+                worker_queue.register_worker(worker_index);
+                while let Some(job) = worker_queue.pop(worker_index) {
                     #[cfg(test)]
                     completed_runs.fetch_add(1, Ordering::Relaxed);
                     match job {
@@ -1087,7 +1168,7 @@ impl CryptoWorkers {
             "the crypto pool needs at least one worker"
         );
 
-        let queue = Arc::new(CryptoQueue::new(MAX_QUEUED_CRYPTO_JOBS));
+        let queue = Arc::new(CryptoQueue::new(MAX_QUEUED_CRYPTO_JOBS, worker_count));
         let active_batches = Arc::new(AtomicUsize::new(0));
         #[cfg(test)]
         let worker_run_count = Arc::new(AtomicUsize::new(0));
@@ -1185,7 +1266,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::future::Future;
     use std::hint::black_box;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -1195,9 +1276,9 @@ mod tests {
     use zerocopy::IntoBytes;
 
     use super::{
-        CRYPTO_BATCH_SIZE, CRYPTO_CHUNK_SIZE, CRYPTO_WORKER_BATCH_SIZE, CryptoWorkers,
-        IncomingCompletion, MAX_PEER_CRYPTO_IN_FLIGHT, MIN_PARALLEL_RUN_SIZE, OrderStore,
-        OrderedCompletions,
+        ActiveBatch, CRYPTO_BATCH_SIZE, CRYPTO_CHUNK_SIZE, CRYPTO_WORKER_BATCH_SIZE, CryptoJob,
+        CryptoQueue, CryptoWorkers, IncomingCompletion, MAX_PEER_CRYPTO_IN_FLIGHT,
+        MIN_PARALLEL_RUN_SIZE, OrderStore, OrderedCompletions, QueuedCryptoJob,
     };
     use crate::noise::index_table::IndexTable;
     use crate::noise::rate_limiter::RateLimiter;
@@ -1321,6 +1402,64 @@ mod tests {
                 panic!("the profile worker count is valid text")
             }
         }
+    }
+
+    /// Spread consecutive crypto handoffs evenly across the worker-owned queue shards.
+    #[test]
+    fn crypto_queue_rotates_handoffs_across_worker_shards() {
+        let queue = CryptoQueue::new(super::MAX_QUEUED_CRYPTO_JOBS, 4);
+        queue.set_active_worker_count(4);
+
+        let assignments = (0..8)
+            .map(|_| queue.next_worker_shard())
+            .collect::<Vec<_>>();
+
+        assert_eq!(assignments, vec![0, 1, 2, 3, 0, 1, 2, 3]);
+    }
+
+    /// Keep partial worker startup on the queue shards that actually have a consumer.
+    #[test]
+    fn crypto_queue_rotates_only_across_started_workers() {
+        let queue = CryptoQueue::new(super::MAX_QUEUED_CRYPTO_JOBS, 4);
+        queue.set_active_worker_count(2);
+
+        let assignments = (0..6)
+            .map(|_| queue.next_worker_shard())
+            .collect::<Vec<_>>();
+
+        assert_eq!(assignments, vec![0, 1, 0, 1, 0, 1]);
+    }
+
+    /// Let a surviving worker steal queued work and drain it after queue shutdown.
+    #[test]
+    fn crypto_queue_steals_and_drains_after_close() {
+        let queue = CryptoQueue::new(super::MAX_QUEUED_CRYPTO_JOBS, 2);
+        queue.set_active_worker_count(2);
+        let permit = Arc::clone(&queue.queued_slots)
+            .try_acquire_owned()
+            .expect("the queue has a free pending-run permit");
+        let (result_sender, _result_receiver) = tokio::sync::oneshot::channel();
+        let active_batches = Arc::new(AtomicUsize::new(0));
+        let active = ActiveBatch::enter_queued(&active_batches);
+        queue.shards[1]
+            .state
+            .lock()
+            .jobs
+            .push_back(QueuedCryptoJob {
+                job: CryptoJob::Encrypt(Vec::new(), result_sender, active),
+                _permit: permit,
+            });
+        queue.queued_jobs.store(1, Ordering::Release);
+
+        queue.close();
+        let job = queue
+            .pop(0)
+            .expect("worker zero can steal from the second shard");
+
+        assert!(matches!(&job, CryptoJob::Encrypt(..)));
+        drop(job);
+        assert_eq!(active_batches.load(Ordering::Relaxed), 0);
+        assert!(queue.pop(0).is_none());
     }
 
     /// One peer's ready packet run and its arrival time at the crypto stage.
@@ -2006,7 +2145,8 @@ mod tests {
         let queue = Arc::clone(&workers.queue);
         let worker_exit_rx = Arc::clone(&workers.worker_exit_rx);
         drop(workers);
-        let closed = queue.state.lock().closed;
+        let closed = queue.closed.load(Ordering::Acquire)
+            && queue.shards.iter().all(|shard| shard.state.lock().closed);
         let exited_workers = (0..2)
             .take_while(|_| {
                 worker_exit_rx

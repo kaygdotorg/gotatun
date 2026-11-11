@@ -12,6 +12,9 @@
 
 use std::sync::OnceLock;
 
+/// Shared origin for timestamps in one opt-in pipeline diagnostic run.
+static PIPELINE_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+
 /// One environment-controlled diagnostic switch, read once and then cached.
 ///
 /// Declare a switch as a `static` and ask it with [`Switch::on`]. Only the variable's presence
@@ -42,6 +45,14 @@ impl Switch {
 
 /// Print a line for each stage a packet run passes through.
 pub(crate) static PIPELINE: Switch = Switch::new("GOTATUN_DIAG_PIPELINE");
+
+/// Return monotonic nanoseconds since the first pipeline diagnostic event in this process.
+pub(crate) fn pipeline_timestamp_ns() -> u128 {
+    PIPELINE_EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos()
+}
 
 /// Print UDP and TUN send-queue reservations and releases.
 pub(crate) static SEND_QUEUE: Switch = Switch::new("GOTATUN_DIAG_SEND_QUEUE");
