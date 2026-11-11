@@ -16,6 +16,9 @@
 //! it progressed, the current short batch is retried one datagram at a time; an already-sent
 //! prefix can therefore be duplicated. The protocol rejects duplicate packets through its replay
 //! window, and this bound limits that retry to one small run.
+//!
+//! A bounded FIFO sends batches on one OS thread so synchronous syscalls yield the packet executor
+//! between batches. The one-request channel adds no unbounded backlog.
 
 use std::{
     ffi::{CStr, c_int, c_uint, c_void},
@@ -24,13 +27,20 @@ use std::{
     net::SocketAddr,
     os::fd::AsRawFd,
     sync::{
-        OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
+    thread::{self, JoinHandle},
 };
 
 use socket2::SockAddr;
-use tokio::io::Interest;
+use tokio::{
+    io::Interest,
+    sync::{mpsc, oneshot},
+};
+
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 
 use crate::{
     packet::{Packet, PacketBufPool},
@@ -100,10 +110,153 @@ struct BatchFns {
     recv: RecvMsgXFn,
 }
 
+/// Owns one bounded request while the macOS sender thread calls `sendmsg_x`.
+struct SendBatchRequest {
+    /// Private syscall functions selected by the socket's runtime probe.
+    fns: BatchFns,
+    /// Socket descriptor kept alive by the sending socket until its request completes.
+    fd: c_int,
+    /// The ordered packet list returned to the async caller after the syscall.
+    packets: Vec<(Packet, SocketAddr)>,
+    /// Mapped destinations returned so the caller can reuse their allocation.
+    targets: Vec<SockAddr>,
+    /// Start of the current bounded batch within `packets` and `targets`.
+    start: usize,
+    /// End of the current bounded batch within `packets` and `targets`.
+    end: usize,
+    /// Returns the syscall result and the owned buffers to the async caller.
+    response: oneshot::Sender<SendBatchResponse>,
+}
+
+/// Returns the batch result and reusable buffers to the socket task.
+struct SendBatchResponse {
+    /// Number of datagrams accepted by the socket, or the syscall error.
+    result: io::Result<usize>,
+    /// Original packet ownership, unchanged by the syscall.
+    packets: Vec<(Packet, SocketAddr)>,
+    /// Mapped destinations, retained for the next batch.
+    targets: Vec<SockAddr>,
+}
+
+/// Runs serialized private UDP batch syscalls away from the packet executor.
+///
+/// Its one-message channel keeps work bounded. Dropping the last sender closes the channel and
+/// lets the OS thread leave its blocking receive loop.
+struct SendWorker {
+    /// One queued batch at most, so a stalled syscall cannot build a second hidden backlog.
+    sender: mpsc::Sender<SendBatchRequest>,
+    /// Keeps the thread handle available for diagnostics and detaches it on worker drop.
+    _thread: JoinHandle<()>,
+    /// Test-only count used to prove sends reach this worker through the real socket path.
+    #[cfg(test)]
+    calls: Arc<AtomicUsize>,
+}
+
+impl SendWorker {
+    /// Start a single OS thread that sends each batch then returns its packet buffers.
+    fn new() -> io::Result<Self> {
+        let (sender, mut receiver) = mpsc::channel(1);
+        #[cfg(test)]
+        let calls = Arc::new(AtomicUsize::new(0));
+        #[cfg(test)]
+        let worker_calls = Arc::clone(&calls);
+        let worker = thread::Builder::new()
+            .name("gotatun-macos-udp-send".to_owned())
+            .spawn(move || {
+                while let Some(request) = receiver.blocking_recv() {
+                    #[cfg(test)]
+                    worker_calls.fetch_add(1, Ordering::Relaxed);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        send_batch(
+                            request.fns,
+                            request.fd,
+                            &request.packets[request.start..request.end],
+                            &request.targets[request.start..request.end],
+                        )
+                    }))
+                    .unwrap_or_else(|_| Err(io::Error::other("macOS UDP send worker panicked")));
+                    let _ = request.response.send(SendBatchResponse {
+                        result,
+                        packets: request.packets,
+                        targets: request.targets,
+                    });
+                }
+            })?;
+        Ok(Self {
+            sender,
+            _thread: worker,
+            #[cfg(test)]
+            calls,
+        })
+    }
+
+    /// Send one bounded batch on the worker, waiting for socket readiness without blocking the
+    /// async executor. A `WouldBlock` result clears Tokio's stale writable notification and retries.
+    async fn send_batch(
+        &self,
+        socket: &tokio::net::UdpSocket,
+        fns: BatchFns,
+        fd: c_int,
+        packets: &mut Vec<(Packet, SocketAddr)>,
+        targets: &mut Vec<SockAddr>,
+        start: usize,
+        end: usize,
+    ) -> io::Result<usize> {
+        loop {
+            socket.writable().await?;
+            let (response, reply) = oneshot::channel();
+            let request = SendBatchRequest {
+                fns,
+                fd,
+                packets: std::mem::take(packets),
+                targets: std::mem::take(targets),
+                start,
+                end,
+                response,
+            };
+            let request = match self.sender.send(request).await {
+                Ok(()) => {
+                    let response = reply.await.map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "macOS UDP send worker stopped before replying",
+                        )
+                    })?;
+                    *packets = response.packets;
+                    *targets = response.targets;
+                    response.result
+                }
+                Err(error) => {
+                    let request = error.0;
+                    *packets = request.packets;
+                    *targets = request.targets;
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "macOS UDP send worker stopped before accepting a batch",
+                    ));
+                }
+            };
+            match request {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let _ = socket.try_io(Interest::WRITABLE, || {
+                        Err::<(), _>(io::ErrorKind::WouldBlock.into())
+                    });
+                }
+                result => {
+                    tokio::task::yield_now().await;
+                    return result;
+                }
+            }
+        }
+    }
+}
+
 /// Batching state shared by every clone of one [`super::UdpSocket`].
 pub(crate) struct BatchState {
     /// The resolved calls, or `None` when this socket starts on per-datagram sends.
     fns: Option<BatchFns>,
+    /// A bounded sender thread created only after the runtime probe enables batching.
+    send_worker: Option<SendWorker>,
     /// Set after a runtime error shows that this socket cannot use the private send call.
     disabled: AtomicBool,
 }
@@ -137,13 +290,21 @@ impl BatchState {
         log_choice_once(|| {
             tracing::info!("macOS UDP: using sendmsg_x batches of up to {SEND_BATCH} datagrams")
         });
-        Self::with_fns(Some(fns))
+        let mut state = Self::with_fns(Some(fns));
+        match SendWorker::new() {
+            Ok(worker) => state.send_worker = Some(worker),
+            Err(error) => tracing::warn!(
+                "macOS UDP: cannot start private batch sender thread ({error}); using in-executor sends"
+            ),
+        }
+        state
     }
 
     /// Store a runtime result, with tests able to inject missing or failing calls.
     fn with_fns(fns: Option<BatchFns>) -> Self {
         Self {
             fns,
+            send_worker: None,
             disabled: AtomicBool::new(false),
         }
     }
@@ -329,23 +490,38 @@ impl UdpSend for super::UdpSocket {
                 .map(|(_, address)| SockAddr::from(self.map_dst(*address))),
         );
 
+        let mut pending = std::mem::take(packets);
+        let mut targets = std::mem::take(&mut send_buf.targets);
         let mut start = 0;
-        while start < packets.len() {
+        while start < pending.len() {
             let Some(fns) = self.inner.batch.active() else {
                 break;
             };
-            let end = packets.len().min(start + SEND_BATCH);
-            let result = self
-                .socket()
-                .async_io(Interest::WRITABLE, || {
-                    send_batch(
+            let end = pending.len().min(start + SEND_BATCH);
+            let result = if let Some(worker) = &self.inner.batch.send_worker {
+                worker
+                    .send_batch(
+                        self.socket(),
                         fns,
                         self.socket().as_raw_fd(),
-                        &packets[start..end],
-                        &send_buf.targets[start..end],
+                        &mut pending,
+                        &mut targets,
+                        start,
+                        end,
                     )
-                })
-                .await;
+                    .await
+            } else {
+                self.socket()
+                    .async_io(Interest::WRITABLE, || {
+                        send_batch(
+                            fns,
+                            self.socket().as_raw_fd(),
+                            &pending[start..end],
+                            &targets[start..end],
+                        )
+                    })
+                    .await
+            };
 
             match result {
                 Ok(sent) if sent > 0 => start += sent,
@@ -359,7 +535,7 @@ impl UdpSend for super::UdpSocket {
                             "macOS UDP sendmsg_x failed; retrying this bounded run per datagram: {error}"
                         );
                     }
-                    for (packet, destination) in &packets[start..end] {
+                    for (packet, destination) in &pending[start..end] {
                         if let Err(error) = self.send_one(packet, *destination).await {
                             first_error.get_or_insert(error);
                         }
@@ -369,12 +545,13 @@ impl UdpSend for super::UdpSocket {
             }
         }
 
-        for (packet, destination) in packets.drain(..).skip(start) {
+        for (packet, destination) in pending.drain(..).skip(start) {
             if let Err(error) = self.send_one(&packet, destination).await {
                 first_error.get_or_insert(error);
             }
         }
-        send_buf.targets.clear();
+        targets.clear();
+        send_buf.targets = targets;
         first_error.map_or(Ok(()), Err)
     }
 
@@ -652,15 +829,15 @@ mod tests {
     /// A batch sender on a separate thread delivers packets in FIFO order.
     #[tokio::test]
     async fn batched_send_runs_on_independent_sender_thread() {
-        let Some(real) = resolve() else {
+        if resolve().is_none() {
             return;
-        };
+        }
         let tx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0).into(), SockOpt::default())
             .expect("bind send socket");
         let Some(worker) = tx.inner.batch.send_worker.as_ref() else {
             return;
         };
-        assert_ne!(worker.thread.thread().id(), std::thread::current().id());
+        assert_ne!(worker._thread.thread().id(), std::thread::current().id());
         let calls = worker.calls.load(Ordering::Relaxed);
 
         let receiver = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
@@ -672,7 +849,7 @@ mod tests {
             .await
             .expect("send through the independent worker");
         assert!(packets.is_empty());
-        assert_eq!(worker.calls.load(Ordering::Relaxed), calls + 1);
+        assert!(worker.calls.load(Ordering::Relaxed) > calls);
 
         let mut buffer = [0u8; 64];
         for index in 0..2 {
@@ -682,7 +859,6 @@ mod tests {
                 .expect("receive packet");
             assert_eq!(packet_number(&buffer[..length]), index);
         }
-        let _ = real;
     }
 
     /// A batch to IPv6 loopback carries every packet in order.
