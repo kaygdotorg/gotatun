@@ -101,16 +101,16 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100;
 /// Maximum number of packet buffers that each channel may contain
 const MAX_PACKET_BUFS: usize = 4000;
 
-/// How many packets the macOS TUN channels and buffered UDP queues may hold.
+/// How many packets the macOS TUN channels and inbound UDP queue may hold.
 ///
 /// On macOS the utun write is the slowest stage when a fast peer sends to us (#260, J461). With
 /// [`MAX_PACKET_BUFS`] there, one TCP flow kept ~4,000 packets waiting between the UDP socket and
 /// utun, about 45 ms at 1 Gbit/s, and every packet of every flow waited behind them (loaded p99
 /// 44 ms). 512 packets of 1280 B is ~5 ms at that rate: still enough to keep utun busy across
-/// scheduling gaps (goodput unchanged at 512 and 1024; 256 lost 10-15%), while the receive queue
-/// drops the excess early so TCP slows down instead of queueing. The same cap on the outbound UDP
-/// queue keeps a faster utun reader from moving its backlog into a 4,000-packet send queue (#260,
-/// J461b).
+/// scheduling gaps (goodput unchanged at 512 and 1024; 256 lost 10-15%), while the inbound UDP
+/// queue drops the excess early so TCP slows down instead of queueing. Outbound UDP uses a
+/// separate, smaller bound because the Mac-send matrix still showed excess loaded latency at 512
+/// queued packets (#260, J461b, J461c).
 #[cfg(target_os = "macos")]
 const MACOS_PIPELINE_BUFS: usize = 512;
 
@@ -120,6 +120,18 @@ const PIPELINE_BUFS: usize = MACOS_PIPELINE_BUFS;
 /// Capacity for the buffered tunnel queues on this platform.
 #[cfg(not(target_os = "macos"))]
 const PIPELINE_BUFS: usize = MAX_PACKET_BUFS;
+
+/// Bound the macOS outbound UDP backlog to one 64-packet send batch.
+///
+/// At the measured 0.32 Gbit/s Mac-send goodput, 64 full-size packets hold about 2.3 ms of
+/// payload. This cap targets the loaded p99 regression while the TUN and receive queues keep
+/// their separately measured 512-packet burst capacity (#260, J461c).
+#[cfg(target_os = "macos")]
+const UDP_SEND_BUFS: usize = 64;
+
+/// Keep the existing outbound UDP capacity on Linux and other non-macOS targets.
+#[cfg(not(target_os = "macos"))]
+const UDP_SEND_BUFS: usize = MAX_PACKET_BUFS;
 
 /// How often the receive task checks for an idle link.
 ///
@@ -1139,7 +1151,7 @@ impl<T: DeviceTransports> Connection<T> {
         )
         .await;
 
-        let buffered_udp_tx = BufferedUdpSend::new(PIPELINE_BUFS, udp_tx.clone());
+        let buffered_udp_tx = BufferedUdpSend::new(UDP_SEND_BUFS, udp_tx.clone());
 
         // Linux sockets already return recvmmsg/GRO batches here. Avoid queueing them across a
         // second worker handoff before packet processing.

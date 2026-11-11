@@ -38,6 +38,21 @@ use crate::noise::index_table::IndexTable;
 use crate::packet::{Ip, Packet, PacketBufPool};
 use crate::tun::{IpRecv, IpSend, MtuWatcher};
 
+/// macOS keeps its TUN and receive queues at 512 while bounding outbound UDP backlog separately.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_outbound_udp_queue_is_separate_from_tun_and_receive_capacity() {
+    assert_eq!(super::UDP_SEND_BUFS, 64);
+    assert_eq!(super::PIPELINE_BUFS, 512);
+}
+
+/// Linux keeps the existing outbound UDP queue capacity.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn non_macos_outbound_udp_queue_keeps_existing_capacity() {
+    assert_eq!(super::UDP_SEND_BUFS, super::MAX_PACKET_BUFS);
+}
+
 pub mod mock;
 
 /// A TUN test double that drains each immediately ready run in packet order.
