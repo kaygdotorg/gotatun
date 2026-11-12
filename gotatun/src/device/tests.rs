@@ -1832,7 +1832,6 @@ async fn a_pipeline_failure_wakes_waiters_with_the_first_reason() {
     );
 }
 
-
 /// Give Alice's peer a current session by a manual handshake with Bob, queue
 /// `QUEUED` packets behind it, optionally remove the peer, then run the TUN task's drain. Returns
 /// how many datagrams reached Bob's UDP socket.

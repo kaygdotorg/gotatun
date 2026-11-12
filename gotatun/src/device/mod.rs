@@ -1678,7 +1678,6 @@ impl<T: DeviceTransports> DeviceState<T> {
         let mut tun_packets = Vec::with_capacity(completed_packets.len());
 
         for packet in completed_packets {
-
             if packet.is_empty() {
                 empty_packet_count += 1;
                 continue;
