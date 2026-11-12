@@ -622,7 +622,7 @@ fn receive_batch(
         }
 
         // SAFETY: the kernel initialized this source storage and `address_len` is within it.
-        let address_len = match i32::try_from(address_len) {
+        let address_len = match libc::socklen_t::try_from(address_len) {
             Ok(address_len) => address_len,
             Err(error) => {
                 buffers.clear();
