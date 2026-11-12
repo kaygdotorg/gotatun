@@ -45,12 +45,34 @@ mod linux;
 mod windows;
 
 /// An implementation of [`UdpTransportFactory`] for regular UDP sockets. This provides `bind`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct UdpSocketFactory {
     /// If `Some`, set `SO_RCVBUF` on the socket.
     pub recv_buffer_size: Option<usize>,
     /// If `Some`, set `SO_SNDBUF` on the socket.
     pub send_buffer_size: Option<usize>,
+}
+
+/// Default send-buffer size for macOS builds that enable the private batch path.
+///
+/// A new macOS UDP socket has only 9 KiB of send capacity, below one common packet run. The
+/// 64 KiB override lets the existing 64-packet batch drain without changing receive buffering.
+#[cfg(all(target_os = "macos", feature = "macos-batch-io"))]
+const MACOS_DEFAULT_SEND_BUFFER_SIZE: usize = 64 * 1024;
+
+/// Keep current defaults on every platform except the measured batched macOS build.
+impl Default for UdpSocketFactory {
+    fn default() -> Self {
+        #[cfg(all(target_os = "macos", feature = "macos-batch-io"))]
+        let send_buffer_size = Some(MACOS_DEFAULT_SEND_BUFFER_SIZE);
+        #[cfg(not(all(target_os = "macos", feature = "macos-batch-io")))]
+        let send_buffer_size = None;
+
+        Self {
+            recv_buffer_size: None,
+            send_buffer_size,
+        }
+    }
 }
 
 impl UdpTransportFactory for UdpSocketFactory {
@@ -616,6 +638,44 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// The batch-enabled macOS factory must apply the tuned default send buffer to its socket.
+    #[cfg(all(target_os = "macos", feature = "macos-batch-io"))]
+    #[tokio::test]
+    async fn macos_factory_applies_the_default_send_buffer() {
+        use std::os::fd::AsRawFd;
+
+        let mut factory = UdpSocketFactory::default();
+        let params = UdpTransportFactoryParams {
+            addr: None,
+            port: 0,
+            #[cfg(target_os = "linux")]
+            fwmark: None,
+        };
+        let (socket, _) = factory.bind(&params).await.expect("bind UDP socket");
+        let mut actual: libc::c_int = 0;
+        let mut size = std::mem::size_of_val(&actual) as libc::socklen_t;
+        // SAFETY: The fd belongs to a live UDP socket. The pointer and length describe `actual`.
+        let result = unsafe {
+            libc::getsockopt(
+                socket.socket().as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&mut actual as *mut libc::c_int).cast(),
+                &mut size,
+            )
+        };
+        assert_eq!(
+            result,
+            0,
+            "getsockopt(SO_SNDBUF): {}",
+            io::Error::last_os_error()
+        );
+        assert!(
+            actual >= 64 * 1024,
+            "the send buffer must allow at least 64 KiB, got {actual} bytes"
+        );
     }
 
     /// Without `CAP_NET_ADMIN` the forced call fails; binding must still succeed
