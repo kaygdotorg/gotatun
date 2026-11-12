@@ -53,8 +53,17 @@ pub struct BufferedUdpSend {
 /// One queued datagram or one ordered run of datagrams.
 /// A batch id is present only for opt-in send-queue diagnostics.
 enum BufferedUdpMessage {
-    Single(Packet, SocketAddr, OwnedSemaphorePermit),
-    Batch(Vec<(Packet, SocketAddr)>, OwnedSemaphorePermit, Option<u64>),
+    Single(
+        Packet,
+        SocketAddr,
+        OwnedSemaphorePermit,
+        Option<crate::diag::UdpSendBatchDiagnostic>,
+    ),
+    Batch(
+        Vec<(Packet, SocketAddr)>,
+        OwnedSemaphorePermit,
+        Option<crate::diag::UdpSendBatchDiagnostic>,
+    ),
 }
 
 /// Send one same-family UDP run through the transport's reusable send buffer.
@@ -62,6 +71,7 @@ async fn flush_udp_packets<U: UdpSend>(
     udp_tx: &U,
     send_buf: &mut U::SendManyBuf,
     packets: &mut Vec<(Packet, SocketAddr)>,
+    send_diagnostic: Option<crate::diag::UdpSendBatchDiagnostic>,
 ) {
     let diagnostic = crate::diag::PIPELINE.on();
     let packet_count = packets.len();
@@ -96,7 +106,16 @@ async fn flush_udp_packets<U: UdpSend>(
             }
         }
         _ => {
-            let result = udp_tx.send_many_to(send_buf, packets).await;
+            let result = match send_diagnostic {
+                Some(send_diagnostic) => {
+                    crate::diag::with_udp_send_batch(
+                        send_diagnostic,
+                        udp_tx.send_many_to(send_buf, packets),
+                    )
+                    .await
+                }
+                None => udp_tx.send_many_to(send_buf, packets).await,
+            };
             if diagnostic {
                 eprintln!(
                     "pipeline stage=udp_socket_send packets={} mode=batch success={}",
@@ -122,17 +141,18 @@ async fn flush_udp_run<U: UdpSend>(
     send_buf: &mut U::SendManyBuf,
     packets: Vec<(Packet, SocketAddr)>,
     max_packet_count: usize,
+    send_diagnostic: Option<crate::diag::UdpSendBatchDiagnostic>,
 ) {
     if packets.len() <= max_packet_count {
         let mut packets = packets;
-        flush_udp_packets(udp_tx, send_buf, &mut packets).await;
+        flush_udp_packets(udp_tx, send_buf, &mut packets, send_diagnostic).await;
         return;
     }
 
     let mut packets = packets.into_iter();
     while packets.len() > 0 {
         let mut batch = packets.by_ref().take(max_packet_count).collect::<Vec<_>>();
-        flush_udp_packets(udp_tx, send_buf, &mut batch).await;
+        flush_udp_packets(udp_tx, send_buf, &mut batch, send_diagnostic).await;
     }
 }
 
@@ -148,6 +168,7 @@ impl BufferedUdpSend {
             let mut send_many_buf = Default::default();
             let mut singles = Vec::with_capacity(max_packet_count);
             let mut single_permits = Vec::with_capacity(max_packet_count);
+            let mut single_diagnostics = Vec::new();
 
             loop {
                 let count = send_rx.recv_many(&mut buf, max_packet_count).await;
@@ -157,35 +178,70 @@ impl BufferedUdpSend {
 
                 for message in buf.drain(..) {
                     match message {
-                        BufferedUdpMessage::Single(packet, addr, permit) => {
+                        BufferedUdpMessage::Single(packet, addr, permit, diagnostic) => {
                             if singles.first().is_some_and(|(_, first_addr)| {
                                 matches!(first_addr, SocketAddr::V4(..))
                                     != matches!(addr, SocketAddr::V4(..))
                             }) {
-                                flush_udp_packets(&udp_tx, &mut send_many_buf, &mut singles).await;
+                                let send_diagnostic = single_diagnostics.first().copied();
+                                flush_udp_packets(
+                                    &udp_tx,
+                                    &mut send_many_buf,
+                                    &mut singles,
+                                    send_diagnostic,
+                                )
+                                .await;
                                 single_permits.clear();
+                                single_diagnostics.clear();
                             }
                             singles.push((packet, addr));
                             single_permits.push(permit);
+                            if let Some(diagnostic) = diagnostic {
+                                single_diagnostics.push(diagnostic);
+                            }
                             if singles.len() == max_packet_count {
-                                flush_udp_packets(&udp_tx, &mut send_many_buf, &mut singles).await;
+                                let send_diagnostic = single_diagnostics.first().copied();
+                                flush_udp_packets(
+                                    &udp_tx,
+                                    &mut send_many_buf,
+                                    &mut singles,
+                                    send_diagnostic,
+                                )
+                                .await;
                                 single_permits.clear();
+                                single_diagnostics.clear();
                             }
                         }
-                        BufferedUdpMessage::Batch(packets, permit, sequence) => {
+                        BufferedUdpMessage::Batch(packets, permit, diagnostic) => {
                             let packet_count = packets.len();
-                            if let Some(sequence) = sequence {
+                            if let Some(diagnostic) = diagnostic {
                                 eprintln!(
-                                    "send_many dequeue direction=udp sequence={sequence} packets={packet_count}"
+                                    "send_many dequeue direction=udp sequence={} packets={packet_count} outstanding_packets={}",
+                                    diagnostic.sequence, diagnostic.outstanding_packets
                                 );
                             }
-                            flush_udp_packets(&udp_tx, &mut send_many_buf, &mut singles).await;
+                            let single_diagnostic = single_diagnostics.first().copied();
+                            flush_udp_packets(
+                                &udp_tx,
+                                &mut send_many_buf,
+                                &mut singles,
+                                single_diagnostic,
+                            )
+                            .await;
                             single_permits.clear();
-                            flush_udp_run(&udp_tx, &mut send_many_buf, packets, max_packet_count)
-                                .await;
-                            if let Some(sequence) = sequence {
+                            single_diagnostics.clear();
+                            flush_udp_run(
+                                &udp_tx,
+                                &mut send_many_buf,
+                                packets,
+                                max_packet_count,
+                                diagnostic,
+                            )
+                            .await;
+                            if let Some(diagnostic) = diagnostic {
                                 eprintln!(
-                                    "send_many complete direction=udp sequence={sequence} packets={packet_count}"
+                                    "send_many complete direction=udp sequence={} packets={packet_count}",
+                                    diagnostic.sequence
                                 );
                             }
                             drop(permit);
@@ -193,8 +249,10 @@ impl BufferedUdpSend {
                     }
                 }
 
-                flush_udp_packets(&udp_tx, &mut send_many_buf, &mut singles).await;
+                let send_diagnostic = single_diagnostics.first().copied();
+                flush_udp_packets(&udp_tx, &mut send_many_buf, &mut singles, send_diagnostic).await;
                 single_permits.clear();
+                single_diagnostics.clear();
             }
         });
 
@@ -215,10 +273,36 @@ impl UdpSend for BufferedUdpSend {
             .acquire_owned()
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
-        self.send_tx
-            .send(BufferedUdpMessage::Single(packet, destination, permit))
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+        if crate::diag::SEND_QUEUE.on() {
+            let queue_permit = self
+                .send_tx
+                .reserve()
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+            let diagnostic = crate::diag::UdpSendBatchDiagnostic::new(
+                NEXT_DIAGNOSTIC_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+                self.packet_capacity
+                    .saturating_sub(self.packet_slots.available_permits()),
+                1,
+                packet.len(),
+            );
+            queue_permit.send(BufferedUdpMessage::Single(
+                packet,
+                destination,
+                permit,
+                Some(diagnostic),
+            ));
+        } else {
+            self.send_tx
+                .send(BufferedUdpMessage::Single(
+                    packet,
+                    destination,
+                    permit,
+                    None,
+                ))
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+        }
         Ok(())
     }
 
@@ -271,15 +355,46 @@ impl UdpSend for BufferedUdpSend {
             } else {
                 packets.drain(..count).collect()
             };
-            if let Err(error) = self
-                .send_tx
-                .send(BufferedUdpMessage::Batch(batch, permit, sequence))
-                .await
-            {
-                let mut unsent = match error.0 {
-                    BufferedUdpMessage::Batch(batch, _, _) => batch,
-                    BufferedUdpMessage::Single(..) => unreachable!("send_many_to queues a batch"),
-                };
+            let batch_bytes = if sequence.is_some() {
+                batch.iter().map(|(packet, _)| packet.len()).sum()
+            } else {
+                0
+            };
+            let enqueue_result = if let Some(sequence) = sequence {
+                match self.send_tx.reserve().await {
+                    Ok(queue_permit) => {
+                        let diagnostic = crate::diag::UdpSendBatchDiagnostic::new(
+                            sequence,
+                            self.packet_capacity
+                                .saturating_sub(self.packet_slots.available_permits()),
+                            count,
+                            batch_bytes,
+                        );
+                        queue_permit.send(BufferedUdpMessage::Batch(
+                            batch,
+                            permit,
+                            Some(diagnostic),
+                        ));
+                        Ok(())
+                    }
+                    Err(_) => Err(batch),
+                }
+            } else {
+                match self
+                    .send_tx
+                    .send(BufferedUdpMessage::Batch(batch, permit, None))
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(error) => match error.0 {
+                        BufferedUdpMessage::Batch(batch, _, _) => Err(batch),
+                        BufferedUdpMessage::Single(..) => {
+                            unreachable!("send_many_to queues a batch")
+                        }
+                    },
+                }
+            };
+            if let Err(mut unsent) = enqueue_result {
                 if let Some(sequence) = sequence {
                     eprintln!(
                         "send_many enqueue_failed direction=udp sequence={sequence} packets={count}"

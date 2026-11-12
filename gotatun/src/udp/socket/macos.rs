@@ -394,7 +394,31 @@ impl super::UdpSocket {
     }
 }
 
+/// Read the number of bytes waiting in the socket's send buffer when Darwin exposes it.
+///
+/// `SO_NWRITE` is sampled only during opt-in send-queue diagnostics; unreadable values remain
+/// absent instead of changing the send decision.
+fn socket_nwrite_bytes(fd: c_int) -> Option<libc::c_int> {
+    let mut bytes = 0;
+    let mut length = socklen_of::<libc::c_int>();
+    // SAFETY: both output pointers refer to live writable values for this getsockopt call.
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_NWRITE,
+            (&mut bytes as *mut libc::c_int).cast(),
+            &mut length,
+        )
+    };
+    (result == 0).then_some(bytes)
+}
+
 /// Send one bounded run through `sendmsg_x` and return the number accepted by the kernel.
+///
+/// With `GOTATUN_DIAG_SEND_QUEUE` set, this records queue age, syscall duration, the partial-send
+/// result, transient kernel errors and `SO_NWRITE` around the syscall. Normal sends make none of
+/// the timestamp or socket-option calls.
 fn send_batch(
     fns: BatchFns,
     fd: c_int,
@@ -425,10 +449,58 @@ fn send_batch(
     }
 
     let count_arg = c_uint::try_from(count).expect("the bounded send count fits in u_int");
+    let diagnostics_enabled = crate::diag::SEND_QUEUE.on();
+    let send_diagnostic = diagnostics_enabled
+        .then(crate::diag::current_udp_send_batch)
+        .flatten();
+    let so_nwrite_before = diagnostics_enabled
+        .then(|| socket_nwrite_bytes(fd))
+        .flatten();
+    let syscall_started = diagnostics_enabled.then(crate::diag::udp_send_monotonic_now);
     // SAFETY: initialized headers point to live SockAddr and Packet storage for this call.
     let result = unsafe { (fns.send)(fd, headers.as_ptr(), count_arg, libc::MSG_DONTWAIT) };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
+    let syscall_finished_at = diagnostics_enabled.then(std::time::Instant::now);
+    let error = (result < 0).then(io::Error::last_os_error);
+    let syscall_finished_mono_ns = syscall_finished_at.map(crate::diag::udp_send_monotonic_ns);
+    let so_nwrite_after = diagnostics_enabled
+        .then(|| socket_nwrite_bytes(fd))
+        .flatten();
+    if diagnostics_enabled {
+        let accepted = usize::try_from(result).unwrap_or(0);
+        let queue_to_start_ns =
+            send_diagnostic
+                .zip(syscall_started)
+                .map(|(diagnostic, (started_at, _))| {
+                    started_at
+                        .saturating_duration_since(diagnostic.enqueued_at)
+                        .as_nanos()
+                });
+        let syscall_wall_ns =
+            syscall_started
+                .zip(syscall_finished_at)
+                .map(|((started_at, _), finished_at)| {
+                    finished_at.saturating_duration_since(started_at).as_nanos()
+                });
+        let eagain = error
+            .as_ref()
+            .is_some_and(|error| error.raw_os_error() == Some(libc::EAGAIN));
+        let enobufs = error
+            .as_ref()
+            .is_some_and(|error| error.raw_os_error() == Some(libc::ENOBUFS));
+        eprintln!(
+            "udp_sendmsg_x batch_id={:?} enqueue_mono_ns={:?} syscall_start_mono_ns={:?} syscall_end_mono_ns={syscall_finished_mono_ns:?} queue_to_start_ns={queue_to_start_ns:?} syscall_wall_ns={syscall_wall_ns:?} offered={count} accepted={accepted} eagain={} enobufs={} outstanding_packets={:?} batch_packets={:?} batch_bytes={:?} so_nwrite_before={so_nwrite_before:?} so_nwrite_after={so_nwrite_after:?}",
+            send_diagnostic.map(|diagnostic| diagnostic.sequence),
+            send_diagnostic.map(|diagnostic| diagnostic.enqueued_mono_ns),
+            syscall_started.map(|(_, monotonic_ns)| monotonic_ns),
+            u8::from(eagain),
+            u8::from(enobufs),
+            send_diagnostic.map(|diagnostic| diagnostic.outstanding_packets),
+            send_diagnostic.map(|diagnostic| diagnostic.batch_packets),
+            send_diagnostic.map(|diagnostic| diagnostic.batch_bytes),
+        );
+    }
+    if let Some(error) = error {
+        return Err(error);
     }
     let sent = usize::try_from(result).map_err(io::Error::other)?;
     if sent > count {
@@ -456,6 +528,7 @@ impl UdpRecv for super::UdpSocket {
 mod tests {
     use std::{
         net::{Ipv4Addr, Ipv6Addr},
+        process::Command,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -468,6 +541,7 @@ mod tests {
     use super::*;
     use crate::{
         packet::PacketBufPool,
+        udp::buffer::BufferedUdpSend,
         udp::socket::{SockOpt, UdpSocket, UdpSocketState},
     };
 
@@ -586,6 +660,157 @@ mod tests {
                 .expect("receive packet");
             assert_eq!(packet_number(&buffer[..length]), index);
         }
+    }
+
+    /// Run the real buffered sender in a fresh process so its environment switch starts unset.
+    fn send_diagnostic_child(enabled: bool) -> String {
+        let mut command = Command::new(std::env::current_exe().expect("test executable path"));
+        command
+            .arg("udp_send_diagnostic_child")
+            .arg("--nocapture")
+            .env_remove("GOTATUN_DIAG_SEND_QUEUE");
+        if enabled {
+            command.env("GOTATUN_DIAG_SEND_QUEUE", "1");
+        }
+        let output = command.output().expect("diagnostic child test starts");
+        assert!(
+            output.status.success(),
+            "diagnostic child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    /// Keep queue and syscall measurements silent unless the send-queue diagnostic switch is set.
+    #[test]
+    fn udp_send_diagnostics_are_silent_by_default() {
+        let output = send_diagnostic_child(false);
+
+        assert!(!output.contains("udp_sendmsg_x "), "{output}");
+    }
+
+    /// Report queue delay, syscall results, transient errors and socket occupancy for each call.
+    #[test]
+    fn udp_send_diagnostics_include_queue_and_syscall_measurements() {
+        let output = send_diagnostic_child(true);
+        let calls: Vec<_> = output
+            .lines()
+            .filter(|line| line.contains("udp_sendmsg_x "))
+            .collect();
+
+        assert!(calls.len() >= 2, "{output}");
+        assert!(
+            calls.iter().any(|line| {
+                line.contains("queue_to_start_ns=")
+                    && !line.contains("queue_to_start_ns=none")
+                    && line.contains("syscall_wall_ns=")
+                    && line.contains("offered=3")
+                    && line.contains("accepted=3")
+                    && line.contains("eagain=0")
+                    && line.contains("enobufs=0")
+                    && line.contains("so_nwrite_before=")
+                    && line.contains("so_nwrite_after=")
+            }),
+            "{output}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|line| { line.contains("eagain=1") && line.contains("enobufs=0") }),
+            "{output}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|line| { line.contains("eagain=0") && line.contains("enobufs=1") }),
+            "{output}"
+        );
+    }
+
+    /// Exercise the buffered queue and injected syscall errors in an isolated process.
+    #[tokio::test]
+    async fn udp_send_diagnostic_child() {
+        let Some(real) = resolve() else {
+            return;
+        };
+        let tx = bind_with(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Some(BatchFns {
+                send: counting_send,
+                recv: real.recv,
+            }),
+        );
+        let receiver = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind receiver");
+        let destination = receiver.local_addr().expect("receive address");
+        let sender = BufferedUdpSend::new(8, tx.clone());
+        let mut packets: Vec<_> = (0..3).map(|index| (payload(index), destination)).collect();
+        sender
+            .send_many_to(&mut (), &mut packets)
+            .await
+            .expect("the queue accepts the run and retries syscall errors per datagram");
+        assert!(packets.is_empty());
+
+        let mut buffer = [0u8; 64];
+        for index in 0..3 {
+            let length = timeout(Duration::from_secs(2), receiver.recv(&mut buffer))
+                .await
+                .expect("buffered datagram arrives")
+                .expect("receive buffered datagram");
+            assert_eq!(packet_number(&buffer[..length]), index);
+        }
+
+        DIAGNOSTIC_SEND_CALLS.store(0, Ordering::Relaxed);
+        let destination = SockAddr::from(destination);
+        let packet = [(
+            payload(3),
+            destination.as_socket().expect("IPv4 socket address"),
+        )];
+        for (index, expected_errno) in [libc::EAGAIN, libc::ENOBUFS].into_iter().enumerate() {
+            let result = send_batch(
+                BatchFns {
+                    send: fail_eagain_then_enobufs,
+                    recv: real.recv,
+                },
+                tx.socket().as_raw_fd(),
+                &packet,
+                std::slice::from_ref(&destination),
+            );
+            assert_eq!(
+                result
+                    .expect_err("the injected transient error is returned")
+                    .raw_os_error(),
+                Some(expected_errno),
+                "injected syscall {index}"
+            );
+        }
+    }
+
+    /// Number the two injected send errors before the safe per-datagram fallback is exercised.
+    static DIAGNOSTIC_SEND_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Return EAGAIN, then ENOBUFS, so diagnostics prove that both errors are counted.
+    unsafe extern "C" fn fail_eagain_then_enobufs(
+        _: c_int,
+        _: *const MsghdrX,
+        _: c_uint,
+        _: c_int,
+    ) -> isize {
+        let call = DIAGNOSTIC_SEND_CALLS.fetch_add(1, Ordering::Relaxed);
+        let errno = match call {
+            0 => libc::EAGAIN,
+            1 => libc::ENOBUFS,
+            _ => libc::EIO,
+        };
+        // SAFETY: `__error` returns this thread's errno slot on macOS.
+        unsafe { *libc::__error() = errno };
+        -1
     }
 
     /// `sendmsg_x` calls made by [`counting_send`].
