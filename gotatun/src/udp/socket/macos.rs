@@ -10,7 +10,8 @@
 //! system symbols at runtime and probes a fresh nonblocking socket before using them. If either
 //! symbol or the probe is unavailable, a batch call reports an unsupported error, or
 //! `GOTATUN_MACOS_BATCH_UDP` is set to `0`, sends use Tokio's per-datagram path instead. Receives
-//! stay on the ordinary one-datagram path.
+//! use the same resolved `recvmsg_x` entry point to drain a bounded set of ready datagrams; an
+//! unsupported receive call disables only batching for that receive buffer.
 //!
 //! Each batch is limited to [`SEND_BATCH`] messages. When the private call cannot report how far
 //! it progressed, the current short batch is retried one datagram at a time; an already-sent
@@ -29,7 +30,7 @@ use std::{
     },
 };
 
-use socket2::SockAddr;
+use socket2::{SockAddr, SockAddrStorage};
 use tokio::io::Interest;
 
 use crate::{
@@ -42,6 +43,12 @@ use crate::{
 /// This caps the time spent in one syscall and the temporary header arrays while amortizing the
 /// trap cost across a useful run. The queue remains separately bounded by the device pipeline.
 pub(crate) const SEND_BATCH: usize = 64;
+
+/// Maximum datagrams read by one `recvmsg_x` call.
+///
+/// Keep this bounded so one readable socket cannot monopolize the task while the kernel and the
+/// device pipeline already hold separate bounded queues.
+const RECV_BATCH: usize = 64;
 
 /// Runtime switch for falling back to one datagram per socket send.
 const BATCH_ENV: &str = "GOTATUN_MACOS_BATCH_UDP";
@@ -274,6 +281,29 @@ pub struct SendManyBuf {
     targets: Vec<SockAddr>,
 }
 
+/// Reusable packet storage and fallback state for batched macOS receives.
+///
+/// Pass one value to each receive loop and keep it between calls. The packet vector is refilled
+/// from the caller's pool only after the socket is ready; if `recvmsg_x` is unsupported, this
+/// value remembers to use the ordinary one-datagram receive path from then on.
+pub struct RecvManyBuf {
+    /// Packet buffers borrowed from the pool while one receive syscall is in progress.
+    buffers: Vec<Packet>,
+    /// Whether this receive loop has already fallen back from the private syscall.
+    disabled: bool,
+}
+
+/// Reserve bounded scratch capacity once for a receive loop.
+impl Default for RecvManyBuf {
+    /// Create reusable packet metadata without allocating payload buffers up front.
+    fn default() -> Self {
+        Self {
+            buffers: Vec::with_capacity(RECV_BATCH),
+            disabled: false,
+        }
+    }
+}
+
 impl UdpSend for super::UdpSocket {
     type SendManyBuf = SendManyBuf;
 
@@ -441,7 +471,7 @@ fn send_batch(
 }
 
 impl UdpRecv for super::UdpSocket {
-    type RecvManyBuf = ();
+    type RecvManyBuf = RecvManyBuf;
 
     /// Receive one datagram and map dual-stack sources back to IPv4 when needed.
     async fn recv_from(&mut self, pool: &mut PacketBufPool) -> io::Result<(Packet, SocketAddr)> {
@@ -450,6 +480,176 @@ impl UdpRecv for super::UdpSocket {
         buffer.truncate(received);
         Ok((buffer, self.map_src(source)))
     }
+
+    /// Drain the datagrams already queued when this socket becomes readable.
+    async fn recv_many_from(
+        &mut self,
+        recv_buf: &mut RecvManyBuf,
+        pool: &mut PacketBufPool,
+        packets: &mut Vec<(Packet, SocketAddr)>,
+    ) -> io::Result<()> {
+        let Some(fns) = self.inner.batch.fns.filter(|_| !recv_buf.disabled) else {
+            let (packet, source) = self.recv_from(pool).await?;
+            packets.push((packet, source));
+            return Ok(());
+        };
+
+        let socket = self.socket();
+        let fd = socket.as_raw_fd();
+        let first_new_packet = packets.len();
+        match socket
+            .async_io(Interest::READABLE, || {
+                receive_batch(fns, fd, &mut recv_buf.buffers, pool, packets)
+            })
+            .await
+        {
+            Ok(()) => {
+                for (_, source) in &mut packets[first_new_packet..] {
+                    *source = self.map_src(*source);
+                }
+                Ok(())
+            }
+            Err(error) if is_unsupported(&error) => {
+                recv_buf.disabled = true;
+                tracing::warn!(
+                    "macOS UDP: recvmsg_x is unsupported on this socket ({error}); using per-datagram receives"
+                );
+                let (packet, source) = self.recv_from(pool).await?;
+                packets.push((packet, source));
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Receive a bounded run through `recvmsg_x` and append it in source order.
+///
+/// `async_io` calls this only while readable and retries `WouldBlock`. Every pointer placed in a
+/// message header refers to storage that remains live for the syscall; the kernel returns the
+/// source address and byte count in the same header slot as its datagram.
+fn receive_batch(
+    fns: BatchFns,
+    fd: c_int,
+    buffers: &mut Vec<Packet>,
+    pool: &mut PacketBufPool,
+    packets: &mut Vec<(Packet, SocketAddr)>,
+) -> io::Result<()> {
+    buffers.clear();
+    let count = pool.capacity().clamp(1, RECV_BATCH);
+    let count_arg = c_uint::try_from(count).map_err(io::Error::other)?;
+    buffers.reserve(count);
+    for _ in 0..count {
+        buffers.push(pool.get());
+    }
+
+    let mut addresses: [MaybeUninit<SockAddrStorage>; RECV_BATCH] =
+        std::array::from_fn(|_| MaybeUninit::uninit());
+    let mut sources: [MaybeUninit<SocketAddr>; RECV_BATCH] =
+        std::array::from_fn(|_| MaybeUninit::uninit());
+    let mut iovs = [libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    }; RECV_BATCH];
+    let mut headers = [MsghdrX::EMPTY; RECV_BATCH];
+
+    for (index, packet) in buffers.iter_mut().enumerate().take(count) {
+        let buffer = packet.buf_mut();
+        iovs[index] = libc::iovec {
+            iov_base: buffer.as_mut_ptr().cast(),
+            iov_len: buffer.len(),
+        };
+        headers[index] = MsghdrX {
+            msg_name: addresses[index].as_mut_ptr().cast(),
+            msg_namelen: socklen_of::<SockAddrStorage>(),
+            msg_iov: &mut iovs[index],
+            msg_iovlen: 1,
+            ..MsghdrX::EMPTY
+        };
+    }
+
+    // SAFETY: each header points to live packet, address and iovec storage for this call.
+    let result = unsafe { (fns.recv)(fd, headers.as_mut_ptr(), count_arg, libc::MSG_DONTWAIT) };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        buffers.clear();
+        return Err(error);
+    }
+    if result == 0 {
+        buffers.clear();
+        return Err(io::ErrorKind::WouldBlock.into());
+    }
+
+    let received = match usize::try_from(result) {
+        Ok(received) => received,
+        Err(error) => {
+            buffers.clear();
+            return Err(io::Error::other(error));
+        }
+    };
+    if received > count {
+        buffers.clear();
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recvmsg_x returned more datagrams than the submitted run",
+        ));
+    }
+
+    for (index, header) in headers.iter().enumerate().take(received) {
+        if header.msg_flags & libc::MSG_TRUNC != 0 || header.msg_datalen > buffers[index].len() {
+            buffers.clear();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recvmsg_x returned a truncated UDP datagram",
+            ));
+        }
+
+        let address_len = match usize::try_from(header.msg_namelen) {
+            Ok(address_len) => address_len,
+            Err(error) => {
+                buffers.clear();
+                return Err(io::Error::other(error));
+            }
+        };
+        if address_len < mem::size_of::<libc::sa_family_t>()
+            || address_len > mem::size_of::<SockAddrStorage>()
+        {
+            buffers.clear();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recvmsg_x returned an invalid UDP source address length",
+            ));
+        }
+
+        // SAFETY: the kernel initialized this source storage and `address_len` is within it.
+        let address_len = match i32::try_from(address_len) {
+            Ok(address_len) => address_len,
+            Err(error) => {
+                buffers.clear();
+                return Err(io::Error::other(error));
+            }
+        };
+        // SAFETY: the kernel initialized this source storage and `address_len` is within it.
+        let address = unsafe { SockAddr::new(addresses[index].assume_init_read(), address_len) };
+        let Some(source) = address.as_socket() else {
+            buffers.clear();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recvmsg_x returned a non-IP UDP source address",
+            ));
+        };
+        sources[index].write(source);
+    }
+
+    packets.reserve(received);
+    for (index, mut buffer) in buffers.drain(..received).enumerate() {
+        buffer.truncate(headers[index].msg_datalen);
+        // SAFETY: every source slot in this received prefix was initialized above.
+        let source = unsafe { sources[index].assume_init_read() };
+        packets.push((buffer, source));
+    }
+    buffers.clear();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -473,7 +673,16 @@ mod tests {
 
     /// Bind a socket with the exact private-call state selected by the test.
     fn bind_with(address: SocketAddr, fns: Option<BatchFns>) -> UdpSocket {
-        let socket = UdpSocket::bind(address, SockOpt::default()).expect("bind UDP socket");
+        bind_with_options(address, SockOpt::default(), fns)
+    }
+
+    /// Bind a socket with explicit socket options and private-call state for one test.
+    fn bind_with_options(
+        address: SocketAddr,
+        options: SockOpt,
+        fns: Option<BatchFns>,
+    ) -> UdpSocket {
+        let socket = UdpSocket::bind(address, options).expect("bind UDP socket");
         let state = Arc::try_unwrap(socket.inner)
             .ok()
             .expect("the new socket has no clones");
@@ -720,7 +929,54 @@ mod tests {
         .expect("queued datagrams arrive")
         .expect("receive batch");
 
-        assert_eq!(received.len(), 8, "one readiness batch drains the queued run");
+        assert_eq!(
+            received.len(),
+            8,
+            "one readiness batch drains the queued run"
+        );
+        for (index, (packet, address)) in received.into_iter().enumerate() {
+            assert_eq!(packet_number(&packet), index);
+            assert_eq!(address, source);
+        }
+    }
+
+    /// Batched receives map IPv4-mapped sources back on a dual-stack socket.
+    #[tokio::test]
+    async fn recv_many_maps_dual_stack_ipv4_sources() {
+        let Some(real) = resolve() else {
+            return;
+        };
+        let options = SockOpt {
+            only_v6: Some(false),
+            ..SockOpt::default()
+        };
+        let mut receiver =
+            bind_with_options((Ipv6Addr::UNSPECIFIED, 0).into(), options, Some(real));
+        let sender = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind IPv4 sender");
+        let source = sender.local_addr().expect("sender address");
+        let receive_port = receiver.local_addr().expect("receive address").port();
+        let destination = SocketAddr::from((Ipv4Addr::LOCALHOST, receive_port));
+        for index in 0..2 {
+            sender
+                .send_to(payload(index).as_ref(), destination)
+                .await
+                .expect("queue IPv4 datagram");
+        }
+
+        let mut recv_buf = <UdpSocket as UdpRecv>::RecvManyBuf::default();
+        let mut pool = PacketBufPool::new(2);
+        let mut received = Vec::new();
+        timeout(
+            Duration::from_secs(2),
+            receiver.recv_many_from(&mut recv_buf, &mut pool, &mut received),
+        )
+        .await
+        .expect("IPv4 datagrams arrive")
+        .expect("receive batch");
+
+        assert_eq!(received.len(), 2);
         for (index, (packet, address)) in received.into_iter().enumerate() {
             assert_eq!(packet_number(&packet), index);
             assert_eq!(address, source);
@@ -787,12 +1043,7 @@ mod tests {
     static COUNTED_RECEIVE_FAILURES: AtomicUsize = AtomicUsize::new(0);
 
     /// Return `ENOSYS` so the receive path must switch to Tokio's one-datagram implementation.
-    unsafe extern "C" fn fail_recv_enosys(
-        _: c_int,
-        _: *mut MsghdrX,
-        _: c_uint,
-        _: c_int,
-    ) -> isize {
+    unsafe extern "C" fn fail_recv_enosys(_: c_int, _: *mut MsghdrX, _: c_uint, _: c_int) -> isize {
         COUNTED_RECEIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `__error` returns this thread's errno slot on macOS.
         unsafe { *libc::__error() = libc::ENOSYS };
