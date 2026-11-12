@@ -690,6 +690,43 @@ mod tests {
         }
     }
 
+    /// One receive readiness batch contains every already-queued UDP datagram in order.
+    #[tokio::test]
+    async fn recv_many_coalesces_available_datagrams() {
+        let Some(real) = resolve() else {
+            return;
+        };
+        let mut receiver = bind_with((Ipv4Addr::LOCALHOST, 0).into(), Some(real));
+        let sender = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind sender");
+        let destination = receiver.local_addr().expect("receive address");
+        let source = sender.local_addr().expect("send address");
+        for index in 0..8 {
+            sender
+                .send_to(payload(index).as_ref(), destination)
+                .await
+                .expect("queue datagram");
+        }
+
+        let mut recv_buf = ();
+        let mut pool = PacketBufPool::new(8);
+        let mut received = Vec::new();
+        timeout(
+            Duration::from_secs(2),
+            receiver.recv_many_from(&mut recv_buf, &mut pool, &mut received),
+        )
+        .await
+        .expect("queued datagrams arrive")
+        .expect("receive batch");
+
+        assert_eq!(received.len(), 8, "one readiness batch drains the queued run");
+        for (index, (packet, address)) in received.into_iter().enumerate() {
+            assert_eq!(packet_number(&packet), index);
+            assert_eq!(address, source);
+        }
+    }
+
     /// Return an unsupported error so the next send must use the ordinary path.
     unsafe extern "C" fn fail_enosys(_: c_int, _: *const MsghdrX, _: c_uint, _: c_int) -> isize {
         // SAFETY: `__error` returns this thread's errno slot on macOS.
