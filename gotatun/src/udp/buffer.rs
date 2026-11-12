@@ -32,7 +32,7 @@ use crate::task::Task;
 use crate::udp::UdpRecv;
 use crate::udp::UdpSend;
 
-/// Identifies buffered UDP runs only when GOTATUN_DIAG_SEND_QUEUE is enabled.
+/// Identifies buffered UDP runs when send timing or queue tracing is enabled.
 static NEXT_DIAGNOSTIC_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// A [`UdpSend`] that wraps another [`UdpSend`] to provide buffering.
@@ -51,7 +51,7 @@ pub struct BufferedUdpSend {
 }
 
 /// One queued datagram or one ordered run of datagrams.
-/// A batch id is present only for opt-in send-queue diagnostics.
+/// Timing metadata is present only for opt-in UDP send diagnostics.
 enum BufferedUdpMessage {
     Single(
         Packet,
@@ -214,12 +214,6 @@ impl BufferedUdpSend {
                         }
                         BufferedUdpMessage::Batch(packets, permit, diagnostic) => {
                             let packet_count = packets.len();
-                            if let Some(diagnostic) = diagnostic {
-                                eprintln!(
-                                    "send_many dequeue direction=udp sequence={} packets={packet_count} outstanding_packets={}",
-                                    diagnostic.sequence, diagnostic.outstanding_packets
-                                );
-                            }
                             let single_diagnostic = single_diagnostics.first().copied();
                             flush_udp_packets(
                                 &udp_tx,
@@ -238,7 +232,9 @@ impl BufferedUdpSend {
                                 diagnostic,
                             )
                             .await;
-                            if let Some(diagnostic) = diagnostic {
+                            if crate::diag::SEND_QUEUE.on()
+                                && let Some(diagnostic) = diagnostic
+                            {
                                 eprintln!(
                                     "send_many complete direction=udp sequence={} packets={packet_count}",
                                     diagnostic.sequence
@@ -273,7 +269,7 @@ impl UdpSend for BufferedUdpSend {
             .acquire_owned()
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
-        if crate::diag::SEND_QUEUE.on() {
+        if crate::diag::UDP_SEND_TIMING.on() {
             let queue_permit = self
                 .send_tx
                 .reserve()
@@ -326,10 +322,12 @@ impl UdpSend for BufferedUdpSend {
         }
         while !packets.is_empty() {
             let count = packets.len().min(self.packet_capacity);
-            let sequence_diagnostic = crate::diag::SEND_QUEUE.on();
-            let sequence = sequence_diagnostic
+            let queue_trace = crate::diag::SEND_QUEUE.on();
+            let send_timing = crate::diag::UDP_SEND_TIMING.on();
+            let sequence = (queue_trace || send_timing)
                 .then(|| NEXT_DIAGNOSTIC_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed));
-            if let Some(sequence) = sequence {
+            let timing_sequence = send_timing.then_some(sequence).flatten();
+            if queue_trace && let Some(sequence) = sequence {
                 eprintln!(
                     "send_many enqueue_wait direction=udp sequence={sequence} packets={count} available={}",
                     self.packet_slots.available_permits()
@@ -345,7 +343,7 @@ impl UdpSend for BufferedUdpSend {
                 .acquire_many_owned(permit_count)
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
-            if let Some(sequence) = sequence {
+            if queue_trace && let Some(sequence) = sequence {
                 eprintln!(
                     "send_many permit_acquired direction=udp sequence={sequence} packets={count}"
                 );
@@ -355,12 +353,12 @@ impl UdpSend for BufferedUdpSend {
             } else {
                 packets.drain(..count).collect()
             };
-            let batch_bytes = if sequence.is_some() {
+            let batch_bytes = if timing_sequence.is_some() {
                 batch.iter().map(|(packet, _)| packet.len()).sum()
             } else {
                 0
             };
-            let enqueue_result = if let Some(sequence) = sequence {
+            let enqueue_result = if let Some(sequence) = timing_sequence {
                 match self.send_tx.reserve().await {
                     Ok(queue_permit) => {
                         let diagnostic = crate::diag::UdpSendBatchDiagnostic::new(
@@ -395,7 +393,7 @@ impl UdpSend for BufferedUdpSend {
                 }
             };
             if let Err(mut unsent) = enqueue_result {
-                if let Some(sequence) = sequence {
+                if queue_trace && let Some(sequence) = sequence {
                     eprintln!(
                         "send_many enqueue_failed direction=udp sequence={sequence} packets={count}"
                     );
@@ -407,7 +405,7 @@ impl UdpSend for BufferedUdpSend {
                     "UDP send task stopped",
                 ));
             }
-            if let Some(sequence) = sequence {
+            if queue_trace && let Some(sequence) = sequence {
                 eprintln!("send_many enqueued direction=udp sequence={sequence} packets={count}");
             }
         }

@@ -416,9 +416,9 @@ fn socket_nwrite_bytes(fd: c_int) -> Option<libc::c_int> {
 
 /// Send one bounded run through `sendmsg_x` and return the number accepted by the kernel.
 ///
-/// With `GOTATUN_DIAG_SEND_QUEUE` set, this records queue age, syscall duration, the partial-send
-/// result, transient kernel errors and `SO_NWRITE` around the syscall. Normal sends make none of
-/// the timestamp or socket-option calls.
+/// With `GOTATUN_DIAG_UDP_SEND_TIMING` set, this records queue age, syscall duration, the
+/// partial-send result, transient kernel errors and `SO_NWRITE` around the syscall. Normal sends
+/// make none of the timestamp or socket-option calls.
 fn send_batch(
     fns: BatchFns,
     fd: c_int,
@@ -449,7 +449,7 @@ fn send_batch(
     }
 
     let count_arg = c_uint::try_from(count).expect("the bounded send count fits in u_int");
-    let diagnostics_enabled = crate::diag::SEND_QUEUE.on();
+    let diagnostics_enabled = crate::diag::UDP_SEND_TIMING.on();
     let send_diagnostic = diagnostics_enabled
         .then(crate::diag::current_udp_send_batch)
         .flatten();
@@ -668,9 +668,11 @@ mod tests {
         command
             .arg("udp_send_diagnostic_child")
             .arg("--nocapture")
-            .env_remove("GOTATUN_DIAG_SEND_QUEUE");
+            .env_remove("GOTATUN_DIAG_PIPELINE")
+            .env_remove("GOTATUN_DIAG_SEND_QUEUE")
+            .env_remove("GOTATUN_DIAG_UDP_SEND_TIMING");
         if enabled {
-            command.env("GOTATUN_DIAG_SEND_QUEUE", "1");
+            command.env("GOTATUN_DIAG_UDP_SEND_TIMING", "1");
         }
         let output = command.output().expect("diagnostic child test starts");
         assert!(
@@ -694,7 +696,7 @@ mod tests {
         assert!(!output.contains("udp_sendmsg_x "), "{output}");
     }
 
-    /// Report queue delay, syscall results, transient errors and socket occupancy for each call.
+    /// Report UDP timing without enabling the broader packet-pipeline traces.
     #[test]
     fn udp_send_diagnostics_include_queue_and_syscall_measurements() {
         let output = send_diagnostic_child(true);
@@ -703,7 +705,11 @@ mod tests {
             .filter(|line| line.contains("udp_sendmsg_x "))
             .collect();
 
-        assert!(calls.len() >= 2, "{output}");
+        assert!(
+            calls.len() >= 2,
+            "UDP timing switch produced no syscall records: {output}"
+        );
+        assert!(!output.contains("pipeline stage="), "{output}");
         assert!(
             calls.iter().any(|line| {
                 line.contains("queue_to_start_ns=")

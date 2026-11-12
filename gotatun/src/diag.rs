@@ -126,6 +126,9 @@ pub(crate) static PIPELINE: Switch = Switch::new("GOTATUN_DIAG_PIPELINE");
 /// Print UDP and TUN send-queue reservations and releases.
 pub(crate) static SEND_QUEUE: Switch = Switch::new("GOTATUN_DIAG_SEND_QUEUE");
 
+/// Record buffered UDP queue and macOS send syscall timings without enabling pipeline traces.
+pub(crate) static UDP_SEND_TIMING: Switch = Switch::new("GOTATUN_DIAG_UDP_SEND_TIMING");
+
 /// Never hand peer crypto runs to the worker pool.
 pub(crate) static FORCE_INLINE: Switch = Switch::new("GOTATUN_DIAG_FORCE_INLINE");
 
