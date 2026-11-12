@@ -276,7 +276,7 @@ impl UdpSend for BufferedUdpSend {
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
             let diagnostic = crate::diag::UdpSendBatchDiagnostic::new(
-                NEXT_DIAGNOSTIC_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+                0,
                 self.packet_capacity
                     .saturating_sub(self.packet_slots.available_permits()),
                 1,
@@ -324,9 +324,8 @@ impl UdpSend for BufferedUdpSend {
             let count = packets.len().min(self.packet_capacity);
             let queue_trace = crate::diag::SEND_QUEUE.on();
             let send_timing = crate::diag::UDP_SEND_TIMING.on();
-            let sequence = (queue_trace || send_timing)
-                .then(|| NEXT_DIAGNOSTIC_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed));
-            let timing_sequence = send_timing.then_some(sequence).flatten();
+            let sequence =
+                queue_trace.then(|| NEXT_DIAGNOSTIC_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed));
             if queue_trace && let Some(sequence) = sequence {
                 eprintln!(
                     "send_many enqueue_wait direction=udp sequence={sequence} packets={count} available={}",
@@ -353,16 +352,16 @@ impl UdpSend for BufferedUdpSend {
             } else {
                 packets.drain(..count).collect()
             };
-            let batch_bytes = if timing_sequence.is_some() {
+            let batch_bytes = if send_timing {
                 batch.iter().map(|(packet, _)| packet.len()).sum()
             } else {
                 0
             };
-            let enqueue_result = if let Some(sequence) = timing_sequence {
+            let enqueue_result = if send_timing {
                 match self.send_tx.reserve().await {
                     Ok(queue_permit) => {
                         let diagnostic = crate::diag::UdpSendBatchDiagnostic::new(
-                            sequence,
+                            sequence.unwrap_or_default(),
                             self.packet_capacity
                                 .saturating_sub(self.packet_slots.available_permits()),
                             count,

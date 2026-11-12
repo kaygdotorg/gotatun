@@ -25,7 +25,7 @@ use std::{
     os::fd::AsRawFd,
     sync::{
         OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -106,6 +106,8 @@ pub(crate) struct BatchState {
     fns: Option<BatchFns>,
     /// Set after a runtime error shows that this socket cannot use the private send call.
     disabled: AtomicBool,
+    /// Bounded timing summaries, allocated only when send diagnostics were enabled at startup.
+    diagnostics: Option<SendTimingDiagnostics>,
 }
 
 impl BatchState {
@@ -145,6 +147,9 @@ impl BatchState {
         Self {
             fns,
             disabled: AtomicBool::new(false),
+            diagnostics: crate::diag::UDP_SEND_TIMING
+                .on()
+                .then(SendTimingDiagnostics::default),
         }
     }
 
@@ -163,6 +168,357 @@ impl BatchState {
             );
         }
     }
+
+    /// Return the enabled collector to the send path without checking the environment again.
+    fn diagnostics(&self) -> Option<&SendTimingDiagnostics> {
+        self.diagnostics.as_ref()
+    }
+}
+
+impl Drop for BatchState {
+    /// Emit one compact summary after the socket's measured work has ended.
+    fn drop(&mut self) {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.write_summary();
+        }
+    }
+}
+
+/// Number of logarithmic buckets used for each per-batch latency histogram.
+const SEND_TIMING_BUCKETS: usize = 64 * 8;
+
+/// A fixed-size histogram for one monotonic per-batch duration.
+struct TimingHistogram {
+    /// Counts by logarithmic time bucket; updates never allocate or wait on a mutex.
+    buckets: [AtomicU64; SEND_TIMING_BUCKETS],
+    /// Number of durations recorded in this histogram.
+    count: AtomicU64,
+    /// Smallest exact duration recorded, in nanoseconds.
+    min_ns: AtomicU64,
+    /// Largest exact duration recorded, in nanoseconds.
+    max_ns: AtomicU64,
+}
+
+impl Default for TimingHistogram {
+    /// Create an empty histogram whose storage is bounded for the socket's lifetime.
+    fn default() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            count: AtomicU64::new(0),
+            min_ns: AtomicU64::new(u64::MAX),
+            max_ns: AtomicU64::new(0),
+        }
+    }
+}
+
+impl TimingHistogram {
+    /// Add one duration to its bucket and retain the exact minimum and maximum.
+    fn record(&self, ns: u64) {
+        self.buckets[timing_bucket(ns)].fetch_add(1, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.min_ns.fetch_min(ns, Ordering::Relaxed);
+        self.max_ns.fetch_max(ns, Ordering::Relaxed);
+    }
+
+    /// Estimate a percentile using the upper edge of its bounded histogram bucket.
+    fn percentile_ns(&self, percentile: u64) -> Option<u64> {
+        let count = self.count.load(Ordering::Relaxed);
+        if count == 0 {
+            return None;
+        }
+        let target = u64::try_from((u128::from(count) * u128::from(percentile) + 99) / 100)
+            .unwrap_or(u64::MAX);
+        let mut cumulative = 0_u64;
+        for (index, bucket) in self.buckets.iter().enumerate() {
+            cumulative = cumulative.saturating_add(bucket.load(Ordering::Relaxed));
+            if cumulative >= target {
+                return Some(timing_bucket_upper_ns(index));
+            }
+        }
+        Some(u64::MAX)
+    }
+
+    /// Return the exact minimum when this histogram contains at least one duration.
+    fn min_ns(&self) -> Option<u64> {
+        (self.count.load(Ordering::Relaxed) > 0).then(|| self.min_ns.load(Ordering::Relaxed))
+    }
+
+    /// Return the exact maximum when this histogram contains at least one duration.
+    fn max_ns(&self) -> Option<u64> {
+        (self.count.load(Ordering::Relaxed) > 0).then(|| self.max_ns.load(Ordering::Relaxed))
+    }
+}
+
+/// Diagnostic counters shared by all buffered sends on one UDP socket.
+///
+/// Each batch updates only fixed-size relaxed atomics. The output is deferred until the owning
+/// socket is dropped, so measurement does not format or write one log line per send call.
+struct SendTimingDiagnostics {
+    /// Number of batched send calls observed.
+    batches: AtomicU64,
+    /// Total datagrams offered to the private send call.
+    offered: AtomicU64,
+    /// Total datagrams accepted by the private send call.
+    accepted: AtomicU64,
+    /// Number of calls that returned EAGAIN.
+    eagain: AtomicU64,
+    /// Number of calls that returned ENOBUFS.
+    enobufs: AtomicU64,
+    /// Queue-entry-to-syscall-start duration distribution.
+    queue_to_start: TimingHistogram,
+    /// Private syscall wall-time distribution.
+    syscall_wall: TimingHistogram,
+    /// Send-buffer occupancy sampled before the private send call.
+    so_nwrite_before: SocketOccupancyStats,
+    /// Send-buffer occupancy sampled after the private send call.
+    so_nwrite_after: SocketOccupancyStats,
+    /// Queue depth and payload size attached to each buffered send run.
+    queue_state: QueueStateStats,
+}
+
+impl Default for SendTimingDiagnostics {
+    /// Allocate a bounded collector for one socket after the diagnostic switch is enabled.
+    fn default() -> Self {
+        Self {
+            batches: AtomicU64::new(0),
+            offered: AtomicU64::new(0),
+            accepted: AtomicU64::new(0),
+            eagain: AtomicU64::new(0),
+            enobufs: AtomicU64::new(0),
+            queue_to_start: TimingHistogram::default(),
+            syscall_wall: TimingHistogram::default(),
+            so_nwrite_before: SocketOccupancyStats::default(),
+            so_nwrite_after: SocketOccupancyStats::default(),
+            queue_state: QueueStateStats::default(),
+        }
+    }
+}
+
+/// One completed private send call passed to the bounded timing collector.
+struct SendBatchObservation {
+    /// Number of datagrams offered to this syscall.
+    offered: usize,
+    /// Number of datagrams accepted by this syscall.
+    accepted: usize,
+    /// Queue-entry-to-syscall-start duration, when the buffered queue supplied a timestamp.
+    queue_to_start_ns: Option<u128>,
+    /// Wall time spent inside the private syscall.
+    syscall_wall_ns: Option<u128>,
+    /// Whether this call returned EAGAIN.
+    eagain: bool,
+    /// Whether this call returned ENOBUFS.
+    enobufs: bool,
+    /// Readable send-buffer occupancy before the syscall, if available.
+    so_nwrite_before: Option<libc::c_int>,
+    /// Readable send-buffer occupancy after the syscall, if available.
+    so_nwrite_after: Option<libc::c_int>,
+    /// Reserved packet count when the buffered queue supplied it.
+    outstanding_packets: Option<usize>,
+    /// Datagrams in the queued run, when the buffered queue supplied it.
+    batch_packets: Option<usize>,
+    /// Payload bytes in the queued run, when the buffered queue supplied it.
+    batch_bytes: Option<usize>,
+}
+
+impl SendTimingDiagnostics {
+    /// Record one batch without formatting, allocating, or waiting for another sender.
+    fn record(&self, observation: SendBatchObservation) {
+        self.batches.fetch_add(1, Ordering::Relaxed);
+        self.offered.fetch_add(
+            u64::try_from(observation.offered).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.accepted.fetch_add(
+            u64::try_from(observation.accepted).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        if let Some(ns) = observation.queue_to_start_ns {
+            self.queue_to_start
+                .record(u64::try_from(ns).unwrap_or(u64::MAX));
+        }
+        if let Some(ns) = observation.syscall_wall_ns {
+            self.syscall_wall
+                .record(u64::try_from(ns).unwrap_or(u64::MAX));
+        }
+        if observation.eagain {
+            self.eagain.fetch_add(1, Ordering::Relaxed);
+        }
+        if observation.enobufs {
+            self.enobufs.fetch_add(1, Ordering::Relaxed);
+        }
+        self.so_nwrite_before.record(observation.so_nwrite_before);
+        self.so_nwrite_after.record(observation.so_nwrite_after);
+        self.queue_state.record(
+            observation.outstanding_packets,
+            observation.batch_packets,
+            observation.batch_bytes,
+        );
+    }
+
+    /// Print one bounded summary after measured work, including approximate percentiles.
+    fn write_summary(&self) {
+        let batches = self.batches.load(Ordering::Relaxed);
+        if batches == 0 {
+            return;
+        }
+        eprintln!(
+            "udp_sendmsg_x_summary batches={batches} offered={} accepted={} eagain={} enobufs={} queue_samples={} queue_p50_ns={:?} queue_p95_ns={:?} queue_p99_ns={:?} queue_min_ns={:?} queue_max_ns={:?} syscall_samples={} syscall_p50_ns={:?} syscall_p95_ns={:?} syscall_p99_ns={:?} syscall_min_ns={:?} syscall_max_ns={:?} so_nwrite_before_samples={} so_nwrite_before_unavailable={} so_nwrite_before_min={:?} so_nwrite_before_max={:?} so_nwrite_after_samples={} so_nwrite_after_unavailable={} so_nwrite_after_min={:?} so_nwrite_after_max={:?} queue_state_samples={} outstanding_packets_max={} batch_packets_max={} batch_bytes_max={}",
+            self.offered.load(Ordering::Relaxed),
+            self.accepted.load(Ordering::Relaxed),
+            self.eagain.load(Ordering::Relaxed),
+            self.enobufs.load(Ordering::Relaxed),
+            self.queue_to_start.count.load(Ordering::Relaxed),
+            self.queue_to_start.percentile_ns(50),
+            self.queue_to_start.percentile_ns(95),
+            self.queue_to_start.percentile_ns(99),
+            self.queue_to_start.min_ns(),
+            self.queue_to_start.max_ns(),
+            self.syscall_wall.count.load(Ordering::Relaxed),
+            self.syscall_wall.percentile_ns(50),
+            self.syscall_wall.percentile_ns(95),
+            self.syscall_wall.percentile_ns(99),
+            self.syscall_wall.min_ns(),
+            self.syscall_wall.max_ns(),
+            self.so_nwrite_before.readable.load(Ordering::Relaxed),
+            self.so_nwrite_before.unavailable.load(Ordering::Relaxed),
+            self.so_nwrite_before.min_value(),
+            self.so_nwrite_before.max_value(),
+            self.so_nwrite_after.readable.load(Ordering::Relaxed),
+            self.so_nwrite_after.unavailable.load(Ordering::Relaxed),
+            self.so_nwrite_after.min_value(),
+            self.so_nwrite_after.max_value(),
+            self.queue_state.samples.load(Ordering::Relaxed),
+            self.queue_state
+                .outstanding_packets_max
+                .load(Ordering::Relaxed),
+            self.queue_state.batch_packets_max.load(Ordering::Relaxed),
+            self.queue_state.batch_bytes_max.load(Ordering::Relaxed),
+        );
+    }
+}
+
+/// Bounded high-water marks for queue depth and payload size.
+struct QueueStateStats {
+    /// Number of send calls with queue metadata.
+    samples: AtomicU64,
+    /// Largest reserved packet count observed before a syscall.
+    outstanding_packets_max: AtomicU64,
+    /// Largest queued run size observed before a syscall.
+    batch_packets_max: AtomicU64,
+    /// Largest queued payload size observed before a syscall.
+    batch_bytes_max: AtomicU64,
+}
+
+impl Default for QueueStateStats {
+    /// Start with no queue samples.
+    fn default() -> Self {
+        Self {
+            samples: AtomicU64::new(0),
+            outstanding_packets_max: AtomicU64::new(0),
+            batch_packets_max: AtomicU64::new(0),
+            batch_bytes_max: AtomicU64::new(0),
+        }
+    }
+}
+
+impl QueueStateStats {
+    /// Record one run's bounded queue and payload high-water values.
+    fn record(
+        &self,
+        outstanding_packets: Option<usize>,
+        batch_packets: Option<usize>,
+        batch_bytes: Option<usize>,
+    ) {
+        let (Some(outstanding_packets), Some(batch_packets), Some(batch_bytes)) =
+            (outstanding_packets, batch_packets, batch_bytes)
+        else {
+            return;
+        };
+        self.samples.fetch_add(1, Ordering::Relaxed);
+        self.outstanding_packets_max.fetch_max(
+            u64::try_from(outstanding_packets).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.batch_packets_max.fetch_max(
+            u64::try_from(batch_packets).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.batch_bytes_max.fetch_max(
+            u64::try_from(batch_bytes).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// Summary counters for one optional `SO_NWRITE` occupancy measurement.
+struct SocketOccupancyStats {
+    /// Number of successful reads.
+    readable: AtomicU64,
+    /// Number of failed or invalid reads.
+    unavailable: AtomicU64,
+    /// Smallest readable occupancy in bytes.
+    min_bytes: AtomicU64,
+    /// Largest readable occupancy in bytes.
+    max_bytes: AtomicU64,
+}
+
+impl Default for SocketOccupancyStats {
+    /// Start with no readable occupancy samples.
+    fn default() -> Self {
+        Self {
+            readable: AtomicU64::new(0),
+            unavailable: AtomicU64::new(0),
+            min_bytes: AtomicU64::new(u64::MAX),
+            max_bytes: AtomicU64::new(0),
+        }
+    }
+}
+
+impl SocketOccupancyStats {
+    /// Record a readable occupancy or count the missing sample.
+    fn record(&self, bytes: Option<libc::c_int>) {
+        let Some(bytes) = bytes.and_then(|value| u64::try_from(value).ok()) else {
+            self.unavailable.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        self.readable.fetch_add(1, Ordering::Relaxed);
+        self.min_bytes.fetch_min(bytes, Ordering::Relaxed);
+        self.max_bytes.fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    /// Return the smallest readable occupancy, if any sample succeeded.
+    fn min_value(&self) -> Option<u64> {
+        (self.readable.load(Ordering::Relaxed) > 0).then(|| self.min_bytes.load(Ordering::Relaxed))
+    }
+
+    /// Return the largest readable occupancy, if any sample succeeded.
+    fn max_value(&self) -> Option<u64> {
+        (self.readable.load(Ordering::Relaxed) > 0).then(|| self.max_bytes.load(Ordering::Relaxed))
+    }
+}
+
+/// Map one nanosecond duration into a fixed logarithmic histogram bucket.
+fn timing_bucket(ns: u64) -> usize {
+    if ns < 8 {
+        return usize::try_from(ns).unwrap_or(7);
+    }
+    let exponent = 63 - ns.leading_zeros() as usize;
+    let base = 1_u64 << exponent;
+    let subdivision = (((u128::from(ns - base) * 8) / u128::from(base)).min(7)) as usize;
+    8 + (exponent - 3) * 8 + subdivision
+}
+
+/// Return the exclusive upper edge of a logarithmic timing bucket.
+fn timing_bucket_upper_ns(index: usize) -> u64 {
+    if index < 8 {
+        return index as u64;
+    }
+    let relative = index - 8;
+    let exponent = 3 + relative / 8;
+    let subdivision = relative % 8;
+    let base = 1_u64 << exponent;
+    let width = base / 8;
+    base.saturating_add(width.saturating_mul((subdivision + 1) as u64))
 }
 
 /// Decide whether the runtime switch allows batching for one process.
@@ -335,6 +691,7 @@ impl UdpSend for super::UdpSocket {
                 break;
             };
             let end = packets.len().min(start + SEND_BATCH);
+            let diagnostics = self.inner.batch.diagnostics();
             let result = self
                 .socket()
                 .async_io(Interest::WRITABLE, || {
@@ -343,6 +700,7 @@ impl UdpSend for super::UdpSocket {
                         self.socket().as_raw_fd(),
                         &packets[start..end],
                         &send_buf.targets[start..end],
+                        diagnostics,
                     )
                 })
                 .await;
@@ -417,13 +775,15 @@ fn socket_nwrite_bytes(fd: c_int) -> Option<libc::c_int> {
 /// Send one bounded run through `sendmsg_x` and return the number accepted by the kernel.
 ///
 /// With `GOTATUN_DIAG_UDP_SEND_TIMING` set, this records queue age, syscall duration, the
-/// partial-send result, transient kernel errors and `SO_NWRITE` around the syscall. Normal sends
-/// make none of the timestamp or socket-option calls.
+/// partial-send result, transient kernel errors and `SO_NWRITE` around the syscall. It updates a
+/// bounded histogram and emits one summary when the owning socket is dropped. Normal sends make
+/// none of the timestamp or socket-option calls.
 fn send_batch(
     fns: BatchFns,
     fd: c_int,
     packets: &[(Packet, SocketAddr)],
     targets: &[SockAddr],
+    diagnostics: Option<&SendTimingDiagnostics>,
 ) -> io::Result<usize> {
     debug_assert_eq!(packets.len(), targets.len());
     debug_assert!(packets.len() <= SEND_BATCH);
@@ -449,7 +809,7 @@ fn send_batch(
     }
 
     let count_arg = c_uint::try_from(count).expect("the bounded send count fits in u_int");
-    let diagnostics_enabled = crate::diag::UDP_SEND_TIMING.on();
+    let diagnostics_enabled = diagnostics.is_some();
     let send_diagnostic = diagnostics_enabled
         .then(crate::diag::current_udp_send_batch)
         .flatten();
@@ -459,45 +819,40 @@ fn send_batch(
     let syscall_started = diagnostics_enabled.then(crate::diag::udp_send_monotonic_now);
     // SAFETY: initialized headers point to live SockAddr and Packet storage for this call.
     let result = unsafe { (fns.send)(fd, headers.as_ptr(), count_arg, libc::MSG_DONTWAIT) };
-    let syscall_finished_at = diagnostics_enabled.then(std::time::Instant::now);
+    let syscall_finished = diagnostics_enabled.then(crate::diag::udp_send_monotonic_now);
     let error = (result < 0).then(io::Error::last_os_error);
-    let syscall_finished_mono_ns = syscall_finished_at.map(crate::diag::udp_send_monotonic_ns);
     let so_nwrite_after = diagnostics_enabled
         .then(|| socket_nwrite_bytes(fd))
         .flatten();
-    if diagnostics_enabled {
-        let accepted = usize::try_from(result).unwrap_or(0);
-        let queue_to_start_ns =
-            send_diagnostic
-                .zip(syscall_started)
-                .map(|(diagnostic, (started_at, _))| {
-                    started_at
-                        .saturating_duration_since(diagnostic.enqueued_at)
-                        .as_nanos()
-                });
-        let syscall_wall_ns =
-            syscall_started
-                .zip(syscall_finished_at)
-                .map(|((started_at, _), finished_at)| {
-                    finished_at.saturating_duration_since(started_at).as_nanos()
-                });
-        let eagain = error
-            .as_ref()
-            .is_some_and(|error| error.raw_os_error() == Some(libc::EAGAIN));
-        let enobufs = error
-            .as_ref()
-            .is_some_and(|error| error.raw_os_error() == Some(libc::ENOBUFS));
-        eprintln!(
-            "udp_sendmsg_x batch_id={:?} enqueue_mono_ns={:?} syscall_start_mono_ns={:?} syscall_end_mono_ns={syscall_finished_mono_ns:?} queue_to_start_ns={queue_to_start_ns:?} syscall_wall_ns={syscall_wall_ns:?} offered={count} accepted={accepted} eagain={} enobufs={} outstanding_packets={:?} batch_packets={:?} batch_bytes={:?} so_nwrite_before={so_nwrite_before:?} so_nwrite_after={so_nwrite_after:?}",
-            send_diagnostic.map(|diagnostic| diagnostic.sequence),
-            send_diagnostic.map(|diagnostic| diagnostic.enqueued_mono_ns),
-            syscall_started.map(|(_, monotonic_ns)| monotonic_ns),
-            u8::from(eagain),
-            u8::from(enobufs),
-            send_diagnostic.map(|diagnostic| diagnostic.outstanding_packets),
-            send_diagnostic.map(|diagnostic| diagnostic.batch_packets),
-            send_diagnostic.map(|diagnostic| diagnostic.batch_bytes),
-        );
+    let accepted = usize::try_from(result).unwrap_or(0);
+    let queue_to_start_ns = send_diagnostic
+        .zip(syscall_started)
+        .map(|(diagnostic, started_ns)| {
+            u128::from(started_ns.saturating_sub(diagnostic.enqueued_mono_ns))
+        });
+    let syscall_wall_ns = syscall_started
+        .zip(syscall_finished)
+        .map(|(started_ns, finished_ns)| u128::from(finished_ns.saturating_sub(started_ns)));
+    let eagain = error
+        .as_ref()
+        .is_some_and(|error| error.raw_os_error() == Some(libc::EAGAIN));
+    let enobufs = error
+        .as_ref()
+        .is_some_and(|error| error.raw_os_error() == Some(libc::ENOBUFS));
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.record(SendBatchObservation {
+            offered: count,
+            accepted,
+            queue_to_start_ns,
+            syscall_wall_ns,
+            eagain,
+            enobufs,
+            so_nwrite_before,
+            so_nwrite_after,
+            outstanding_packets: send_diagnostic.map(|diagnostic| diagnostic.outstanding_packets),
+            batch_packets: send_diagnostic.map(|diagnostic| diagnostic.batch_packets),
+            batch_bytes: send_diagnostic.map(|diagnostic| diagnostic.batch_bytes),
+        });
     }
     if let Some(error) = error {
         return Err(error);
@@ -700,40 +1055,30 @@ mod tests {
     #[test]
     fn udp_send_diagnostics_include_queue_and_syscall_measurements() {
         let output = send_diagnostic_child(true);
-        let calls: Vec<_> = output
+        let summaries: Vec<_> = output
             .lines()
-            .filter(|line| line.contains("udp_sendmsg_x "))
+            .filter(|line| line.contains("udp_sendmsg_x_summary "))
             .collect();
 
         assert!(
-            calls.len() >= 2,
-            "UDP timing switch produced no syscall records: {output}"
+            summaries.len() == 1,
+            "UDP timing switch should emit one bounded summary: {output}"
         );
         assert!(!output.contains("pipeline stage="), "{output}");
+        assert!(!output.contains("udp_sendmsg_x batch_id="), "{output}");
+        let summary = summaries[0];
         assert!(
-            calls.iter().any(|line| {
-                line.contains("queue_to_start_ns=")
-                    && !line.contains("queue_to_start_ns=none")
-                    && line.contains("syscall_wall_ns=")
-                    && line.contains("offered=3")
-                    && line.contains("accepted=3")
-                    && line.contains("eagain=0")
-                    && line.contains("enobufs=0")
-                    && line.contains("so_nwrite_before=")
-                    && line.contains("so_nwrite_after=")
-            }),
-            "{output}"
-        );
-        assert!(
-            calls
-                .iter()
-                .any(|line| { line.contains("eagain=1") && line.contains("enobufs=0") }),
-            "{output}"
-        );
-        assert!(
-            calls
-                .iter()
-                .any(|line| { line.contains("eagain=0") && line.contains("enobufs=1") }),
+            summary.contains("queue_samples=")
+                && !summary.contains("queue_p99_ns=None")
+                && summary.contains("syscall_samples=")
+                && summary.contains("offered=5")
+                && summary.contains("accepted=3")
+                && summary.contains("eagain=1")
+                && summary.contains("enobufs=1")
+                && summary.contains("so_nwrite_before_samples=")
+                && summary.contains("so_nwrite_after_samples=")
+                && summary.contains("outstanding_packets_max=")
+                && summary.contains("batch_bytes_max="),
             "{output}"
         );
     }
@@ -787,6 +1132,7 @@ mod tests {
                 tx.socket().as_raw_fd(),
                 &packet,
                 std::slice::from_ref(&destination),
+                tx.inner.batch.diagnostics(),
             );
             assert_eq!(
                 result

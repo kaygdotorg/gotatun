@@ -27,10 +27,8 @@ tokio::task_local! {
 /// transport trait.
 #[derive(Clone, Copy)]
 pub(crate) struct UdpSendBatchDiagnostic {
-    /// Monotonic run number used to join queue and syscall log lines.
+    /// Monotonic run number shared with optional send-queue trace messages.
     pub(crate) sequence: u64,
-    /// Instant at which a queue permit accepted this run.
-    pub(crate) enqueued_at: Instant,
     /// Process-relative monotonic timestamp for the queue insertion event.
     pub(crate) enqueued_mono_ns: u64,
     /// Total packet permits reserved, including this run and work already being sent.
@@ -49,10 +47,9 @@ impl UdpSendBatchDiagnostic {
         batch_packets: usize,
         batch_bytes: usize,
     ) -> Self {
-        let (enqueued_at, enqueued_mono_ns) = udp_send_monotonic_now();
+        let enqueued_mono_ns = udp_send_monotonic_now();
         Self {
             sequence,
-            enqueued_at,
             enqueued_mono_ns,
             outstanding_packets,
             batch_packets,
@@ -61,18 +58,11 @@ impl UdpSendBatchDiagnostic {
     }
 }
 
-/// Return the current instant and its process-relative monotonic timestamp.
-pub(crate) fn udp_send_monotonic_now() -> (Instant, u64) {
+/// Return the current process-relative monotonic timestamp in nanoseconds.
+pub(crate) fn udp_send_monotonic_now() -> u64 {
     let epoch = *UDP_SEND_EPOCH.get_or_init(Instant::now);
     let now = Instant::now();
     let elapsed = now.saturating_duration_since(epoch).as_nanos();
-    (now, u64::try_from(elapsed).unwrap_or(u64::MAX))
-}
-
-/// Convert a captured instant into the process-relative send-diagnostic clock.
-pub(crate) fn udp_send_monotonic_ns(at: Instant) -> u64 {
-    let epoch = *UDP_SEND_EPOCH.get_or_init(|| at);
-    let elapsed = at.saturating_duration_since(epoch).as_nanos();
     u64::try_from(elapsed).unwrap_or(u64::MAX)
 }
 
