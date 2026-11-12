@@ -709,7 +709,7 @@ mod tests {
                 .expect("queue datagram");
         }
 
-        let mut recv_buf = ();
+        let mut recv_buf = <UdpSocket as UdpRecv>::RecvManyBuf::default();
         let mut pool = PacketBufPool::new(8);
         let mut received = Vec::new();
         timeout(
@@ -727,8 +727,73 @@ mod tests {
         }
     }
 
+    /// `recvmsg_x` becoming unsupported falls back once without disabling batched sends.
+    #[tokio::test]
+    async fn unsupported_receive_batch_falls_back_without_disabling_send_batching() {
+        let Some(real) = resolve() else {
+            return;
+        };
+        COUNTED_RECEIVE_FAILURES.store(0, Ordering::Relaxed);
+
+        let mut receiver = bind_with(
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Some(BatchFns {
+                send: real.send,
+                recv: fail_recv_enosys,
+            }),
+        );
+        let sender = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind sender");
+        let destination = receiver.local_addr().expect("receive address");
+        let source = sender.local_addr().expect("send address");
+        for index in 0..2 {
+            sender
+                .send_to(payload(index).as_ref(), destination)
+                .await
+                .expect("queue datagram");
+        }
+
+        let mut recv_buf = <UdpSocket as UdpRecv>::RecvManyBuf::default();
+        let mut pool = PacketBufPool::new(2);
+        let mut received = Vec::new();
+        for _ in 0..2 {
+            timeout(
+                Duration::from_secs(2),
+                receiver.recv_many_from(&mut recv_buf, &mut pool, &mut received),
+            )
+            .await
+            .expect("queued datagram arrives")
+            .expect("receive with ordinary fallback");
+        }
+
+        assert_eq!(received.len(), 2);
+        assert_eq!(COUNTED_RECEIVE_FAILURES.load(Ordering::Relaxed), 1);
+        assert_eq!(receiver.max_number_of_packets_to_send(), SEND_BATCH);
+        for (index, (packet, address)) in received.into_iter().enumerate() {
+            assert_eq!(packet_number(&packet), index);
+            assert_eq!(address, source);
+        }
+    }
+
     /// Return an unsupported error so the next send must use the ordinary path.
     unsafe extern "C" fn fail_enosys(_: c_int, _: *const MsghdrX, _: c_uint, _: c_int) -> isize {
+        // SAFETY: `__error` returns this thread's errno slot on macOS.
+        unsafe { *libc::__error() = libc::ENOSYS };
+        -1
+    }
+
+    /// Count receive-batch fallback attempts while returning a private-call unsupported error.
+    static COUNTED_RECEIVE_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+    /// Return `ENOSYS` so the receive path must switch to Tokio's one-datagram implementation.
+    unsafe extern "C" fn fail_recv_enosys(
+        _: c_int,
+        _: *mut MsghdrX,
+        _: c_uint,
+        _: c_int,
+    ) -> isize {
+        COUNTED_RECEIVE_FAILURES.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `__error` returns this thread's errno slot on macOS.
         unsafe { *libc::__error() = libc::ENOSYS };
         -1
