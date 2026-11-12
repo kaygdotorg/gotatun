@@ -688,6 +688,10 @@ struct CryptoQueue {
     queued_slots: Arc<Semaphore>,
     /// Number of queued runs across every shard, excluding runs already being processed.
     queued_jobs: AtomicUsize,
+    /// Whether the opt-in queue sampler was enabled when this pool was created.
+    queue_depth_diagnostics: bool,
+    /// Rate limiter shared by every worker that may report this queue's depth.
+    queue_depth_sampler: crate::diag::QueueDepthSampler,
 }
 
 /// One worker-owned queue shard, which other workers may drain when it has work.
@@ -716,6 +720,7 @@ impl CryptoQueue {
             "the crypto queue needs at least one worker"
         );
         let shard_capacity = capacity.div_ceil(worker_count);
+        let queue_depth_diagnostics = crate::diag::CRYPTO_QUEUE_DEPTH.on();
         Self {
             shards: (0..worker_count)
                 .map(|_| CryptoQueueShard {
@@ -731,6 +736,8 @@ impl CryptoQueue {
             closed: AtomicBool::new(false),
             queued_slots: Arc::new(Semaphore::new(capacity)),
             queued_jobs: AtomicUsize::new(0),
+            queue_depth_diagnostics,
+            queue_depth_sampler: crate::diag::QueueDepthSampler::new(),
         }
     }
 
@@ -764,6 +771,20 @@ impl CryptoQueue {
         }
     }
 
+    /// Emit a low-rate snapshot after the shard mutex has been released.
+    fn sample_queue_depth(&self, stage: &'static str) {
+        if !self.queue_depth_diagnostics {
+            return;
+        }
+        let elapsed_ns = crate::diag::pipeline_timestamp_ns();
+        let now_ns = u64::try_from(elapsed_ns).unwrap_or(u64::MAX - 1);
+        if !self.queue_depth_sampler.is_due(now_ns) {
+            return;
+        }
+        let queued_jobs = self.queued_jobs.load(Ordering::Relaxed);
+        eprintln!("pipeline mono_ns={now_ns} stage=crypto_queue_{stage} queued_jobs={queued_jobs}");
+    }
+
     /// Enqueue one complete run in a shard and wake workers that can drain it.
     async fn push(&self, job: CryptoJob) -> Result<(), ()> {
         let permit = Arc::clone(&self.queued_slots)
@@ -787,6 +808,7 @@ impl CryptoQueue {
                 crate::diag::pipeline_timestamp_ns()
             );
         }
+        self.sample_queue_depth("push");
         self.wake_workers();
         Ok(())
     }
@@ -808,6 +830,7 @@ impl CryptoQueue {
                             crate::diag::pipeline_timestamp_ns()
                         );
                     }
+                    self.sample_queue_depth("pop");
                     return Some(job);
                 }
             }
@@ -1428,6 +1451,67 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(assignments, vec![0, 1, 0, 1, 0, 1]);
+    }
+
+    /// Run the real queue producer test in a child process with one diagnostic environment.
+    fn queue_depth_diagnostic_child(enabled: bool) -> String {
+        let mut command = std::process::Command::new(
+            std::env::current_exe().expect("the test binary path is available"),
+        );
+        command
+            .arg("crypto_queue_depth_diagnostic_child")
+            .arg("--nocapture")
+            .env_remove("GOTATUN_DIAG_CRYPTO_QUEUE_DEPTH")
+            .env_remove("GOTATUN_DIAG_PIPELINE");
+        if enabled {
+            command.env("GOTATUN_DIAG_CRYPTO_QUEUE_DEPTH", "1");
+        }
+        let output = command
+            .output()
+            .expect("the queue diagnostic child test starts");
+        assert!(
+            output.status.success(),
+            "queue diagnostic child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    }
+
+    /// Keep queue-depth diagnostics opt-in so ordinary crypto runs do not emit samples.
+    #[test]
+    fn crypto_queue_depth_diagnostic_is_silent_by_default() {
+        let stderr = queue_depth_diagnostic_child(false);
+
+        assert!(!stderr.contains("stage=crypto_queue_"), "{stderr}");
+    }
+
+    /// Emit a parser-compatible queue-depth sample when the low-rate switch is enabled.
+    #[test]
+    fn crypto_queue_depth_diagnostic_emits_when_enabled() {
+        let stderr = queue_depth_diagnostic_child(true);
+
+        assert!(
+            stderr.lines().any(|line| {
+                line.contains("stage=crypto_queue_push") && line.contains("queued_jobs=1")
+            }),
+            "{stderr}"
+        );
+    }
+
+    /// Exercise the queue's real producer path for the diagnostic subprocess tests.
+    #[tokio::test]
+    async fn crypto_queue_depth_diagnostic_child() {
+        let queue = CryptoQueue::new(4, 1);
+        let active_batches = Arc::new(AtomicUsize::new(0));
+        let (result_sender, _result_receiver) = tokio::sync::oneshot::channel();
+        queue
+            .push(CryptoJob::Encrypt(
+                Vec::new(),
+                result_sender,
+                ActiveBatch::enter_queued(&active_batches),
+            ))
+            .await
+            .expect("the bounded queue accepts the diagnostic job");
     }
 
     /// Let a surviving worker steal queued work and drain it after queue shutdown.

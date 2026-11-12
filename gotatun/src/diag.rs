@@ -10,7 +10,10 @@
 //! GOTATUN_DIAG_PIPELINE=1 cargo test ...
 //! ```
 
-use std::sync::OnceLock;
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 /// Shared origin for timestamps in one opt-in pipeline diagnostic run.
 static PIPELINE_EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
@@ -24,6 +27,50 @@ pub(crate) struct Switch {
     name: &'static str,
     /// Cached presence of the variable, filled on the first call to [`Switch::on`].
     enabled: OnceLock<bool>,
+}
+
+/// Minimum time between opt-in crypto-queue snapshots, in nanoseconds.
+const CRYPTO_QUEUE_SAMPLE_INTERVAL_NS: u64 = 100_000_000;
+
+/// Marker used before the first sampled queue event.
+const NO_CRYPTO_QUEUE_SAMPLE: u64 = u64::MAX;
+
+/// Rate-limit sampled crypto-queue snapshots without locking the queue itself.
+/// The atomic only reserves a sample time; queue contents use their own counter.
+pub(crate) struct QueueDepthSampler {
+    /// Monotonic timestamp of the last snapshot claimed by any queue worker.
+    last_sample_ns: AtomicU64,
+}
+
+impl QueueDepthSampler {
+    /// Start with no sample claimed so the first enabled queue event is recorded.
+    pub(crate) const fn new() -> Self {
+        Self {
+            last_sample_ns: AtomicU64::new(NO_CRYPTO_QUEUE_SAMPLE),
+        }
+    }
+
+    /// Whether this event may emit a sample at `now_ns`, at most once per 100 ms.
+    pub(crate) fn is_due(&self, now_ns: u64) -> bool {
+        let mut previous = self.last_sample_ns.load(Ordering::Relaxed);
+        loop {
+            if previous != NO_CRYPTO_QUEUE_SAMPLE
+                && now_ns.saturating_sub(previous) < CRYPTO_QUEUE_SAMPLE_INTERVAL_NS
+            {
+                return false;
+            }
+            // This atomic only coordinates sample claims, so it needs no ordering with queue data.
+            match self.last_sample_ns.compare_exchange_weak(
+                previous,
+                now_ns,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => previous = actual,
+            }
+        }
+    }
 }
 
 impl Switch {
@@ -45,6 +92,9 @@ impl Switch {
 
 /// Print a line for each stage a packet run passes through.
 pub(crate) static PIPELINE: Switch = Switch::new("GOTATUN_DIAG_PIPELINE");
+
+/// Print one queue-depth snapshot at most every 100 ms when the queue changes.
+pub(crate) static CRYPTO_QUEUE_DEPTH: Switch = Switch::new("GOTATUN_DIAG_CRYPTO_QUEUE_DEPTH");
 
 /// Return monotonic nanoseconds since the first pipeline diagnostic event in this process.
 pub(crate) fn pipeline_timestamp_ns() -> u128 {
@@ -86,4 +136,23 @@ pub(crate) fn rekey_after() -> Option<std::time::Duration> {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Keep the opt-in queue sampler bounded without relying on wall-clock sleeps.
+
+    use super::QueueDepthSampler;
+
+    /// Allow the first sample and then no more than one sample in each 100 ms interval.
+    #[test]
+    fn crypto_queue_depth_sampler_limits_samples_to_100ms_intervals() {
+        let sampler = QueueDepthSampler::new();
+
+        assert!(sampler.is_due(12));
+        assert!(!sampler.is_due(100_000_011));
+        assert!(sampler.is_due(100_000_012));
+        assert!(!sampler.is_due(150_000_012));
+        assert!(sampler.is_due(200_000_012));
+    }
 }
