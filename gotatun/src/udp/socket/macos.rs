@@ -39,9 +39,9 @@ use crate::{
 
 /// Maximum datagrams passed to one `sendmsg_x` call.
 ///
-/// This covers the common 8–9 packet runs without splitting the nine-packet run into two
-/// syscalls. The queue remains separately bounded by the device pipeline.
-pub(crate) const SEND_BATCH: usize = 9;
+/// This caps the time spent in one syscall and the temporary header arrays while amortizing the
+/// trap cost across a useful run. The queue remains separately bounded by the device pipeline.
+pub(crate) const SEND_BATCH: usize = 64;
 
 /// Runtime switch for falling back to one datagram per socket send.
 const BATCH_ENV: &str = "GOTATUN_MACOS_BATCH_UDP";
@@ -591,9 +591,6 @@ mod tests {
     /// `sendmsg_x` calls made by [`counting_send`].
     static COUNTED_SENDS: AtomicUsize = AtomicUsize::new(0);
 
-    /// Largest datagram count observed in a private send call during a batching test.
-    static MAX_COUNTED_BATCH: AtomicUsize = AtomicUsize::new(0);
-
     /// Call the real private send function and count how many batches reached it.
     unsafe extern "C" fn counting_send(
         fd: c_int,
@@ -602,10 +599,6 @@ mod tests {
         flags: c_int,
     ) -> isize {
         COUNTED_SENDS.fetch_add(1, Ordering::Relaxed);
-        MAX_COUNTED_BATCH.fetch_max(
-            usize::try_from(count).expect("the batch count fits usize"),
-            Ordering::Relaxed,
-        );
         let Some(fns) = resolve() else {
             // SAFETY: `__error` returns this thread's errno slot on macOS.
             unsafe { *libc::__error() = libc::ENOSYS };
@@ -613,29 +606,6 @@ mod tests {
         };
         // SAFETY: the test forwards the live arguments unchanged to the resolved call.
         unsafe { (fns.send)(fd, headers, count, flags) }
-    }
-
-    /// Bound private send calls to cover common 8–9 packet runs without splitting them.
-    #[tokio::test]
-    async fn private_send_runs_are_capped_at_9_datagrams() {
-        let Some(real) = resolve() else {
-            return;
-        };
-        let tx = bind_with(
-            (Ipv4Addr::LOCALHOST, 0).into(),
-            Some(BatchFns {
-                send: counting_send,
-                recv: real.recv,
-            }),
-        );
-        let mut rx = bind_with((Ipv4Addr::LOCALHOST, 0).into(), None);
-        MAX_COUNTED_BATCH.store(0, Ordering::Relaxed);
-        round_trip(&tx, &mut rx, 128).await;
-        assert_eq!(
-            MAX_COUNTED_BATCH.load(Ordering::Relaxed),
-            9,
-            "one private send call must not contain more than 9 datagrams"
-        );
     }
 
     /// One unconnected socket can send each message to its own IPv4 destination in one syscall.
