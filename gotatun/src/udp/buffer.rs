@@ -699,6 +699,51 @@ mod test {
         assert_eq!(&packet[..], b"after-bad");
     }
 
+    /// One receive call hands the packet task every datagram already queued, up to a batch of
+    /// 64, in arrival order (#260, J582). With one datagram per call, the macOS packet task
+    /// paid a full loop turn per returning ACK while it also encrypted the bulk send, so the
+    /// receive queue sat full and probe replies waited 5–15 ms (p99) in Mac-send with 8 flows.
+    #[tokio::test]
+    async fn one_receive_call_drains_the_queued_datagrams_in_order() {
+        let script = Script((0..100_u8).map(|i| Ok(datagram(&[i]))).collect());
+        let mut receiver = BufferedUdpReceive::new(128, script, PacketBufPool::new(128));
+        for _ in 0..10_000 {
+            if receiver.recv_rx.len() == 100 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            receiver.recv_rx.len(),
+            100,
+            "the receive task queues all 100"
+        );
+
+        let mut pool = PacketBufPool::new(1);
+        let mut packets = Vec::new();
+        receiver
+            .recv_many_from(&mut (), &mut pool, &mut packets)
+            .await
+            .expect("queued datagrams");
+        let first: Vec<u8> = packets.drain(..).map(|(p, _)| p[0]).collect();
+        assert_eq!(
+            first,
+            (0..64).collect::<Vec<u8>>(),
+            "a full batch, in order"
+        );
+
+        receiver
+            .recv_many_from(&mut (), &mut pool, &mut packets)
+            .await
+            .expect("queued datagrams");
+        let rest: Vec<u8> = packets.drain(..).map(|(p, _)| p[0]).collect();
+        assert_eq!(
+            rest,
+            (64..100).collect::<Vec<u8>>(),
+            "the rest, without waiting"
+        );
+    }
+
     /// A gone socket is still reported, and the receive task then stops.
     #[tokio::test]
     async fn closed_socket_still_stops_the_receiver() {
