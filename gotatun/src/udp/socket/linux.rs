@@ -31,8 +31,11 @@ use crate::{
     },
 };
 
-/// Max number of packets/messages for sendmmsg/recvmmsg
-const MAX_PACKET_COUNT: usize = 100;
+/// Max number of packets/messages for sendmmsg/recvmmsg.
+///
+/// Each GRO slot reserves 256 KiB, so matching the 64-segment UDP GSO limit bounds the receive
+/// reserve to 16 MiB instead of reserving 25 MiB for 100 messages.
+const MAX_PACKET_COUNT: usize = UDP_SEGMENT_MAX_DATAGRAMS;
 
 /// Maximum UDP payload length for one IPv4 datagram, accounting for IPv4 and UDP headers.
 #[cfg(target_os = "linux")]
@@ -225,11 +228,17 @@ async fn send_gso_segment(
 #[cfg(all(test, target_os = "linux"))]
 mod gso_tests {
     use super::{
-        MAX_IPV4_PAYLOAD_LEN, MAX_IPV6_PAYLOAD_LEN, UDP_SEGMENT_MAX_DATAGRAMS, UdpGsoBatch,
-        plan_udp_gso_batches, udp_gso_control_messages, udp_gso_segment_size,
+        MAX_IPV4_PAYLOAD_LEN, MAX_IPV6_PAYLOAD_LEN, MAX_PACKET_COUNT, UDP_SEGMENT_MAX_DATAGRAMS,
+        UdpGsoBatch, plan_udp_gso_batches, udp_gso_control_messages, udp_gso_segment_size,
     };
     use nix::sys::socket::ControlMessage;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    /// Keep each Linux UDP batch within the segment limit that also bounds GRO buffer memory.
+    #[test]
+    fn message_batch_capacity_matches_udp_segment_limit() {
+        assert_eq!(MAX_PACKET_COUNT, UDP_SEGMENT_MAX_DATAGRAMS);
+    }
 
     fn target(port: u16) -> SocketAddr {
         (Ipv4Addr::LOCALHOST, port).into()
@@ -912,7 +921,7 @@ mod gro {
     impl RecvManyBuf {
         /// Discard the pages the kernel wrote into, keeping the mapping.
         ///
-        /// The buffers are reserved at 100 × 256 KiB but only touched as far as each
+        /// The buffers are reserved at 64 × 256 KiB but only touched as far as each
         /// GRO batch reaches, so after a burst several MiB stay resident for good. Dropping
         /// the pages in place (instead of freeing and reallocating the buffer) leaves the
         /// allocator alone: freeing a chunk this large would raise glibc's mmap threshold and
