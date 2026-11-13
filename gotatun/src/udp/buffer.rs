@@ -308,6 +308,12 @@ impl UdpSend for BufferedUdpSend {
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
         }
+        if crate::diag::PATH_TIMING.on() {
+            crate::diag::take_pending(
+                &crate::diag::PENDING_TUN_RX_NS,
+                &crate::diag::path::TUN_RX_TO_UDP_QUEUE_NS,
+            );
+        }
         Ok(())
     }
 
@@ -425,6 +431,12 @@ impl UdpSend for BufferedUdpSend {
             if queue_trace && let Some(sequence) = sequence {
                 eprintln!("send_many enqueued direction=udp sequence={sequence} packets={count}");
             }
+            if crate::diag::PATH_TIMING.on() {
+                crate::diag::take_pending(
+                    &crate::diag::PENDING_TUN_RX_NS,
+                    &crate::diag::path::TUN_RX_TO_UDP_QUEUE_NS,
+                );
+            }
         }
         Ok(())
     }
@@ -442,7 +454,9 @@ impl UdpSend for BufferedUdpSend {
 #[cfg(any(not(target_os = "linux"), test))]
 pub struct BufferedUdpReceive {
     _recv_task: Arc<Task>,
-    recv_rx: mpsc::Receiver<io::Result<(Packet, SocketAddr)>>,
+    /// Datagrams in arrival order, each with its receive-completion time on the
+    /// [`crate::diag::udp_send_monotonic_now`] clock (0 unless path timing is on).
+    recv_rx: mpsc::Receiver<io::Result<(Packet, SocketAddr, u64)>>,
 }
 
 #[cfg(any(not(target_os = "linux"), test))]
@@ -480,8 +494,13 @@ impl BufferedUdpReceive {
                     tokio::task::yield_now().await;
                 }
 
+                let received_ns = if crate::diag::PATH_TIMING.on() {
+                    crate::diag::udp_send_monotonic_now().max(1)
+                } else {
+                    0
+                };
                 for (packet_buf, src) in packet_bufs.drain(..) {
-                    match recv_tx.try_send(Ok((packet_buf, src))) {
+                    match recv_tx.try_send(Ok((packet_buf, src, received_ns))) {
                         Ok(()) => (),
                         Err(mpsc::error::TrySendError::Full(packet)) => {
                             if recv_tx.send(packet).await.is_err() {
@@ -513,7 +532,15 @@ impl UdpRecv for BufferedUdpReceive {
                 "UDP receive task stopped",
             ));
         };
-        packet
+        let (packet, source, received_ns) = packet?;
+        if received_ns != 0 {
+            use crate::diag::path;
+            let now = crate::diag::udp_send_monotonic_now();
+            path::UDP_RX_QUEUE_WAIT_NS.record(now.saturating_sub(received_ns));
+            path::UDP_RX_QUEUE_PKTS.record(self.recv_rx.len() as u64);
+            crate::diag::mark_pending(&crate::diag::PENDING_UDP_RX_NS, received_ns);
+        }
+        Ok((packet, source))
     }
 }
 
