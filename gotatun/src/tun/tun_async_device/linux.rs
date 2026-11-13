@@ -22,12 +22,49 @@ pub(super) fn create_tun_with_vnet_fallback(
     })
 }
 
-pub(super) fn enable_tso_with_fallback(tun: &impl AsRawFd) -> bool {
-    match super::tso::try_enable_tso(tun) {
-        Ok(()) => true,
+/// Offloads successfully enabled on the TUN descriptor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct TunOffloadState {
+    pub(super) tcp_tso: bool,
+    pub(super) udp_uso: bool,
+}
+
+/// Enable TCP TSO first, then add UDP USO when the running kernel supports it.
+///
+/// The second ioctl repeats the TCP flags because `TUNSETOFFLOAD` replaces the descriptor's full
+/// offload mask. A kernel that rejects USO therefore keeps the first, TCP-only mask.
+pub(super) fn enable_tun_offloads_with_fallback(tun: &impl AsRawFd) -> TunOffloadState {
+    enable_offloads_with_fallback(
+        || super::tso::try_enable_tso(tun),
+        || super::tso::try_enable_udp_segmentation(tun),
+    )
+}
+
+/// Convert ordered TUN offload requests into the capabilities that remain available.
+///
+/// UDP USO is attempted only after TCP TSO succeeds. A rejected USO request must preserve the
+/// earlier TCP-only mask and leave the software UDP segmentation path available.
+fn enable_offloads_with_fallback(
+    enable_tcp_tso: impl FnOnce() -> io::Result<()>,
+    enable_udp_uso: impl FnOnce() -> io::Result<()>,
+) -> TunOffloadState {
+    match enable_tcp_tso() {
+        Ok(()) => match enable_udp_uso() {
+            Ok(()) => TunOffloadState {
+                tcp_tso: true,
+                udp_uso: true,
+            },
+            Err(error) => {
+                tracing::debug!(%error, "TUN UDP segmentation unavailable; continuing with TCP TSO");
+                TunOffloadState {
+                    tcp_tso: true,
+                    udp_uso: false,
+                }
+            }
+        },
         Err(error) => {
             tracing::debug!(%error, "TUN TSO unavailable; using software packet handling");
-            false
+            TunOffloadState::default()
         }
     }
 }
@@ -210,6 +247,37 @@ mod tests {
     fn unsupported_tun_tso_ioctl_keeps_the_software_path_available() {
         let file = File::open("/dev/null").unwrap();
 
-        assert!(!super::enable_tso_with_fallback(&file));
+        assert_eq!(
+            super::enable_tun_offloads_with_fallback(&file),
+            super::TunOffloadState::default()
+        );
+    }
+
+    /// Keeps TCP TSO active when a kernel rejects the later UDP USO request.
+    #[test]
+    fn unsupported_udp_segmentation_keeps_tcp_tso_enabled() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let state = super::enable_offloads_with_fallback(
+            || {
+                calls.borrow_mut().push("tcp");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("udp");
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "UDP USO unavailable",
+                ))
+            },
+        );
+
+        assert_eq!(
+            state,
+            super::TunOffloadState {
+                tcp_tso: true,
+                udp_uso: false,
+            }
+        );
+        assert_eq!(calls.into_inner(), ["tcp", "udp"]);
     }
 }
