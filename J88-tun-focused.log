@@ -1,0 +1,393 @@
+build-slot: [06:39:26] all 4 slots busy; queue position 1, waiting...
+build-slot: [06:49:15] got slot 2/4
+warning: unused import: `marker::PhantomData`
+  --> gotatun/src/tun/buffer.rs:14:15
+   |
+14 | use std::{io, marker::PhantomData, sync::Arc, time::Duration};
+   |               ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: irrefutable `let...else` pattern
+   --> gotatun/src/tun/buffer.rs:230:13
+    |
+230 | /             let Self {
+231 | |                 mode: IpRecvMode::Direct { inner, token },
+232 | |                 rx_packet_buf,
+233 | |                 ..
+234 | |             } = self
+    | |____________________^
+    |
+    = note: this pattern will always match, so the `else` clause is useless
+    = help: consider removing the `else` clause
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: irrefutable `if let` pattern
+   --> gotatun/src/tun/buffer.rs:295:12
+    |
+295 |         if let IpRecvMode::Direct { token, .. } = &self.mode {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+
+warning: `gotatun` (lib test) generated 3 warnings (run `cargo fix --lib -p gotatun --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.48s
+     Running unittests src/lib.rs (target/debug/deps/gotatun-56a616a47908a790)
+
+running 3 tests
+test tun::buffer::tests::linux_tun_receive_cancellation_releases_reader_and_send_queue ... ok
+test tun::buffer::tests::linux_tun_receive_returns_fatal_error_without_retrying ... ok
+test tun::buffer::tests::linux_tun_receive_is_demand_driven_and_preserves_batch_order ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 138 filtered out; finished in 0.00s
+
+warning: unused import: `marker::PhantomData`
+  --> gotatun/src/tun/buffer.rs:14:15
+   |
+14 | use std::{io, marker::PhantomData, sync::Arc, time::Duration};
+   |               ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: irrefutable `let...else` pattern
+   --> gotatun/src/tun/buffer.rs:230:13
+    |
+230 | /             let Self {
+231 | |                 mode: IpRecvMode::Direct { inner, token },
+232 | |                 rx_packet_buf,
+233 | |                 ..
+234 | |             } = self
+    | |____________________^
+    |
+    = note: this pattern will always match, so the `else` clause is useless
+    = help: consider removing the `else` clause
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: irrefutable `if let` pattern
+   --> gotatun/src/tun/buffer.rs:295:12
+    |
+295 |         if let IpRecvMode::Direct { token, .. } = &self.mode {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+
+warning: `gotatun` (lib test) generated 3 warnings (run `cargo fix --lib -p gotatun --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src/lib.rs (target/debug/deps/gotatun-56a616a47908a790)
+
+running 141 tests
+test device::allowed_ips::tests::test_allowed_ips_iter_zero_leaf_bits ... ok
+test device::allowed_ips::tests::test_allowed_ips_insert_find ... ok
+test device::allowed_ips::tests::test_allowed_ips_iter ... ok
+test device::allowed_ips::tests::test_allowed_ips_remove ... ok
+test device::daita::hooks::test::test_constant_packet_size_ipv6 ... ok
+test device::daita::types::tests::test_internal_machine_timer_replace ... ok
+test device::daita::hooks::test::test_constant_packet_size_ipv4 ... ok
+test device::allowed_ips::tests::test_allowed_ips_v4_kernel_compatibility ... ok
+test device::integration_tests::tests::test_wg_concurrent ... ignored
+test device::integration_tests::tests::test_wg_concurrent_v6 ... ignored
+test device::integration_tests::tests::test_wg_start_ipv4 ... ignored
+test device::integration_tests::tests::test_wg_start_ipv6 ... ignored
+test device::integration_tests::tests::test_wg_start_ipv6_endpoint ... ignored
+test device::daita::types::tests::test_machine_timers_schedule_and_remove ... ok
+test device::integration_tests::tests::test_wireguard_get ... ignored
+test device::integration_tests::tests::test_wireguard_set ... ignored
+test device::builder::tests::detects_duplicate_peer_public_keys ... ok
+test device::allowed_ips::tests::test_allowed_ips_v6_kernel_compatibility ... ok
+test device::tests::allowed_ip_updates_preserve_v4_v6_listing_and_routes ... ok
+test device::tests::listen_port_zero_reports_bound_port ... ok
+test device::tests::add_peers_rejects_duplicate_public_keys ... ok
+test device::tests::modify_peer_timer_params_reach_tunnel ... ok
+test device::tests::test_endpoint_roaming ... ok
+test device::tests::reconfigure_while_suspended_stays_down ... ok
+test device::tests::suspend_and_resume ... ok
+test device::tests::one_keepalive ... ok
+test device::uapi::tests::rejects_duplicate_peer_public_keys ... ok
+test noise::handshake::tests::chacha20_seal_rfc7530_test_vector ... ok
+test noise::handshake::tests::symmetric_chacha20_seal_open ... ok
+test noise::index_table::tests::test_reuse_on_drop ... ok
+test noise::session::tests::test_receive_rejects_counter_at_reject_after_messages ... ok
+test noise::session::tests::test_replay_counter ... ok
+test noise::tests::configured_persistent_keepalive_remains_immediate_after_reset_and_update ... ok
+test noise::tests::create_two_tunnels_linked_to_eachother ... ok
+test device::tests::ipv6_isnt_used ... ok
+test noise::tests::custom_timer_params_applied ... ok
+test noise::tests::full_handshake_plus_timers ... ok
+test noise::tests::full_handshake ... ok
+test noise::tests::handshake_completes_with_matching_preshared_key ... ok
+test noise::tests::handshake_fails_with_different_preshared_key ... ok
+test noise::tests::handshake_init ... ok
+test noise::tests::handshake_fails_with_one_sided_preshared_key ... ok
+test device::tests::modify_peer_preshared_key_reaches_tunnel ... ok
+test noise::tests::handshake_init_and_response ... ok
+test noise::tests::handshake_jitter_applied ... ok
+test noise::tests::handshake_no_resp_rekey_timeout ... ok
+test noise::tests::keepalive_is_not_answered_with_keepalive ... ok
+test noise::tests::one_ip_packet ... ok
+test noise::tests::new_handshake_after_two_mins ... ok
+test noise::tests::persistent_keepalive_uses_configured_interval_after_initial_send ... ok
+test noise::tests::outgoing_packet_refused_after_message_limit ... ok
+test noise::tests::reject_handshake ... ok
+test noise::tests::set_preshared_key_only_affects_next_session ... ok
+test noise::tests::time_since_last_handshake_doesnt_decrease_on_backward_jump ... ok
+test device::tests::number_of_packets ... ok
+test noise::tests::timers_freeze_during_backward_jump ... ok
+test noise::tests::tunnel_does_not_embed_the_session_ring ... ok
+test noise::tests::update_timers_handles_backward_time_jump ... ok
+test packet::ipv4::tests::ipv4_checksum_rejects_truncated_options ... ok
+test packet::ipv4::tests::ipv4_decode_and_validate ... ok
+test packet::ipv4::tests::ipv4_decode_invalid_checksum ... ok
+test packet::ipv4::tests::ipv4_header_layout ... ok
+test packet::ipv4::tests::ipv4_layout ... ok
+test packet::ipv4::tests::ipv4_options_are_covered_by_header_checksum ... ok
+test packet::ipv4::tests::ipv4_total_length_must_cover_options ... ok
+test packet::ipv6::tests::ipv6_decode_and_validate ... ok
+test packet::ipv6::tests::ipv6_header_layout ... ok
+test noise::tests::verify_handshake ... ok
+test packet::pool::tests::lazy_pool_retention_is_bounded ... ok
+test packet::pool::tests::packet_grow_beyond_capacity ... ok
+test packet::pool::tests::pool_lazy_allocation_and_recycle ... ok
+test packet::pool::tests::pool_prealloc ... ok
+test packet::pool::tests::pool_buffer_recycle ... ok
+test packet::tcp::tests::tcp_checksum_v4 ... ok
+test packet::tcp::tests::tcp_checksum_v6 ... ok
+test packet::tcp::tests::tcp_header_layout ... ok
+test packet::util::tests::test_ipv4_header_checksum ... ok
+test serialization::tests::reject_invalid_base64_keys ... ok
+test tun::buffer::tests::linux_tun_receive_cancellation_releases_reader_and_send_queue ... ok
+test tun::buffer::tests::linux_tun_receive_is_demand_driven_and_preserves_batch_order ... ok
+test serialization::tests::parse_padded_and_unpadded_base64_keys ... ok
+test tun::channel::fragmentation::test::test_fragment_after_terminal_fragment_is_dropped ... ok
+test tun::buffer::tests::linux_tun_receive_returns_fatal_error_without_retrying ... ok
+test tun::channel::fragmentation::test::test_fragmentation_overlap ... ok
+test tun::channel::fragmentation::test::test_fragments_with_different_protocols_are_reassembled_separately ... ok
+test tun::channel::fragmentation::test::test_ipv4_defragmentation ... ok
+test tun::channel::fragmentation::test::test_ipv4_defragmentation_single_packet ... ok
+test tun::channel::fragmentation::test::test_fragment_eviction_max_concurrent_frags ... ok
+test tun::channel::fragmentation::test::test_terminal_fragment_before_buffered_fragment_is_dropped ... ok
+test tun::tun_async_device::linux::tests::failure_of_both_open_modes_returns_the_original_error ... ok
+test tun::channel::fragmentation::test::test_reassembled_ipv4_packet_length_limit ... ok
+test tun::tun_async_device::linux::tests::unsupported_tun_tso_ioctl_keeps_the_software_path_available ... ok
+test tun::tun_async_device::linux::tests::unsupported_vnet_header_retries_without_the_header ... ok
+test tun::tun_async_device::tso::tests::tso_gso_size_is_tcp_payload_mss_and_checksums_are_valid ... ok
+test tun::tun_async_device::tso::tests::tso_ipv4_options_are_preserved_and_checksums_rebuilt ... ok
+test noise::tests::per_ip_rate_limiting_isolation ... ok
+test tun::tun_async_device::tso::tests::tso_ipv6_rebuilds_lengths_sequences_and_checksums ... ok
+test tun::tun_async_device::tso::tests::vnet_header_completes_partial_udp_checksum_before_forwarding ... ok
+test device::tests::one_handshake ... ok
+test tun::tun_async_device::tso::tests::vnet_header_rejects_conflicting_checksum_flags ... ok
+test tun::tun_async_device::tso::tests::vnet_header_rejects_fragmented_tcp_gso ... ok
+test tun::tun_async_device::tso::tests::vnet_header_rejects_invalid_ipv4_ihl_without_panicking ... ok
+test tun::tun_async_device::tso::tests::vnet_header_rejects_invalid_mss_and_header_length ... ok
+test tun::tun_async_device::tso::tests::vnet_header_completes_partial_udp_checksum_with_ipv4_options ... ok
+test tun::tun_async_device::tso::tests::vnet_header_rejects_truncated_metadata_without_panicking ... ok
+test tun::tun_async_device::tso::tests::vnet_header_rejects_unsupported_udp_gso ... ok
+test tun::tun_async_device::tso::tests::vnet_header_without_gso_preserves_one_packet ... ok
+test udp::buffer::test::empty_loopback_datagram_mustnt_stop_buffered_udp_receive ... ok
+test udp::channel::tests::test_create_ipv4_payload_checksum ... ok
+test udp::channel::tests::test_create_ipv4_payload_checksum_zero ... ok
+test udp::channel::tests::test_create_ipv6_payload_checksum ... ok
+test udp::socket::linux::gro::tests::gro_receive_rejects_a_length_larger_than_its_iovec ... ok
+test udp::socket::linux::gro::tests::gro_receive_splits_only_the_bytes_reported_by_recvmmsg ... ok
+test tun::tun_async_device::tso::tests::tso_ipv4_options_at_max_packet_length_stays_within_mtu ... ok
+test udp::socket::linux::gso_tests::eio_disables_udp_gso ... ok
+test udp::socket::linux::gso_tests::gso_plan_allows_short_tail_then_starts_new_batch ... ok
+test udp::socket::linux::gso_tests::gso_plan_coalesces_equal_datagrams ... ok
+test udp::socket::linux::gro::tests::recv_many_from_grows_for_oversized_datagram ... ok
+test udp::socket::linux::gso_tests::gso_plan_does_not_coalesce_zero_length_datagrams ... ok
+test udp::socket::linux::gro::tests::recv_many_from_preserves_ipv6_source_addr ... ok
+test udp::socket::linux::gso_tests::gso_plan_splits_at_address_family_changes ... ok
+test udp::socket::linux::gso_tests::gso_plan_splits_at_destination_changes ... ok
+test udp::socket::linux::gso_tests::gso_plan_splits_at_ipv4_payload_limit ... ok
+test udp::socket::linux::gso_tests::gso_plan_splits_at_segment_count_limit ... ok
+test udp::socket::linux::gso_tests::gso_plan_uses_ipv6_payload_limit ... ok
+test udp::socket::linux::gso_tests::gso_segment_size_only_emits_for_coalesced_batches ... ok
+test udp::socket::linux::gso_tests::gso_segment_size_rejects_oversized_segment ... ok
+test udp::socket::linux::gso_tests::send_many_to_preserves_datagrams_when_gso_is_disabled ... ok
+test udp::socket::linux::gso_tests::send_many_to_records_ipv6_gso_plan ... ok
+test udp::socket::linux::gso_tests::send_many_to_records_reusable_gso_plan ... ok
+test udp::socket::linux::gso_tests::udp_gso_control_message_uses_udp_segment_size ... ok
+test udp::socket::tests::udp_gso_disabled_state_is_shared_by_clones ... ok
+test tun::tun_async_device::tso::tests::tso_ipv6_at_max_payload_length_stays_within_mtu ... ok
+test noise::tests::verify_cookie_reply ... ok
+test device::tests::test_indices ... ok
+test device::tests::update_peer_preshared_key_reaches_tunnel ... ok
+test device::tests::wg_data_length_is_x16 ... ok
+test device::tests::force_handshake ... ok
+test device::tests::reverse_path_rejects_source_owned_by_another_peer ... ok
+test udp::socket::tests::dual_stack_socket_recv ... ok
+test udp::socket::tests::dual_stack_socket_send ... ok
+
+test result: ok. 134 passed; 0 failed; 7 ignored; 0 measured; 0 filtered out; finished in 1.31s
+
+   Compiling proc-macro2 v1.0.103
+   Compiling quote v1.0.42
+   Compiling unicode-ident v1.0.22
+   Compiling libc v0.2.182
+   Compiling cfg-if v1.0.4
+   Compiling version_check v0.9.5
+   Compiling typenum v1.19.0
+   Compiling generic-array v0.14.7
+   Compiling syn v2.0.111
+   Compiling autocfg v1.5.0
+   Compiling syn v3.0.4
+   Compiling getrandom v0.2.16
+   Compiling rand_core v0.6.4
+   Compiling crypto-common v0.1.7
+   Compiling subtle v2.6.1
+   Compiling jobserver v0.1.34
+   Compiling pin-project-lite v0.2.16
+   Compiling smallvec v1.15.1
+   Compiling find-msvc-tools v0.1.5
+   Compiling once_cell v1.21.3
+   Compiling shlex v1.3.0
+   Compiling futures-sink v0.3.34
+   Compiling cc v1.2.50
+   Compiling futures-core v0.3.34
+   Compiling parking_lot_core v0.9.12
+   Compiling getrandom v0.3.4
+   Compiling dunce v1.0.5
+   Compiling cpufeatures v0.2.17
+   Compiling semver v1.0.27
+   Compiling cmake v0.1.58
+   Compiling fs_extra v1.3.0
+   Compiling scopeguard v1.2.0
+   Compiling zerocopy v0.8.37
+   Compiling aws-lc-sys v0.39.1
+   Compiling lock_api v0.4.14
+   Compiling rustc_version v0.4.1
+   Compiling tracing-core v0.1.36
+   Compiling memoffset v0.9.1
+   Compiling proc-macro-error-attr v1.0.4
+   Compiling log v0.4.34
+   Compiling cfg_aliases v0.2.1
+   Compiling syn v1.0.109
+   Compiling thiserror v2.0.20
+   Compiling zeroize_derive v1.4.2
+   Compiling zerocopy-derive v0.8.37
+   Compiling tokio-macros v2.6.0
+   Compiling nix v0.31.2
+   Compiling zeroize v1.8.2
+   Compiling thiserror-impl v2.0.20
+   Compiling futures-macro v0.3.34
+   Compiling parking_lot v0.12.5
+   Compiling curve25519-dalek v4.1.3
+   Compiling futures-channel v0.3.34
+   Compiling mio v1.1.1
+   Compiling signal-hook-registry v1.4.7
+   Compiling socket2 v0.6.5
+   Compiling block-buffer v0.10.4
+   Compiling inout v0.1.4
+   Compiling proc-macro-error v1.0.4
+   Compiling crossbeam-utils v0.8.21
+   Compiling memchr v2.7.6
+   Compiling futures-task v0.3.34
+   Compiling futures-io v0.3.34
+   Compiling bytes v1.11.1
+   Compiling slab v0.4.11
+   Compiling tokio v1.50.0
+   Compiling futures-util v0.3.34
+   Compiling ppv-lite86 v0.2.21
+   Compiling cipher v0.4.4
+   Compiling digest v0.10.7
+   Compiling rand_core v0.9.5
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling universal-hash v0.5.1
+   Compiling indexmap v1.9.3
+   Compiling bitflags v2.10.0
+   Compiling aws-lc-rs v1.16.2
+   Compiling thiserror v1.0.69
+   Compiling powerfmt v0.2.0
+   Compiling opaque-debug v0.3.1
+   Compiling eyre v0.6.12
+   Compiling lazy_static v1.5.0
+   Compiling sharded-slab v0.1.7
+   Compiling tokio-util v0.7.18
+   Compiling poly1305 v0.8.0
+   Compiling deranged v0.5.5
+   Compiling futures-executor v0.3.34
+   Compiling rand_chacha v0.9.0
+   Compiling chacha20 v0.9.1
+   Compiling thiserror-impl v1.0.69
+   Compiling typed-builder-macro v0.21.2
+   Compiling tracing-attributes v0.1.31
+   Compiling tracing-log v0.2.0
+   Compiling aead v0.5.2
+   Compiling thread_local v1.1.9
+   Compiling os_str_bytes v6.6.1
+   Compiling ip_network_table-deps-treebitmap v0.5.0
+   Compiling nu-ansi-term v0.50.3
+   Compiling hashbrown v0.12.3
+   Compiling indenter v0.3.4
+   Compiling heck v0.4.1
+   Compiling untrusted v0.7.1
+   Compiling time-core v0.1.6
+   Compiling num-conv v0.1.0
+   Compiling itoa v1.0.16
+   Compiling ip_network v0.4.1
+   Compiling time v0.3.44
+   Compiling ip_network_table v0.2.0
+   Compiling clap_derive v3.2.25
+   Compiling tracing-subscriber v0.3.22
+   Compiling clap_lex v0.2.4
+   Compiling tracing v0.1.44
+   Compiling typed-builder v0.21.2
+   Compiling chacha20poly1305 v0.10.1
+   Compiling crossbeam-channel v0.5.15
+   Compiling rand v0.9.2
+   Compiling tun v0.8.6
+   Compiling futures v0.3.34
+   Compiling x25519-dalek v2.0.1
+   Compiling hmac v0.12.1
+   Compiling blake2 v0.10.6
+   Compiling bitfield-struct v0.12.1
+   Compiling atty v0.2.14
+   Compiling duplicate v2.0.1
+   Compiling base64 v0.22.1
+   Compiling either v1.15.0
+   Compiling bitflags v1.3.2
+   Compiling ipnetwork v0.21.1
+   Compiling strsim v0.10.0
+   Compiling constant_time_eq v0.4.2
+   Compiling termcolor v1.4.1
+   Compiling textwrap v0.16.2
+   Compiling tracing-appender v0.2.4
+   Compiling clap v3.2.25
+   Compiling daemonize v0.5.0
+   Compiling gotatun v0.10.2 (/home/claude/worktrees/j88-latency-tun/gotatun)
+warning: unused import: `marker::PhantomData`
+  --> gotatun/src/tun/buffer.rs:14:15
+   |
+14 | use std::{io, marker::PhantomData, sync::Arc, time::Duration};
+   |               ^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: irrefutable `let...else` pattern
+   --> gotatun/src/tun/buffer.rs:230:13
+    |
+230 | /             let Self {
+231 | |                 mode: IpRecvMode::Direct { inner, token },
+232 | |                 rx_packet_buf,
+233 | |                 ..
+234 | |             } = self
+    | |____________________^
+    |
+    = note: this pattern will always match, so the `else` clause is useless
+    = help: consider removing the `else` clause
+    = note: `#[warn(irrefutable_let_patterns)]` on by default
+
+warning: irrefutable `if let` pattern
+   --> gotatun/src/tun/buffer.rs:295:12
+    |
+295 |         if let IpRecvMode::Direct { token, .. } = &self.mode {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: this pattern will always match, so the `if let` is useless
+    = help: consider replacing the `if let` with a `let`
+
+warning: `gotatun` (lib) generated 3 warnings (run `cargo fix --lib -p gotatun` to apply 1 suggestion)
+   Compiling gotatun-cli v0.10.2 (/home/claude/worktrees/j88-latency-tun/gotatun-cli)
+    Finished `release` profile [optimized] target(s) in 2m 10s
