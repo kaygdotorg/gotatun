@@ -9,22 +9,457 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use std::{future::ready, time::Duration};
+use std::{
+    future::ready,
+    io,
+    net::{Ipv4Addr, Ipv6Addr},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
-use futures::{StreamExt, future::pending};
+use futures::{FutureExt, StreamExt, future::pending};
 use mock::MockEavesdropper;
 use rand::{SeedableRng, rngs::StdRng};
 use tokio::{
     join, select,
+    sync::{Mutex, mpsc, oneshot},
     time::{sleep, timeout},
 };
 use zerocopy::IntoBytes;
 
+use super::{PendingCompletions, PendingIncoming, PendingOutgoing, await_while_completing};
+
 use crate::noise::TimerParams;
 use crate::noise::index_table::IndexTable;
-use crate::packet::{Ip, Packet};
+use crate::packet::{Ip, Packet, PacketBufPool};
+use crate::tun::{IpRecv, IpSend, MtuWatcher};
 
 pub mod mock;
+
+/// A TUN test double that drains each immediately ready run in packet order.
+#[derive(Clone)]
+struct BatchedTun {
+    app_to_tun_rx: Arc<Mutex<mpsc::UnboundedReceiver<Packet<Ip>>>>,
+    tun_to_app_tx: mpsc::UnboundedSender<Packet<Ip>>,
+    observed_input: Arc<StdMutex<Vec<Vec<u8>>>>,
+}
+
+/// Test endpoints for a pair of devices whose TUN reads return bounded runs.
+struct BatchedDevice {
+    _device: crate::device::Device<(
+        crate::udp::channel::UdpChannelFactory,
+        BatchedTun,
+        BatchedTun,
+    )>,
+    app_tx: mpsc::UnboundedSender<Packet<Ip>>,
+    app_rx: mpsc::UnboundedReceiver<Packet<Ip>>,
+    observed_input: Arc<StdMutex<Vec<Vec<u8>>>>,
+}
+
+/// Create the two packet channels and an order record for one test TUN endpoint.
+fn batched_tun() -> (
+    BatchedTun,
+    mpsc::UnboundedSender<Packet<Ip>>,
+    mpsc::UnboundedReceiver<Packet<Ip>>,
+    Arc<StdMutex<Vec<Vec<u8>>>>,
+) {
+    let (app_to_tun_tx, app_to_tun_rx) = mpsc::unbounded_channel();
+    let (tun_to_app_tx, tun_to_app_rx) = mpsc::unbounded_channel();
+    let observed_input = Arc::new(StdMutex::new(Vec::new()));
+    let tun = BatchedTun {
+        app_to_tun_rx: Arc::new(Mutex::new(app_to_tun_rx)),
+        tun_to_app_tx,
+        observed_input: Arc::clone(&observed_input),
+    };
+    (tun, app_to_tun_tx, tun_to_app_rx, observed_input)
+}
+
+impl IpSend for BatchedTun {
+    async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
+        self.tun_to_app_tx
+            .send(packet)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "test TUN receiver closed"))
+    }
+}
+
+impl IpRecv for BatchedTun {
+    async fn recv<'a>(
+        &'a mut self,
+        _pool: &mut PacketBufPool,
+    ) -> io::Result<impl Iterator<Item = Packet<Ip>> + Send + 'a> {
+        let mut app_to_tun_rx = self.app_to_tun_rx.lock().await;
+        let first = app_to_tun_rx
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "test TUN closed"))?;
+        let mut packets = vec![first];
+        while packets.len() < 64 {
+            match app_to_tun_rx.try_recv() {
+                Ok(packet) => packets.push(packet),
+                Err(_) => break,
+            }
+        }
+        self.observed_input
+            .lock()
+            .expect("the input-order record is not poisoned")
+            .extend(packets.iter().map(|packet| packet.as_bytes().to_vec()));
+        Ok(packets.into_iter())
+    }
+
+    fn mtu(&self) -> MtuWatcher {
+        MtuWatcher::new(mock::TUN_MTU)
+    }
+}
+
+/// Build two real devices over bounded in-memory TUN and UDP transports.
+async fn batched_device_pair() -> (BatchedDevice, BatchedDevice) {
+    use crate::device::{DeviceBuilder, Peer};
+    use crate::udp::channel::{UdpChannelFactory, UdpChannelV4, UdpChannelV6};
+    use ipnetwork::Ipv4Network;
+    use rand::{SeedableRng, rngs::StdRng};
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let (tun_a, app_tx_a, app_rx_a, observed_a) = batched_tun();
+    let (tun_b, app_tx_b, app_rx_b, observed_b) = batched_tun();
+    let port = 51820;
+    let endpoint_a = Ipv4Addr::new(10, 0, 0, 1);
+    let endpoint_b = Ipv4Addr::new(10, 0, 0, 2);
+
+    let (udp_a_v4, bridge_a_v4) = UdpChannelV4::new_pair(128);
+    let (udp_b_v4, bridge_b_v4) = UdpChannelV4::new_pair(128);
+    let (udp_a_v6, bridge_a_v6) = UdpChannelV6::new_pair(128);
+    let (udp_b_v6, bridge_b_v6) = UdpChannelV6::new_pair(128);
+    let (bridge_a_v4_rx, bridge_a_v4_tx) = (bridge_a_v4.rx, bridge_a_v4.tx);
+    let (bridge_b_v4_rx, bridge_b_v4_tx) = (bridge_b_v4.rx, bridge_b_v4.tx);
+    let (bridge_a_v6_rx, bridge_a_v6_tx) = (bridge_a_v6.rx, bridge_a_v6.tx);
+    let (bridge_b_v6_rx, bridge_b_v6_tx) = (bridge_b_v6.rx, bridge_b_v6.tx);
+    tokio::spawn(async move {
+        let mut rx = bridge_a_v4_rx;
+        let tx = bridge_b_v4_tx;
+        while let Some(packet) = rx.recv().await {
+            if tx.send(packet).await.is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut rx = bridge_b_v4_rx;
+        let tx = bridge_a_v4_tx;
+        while let Some(packet) = rx.recv().await {
+            if tx.send(packet).await.is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut rx = bridge_a_v6_rx;
+        let tx = bridge_b_v6_tx;
+        while let Some(packet) = rx.recv().await {
+            if tx.send(packet).await.is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut rx = bridge_b_v6_rx;
+        let tx = bridge_a_v6_tx;
+        while let Some(packet) = rx.recv().await {
+            if tx.send(packet).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let udp_a = UdpChannelFactory::new(endpoint_a, udp_a_v4, Ipv6Addr::UNSPECIFIED, udp_a_v6);
+    let udp_b = UdpChannelFactory::new(endpoint_b, udp_b_v4, Ipv6Addr::UNSPECIFIED, udp_b_v6);
+    let private_a = StaticSecret::random();
+    let private_b = StaticSecret::random();
+    let public_a = PublicKey::from(&private_a);
+    let public_b = PublicKey::from(&private_b);
+    let allowed = Ipv4Network::new(Ipv4Addr::UNSPECIFIED, 0)
+        .expect("the catch-all test route is valid")
+        .into();
+
+    let device_a = DeviceBuilder::new()
+        .with_private_key(private_a)
+        .with_ip(tun_a)
+        .with_udp(udp_a)
+        .with_listen_port(port)
+        .with_peer(
+            Peer::new(public_b)
+                .with_endpoint((endpoint_b, port).into())
+                .with_allowed_ip(allowed),
+        )
+        .with_index_table(IndexTable::from_rng(StdRng::seed_from_u64(
+            mock::ALICE_INDEX_SEED,
+        )))
+        .build()
+        .await
+        .expect("the first test device builds");
+    let device_b = DeviceBuilder::new()
+        .with_private_key(private_b)
+        .with_ip(tun_b)
+        .with_udp(udp_b)
+        .with_listen_port(port)
+        .with_peer(
+            Peer::new(public_a)
+                .with_endpoint((endpoint_a, port).into())
+                .with_allowed_ip(allowed),
+        )
+        .with_index_table(IndexTable::from_rng(StdRng::seed_from_u64(
+            mock::BOB_INDEX_SEED,
+        )))
+        .build()
+        .await
+        .expect("the second test device builds");
+
+    (
+        BatchedDevice {
+            _device: device_a,
+            app_tx: app_tx_a,
+            app_rx: app_rx_a,
+            observed_input: observed_a,
+        },
+        BatchedDevice {
+            _device: device_b,
+            app_tx: app_tx_b,
+            app_rx: app_rx_b,
+            observed_input: observed_b,
+        },
+    )
+}
+
+/// Compare complete packet bytes while keeping an ordering failure concise.
+fn assert_packet_order(label: &str, input: &[Vec<u8>], received: &[Vec<u8>]) {
+    assert_eq!(input.len(), received.len(), "{label} packet count differs");
+    let mismatch = input
+        .iter()
+        .zip(received)
+        .position(|(expected, actual)| expected != actual);
+    if let Some(slot) = mismatch {
+        let sequence = |bytes: &[u8]| {
+            let payload = &bytes[crate::packet::Ipv4Header::LEN..];
+            (
+                u64::from_be_bytes(payload[..8].try_into().expect("producer id fits")),
+                u64::from_be_bytes(payload[8..16].try_into().expect("sequence fits")),
+            )
+        };
+        panic!(
+            "{label} order changed at slot {slot}: expected {:?}, received {:?}",
+            sequence(&input[slot]),
+            sequence(&received[slot])
+        );
+    }
+}
+
+/// Verify a queued same-task completion progresses before its parent acquires the peer lock.
+///
+/// This small regression pins the scheduler behavior that can stop the duplex path: a child
+/// completion is first in Tokio's mutex queue, but it only runs when its parent polls the pending
+/// completion stream. The parent must keep polling that stream while waiting for the same mutex.
+#[tokio::test]
+async fn peer_lock_wait_polls_the_completion_queued_ahead_of_it() {
+    let peer = Arc::new(Mutex::new(()));
+    let holder = peer.lock().await;
+    let (completion_tx, completion_rx) = oneshot::channel();
+    let completion_peer = Arc::clone(&peer);
+    let mut incoming = PendingIncoming::new();
+    incoming.push(
+        async move {
+            let _peer = completion_peer.lock().await;
+            completion_tx
+                .send(())
+                .expect("the regression test still observes its completion");
+            Ok(())
+        }
+        .boxed(),
+    );
+
+    assert!(
+        incoming.next().now_or_never().is_none(),
+        "the queued completion waits behind the holder"
+    );
+
+    let mut outgoing = PendingOutgoing::new();
+    let mut pending = PendingCompletions::Incoming(&mut incoming, &mut outgoing);
+    let mut acquire = Box::pin(await_while_completing(peer.lock(), &mut pending));
+    assert!(futures::poll!(acquire.as_mut()).is_pending());
+    drop(holder);
+
+    let _peer = timeout(Duration::from_secs(1), acquire)
+        .await
+        .expect("the peer lock becomes available after its queued completion runs")
+        .expect("the completion stream has no error");
+    completion_rx
+        .await
+        .expect("the queued completion ran before the parent acquired the lock");
+}
+
+/// Keep the data path moving and ordered while a reverse producer sends ACK-sized packets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn threaded_reverse_traffic_preserves_order_and_progress() {
+    const DATA_PACKET_COUNT: usize = 4000;
+    const DATA_PAYLOAD_LEN: usize = 1200;
+    const ACK_EVERY: usize = 2;
+    const ACK_PACKET_COUNT: usize = DATA_PACKET_COUNT / ACK_EVERY;
+    const ACK_PAYLOAD_LEN: usize = 32;
+    let (alice, bob) = batched_device_pair().await;
+    let BatchedDevice {
+        _device: _alice_device,
+        app_tx: alice_tx,
+        app_rx: mut alice_rx,
+        observed_input: alice_input,
+    } = alice;
+    let BatchedDevice {
+        _device: _bob_device,
+        app_tx: bob_tx,
+        app_rx: mut bob_rx,
+        observed_input: bob_input,
+    } = bob;
+    let received_data_progress = Arc::new(AtomicUsize::new(0));
+    // Keep both TUN inputs open until in-flight completions have reached the opposite endpoint.
+    let tun_input_guards = (alice_tx.clone(), bob_tx.clone());
+
+    // Establish both peer sessions before the flood so the bounded handshake queue does not
+    // discard setup traffic and masquerade as an ordered-lane stall.
+    let alice_seed = mock::packet(b"duplex warm-up from Alice");
+    alice_tx
+        .send(alice_seed.clone())
+        .expect("the first endpoint accepts its warm-up packet");
+    let received_alice_seed = timeout(Duration::from_secs(2), bob_rx.recv())
+        .await
+        .expect("the first endpoint's warm-up packet reaches the second endpoint")
+        .expect("the second endpoint remains open during setup");
+    assert_eq!(received_alice_seed.as_bytes(), alice_seed.as_bytes());
+
+    let bob_seed = mock::packet(b"duplex warm-up from Bob");
+    bob_tx
+        .send(bob_seed.clone())
+        .expect("the second endpoint accepts its warm-up packet");
+    let received_bob_seed = timeout(Duration::from_secs(2), alice_rx.recv())
+        .await
+        .expect("the second endpoint's warm-up packet reaches the first endpoint")
+        .expect("the first endpoint remains open during setup");
+    assert_eq!(received_bob_seed.as_bytes(), bob_seed.as_bytes());
+
+    alice_input
+        .lock()
+        .expect("the first endpoint's input-order record is not poisoned")
+        .clear();
+    bob_input
+        .lock()
+        .expect("the second endpoint's input-order record is not poisoned")
+        .clear();
+
+    let alice_producer = thread::Builder::new()
+        .name("data-packet-producer".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("data producer runtime builds");
+            runtime.block_on(async move {
+                for sequence in 0..DATA_PACKET_COUNT {
+                    let mut payload = vec![0; DATA_PAYLOAD_LEN];
+                    payload[..8].copy_from_slice(&0_u64.to_be_bytes());
+                    let sequence = u64::try_from(sequence).expect("test packet ids fit in u64");
+                    payload[8..16].copy_from_slice(&sequence.to_be_bytes());
+                    alice_tx
+                        .send(mock::packet(payload))
+                        .expect("the data endpoint keeps reading TUN packets");
+                    if sequence % 16 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            });
+        })
+        .expect("data producer thread starts");
+
+    let reverse_producer = thread::Builder::new()
+        .name("reverse-ack-producer".into())
+        .spawn(move || {
+            let received_data_progress = Arc::clone(&received_data_progress);
+            let timeout_progress = Arc::clone(&received_data_progress);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("reverse producer runtime builds");
+            runtime.block_on(async move {
+                timeout(Duration::from_secs(45), async move {
+                    let mut received_data = Vec::with_capacity(DATA_PACKET_COUNT);
+                    let mut ack_sequence = 0_usize;
+                    for received_count in 1..=DATA_PACKET_COUNT {
+                        let packet = bob_rx
+                            .recv()
+                            .await
+                            .expect("the reverse endpoint returns each data packet");
+                        received_data.push(packet.as_bytes().to_vec());
+                        received_data_progress.store(received_count, Ordering::Relaxed);
+                        if received_count.is_multiple_of(ACK_EVERY) {
+                            let mut payload = vec![0; ACK_PAYLOAD_LEN];
+                            payload[..8].copy_from_slice(&1_u64.to_be_bytes());
+                            let sequence = u64::try_from(ack_sequence)
+                                .expect("test acknowledgement ids fit in u64");
+                            payload[8..16].copy_from_slice(&sequence.to_be_bytes());
+                            let acknowledged =
+                                u64::try_from(received_count).expect("test packet ids fit in u64");
+                            payload[16..24].copy_from_slice(&acknowledged.to_be_bytes());
+                            bob_tx
+                                .send(mock::packet(payload))
+                                .expect("the data endpoint keeps reading reverse packets");
+                            ack_sequence += 1;
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    received_data
+                })
+                .await
+                .map_err(|_| timeout_progress.load(Ordering::Relaxed))
+            })
+        })
+        .expect("reverse producer thread starts");
+
+    let received_acks = timeout(Duration::from_secs(50), async {
+        let mut packets = Vec::with_capacity(ACK_PACKET_COUNT);
+        for _ in 0..ACK_PACKET_COUNT {
+            let Some(packet) = alice_rx.recv().await else {
+                return Err("the data endpoint closed before all acknowledgements arrived");
+            };
+            packets.push(packet.as_bytes().to_vec());
+        }
+        Ok::<_, &'static str>(packets)
+    })
+    .await;
+
+    alice_producer
+        .join()
+        .expect("data producer thread completes");
+    let received_data = reverse_producer
+        .join()
+        .expect("reverse producer thread completes")
+        .unwrap_or_else(|received| {
+            panic!(
+                "reverse path stopped after receiving {received}/{DATA_PACKET_COUNT} data packets"
+            )
+        });
+    let received_acks = received_acks
+        .expect("the reverse acknowledgements reach the data endpoint")
+        .expect("the data endpoint stays open until the final acknowledgement");
+
+    let alice_input = alice_input
+        .lock()
+        .expect("the data input-order record is not poisoned");
+    let bob_input = bob_input
+        .lock()
+        .expect("the reverse input-order record is not poisoned");
+    assert_packet_order("data", &alice_input, &received_data);
+    assert_packet_order("reverse acknowledgements", &bob_input, &received_acks);
+    drop(tun_input_guards);
+}
 
 /// Assert that the expected number of packets is sent.
 /// We expect there to be [`packet_count`] data packets, one handshake init,

@@ -1,0 +1,1080 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// This file incorporates work covered by the following copyright and
+// permission notice:
+//
+//   Copyright (c) Mullvad VPN AB. All rights reserved.
+//
+// SPDX-License-Identifier: MPL-2.0
+
+use std::{
+    future::ready,
+    io,
+    net::{Ipv4Addr, Ipv6Addr},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+    time::Duration,
+};
+
+use futures::{StreamExt, future::pending};
+use mock::MockEavesdropper;
+use rand::{SeedableRng, rngs::StdRng};
+use tokio::{
+    join, select,
+    sync::{Mutex, mpsc},
+    time::{sleep, timeout},
+};
+use zerocopy::IntoBytes;
+
+use crate::noise::TimerParams;
+use crate::noise::index_table::IndexTable;
+use crate::packet::{Ip, Packet, PacketBufPool};
+use crate::tun::{IpRecv, IpSend, MtuWatcher};
+
+pub mod mock;
+
+/// A TUN test double that drains each immediately ready run in packet order.
+#[derive(Clone)]
+struct BatchedTun {
+    app_to_tun_rx: Arc<Mutex<mpsc::UnboundedReceiver<Packet<Ip>>>>,
+    tun_to_app_tx: mpsc::UnboundedSender<Packet<Ip>>,
+    observed_input: Arc<StdMutex<Vec<Vec<u8>>>>,
+}
+
+/// Test endpoints for a pair of devices whose TUN reads return bounded runs.
+struct BatchedDevice {
+    _device: crate::device::Device<(
+        crate::udp::channel::UdpChannelFactory,
+        BatchedTun,
+        BatchedTun,
+    )>,
+    app_tx: mpsc::UnboundedSender<Packet<Ip>>,
+    app_rx: mpsc::UnboundedReceiver<Packet<Ip>>,
+    observed_input: Arc<StdMutex<Vec<Vec<u8>>>>,
+}
+
+/// Create the two packet channels and an order record for one test TUN endpoint.
+fn batched_tun() -> (
+    BatchedTun,
+    mpsc::UnboundedSender<Packet<Ip>>,
+    mpsc::UnboundedReceiver<Packet<Ip>>,
+    Arc<StdMutex<Vec<Vec<u8>>>>,
+) {
+    let (app_to_tun_tx, app_to_tun_rx) = mpsc::unbounded_channel();
+    let (tun_to_app_tx, tun_to_app_rx) = mpsc::unbounded_channel();
+    let observed_input = Arc::new(StdMutex::new(Vec::new()));
+    let tun = BatchedTun {
+        app_to_tun_rx: Arc::new(Mutex::new(app_to_tun_rx)),
+        tun_to_app_tx,
+        observed_input: Arc::clone(&observed_input),
+    };
+    (tun, app_to_tun_tx, tun_to_app_rx, observed_input)
+}
+
+impl IpSend for BatchedTun {
+    async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
+        self.tun_to_app_tx
+            .send(packet)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "test TUN receiver closed"))
+    }
+}
+
+impl IpRecv for BatchedTun {
+    async fn recv<'a>(
+        &'a mut self,
+        _pool: &mut PacketBufPool,
+    ) -> io::Result<impl Iterator<Item = Packet<Ip>> + Send + 'a> {
+        let mut app_to_tun_rx = self.app_to_tun_rx.lock().await;
+        let first = app_to_tun_rx
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "test TUN closed"))?;
+        let mut packets = vec![first];
+        while packets.len() < 64 {
+            match app_to_tun_rx.try_recv() {
+                Ok(packet) => packets.push(packet),
+                Err(_) => break,
+            }
+        }
+        self.observed_input
+            .lock()
+            .expect("the input-order record is not poisoned")
+            .extend(packets.iter().map(|packet| packet.as_bytes().to_vec()));
+        Ok(packets.into_iter())
+    }
+
+    fn mtu(&self) -> MtuWatcher {
+        MtuWatcher::new(mock::TUN_MTU)
+    }
+}
+
+/// Build two real devices over bounded in-memory TUN and UDP transports.
+async fn batched_device_pair() -> (BatchedDevice, BatchedDevice) {
+    use crate::device::{DeviceBuilder, Peer};
+    use crate::udp::channel::{UdpChannelFactory, UdpChannelV4, UdpChannelV6};
+    use ipnetwork::Ipv4Network;
+    use rand::{SeedableRng, rngs::StdRng};
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let (tun_a, app_tx_a, app_rx_a, observed_a) = batched_tun();
+    let (tun_b, app_tx_b, app_rx_b, observed_b) = batched_tun();
+    let port = 51820;
+    let endpoint_a = Ipv4Addr::new(10, 0, 0, 1);
+    let endpoint_b = Ipv4Addr::new(10, 0, 0, 2);
+
+    let (udp_a_v4, bridge_a_v4) = UdpChannelV4::new_pair(128);
+    let (udp_b_v4, bridge_b_v4) = UdpChannelV4::new_pair(128);
+    let (udp_a_v6, bridge_a_v6) = UdpChannelV6::new_pair(128);
+    let (udp_b_v6, bridge_b_v6) = UdpChannelV6::new_pair(128);
+    let (bridge_a_v4_rx, bridge_a_v4_tx) = (bridge_a_v4.rx, bridge_a_v4.tx);
+    let (bridge_b_v4_rx, bridge_b_v4_tx) = (bridge_b_v4.rx, bridge_b_v4.tx);
+    let (bridge_a_v6_rx, bridge_a_v6_tx) = (bridge_a_v6.rx, bridge_a_v6.tx);
+    let (bridge_b_v6_rx, bridge_b_v6_tx) = (bridge_b_v6.rx, bridge_b_v6.tx);
+    tokio::spawn(async move {
+        let mut rx = bridge_a_v4_rx;
+        let tx = bridge_b_v4_tx;
+        while let Some(packet) = rx.recv().await {
+            if tx.send(packet).await.is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut rx = bridge_b_v4_rx;
+        let tx = bridge_a_v4_tx;
+        while let Some(packet) = rx.recv().await {
+            if tx.send(packet).await.is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut rx = bridge_a_v6_rx;
+        let tx = bridge_b_v6_tx;
+        while let Some(packet) = rx.recv().await {
+            if tx.send(packet).await.is_err() {
+                break;
+            }
+        }
+    });
+    tokio::spawn(async move {
+        let mut rx = bridge_b_v6_rx;
+        let tx = bridge_a_v6_tx;
+        while let Some(packet) = rx.recv().await {
+            if tx.send(packet).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let udp_a = UdpChannelFactory::new(endpoint_a, udp_a_v4, Ipv6Addr::UNSPECIFIED, udp_a_v6);
+    let udp_b = UdpChannelFactory::new(endpoint_b, udp_b_v4, Ipv6Addr::UNSPECIFIED, udp_b_v6);
+    let private_a = StaticSecret::random();
+    let private_b = StaticSecret::random();
+    let public_a = PublicKey::from(&private_a);
+    let public_b = PublicKey::from(&private_b);
+    let allowed = Ipv4Network::new(Ipv4Addr::UNSPECIFIED, 0)
+        .expect("the catch-all test route is valid")
+        .into();
+
+    let device_a = DeviceBuilder::new()
+        .with_private_key(private_a)
+        .with_ip(tun_a)
+        .with_udp(udp_a)
+        .with_listen_port(port)
+        .with_peer(
+            Peer::new(public_b)
+                .with_endpoint((endpoint_b, port).into())
+                .with_allowed_ip(allowed),
+        )
+        .with_index_table(IndexTable::from_rng(StdRng::seed_from_u64(
+            mock::ALICE_INDEX_SEED,
+        )))
+        .build()
+        .await
+        .expect("the first test device builds");
+    let device_b = DeviceBuilder::new()
+        .with_private_key(private_b)
+        .with_ip(tun_b)
+        .with_udp(udp_b)
+        .with_listen_port(port)
+        .with_peer(
+            Peer::new(public_a)
+                .with_endpoint((endpoint_a, port).into())
+                .with_allowed_ip(allowed),
+        )
+        .with_index_table(IndexTable::from_rng(StdRng::seed_from_u64(
+            mock::BOB_INDEX_SEED,
+        )))
+        .build()
+        .await
+        .expect("the second test device builds");
+
+    (
+        BatchedDevice {
+            _device: device_a,
+            app_tx: app_tx_a,
+            app_rx: app_rx_a,
+            observed_input: observed_a,
+        },
+        BatchedDevice {
+            _device: device_b,
+            app_tx: app_tx_b,
+            app_rx: app_rx_b,
+            observed_input: observed_b,
+        },
+    )
+}
+
+/// Compare complete packet bytes while keeping an ordering failure concise.
+fn assert_packet_order(label: &str, input: &[Vec<u8>], received: &[Vec<u8>]) {
+    assert_eq!(input.len(), received.len(), "{label} packet count differs");
+    let mismatch = input
+        .iter()
+        .zip(received)
+        .position(|(expected, actual)| expected != actual);
+    if let Some(slot) = mismatch {
+        let sequence = |bytes: &[u8]| {
+            let payload = &bytes[crate::packet::Ipv4Header::LEN..];
+            (
+                u64::from_be_bytes(payload[..8].try_into().expect("producer id fits")),
+                u64::from_be_bytes(payload[8..16].try_into().expect("sequence fits")),
+            )
+        };
+        panic!(
+            "{label} order changed at slot {slot}: expected {:?}, received {:?}",
+            sequence(&input[slot]),
+            sequence(&received[slot])
+        );
+    }
+}
+
+/// Keep the data path moving and ordered while a reverse producer sends ACK-sized packets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn threaded_reverse_traffic_preserves_order_and_progress() {
+    const DATA_PACKET_COUNT: usize = 4000;
+    const DATA_PAYLOAD_LEN: usize = 1200;
+    const ACK_EVERY: usize = 2;
+    const ACK_PACKET_COUNT: usize = DATA_PACKET_COUNT / ACK_EVERY;
+    const ACK_PAYLOAD_LEN: usize = 32;
+    let (alice, bob) = batched_device_pair().await;
+    let BatchedDevice {
+        _device: _alice_device,
+        app_tx: alice_tx,
+        app_rx: mut alice_rx,
+        observed_input: alice_input,
+    } = alice;
+    let BatchedDevice {
+        _device: _bob_device,
+        app_tx: bob_tx,
+        app_rx: mut bob_rx,
+        observed_input: bob_input,
+    } = bob;
+    let received_data_progress = Arc::new(AtomicUsize::new(0));
+
+    let alice_producer = thread::Builder::new()
+        .name("data-packet-producer".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("data producer runtime builds");
+            runtime.block_on(async move {
+                for sequence in 0..DATA_PACKET_COUNT {
+                    let mut payload = vec![0; DATA_PAYLOAD_LEN];
+                    payload[..8].copy_from_slice(&0_u64.to_be_bytes());
+                    let sequence =
+                        u64::try_from(sequence).expect("test packet ids fit in u64");
+                    payload[8..16].copy_from_slice(&sequence.to_be_bytes());
+                    alice_tx
+                        .send(mock::packet(payload))
+                        .expect("the data endpoint keeps reading TUN packets");
+                    if sequence % 16 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            });
+        })
+        .expect("data producer thread starts");
+
+    let reverse_producer = thread::Builder::new()
+        .name("reverse-ack-producer".into())
+        .spawn(move || {
+            let received_data_progress = Arc::clone(&received_data_progress);
+            let timeout_progress = Arc::clone(&received_data_progress);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("reverse producer runtime builds");
+            runtime.block_on(async move {
+                timeout(Duration::from_secs(45), async move {
+                    let mut received_data = Vec::with_capacity(DATA_PACKET_COUNT);
+                    let mut ack_sequence = 0_usize;
+                    for received_count in 1..=DATA_PACKET_COUNT {
+                        let packet = bob_rx
+                            .recv()
+                            .await
+                            .expect("the reverse endpoint returns each data packet");
+                        received_data.push(packet.as_bytes().to_vec());
+                        received_data_progress.store(received_count, Ordering::Relaxed);
+                        if received_count.is_multiple_of(ACK_EVERY) {
+                            let mut payload = vec![0; ACK_PAYLOAD_LEN];
+                            payload[..8].copy_from_slice(&1_u64.to_be_bytes());
+                            let sequence = u64::try_from(ack_sequence)
+                                .expect("test acknowledgement ids fit in u64");
+                            payload[8..16].copy_from_slice(&sequence.to_be_bytes());
+                            let acknowledged = u64::try_from(received_count)
+                                .expect("test packet ids fit in u64");
+                            payload[16..24].copy_from_slice(&acknowledged.to_be_bytes());
+                            bob_tx
+                                .send(mock::packet(payload))
+                                .expect("the data endpoint keeps reading reverse packets");
+                            ack_sequence += 1;
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    received_data
+                })
+                .await
+                .map_err(|_| timeout_progress.load(Ordering::Relaxed))
+            })
+        })
+        .expect("reverse producer thread starts");
+
+    let received_acks = timeout(Duration::from_secs(50), async {
+        let mut packets = Vec::with_capacity(ACK_PACKET_COUNT);
+        for _ in 0..ACK_PACKET_COUNT {
+            let Some(packet) = alice_rx.recv().await else {
+                return Err("the data endpoint closed before all acknowledgements arrived");
+            };
+            packets.push(packet.as_bytes().to_vec());
+        }
+        Ok::<_, &'static str>(packets)
+    })
+    .await;
+
+    alice_producer.join().expect("data producer thread completes");
+    let received_data = reverse_producer
+        .join()
+        .expect("reverse producer thread completes")
+        .unwrap_or_else(|received| {
+            panic!("reverse path stopped after receiving {received}/{DATA_PACKET_COUNT} data packets")
+        });
+    let received_acks = received_acks
+        .expect("the reverse acknowledgements reach the data endpoint")
+        .expect("the data endpoint stays open until the final acknowledgement");
+
+    let alice_input = alice_input
+        .lock()
+        .expect("the data input-order record is not poisoned");
+    let bob_input = bob_input
+        .lock()
+        .expect("the reverse input-order record is not poisoned");
+    assert_packet_order("data", &alice_input, &received_data);
+    assert_packet_order("reverse acknowledgements", &bob_input, &received_acks);
+}
+
+/// Assert that the expected number of packets is sent.
+/// We expect there to be [`packet_count`] data packets, one handshake init,
+/// one handshake resp, and one keepalive.
+#[tokio::test]
+#[test_log::test]
+async fn number_of_packets() {
+    test_device_pair(async |eve| {
+        let expected_count = packet_count() + 2 + 1;
+        let ipv4_count = eve.ipv4().count().await;
+        assert_eq!(ipv4_count, expected_count);
+    })
+    .await
+}
+
+/// Assert that IPv6 is not used.
+#[tokio::test]
+#[test_log::test]
+async fn ipv6_isnt_used() {
+    test_device_pair(async |eve| {
+        let ipv6_count = eve.ipv6().count().await;
+        assert_eq!(dbg!(ipv6_count), 0);
+    })
+    .await
+}
+
+/// Assert that exactly one handshake is performed.
+/// This test does not run for long enough to trigger a second handshake.
+#[tokio::test]
+#[test_log::test]
+async fn one_handshake() {
+    test_device_pair(async |eve| {
+        let handshake_inits = async {
+            assert_eq!(eve.wg_handshake_init().count().await, 1);
+        };
+        let handshake_resps = async {
+            assert_eq!(eve.wg_handshake_resp().count().await, 1);
+        };
+        join! { handshake_inits, handshake_resps };
+    })
+    .await
+}
+
+// TODO: is this according to spec?
+/// Assert that exactly one keepalive is sent.
+/// The keepalive should be sent after the handshake is completed.
+#[tokio::test]
+#[test_log::test]
+async fn one_keepalive() {
+    test_device_pair(async |eve| {
+        let keepalive_count = eve
+            .wg_data()
+            .filter(|wg_data| ready(wg_data.is_keepalive()))
+            .count()
+            .await;
+
+        assert_eq!(keepalive_count, 1);
+    })
+    .await
+}
+
+/// Assert that all WgData packets lenghts are a multiple of 16.
+#[tokio::test]
+#[test_log::test]
+async fn wg_data_length_is_x16() {
+    test_device_pair(async |eve| {
+        let wg_data_count = eve
+            .wg_data()
+            .map(|wg| {
+                let payload_len = wg.encrypted_encapsulated_packet().len();
+                assert!(
+                    payload_len.is_multiple_of(16),
+                    "wireguard data length must be a multiple of 16, but was {payload_len}"
+                );
+            })
+            .count()
+            .await;
+
+        assert!(dbg!(wg_data_count) >= packet_count());
+    })
+    .await
+}
+
+/// Test that indices work as expected.
+#[tokio::test]
+#[test_log::test]
+async fn test_indices() {
+    // Compute the expected first index from each seeded RNG.
+    let expected_alice_idx =
+        IndexTable::next_id(&mut StdRng::seed_from_u64(mock::ALICE_INDEX_SEED));
+    let expected_bob_idx = IndexTable::next_id(&mut StdRng::seed_from_u64(mock::BOB_INDEX_SEED));
+
+    test_device_pair(async |eve| {
+        let check_init = eve.wg_handshake_init().for_each(async |p| {
+            assert_eq!(p.sender_idx.get(), expected_alice_idx);
+        });
+        let check_alice_data = eve.wg_data().for_each(async |p| {
+            // Every data packet is sent to Bob
+            assert_eq!(p.header.receiver_idx, expected_bob_idx);
+        });
+        let check_resp = eve.wg_handshake_resp().for_each(async |p| {
+            assert_eq!(p.sender_idx.get(), expected_bob_idx);
+        });
+        join!(check_init, check_resp, check_alice_data);
+    })
+    .await;
+}
+
+/// Test that device handles roaming (changes to endpoint) for data packets.
+#[tokio::test]
+#[test_log::test]
+async fn test_endpoint_roaming() {
+    let (mut alice, mut bob, eve) = mock::device_pair().await;
+    let packet = mock::packet(b"Hello!");
+
+    let mut ping_pong = async |alice_ip| {
+        *alice.source_ipv4_override.lock().await = Some(alice_ip);
+
+        alice.app_tx.send(packet.clone()).await;
+        assert_eq!(bob.app_rx.recv().await.as_bytes(), packet.as_bytes());
+
+        let peers = bob.device.peers().await;
+        assert_eq!(peers.len(), 1);
+        let stats = &peers[0];
+
+        // Bob's device's peer should point to Alice's last known endpoint
+        assert_eq!(
+            stats.peer.endpoint.map(|addr| addr.ip()),
+            Some(alice_ip.into()),
+        );
+
+        // Bob's sent packets should use the new endpoint
+        let ip_stream = eve.ip();
+        tokio::pin!(ip_stream);
+
+        let next_packet = async {
+            tokio::time::timeout(Duration::from_secs(5), ip_stream.next())
+                .await
+                .expect("did not see sent packet")
+        };
+
+        let (_, sniffed_packet) = join! {
+            bob.app_tx.send(packet.clone()),
+            next_packet,
+        };
+        alice.app_rx.recv().await;
+
+        assert_eq!(
+            sniffed_packet.and_then(|ip| ip.destination()),
+            Some(alice_ip.into())
+        );
+    };
+
+    // Simulate roaming by changing Alice's source IP
+    ping_pong("1.2.3.4".parse().unwrap()).await;
+    ping_pong("1.3.3.7".parse().unwrap()).await;
+    ping_pong("1.2.3.4".parse().unwrap()).await;
+}
+
+/// Adding peers is atomic, including when a public key is duplicated within the batch.
+#[tokio::test]
+#[test_log::test]
+async fn add_peers_rejects_duplicate_public_keys() {
+    use crate::device::Peer;
+    use ipnetwork::Ipv4Network;
+    use std::{net::Ipv4Addr, sync::Arc};
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let (_alice, bob, _eve) = mock::device_pair().await;
+    let initial_peers = bob.device.peers().await.len();
+    let public_key = PublicKey::from(&StaticSecret::random());
+    let peer_a = Peer::new(public_key).with_allowed_ip(
+        Ipv4Network::new(Ipv4Addr::new(10, 0, 0, 1), 32)
+            .unwrap()
+            .into(),
+    );
+    let peer_b = Peer::new(public_key).with_allowed_ip(
+        Ipv4Network::new(Ipv4Addr::new(10, 0, 0, 2), 32)
+            .unwrap()
+            .into(),
+    );
+
+    let added = bob
+        .device
+        .add_peers([peer_a, peer_b])
+        .await
+        .expect("device reconfiguration should not fail");
+
+    assert!(!added, "duplicate public keys must reject the entire batch");
+    assert_eq!(bob.device.peers().await.len(), initial_peers);
+
+    let state = bob.device.inner.read().await;
+    assert!(state.peers_by_ip.iter().all(|(routed_peer, _)| {
+        state
+            .peers
+            .values()
+            .any(|peer| Arc::ptr_eq(peer, routed_peer))
+    }));
+}
+
+/// Replacing a peer's routes keeps canonical IPv4/IPv6 entries in its listing and the device trie.
+#[tokio::test]
+#[test_log::test]
+async fn allowed_ip_updates_preserve_v4_v6_listing_and_routes() {
+    use ipnetwork::IpNetwork;
+    use std::{net::IpAddr, sync::Arc};
+
+    let (_alice, mut bob, _eve) = mock::device_pair().await;
+    let peer_key = get_first_and_only_peer(&bob).await.public_key;
+    let v4_with_host_bits: IpNetwork = "192.0.2.7/24".parse().unwrap();
+    let v4_canonical: IpNetwork = "192.0.2.0/24".parse().unwrap();
+    let v6_with_host_bits: IpNetwork = "2001:db8:1::abcd/64".parse().unwrap();
+    let v6_canonical: IpNetwork = "2001:db8:1::/64".parse().unwrap();
+
+    let updated = bob
+        .device
+        .modify_peer(&peer_key, |peer_mut| {
+            peer_mut.clear_allowed_ips();
+            peer_mut.add_allowed_ips([v4_with_host_bits, v4_canonical, v6_with_host_bits]);
+        })
+        .await
+        .expect("device reconfiguration should not fail");
+    assert!(updated, "existing peer should be updated");
+
+    let listed = get_first_and_only_peer(&bob).await;
+    assert_eq!(listed.allowed_ips.len(), 2);
+    assert!(listed.allowed_ips.contains(&v4_canonical));
+    assert!(listed.allowed_ips.contains(&v6_canonical));
+
+    let state = bob.device.inner.read().await;
+    let peer = state
+        .peers
+        .get(&peer_key)
+        .expect("configured peer should remain");
+    for address in ["192.0.2.123", "2001:db8:1::1"] {
+        let address: IpAddr = address.parse().unwrap();
+        let route_owner = state
+            .peers_by_ip
+            .find(address)
+            .expect("updated address should remain routable");
+        assert!(Arc::ptr_eq(peer, route_owner));
+    }
+    assert!(
+        state
+            .peers_by_ip
+            .find("198.51.100.1".parse().unwrap())
+            .is_none()
+    );
+}
+
+/// A peer must not inject a packet whose inner source IP belongs
+/// (by longest-prefix match) to a *different* peer, even when the
+/// sending peer's own allowed-ips would cover it. The most specific
+/// allowed IP on the device for the source address of incoming
+/// packets must belong to the peer.
+#[tokio::test]
+#[test_log::test]
+async fn reverse_path_rejects_source_owned_by_another_peer() {
+    use crate::device::Peer;
+    use ipnetwork::Ipv4Network;
+    use std::net::Ipv4Addr;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    // Alice has 0.0.0.0/0 as it's allowed IP range
+    let (alice, mut bob, _eve) = mock::device_pair().await;
+
+    // Set up a third peer "Carol" with 10.0.0.5/32 on Bob's device
+    let carol_pub = PublicKey::from(&StaticSecret::random());
+    let added = bob
+        .device
+        .add_peer(
+            Peer::new(carol_pub).with_allowed_ip(
+                Ipv4Network::new(Ipv4Addr::new(10, 0, 0, 5), 32)
+                    .unwrap()
+                    .into(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(added);
+
+    // Sanity: a legitimately-sourced packet (within Alice's 0.0.0.0/0) is delivered
+    let legit = mock::packet_from(Ipv4Addr::new(192, 168, 0, 1), b"hi");
+    alice.app_tx.send(legit.clone()).await;
+    let got = tokio::time::timeout(Duration::from_secs(2), bob.app_rx.recv())
+        .await
+        .expect("legit packet must be delivered");
+    assert_eq!(got.as_bytes(), legit.as_bytes());
+
+    // Alice spoofs source 10.0.0.5, which on Bob's device belongs to Carol. Bob must drop it.
+    let spoofed = mock::packet_from(Ipv4Addr::new(10, 0, 0, 5), b"spoofed");
+    alice.app_tx.send(spoofed).await;
+    let result = tokio::time::timeout(Duration::from_secs(1), bob.app_rx.recv()).await;
+    assert!(
+        result.is_err(),
+        "Bob delivered a packet whose source 10.0.0.5 is owned by a different peer"
+    );
+}
+
+/// Ensures setting a peer's preshared key via Device::modify_peer propagates into its noise state
+#[tokio::test]
+#[test_log::test]
+async fn modify_peer_preshared_key_reaches_tunnel() {
+    assert_peer_psk_update_reaches_tunnel(async |device: &mut mock::MockDevice, preshared_key| {
+        let peer = get_first_and_only_peer(device).await;
+        let updated = device
+            .device
+            .modify_peer(&peer.public_key, |peer_mut| {
+                peer_mut.set_preshared_key(Some(preshared_key));
+            })
+            .await
+            .expect("modify_peer should succeed");
+        assert!(updated, "peer update should affect an existing peer");
+        advance_mock_clock();
+    })
+    .await;
+}
+
+/// Ensures setting a peer's preshared key via Device::update_peer propagates into its noise state
+#[tokio::test]
+#[test_log::test]
+async fn update_peer_preshared_key_reaches_tunnel() {
+    assert_peer_psk_update_reaches_tunnel(async |device: &mut mock::MockDevice, preshared_key| {
+        let mut peer = get_first_and_only_peer(device).await;
+        peer.preshared_key = Some(preshared_key);
+        let updated = device
+            .device
+            .update_peer(peer)
+            .await
+            .expect("update_peer should succeed");
+        assert!(updated, "peer update should affect an existing peer");
+        advance_mock_clock();
+    })
+    .await;
+}
+
+/// Ensures setting a peer's timer params via Device::modify_peer propagates into its noise state,
+/// and that clearing them restores the defaults
+#[tokio::test]
+#[test_log::test]
+async fn modify_peer_timer_params_reach_tunnel() {
+    let (_alice, mut bob, _eve) = mock::device_pair().await;
+    let peer = get_first_and_only_peer(&bob).await;
+    assert_eq!(peer.danger_timer_params, Some(TimerParams::default()));
+
+    let timer_params = TimerParams {
+        keepalive_timeout: Duration::from_secs(3)..=Duration::from_secs(5),
+        ..TimerParams::default()
+    };
+    for expected in [Some(timer_params.clone()), None] {
+        let updated = bob
+            .device
+            .modify_peer(&peer.public_key, |peer_mut| {
+                peer_mut.dangerously_set_timer_params(expected.clone());
+            })
+            .await
+            .expect("modify_peer should succeed");
+        assert!(updated, "peer update should affect an existing peer");
+
+        let peer = get_first_and_only_peer(&bob).await;
+        assert_eq!(peer.danger_timer_params, Some(expected.unwrap_or_default()),);
+    }
+}
+
+/// The number of packets we send through the tunnel
+fn packet_count() -> usize {
+    mock::packets_of_every_size().len()
+}
+
+/// Setting a peer's preshared key must propagate into its noise state, and must
+/// not tear down a live session. `set_preshared_key` applies the change through
+/// one of the device's configuration APIs.
+async fn assert_peer_psk_update_reaches_tunnel(
+    set_preshared_key: impl AsyncFn(&mut mock::MockDevice, [u8; 32]),
+) {
+    let packet = mock::packet(b"Hello!");
+    let preshared_key = [0xA5; 32];
+
+    // One side changes its PSK: the peers disagree and the handshake fails.
+    {
+        let (mut alice, mut bob, _eve) = mock::device_pair().await;
+        set_preshared_key(&mut alice, preshared_key).await;
+        send_and_expect_blocked(&alice, &mut bob, &packet).await;
+    }
+
+    // Both sides set the same PSK: traffic flows.
+    {
+        let (mut alice, mut bob, _eve) = mock::device_pair().await;
+        set_preshared_key(&mut alice, preshared_key).await;
+        set_preshared_key(&mut bob, preshared_key).await;
+        send_and_expect_delivery(&alice, &mut bob, &packet).await;
+    }
+
+    // Updating an established peer keeps the live session working.
+    {
+        let (mut alice, mut bob, _eve) = mock::device_pair().await;
+        send_and_expect_delivery(&alice, &mut bob, &packet).await;
+        set_preshared_key(&mut alice, preshared_key).await;
+        send_and_expect_delivery(&alice, &mut bob, &packet).await;
+    }
+}
+
+/// Return the device's single configured peer, asserting there is exactly one.
+async fn get_first_and_only_peer(device: &mock::MockDevice) -> crate::device::Peer {
+    let peers = device.device.peers().await;
+    let [stats] = <[_; 1]>::try_from(peers).expect("expected exactly one peer");
+    stats.peer
+}
+
+/// Advance the mock clock so consecutive handshakes get distinct timestamps.
+fn advance_mock_clock() {
+    #[cfg(feature = "mock_instant")]
+    mock_instant::thread_local::MockClock::advance(Duration::from_micros(1));
+}
+
+async fn send_and_expect_blocked(
+    sender: &mock::MockDevice,
+    receiver: &mut mock::MockDevice,
+    packet: &Packet<Ip>,
+) {
+    sender.app_tx.send(packet.clone()).await;
+    assert!(
+        timeout(Duration::from_millis(500), receiver.app_rx.recv())
+            .await
+            .is_err(),
+        "packet should not be delivered while peers disagree on the live PSK"
+    );
+}
+
+async fn send_and_expect_delivery(
+    sender: &mock::MockDevice,
+    receiver: &mut mock::MockDevice,
+    packet: &Packet<Ip>,
+) {
+    sender.app_tx.send(packet.clone()).await;
+    let received = timeout(Duration::from_secs(1), receiver.app_rx.recv())
+        .await
+        .expect("expected packet delivery once both live PSKs match");
+    assert_eq!(received.as_bytes(), packet.as_bytes());
+}
+
+/// [`Device::suspend`] stops all traffic; [`Device::resume`] restores it with a fresh handshake.
+#[tokio::test]
+#[test_log::test]
+async fn suspend_and_resume() {
+    use tokio::time::timeout;
+
+    let (alice, mut bob, eve) = mock::device_pair().await;
+
+    // Sniff handshake initiations across the whole test.
+    let mut inits = std::pin::pin!(eve.wg_handshake_init());
+
+    // 1. Establish the tunnel: a packet from alice must reach bob.
+    let before = b"before suspend";
+    alice.app_tx.send(mock::packet(before)).await;
+    let received = timeout(Duration::from_secs(1), bob.app_rx.recv())
+        .await
+        .expect("bob should receive alice's packet before suspend");
+    assert_eq!(received.as_bytes(), mock::packet(before).as_bytes());
+
+    // The initial handshake should have happened.
+    let first_init = timeout(Duration::from_secs(1), inits.next())
+        .await
+        .expect("a handshake init should be observed");
+    assert!(first_init.is_some());
+
+    // 2. Suspend alice. All of its tasks (timers, inbound, outbound) are now stopped.
+    alice.device.suspend().await;
+    // Suspending again is a no-op.
+    alice.device.suspend().await;
+
+    // 3. While suspended, a packet from alice must NOT reach bob.
+    let during = b"during suspend";
+    alice.app_tx.send(mock::packet(during)).await;
+    let no_delivery = timeout(Duration::from_millis(300), bob.app_rx.recv()).await;
+    assert!(
+        no_delivery.is_err(),
+        "no traffic should flow while suspended"
+    );
+
+    // Time passes while the host process is suspended. Advancing the mock clock
+    // (a no-op without the `mock_instant` feature) ensures the fresh handshake
+    // sent after resume carries a strictly later TAI64N timestamp than the first,
+    // so the peer does not reject it as a replay.
+    advance_mock_clock();
+
+    // 4. Resume alice. The buffered packet should now flow, via a fresh handshake.
+    alice.device.resume().await.expect("resume should succeed");
+    // Resuming again is a no-op.
+    alice
+        .device
+        .resume()
+        .await
+        .expect("resume should be idempotent");
+
+    let received = timeout(Duration::from_secs(2), bob.app_rx.recv())
+        .await
+        .expect("bob should receive alice's packet after resume");
+    assert_eq!(received.as_bytes(), mock::packet(during).as_bytes());
+
+    // Resume cleared alice's sessions, so a second handshake init must be observed.
+    let second_init = timeout(Duration::from_secs(2), inits.next())
+        .await
+        .expect("a fresh handshake init should be observed after resume");
+    assert!(second_init.is_some());
+
+    drop((alice, bob));
+}
+
+/// Binding to port 0 reports the actual port, and keeps it across rebinds.
+#[tokio::test]
+#[test_log::test]
+async fn listen_port_zero_reports_bound_port() {
+    use crate::device::{DeviceBuilder, Peer};
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let (tun, _app_tx, _app_rx) = mock::mock_tun();
+    let peer = Peer::new(PublicKey::from(&StaticSecret::random()));
+
+    let device = DeviceBuilder::new()
+        .with_private_key(StaticSecret::random())
+        .with_ip(tun)
+        .with_default_udp()
+        .with_listen_port(0)
+        .with_peer(peer)
+        .build()
+        .await
+        .expect("create device");
+
+    let port = device.read(async |d| d.listen_port()).await;
+    assert_ne!(port, 0);
+
+    device.suspend().await;
+    device.resume().await.expect("resume should succeed");
+
+    let port_after_resume = device.read(async |d| d.listen_port()).await;
+    assert_eq!(port, port_after_resume);
+
+    device.stop().await;
+}
+
+/// A reconfiguration that would normally rebuild the connection must not
+/// silently un-suspend the device: the change is applied to `DeviceState` but
+/// the connection stays down until [`Device::resume`].
+#[tokio::test]
+#[test_log::test]
+async fn reconfigure_while_suspended_stays_down() {
+    use tokio::time::timeout;
+
+    let (alice, mut bob, _eve) = mock::device_pair().await;
+
+    // Establish the tunnel.
+    alice.app_tx.send(mock::packet(b"before")).await;
+    timeout(Duration::from_secs(1), bob.app_rx.recv())
+        .await
+        .expect("tunnel should establish before suspend");
+
+    alice.device.suspend().await;
+
+    // A config change that internally calls `Connection::set_up`. Reuse the same
+    // listen port so the mock's source-port addressing stays intact on resume.
+    alice
+        .device
+        .set_listen_port(1)
+        .await
+        .expect("reconfigure should succeed while suspended");
+
+    // The connection must stay down: reconfiguring did not resume the tunnel.
+    let during = b"during suspend";
+    alice.app_tx.send(mock::packet(during)).await;
+    let no_delivery = timeout(Duration::from_millis(300), bob.app_rx.recv()).await;
+    assert!(
+        no_delivery.is_err(),
+        "reconfiguring while suspended must not bring the connection up"
+    );
+
+    // Resume brings the connection up with the applied config; traffic flows.
+    advance_mock_clock();
+    alice.device.resume().await.expect("resume should succeed");
+    let received = timeout(Duration::from_secs(2), bob.app_rx.recv())
+        .await
+        .expect("traffic should flow after resume");
+    assert_eq!(received.as_bytes(), mock::packet(during).as_bytes());
+
+    drop((alice, bob));
+}
+
+/// [`Device::force_handshake`] performs a single handshake, and nothing once a session exists.
+#[tokio::test]
+#[test_log::test]
+async fn force_handshake() {
+    use crate::device::Error;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let (alice, _bob, eve) = mock::device_pair().await;
+    let mut inits = std::pin::pin!(eve.wg_handshake_init());
+    let bob_public_key = get_first_and_only_peer(&alice).await.public_key;
+
+    // Concurrent callers share a single handshake.
+    let (first, second) = timeout(Duration::from_secs(2), async {
+        join!(
+            alice.device.force_handshake(&bob_public_key),
+            alice.device.force_handshake(&bob_public_key),
+        )
+    })
+    .await
+    .expect("session should be established");
+    first.expect("first wait should succeed");
+    second.expect("second wait should succeed");
+
+    let first_init = timeout(Duration::from_secs(1), inits.next())
+        .await
+        .expect("a handshake init should be observed");
+    assert!(first_init.is_some());
+
+    assert!(
+        timeout(Duration::from_millis(500), inits.next())
+            .await
+            .is_err(),
+        "no additional handshake init should be sent"
+    );
+
+    // With an active WireGuard session, no handshake is initiated.
+    alice
+        .device
+        .force_handshake(&bob_public_key)
+        .await
+        .expect("wait with a fresh session should succeed");
+
+    assert!(
+        timeout(Duration::from_millis(500), inits.next())
+            .await
+            .is_err(),
+        "no additional handshake init should be sent"
+    );
+
+    let unknown_peer = PublicKey::from(&StaticSecret::random());
+    assert!(matches!(
+        alice.device.force_handshake(&unknown_peer).await,
+        Err(Error::PeerNotFound)
+    ));
+
+    alice.device.suspend().await;
+    assert!(matches!(
+        alice.device.force_handshake(&bob_public_key).await,
+        Err(Error::NotConnected)
+    ));
+}
+
+/// Helper method to test that packets can be sent from one [`Device`] to another.
+/// Use `eavesdrop` to sniff wireguard packets and assert things about the connection.
+async fn test_device_pair(eavesdrop: impl AsyncFnOnce(MockEavesdropper) + Send) {
+    let (mut alice, mut bob, eve) = mock::device_pair().await;
+
+    // Create a future to eavesdrop on alice and bob.
+    let eavesdrop = async {
+        select! {
+            _ = eavesdrop(eve) => {}
+            _ = sleep(Duration::from_secs(1)) => panic!("eavesdrop timeout"),
+        }
+    };
+
+    // Create a future to drive alice and bob.
+    let drive_connection = async move {
+        let packets_to_send = mock::packets_of_every_size();
+        let packets_to_recv = packets_to_send.clone();
+
+        // Send a bunch of packets from alice to bob.
+        let send_packets = async {
+            for packet in packets_to_send {
+                alice.app_tx.send(packet).await;
+            }
+            pending().await
+        };
+
+        // Receive expected packets to bob from alice.
+        let wait_for_packets = async {
+            for expected_packet in packets_to_recv {
+                let p = bob.app_rx.recv().await;
+                assert_eq!(p.as_bytes(), expected_packet.as_bytes());
+            }
+        };
+
+        select! {
+            _ = wait_for_packets => {},
+            _ = send_packets => unreachable!(),
+            _ = alice.app_rx.recv() => panic!("no data is sent from bob to alice"),
+            _ = sleep(Duration::from_secs(1)) => panic!("timeout"),
+        }
+
+        // Shut down alice and bob after `wait_for_packets`
+        drop((alice, bob));
+    };
+
+    // Drive the connection, and eavesdrop it at the same time.
+    join! {
+        drive_connection,
+        eavesdrop
+    };
+}

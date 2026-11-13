@@ -11,7 +11,14 @@
 
 //! Generic buffered IP send and receive implementations.
 
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use crate::{
     packet::{Ip, Packet, PacketBufPool},
@@ -23,6 +30,9 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
+
+/// Identifies buffered TUN runs only when GOTATUN_DIAG_SEND_QUEUE is enabled.
+static NEXT_DIAGNOSTIC_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Create a pair of [`BufferedIpSend`] and [`BufferedIpRecv`] with `capacity`.
 ///
@@ -58,9 +68,10 @@ pub struct BufferedIpSend {
 }
 
 /// A single packet or an ordered run crossing the buffered TUN boundary.
+/// A batch id is present only for opt-in send-queue diagnostics.
 enum BufferedIpMessage {
     Single(Packet<Ip>, OwnedSemaphorePermit),
-    Batch(Vec<Packet<Ip>>, OwnedSemaphorePermit),
+    Batch(Vec<Packet<Ip>>, OwnedSemaphorePermit, Option<u64>),
 }
 
 impl BufferedIpSend {
@@ -93,14 +104,26 @@ impl BufferedIpSend {
                         }
                         (inner.send(packet).await, 1)
                     }
-                    BufferedIpMessage::Batch(mut packets, _permit) => {
+                    BufferedIpMessage::Batch(mut packets, _permit, sequence) => {
                         let batch_len = packets.len() as u64;
+                        if let Some(sequence) = sequence {
+                            eprintln!(
+                                "send_many dequeue direction=tun sequence={sequence} packets={batch_len}"
+                            );
+                        }
                         if diagnostic {
                             eprintln!(
                                 "pipeline stage=tun_buffer_dequeue mode=batch packets={batch_len}"
                             );
                         }
-                        (inner.send_many(&mut packets).await, batch_len)
+                        let result = inner.send_many(&mut packets).await;
+                        if let Some(sequence) = sequence {
+                            eprintln!(
+                                "send_many complete direction=tun sequence={sequence} packets={batch_len} success={}",
+                                result.is_ok()
+                            );
+                        }
+                        (result, batch_len)
                     }
                 };
                 if diagnostic {
@@ -176,6 +199,15 @@ impl IpSend for BufferedIpSend {
 
         while !packets.is_empty() {
             let count = packets.len().min(self.packet_capacity);
+            let sequence_diagnostic = std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some();
+            let sequence = sequence_diagnostic
+                .then(|| NEXT_DIAGNOSTIC_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed));
+            if let Some(sequence) = sequence {
+                eprintln!(
+                    "send_many enqueue_wait direction=tun sequence={sequence} packets={count} available={}",
+                    self.packet_slots.available_permits()
+                );
+            }
             let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some();
             if diagnostic {
                 eprintln!(
@@ -193,6 +225,11 @@ impl IpSend for BufferedIpSend {
                 .acquire_many_owned(permit_count)
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+            if let Some(sequence) = sequence {
+                eprintln!(
+                    "send_many permit_acquired direction=tun sequence={sequence} packets={count}"
+                );
+            }
             if diagnostic {
                 eprintln!("pipeline stage=tun_buffer_permit_acquired packets={count} mode=batch");
             }
@@ -201,17 +238,29 @@ impl IpSend for BufferedIpSend {
             } else {
                 packets.drain(..count).collect()
             };
-            if let Err(error) = self.tx.send(BufferedIpMessage::Batch(batch, permit)).await {
+            if let Err(error) = self
+                .tx
+                .send(BufferedIpMessage::Batch(batch, permit, sequence))
+                .await
+            {
                 let mut unsent = match error.0 {
-                    BufferedIpMessage::Batch(batch, _) => batch,
+                    BufferedIpMessage::Batch(batch, _, _) => batch,
                     BufferedIpMessage::Single(..) => unreachable!("send_many queues a batch"),
                 };
+                if let Some(sequence) = sequence {
+                    eprintln!(
+                        "send_many enqueue_failed direction=tun sequence={sequence} packets={count}"
+                    );
+                }
                 unsent.append(packets);
                 *packets = unsent;
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "TUN send task stopped",
                 ));
+            }
+            if let Some(sequence) = sequence {
+                eprintln!("send_many enqueued direction=tun sequence={sequence} packets={count}");
             }
             if diagnostic {
                 eprintln!("pipeline stage=tun_buffer_channel_sent packets={count} mode=batch");

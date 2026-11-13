@@ -165,7 +165,10 @@ impl<T: DeviceTransports> DeviceRead<'_, T> {
     pub async fn peers(&self) -> Vec<PeerStats> {
         let mut peers = vec![];
         for (pubkey, peer) in self.device.peers.iter() {
-            let p = peer.lock().await;
+            let peer_key = super::peer_order_key(peer);
+            let mut peer_trace = super::PeerLockDiagnostic::waiting("device_read_peers", peer_key);
+            let p =
+                super::lock_peer_state(peer, "device_read_peers", peer_key, &mut peer_trace).await;
 
             #[cfg(feature = "daita")]
             let daita = p.daita_settings().cloned();
@@ -319,7 +322,15 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
         };
 
         let existing_peer_arc = Arc::clone(existing_peer);
-        let mut existing_peer = existing_peer_arc.lock().await;
+        let peer_key = super::peer_order_key(&existing_peer_arc);
+        let mut peer_trace = super::PeerLockDiagnostic::waiting("device_modify_peer", peer_key);
+        let mut existing_peer = super::lock_peer_state(
+            &existing_peer_arc,
+            "device_modify_peer",
+            peer_key,
+            &mut peer_trace,
+        )
+        .await;
 
         let mut peer_mut = PeerMut::default();
         f(&mut peer_mut);

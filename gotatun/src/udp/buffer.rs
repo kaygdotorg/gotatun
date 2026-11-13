@@ -11,7 +11,13 @@
 
 //! Generic buffered `UdpTransport` implementation.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use tokio::{
     io,
@@ -25,6 +31,9 @@ use crate::task::Task;
 #[cfg(any(not(target_os = "linux"), test))]
 use crate::udp::UdpRecv;
 use crate::udp::UdpSend;
+
+/// Identifies buffered UDP runs only when GOTATUN_DIAG_SEND_QUEUE is enabled.
+static NEXT_DIAGNOSTIC_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// A [`UdpSend`] that wraps another [`UdpSend`] to provide buffering.
 ///
@@ -42,9 +51,10 @@ pub struct BufferedUdpSend {
 }
 
 /// One queued datagram or one ordered run of datagrams.
+/// A batch id is present only for opt-in send-queue diagnostics.
 enum BufferedUdpMessage {
     Single(Packet, SocketAddr, OwnedSemaphorePermit),
-    Batch(Vec<(Packet, SocketAddr)>, OwnedSemaphorePermit),
+    Batch(Vec<(Packet, SocketAddr)>, OwnedSemaphorePermit, Option<u64>),
 }
 
 /// Send one same-family UDP run through the transport's reusable send buffer.
@@ -162,11 +172,22 @@ impl BufferedUdpSend {
                                 single_permits.clear();
                             }
                         }
-                        BufferedUdpMessage::Batch(packets, permit) => {
+                        BufferedUdpMessage::Batch(packets, permit, sequence) => {
+                            let packet_count = packets.len();
+                            if let Some(sequence) = sequence {
+                                eprintln!(
+                                    "send_many dequeue direction=udp sequence={sequence} packets={packet_count}"
+                                );
+                            }
                             flush_udp_packets(&udp_tx, &mut send_many_buf, &mut singles).await;
                             single_permits.clear();
                             flush_udp_run(&udp_tx, &mut send_many_buf, packets, max_packet_count)
                                 .await;
+                            if let Some(sequence) = sequence {
+                                eprintln!(
+                                    "send_many complete direction=udp sequence={sequence} packets={packet_count}"
+                                );
+                            }
                             drop(permit);
                         }
                     }
@@ -221,6 +242,15 @@ impl UdpSend for BufferedUdpSend {
         }
         while !packets.is_empty() {
             let count = packets.len().min(self.packet_capacity);
+            let sequence_diagnostic = std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some();
+            let sequence = sequence_diagnostic
+                .then(|| NEXT_DIAGNOSTIC_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed));
+            if let Some(sequence) = sequence {
+                eprintln!(
+                    "send_many enqueue_wait direction=udp sequence={sequence} packets={count} available={}",
+                    self.packet_slots.available_permits()
+                );
+            }
             let permit_count = u32::try_from(count).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -231,6 +261,11 @@ impl UdpSend for BufferedUdpSend {
                 .acquire_many_owned(permit_count)
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+            if let Some(sequence) = sequence {
+                eprintln!(
+                    "send_many permit_acquired direction=udp sequence={sequence} packets={count}"
+                );
+            }
             let batch = if count == packets.len() {
                 std::mem::take(packets)
             } else {
@@ -238,19 +273,27 @@ impl UdpSend for BufferedUdpSend {
             };
             if let Err(error) = self
                 .send_tx
-                .send(BufferedUdpMessage::Batch(batch, permit))
+                .send(BufferedUdpMessage::Batch(batch, permit, sequence))
                 .await
             {
                 let mut unsent = match error.0 {
-                    BufferedUdpMessage::Batch(batch, _) => batch,
+                    BufferedUdpMessage::Batch(batch, _, _) => batch,
                     BufferedUdpMessage::Single(..) => unreachable!("send_many_to queues a batch"),
                 };
+                if let Some(sequence) = sequence {
+                    eprintln!(
+                        "send_many enqueue_failed direction=udp sequence={sequence} packets={count}"
+                    );
+                }
                 unsent.append(packets);
                 *packets = unsent;
                 return Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "UDP send task stopped",
                 ));
+            }
+            if let Some(sequence) = sequence {
+                eprintln!("send_many enqueued direction=udp sequence={sequence} packets={count}");
             }
         }
         Ok(())

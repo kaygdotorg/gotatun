@@ -33,11 +33,12 @@ use std::collections::HashMap;
 use std::io::{self};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
 use std::ops::BitOrAssign;
-use std::sync::{Arc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 use tokio::join;
 use tokio::sync::RwLock;
-use tokio::sync::{Mutex, watch};
+use tokio::sync::{Mutex, MutexGuard, watch};
 use tracing::{Level, instrument};
 
 use crate::noise::errors::WireGuardError;
@@ -143,6 +144,48 @@ type PendingOutgoing = FuturesUnordered<BoxFuture<'static, ()>>;
 /// Futures that finish one incoming worker result and release it toward the TUN in order.
 type PendingIncoming = FuturesUnordered<BoxFuture<'static, Result<(), Error>>>;
 
+/// Completion streams that a packet task must keep polling while it waits for peer state.
+enum PendingCompletions<'a> {
+    /// Receive-side completions can deliver packets and propagate device errors.
+    Incoming(&'a mut PendingIncoming, &'a mut PendingOutgoing),
+    /// A send-side task owns only its outgoing completion stream.
+    Outgoing(&'a mut PendingOutgoing),
+}
+
+impl PendingCompletions<'_> {
+    /// Report whether the owner task has any completion future that still needs polling.
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Incoming(incoming, outgoing) => incoming.is_empty() && outgoing.is_empty(),
+            Self::Outgoing(outgoing) => outgoing.is_empty(),
+        }
+    }
+
+    /// Poll one completion so a queued mutex waiter can receive its granted permit.
+    async fn next(&mut self) -> Result<(), Error> {
+        match self {
+            Self::Incoming(incoming, outgoing) => {
+                tokio::select! {
+                    completed = incoming.next(), if !incoming.is_empty() => {
+                        completed.expect("a nonempty receive set has a completion future")
+                    }
+                    completed = outgoing.next(), if !outgoing.is_empty() => {
+                        completed.expect("a nonempty send set has a completion future");
+                        Ok(())
+                    }
+                }
+            }
+            Self::Outgoing(outgoing) => {
+                outgoing
+                    .next()
+                    .await
+                    .expect("a nonempty send set has a completion future");
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Prepared authenticated work gathered from one peer in a receive batch.
 struct PreparedIncomingRun {
     peer_key: usize,
@@ -233,6 +276,127 @@ fn peer_order_key(peer: &Arc<Mutex<PeerState>>) -> usize {
     Arc::as_ptr(peer) as usize
 }
 
+/// Correlates peer-state lock waits and releases in an opt-in pipeline diagnostic run.
+static NEXT_PEER_LOCK_DIAGNOSTIC_ID: AtomicU64 = AtomicU64::new(0);
+static PEER_LOCK_DIAGNOSTICS_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Identifies the operation holding a peer-state lock when pipeline diagnostics are enabled.
+///
+/// Construct this before awaiting the mutex so its release log follows the guard's drop order.
+struct PeerLockDiagnostic {
+    id: u64,
+    operation: &'static str,
+    peer_key: usize,
+    enabled: bool,
+    acquired: bool,
+}
+
+impl PeerLockDiagnostic {
+    /// Begin tracing one peer-state mutex wait.
+    fn waiting(operation: &'static str, peer_key: usize) -> Self {
+        let enabled = *PEER_LOCK_DIAGNOSTICS_ENABLED.get_or_init(|| {
+            std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
+                || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some()
+        });
+        let id = NEXT_PEER_LOCK_DIAGNOSTIC_ID.fetch_add(1, Ordering::Relaxed);
+        if enabled {
+            eprintln!("peer_lock wait id={id} operation={operation} peer={peer_key}");
+        }
+        Self {
+            id,
+            operation,
+            peer_key,
+            enabled,
+            acquired: false,
+        }
+    }
+
+    /// Record that the mutex guard now belongs to this operation.
+    fn acquired(&mut self) {
+        self.acquired = true;
+        if self.enabled {
+            eprintln!(
+                "peer_lock acquired id={} operation={} peer={}",
+                self.id, self.operation, self.peer_key
+            );
+        }
+    }
+}
+
+impl Drop for PeerLockDiagnostic {
+    /// Log the scope ending after its mutex guard has been released.
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let stage = if self.acquired {
+            "released"
+        } else {
+            "wait_cancelled"
+        };
+        eprintln!(
+            "peer_lock {stage} id={} operation={} peer={}",
+            self.id, self.operation, self.peer_key
+        );
+    }
+}
+
+/// Acquire one peer-state mutex while recording the operation that owns it.
+async fn lock_peer_state<'a>(
+    peer: &'a Arc<Mutex<PeerState>>,
+    operation: &'static str,
+    peer_key: usize,
+    diagnostic: &mut PeerLockDiagnostic,
+) -> MutexGuard<'a, PeerState> {
+    debug_assert_eq!(diagnostic.operation, operation);
+    debug_assert_eq!(diagnostic.peer_key, peer_key);
+    let guard = peer.lock().await;
+    diagnostic.acquired();
+    guard
+}
+
+/// Wait for a peer lock while continuing to poll the completion futures owned by this task.
+///
+/// Completion futures are not spawned, so a child waiting ahead of its parent in Tokio's FIFO
+/// mutex queue must be polled by the parent before the lock can make progress. Poll completions
+/// first when work is pending, then keep the lock future pinned across completion polls. The empty
+/// path awaits the lock directly so low-rate traffic pays no select-loop cost.
+async fn await_while_completing<F, T>(
+    future: F,
+    pending: &mut PendingCompletions<'_>,
+) -> Result<T, Error>
+where
+    F: std::future::Future<Output = T>,
+{
+    if pending.is_empty() {
+        return Ok(future.await);
+    }
+
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            biased;
+            completed = pending.next(), if !pending.is_empty() => completed?,
+            output = &mut future => return Ok(output),
+        }
+    }
+}
+
+/// Acquire one peer-state mutex while its owner task continues draining earlier completions.
+async fn lock_peer_state_while_completing<'a>(
+    peer: &'a Arc<Mutex<PeerState>>,
+    operation: &'static str,
+    peer_key: usize,
+    diagnostic: &mut PeerLockDiagnostic,
+    pending: &mut PendingCompletions<'_>,
+) -> Result<MutexGuard<'a, PeerState>, Error> {
+    debug_assert_eq!(diagnostic.operation, operation);
+    debug_assert_eq!(diagnostic.peer_key, peer_key);
+    let guard = await_while_completing(peer.lock(), pending).await?;
+    diagnostic.acquired();
+    Ok(guard)
+}
+
 /// Group interleaved items by key while keeping each group's input order.
 fn group_by_key<K, Metadata, Item>(
     items: impl IntoIterator<Item = (K, Metadata, Item)>,
@@ -297,7 +461,7 @@ async fn complete_outgoing_packet<U: UdpSend>(
         .unwrap_or_else(|| vec![None]);
 
     let _ = lane
-        .complete_run(slot, packets, |mut packets| {
+        .complete_run_traced("outgoing", peer_key, slot, packets, |mut packets| {
             #[cfg(feature = "daita")]
             let peer_arc = Arc::clone(&peer_arc);
             let udp = udp.clone();
@@ -308,11 +472,23 @@ async fn complete_outgoing_packet<U: UdpSend>(
                 #[cfg(feature = "daita")]
                 let packet = {
                     if apply_daita {
-                        let mut peer = peer_arc.lock().await;
-                        match peer.daita.as_mut() {
+                        let peer_key = peer_order_key(&peer_arc);
+                        let mut peer_trace =
+                            PeerLockDiagnostic::waiting("outgoing_packet_daita", peer_key);
+                        let mut peer = lock_peer_state(
+                            &peer_arc,
+                            "outgoing_packet_daita",
+                            peer_key,
+                            &mut peer_trace,
+                        )
+                        .await;
+                        let packet = match peer.daita.as_mut() {
                             Some(daita) => daita.on_tunnel_sent(packet),
                             None => Some(packet),
-                        }
+                        };
+                        drop(peer);
+                        drop(peer_trace);
+                        packet
                     } else {
                         Some(packet)
                     }
@@ -354,7 +530,8 @@ async fn complete_outgoing_batch<U: UdpSend + 'static>(
         send_many_buf,
     } = context;
     let count = prepared.len();
-    let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some();
+    let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
+        || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some();
     if diagnostic {
         eprintln!(
             "pipeline stage=encrypt_start first_slot={first_slot} packets={count} dispatch={}",
@@ -382,15 +559,32 @@ async fn complete_outgoing_batch<U: UdpSend + 'static>(
     }
 
     let _ = lane
-        .complete_run(first_slot, packets, |packets| {
+        .complete_run_traced("outgoing", peer_key, first_slot, packets, |packets| {
             let peer_arc = Arc::clone(&peer_arc);
             let udp = udp.clone();
             let send_many_buf = Arc::clone(&send_many_buf);
             async move {
                 let mut output = Vec::with_capacity(packets.len());
                 #[cfg(feature = "daita")]
-                let mut peer = if apply_daita {
-                    Some(peer_arc.lock().await)
+                let mut peer_trace = if apply_daita {
+                    Some(PeerLockDiagnostic::waiting(
+                        "outgoing_batch_daita",
+                        peer_key,
+                    ))
+                } else {
+                    None
+                };
+                #[cfg(feature = "daita")]
+                let mut peer = if let Some(peer_trace) = peer_trace.as_mut() {
+                    Some(
+                        lock_peer_state(
+                            &peer_arc,
+                            "outgoing_batch_daita",
+                            peer_key,
+                            peer_trace,
+                        )
+                        .await,
+                    )
                 } else {
                     None
                 };
@@ -417,6 +611,8 @@ async fn complete_outgoing_batch<U: UdpSend + 'static>(
 
                 #[cfg(feature = "daita")]
                 drop(peer);
+                #[cfg(feature = "daita")]
+                drop(peer_trace);
 
                 let output_count = output.len();
                 if diagnostic {
@@ -725,7 +921,10 @@ impl<T: DeviceTransports> Device<T> {
 
             // Force a fresh handshake on resume by dropping any existing sessions.
             for peer in device.peers.values() {
-                peer.lock().await.reset();
+                let peer_key = peer_order_key(peer);
+                let mut peer_trace = PeerLockDiagnostic::waiting("resume", peer_key);
+                let mut peer = lock_peer_state(peer, "resume", peer_key, &mut peer_trace).await;
+                peer.reset();
             }
 
             device.suspended = false;
@@ -753,7 +952,10 @@ impl<T: DeviceTransports> Device<T> {
             let connection = device.connection.as_ref().ok_or(Error::NotConnected)?;
             let peer_arc = device.peers.get(public_key).ok_or(Error::PeerNotFound)?;
 
-            let mut peer = peer_arc.lock().await;
+            let peer_key = peer_order_key(peer_arc);
+            let mut peer_trace = PeerLockDiagnostic::waiting("force_handshake", peer_key);
+            let mut peer =
+                lock_peer_state(peer_arc, "force_handshake", peer_key, &mut peer_trace).await;
             let Some(PendingHandshake {
                 completed,
                 initiation,
@@ -766,6 +968,7 @@ impl<T: DeviceTransports> Device<T> {
                 let packet = WgKind::from(packet);
                 DeviceState::<T>::register_handshake_idx(&device.peers_by_idx, &packet, peer_arc);
                 drop(peer);
+                drop(peer_trace);
 
                 // NOTE: Like `handle_timers`, this does not trigger DAITA events.
                 connection.udp.send_to(packet.into(), endpoint_addr).await?;
@@ -931,7 +1134,10 @@ impl<T: DeviceTransports> DeviceState<T> {
         let rate_limiter = Arc::new(RateLimiter::new(&public_key, HANDSHAKE_RATE_LIMIT));
 
         for peer in self.peers.values_mut() {
-            peer.lock().await.tunnel.set_static_private(
+            let peer_key = peer_order_key(peer);
+            let mut peer_trace = PeerLockDiagnostic::waiting("set_key", peer_key);
+            let mut peer = lock_peer_state(peer, "set_key", peer_key, &mut peer_trace).await;
+            peer.tunnel.set_static_private(
                 private_key.clone(),
                 public_key,
                 Arc::clone(&rate_limiter),
@@ -989,14 +1195,16 @@ impl<T: DeviceTransports> DeviceState<T> {
         peers_by_idx.lock().insert(sender_idx, Arc::clone(peer));
     }
 
-    /// Finish a contiguous receive run while holding peer state only once.
+    /// Finish a contiguous receive run while holding peer state only once, retaining its first slot for diagnostics.
     async fn deliver_incoming_run(
+        first_slot: u64,
         device: Weak<RwLock<Self>>,
         peer_arc: Arc<Mutex<PeerState>>,
         completions: Vec<Option<IncomingCompletion>>,
         mut tun_tx: impl IpSend,
     ) -> Result<(), Error> {
-        let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some();
+        let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
+            || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some();
         let completion_count = completions.len();
         if diagnostic {
             eprintln!(
@@ -1014,7 +1222,10 @@ impl<T: DeviceTransports> DeviceState<T> {
             eprintln!("pipeline stage=incoming_device_lock_acquired");
             eprintln!("pipeline stage=incoming_delivery_peer_lock_wait");
         }
-        let mut peer = peer_arc.lock().await;
+        let peer_key = peer_order_key(&peer_arc);
+        let mut peer_trace = PeerLockDiagnostic::waiting("incoming_delivery", peer_key);
+        let mut peer =
+            lock_peer_state(&peer_arc, "incoming_delivery", peer_key, &mut peer_trace).await;
         if diagnostic {
             eprintln!("pipeline stage=incoming_delivery_peer_lock_acquired");
         }
@@ -1072,6 +1283,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         }
 
         drop(peer);
+        drop(peer_trace);
         drop(device_guard);
         let tunnel_packet_count = tun_packets.len();
         if diagnostic {
@@ -1079,6 +1291,13 @@ impl<T: DeviceTransports> DeviceState<T> {
                 "pipeline stage=incoming_release completions={completion_count} tunnel_results={tunnel_result_count} empty={empty_packet_count} malformed={malformed_packet_count} rejected_source={rejected_source_count} queued={tunnel_packet_count}"
             );
             eprintln!("pipeline stage=tun_queue_send_start packets={tunnel_packet_count}");
+        }
+        let sequence_diagnostic = std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some();
+        if sequence_diagnostic && tunnel_packet_count > 1 {
+            eprintln!(
+                "ordered_tun_send_many_start slots={first_slot}..{} packets={tunnel_packet_count}",
+                first_slot + completion_count as u64
+            );
         }
         let result = match tunnel_packet_count {
             0 => Ok(()),
@@ -1094,6 +1313,13 @@ impl<T: DeviceTransports> DeviceState<T> {
         if diagnostic {
             eprintln!(
                 "pipeline stage=tun_queue_enqueue packets={tunnel_packet_count} success={}",
+                result.is_ok()
+            );
+        }
+        if sequence_diagnostic && tunnel_packet_count > 1 {
+            eprintln!(
+                "ordered_tun_send_many_done slots={first_slot}..{} packets={tunnel_packet_count} success={}",
+                first_slot + completion_count as u64,
                 result.is_ok()
             );
         }
@@ -1137,7 +1363,9 @@ impl<T: DeviceTransports> DeviceState<T> {
             let tun_tx = tun_tx.clone();
             pending.push(
                 async move {
-                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
+                        || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some()
+                    {
                         eprintln!(
                             "pipeline stage=decrypt_start first_slot={batch_first_slot} packets={batch_len} worker={force_worker}"
                         );
@@ -1152,7 +1380,9 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 .count()
                         })
                         .unwrap_or_default();
-                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
+                        || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some()
+                    {
                         eprintln!(
                             "pipeline stage=decrypt_complete first_slot={batch_first_slot} packets={batch_len} verified={verified_count} worker={force_worker}"
                         );
@@ -1164,17 +1394,31 @@ impl<T: DeviceTransports> DeviceState<T> {
                         });
 
                     let result = lane
-                        .complete_run(batch_first_slot, results, |completions| {
+                        .complete_run_traced(
+                            "incoming",
+                            peer_key,
+                            batch_first_slot,
+                            results,
+                            |completions| {
                             let device = device.clone();
                             let peer_arc = Arc::clone(&peer_arc);
                             let tun_tx = tun_tx.clone();
                             async move {
-                                Self::deliver_incoming_run(device, peer_arc, completions, tun_tx)
-                                    .await
+                                Self::deliver_incoming_run(
+                                    batch_first_slot,
+                                    device,
+                                    peer_arc,
+                                    completions,
+                                    tun_tx,
+                                )
+                                .await
                             }
-                        })
+                            },
+                        )
                         .await;
-                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
+                        || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some()
+                    {
                         eprintln!(
                             "pipeline stage=ordered_complete first_slot={batch_first_slot} packets={batch_len} success={}",
                             result.is_ok()
@@ -1204,7 +1448,8 @@ impl<T: DeviceTransports> DeviceState<T> {
         if run.packets.is_empty() {
             return Ok(());
         }
-        let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some();
+        let diagnostic = std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some()
+            || std::env::var_os("GOTATUN_DIAG_SEND_QUEUE").is_some();
         let packet_count = run.packets.len();
         let batch_count = run.packets.len().div_ceil(CRYPTO_BATCH_SIZE);
         if diagnostic {
@@ -1304,7 +1549,17 @@ impl<T: DeviceTransports> DeviceState<T> {
                 return Ok(());
             };
             let device_guard = device_arc.read().await;
-            let mut peer = peer_arc.lock().await;
+            let mut peer_trace = PeerLockDiagnostic::waiting("handshake_queue_flush", peer_key);
+            let mut pending_completions = PendingCompletions::Outgoing(pending);
+            let mut peer = lock_peer_state_while_completing(
+                &peer_arc,
+                "handshake_queue_flush",
+                peer_key,
+                &mut peer_trace,
+                &mut pending_completions,
+            )
+            .await?;
+            drop(pending_completions);
             if !peer.tunnel.has_queued_packets() {
                 drop(flush_guard.take());
                 return Ok(());
@@ -1336,6 +1591,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                 drop(flush_guard.take());
             }
             drop(peer);
+            drop(peer_trace);
             drop(device_guard);
 
             if jobs.is_empty() {
@@ -1465,8 +1721,9 @@ impl<T: DeviceTransports> DeviceState<T> {
 
             // Go over each peer and invoke the timer function
             for peer in peer_map.values() {
-                let mut p = peer.lock().await;
                 let peer_key = peer_order_key(peer);
+                let mut peer_trace = PeerLockDiagnostic::waiting("timer", peer_key);
+                let mut p = lock_peer_state(peer, "timer", peer_key, &mut peer_trace).await;
                 if outgoing_order.is_flushing(peer_key) {
                     continue;
                 }
@@ -1485,6 +1742,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                             .expect("timer output fits within the peer order window");
 
                         drop(p);
+                        drop(peer_trace);
 
                         // NOTE: we don't bother with triggering TunnelRecv DAITA events here.
                         complete_outgoing_packet(
@@ -1688,7 +1946,21 @@ impl<T: DeviceTransports> DeviceState<T> {
                             eprintln!("pipeline stage=incoming_peer_lock_wait counter={counter}");
                         }
                         drop(device_guard);
-                        let mut peer = peer_arc.lock().await;
+                        let mut peer_trace =
+                            PeerLockDiagnostic::waiting("incoming_prepare", peer_key);
+                        let mut pending_completions = PendingCompletions::Incoming(
+                            &mut incoming_pending,
+                            &mut outgoing_pending,
+                        );
+                        let mut peer = lock_peer_state_while_completing(
+                            &peer_arc,
+                            "incoming_prepare",
+                            peer_key,
+                            &mut peer_trace,
+                            &mut pending_completions,
+                        )
+                        .await?;
+                        drop(pending_completions);
                         if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
                             eprintln!(
                                 "pipeline stage=incoming_peer_lock_acquired counter={counter}"
@@ -1711,6 +1983,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                     );
                                 }
                                 drop(peer);
+                                drop(peer_trace);
                                 let reached_limit = {
                                     let run = incoming_runs.entry(peer_key).or_insert_with(|| {
                                         PreparedIncomingRun {
@@ -1748,7 +2021,21 @@ impl<T: DeviceTransports> DeviceState<T> {
                             }
                         }
 
-                        let mut peer = peer_arc.lock().await;
+                        let mut peer_trace =
+                            PeerLockDiagnostic::waiting("incoming_control", peer_key);
+                        let mut pending_completions = PendingCompletions::Incoming(
+                            &mut incoming_pending,
+                            &mut outgoing_pending,
+                        );
+                        let mut peer = lock_peer_state_while_completing(
+                            &peer_arc,
+                            "incoming_control",
+                            peer_key,
+                            &mut peer_trace,
+                            &mut pending_completions,
+                        )
+                        .await?;
+                        drop(pending_completions);
                         let result = peer.handle_incoming_packet(packet, addr);
                         match result {
                             TunnResult::Done | TunnResult::Err(_) => {}
@@ -1758,13 +2045,54 @@ impl<T: DeviceTransports> DeviceState<T> {
                                     &packet,
                                     &peer_arc,
                                 );
-                                let (lane, slot) = outgoing_order
-                                    .reserve(peer_key)
-                                    .expect("the peer's outgoing producers fit its order window");
                                 let flush_guard = outgoing_order.begin_flush(peer_key);
-                                let first_lane = Arc::clone(&lane);
+                                // Keep later TUN packets behind this control packet while its
+                                // bounded peer lane has no free sequence slot. Release peer and
+                                // device locks so the pending completions can drain the lane.
                                 drop(peer);
+                                drop(peer_trace);
                                 drop(device_guard);
+                                let (lane, slot) = loop {
+                                    if let Some(reserved) = outgoing_order.reserve(peer_key) {
+                                        if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                            eprintln!(
+                                                "pipeline stage=control_slot_reserved peer={peer_key} slot={} pending={}",
+                                                reserved.1,
+                                                outgoing_pending.len()
+                                            );
+                                        }
+                                        break reserved;
+                                    }
+                                    let Some(lane) = outgoing_order.lane(peer_key) else {
+                                        continue;
+                                    };
+                                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                        eprintln!(
+                                            "pipeline stage=control_slot_wait peer={peer_key} available={} pending={}",
+                                            lane.available(),
+                                            outgoing_pending.len()
+                                        );
+                                    }
+                                    tokio::select! {
+                                        _ = lane.wait_for_capacity() => {
+                                            if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                                eprintln!(
+                                                    "pipeline stage=control_slot_capacity_wake peer={peer_key} available={}",
+                                                    lane.available()
+                                                );
+                                            }
+                                        }
+                                        _ = outgoing_pending.next(), if !outgoing_pending.is_empty() => {
+                                            if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                                eprintln!(
+                                                    "pipeline stage=control_slot_pending_wake peer={peer_key} available={}",
+                                                    lane.available()
+                                                );
+                                            }
+                                        }
+                                    }
+                                };
+                                let first_lane = Arc::clone(&lane);
 
                                 while outgoing_pending.len() >= CRYPTO_CHUNK_SIZE {
                                     outgoing_pending
@@ -1837,9 +2165,15 @@ impl<T: DeviceTransports> DeviceState<T> {
                                     continue;
                                 }
 
+                                if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                    eprintln!("pipeline stage=incoming_control_tun_send_wait");
+                                }
                                 if let Err(e) = tun_tx.send(packet).await {
                                     tracing::trace!("buffered_tun_send.send failed");
                                     return Err(Error::IoError(e));
+                                }
+                                if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                    eprintln!("pipeline stage=incoming_control_tun_send_done");
                                 }
                             }
                         }
@@ -1884,6 +2218,9 @@ impl<T: DeviceTransports> DeviceState<T> {
             tokio::select! {
                 completed = pending.next(), if !pending.is_empty() => {
                     let _ = completed;
+                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                        eprintln!("pipeline stage=outgoing_pending_complete remaining={}", pending.len());
+                    }
                 }
                 packets = tun_rx.recv(&mut packet_pool) => {
                     let packets = match packets {
@@ -1923,7 +2260,19 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 return Ok(());
                             };
                             let device_guard = device_arc.read().await;
-                            let mut peer = peer_arc.lock().await;
+                            let mut peer_trace =
+                                PeerLockDiagnostic::waiting("outgoing_prepare", peer_key);
+                            let mut pending_completions =
+                                PendingCompletions::Outgoing(&mut pending);
+                            let mut peer = lock_peer_state_while_completing(
+                                &peer_arc,
+                                "outgoing_prepare",
+                                peer_key,
+                                &mut peer_trace,
+                                &mut pending_completions,
+                            )
+                            .await?;
+                            drop(pending_completions);
                             let Some(peer_addr) = peer.endpoint().addr else {
                                 tracing::error!("No endpoint");
                                 break;
@@ -1948,8 +2297,15 @@ impl<T: DeviceTransports> DeviceState<T> {
                             if available == 0 {
                                 let lane = outgoing_order.lane(peer_key);
                                 drop(peer);
+                                drop(peer_trace);
                                 drop(device_guard);
                                 if let Some(lane) = lane {
+                                    if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                        eprintln!(
+                                            "pipeline stage=outgoing_slot_wait peer={peer_key} pending={}",
+                                            pending.len()
+                                        );
+                                    }
                                     tokio::select! {
                                         _ = lane.wait_for_capacity() => {}
                                         _ = pending.next(), if !pending.is_empty() => {}
@@ -1999,14 +2355,27 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 .reserve_run(peer_key, prepared.len())
                                 .expect("the prepared run fits in the peer order window");
                             drop(peer);
+                            drop(peer_trace);
                             drop(device_guard);
 
                             let batch_count = prepared.len().div_ceil(CRYPTO_BATCH_SIZE);
                             while pending.len() + batch_count > CRYPTO_CHUNK_SIZE {
+                                if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                    eprintln!(
+                                        "pipeline stage=outgoing_pending_wait peer={peer_key} pending={} batches={batch_count}",
+                                        pending.len()
+                                    );
+                                }
                                 pending
                                     .next()
                                     .await
                                     .expect("a full outgoing run has a completion future");
+                                if std::env::var_os("GOTATUN_DIAG_PIPELINE").is_some() {
+                                    eprintln!(
+                                        "pipeline stage=outgoing_pending_wake peer={peer_key} pending={}",
+                                        pending.len()
+                                    );
+                                }
                             }
                             let batch_context = OutgoingBatchContext {
                                 peer: OutgoingPeerContext {
