@@ -2394,6 +2394,16 @@ impl<T: DeviceTransports> DeviceState<T> {
                     &mut packet_pool,
                     &mut received_packets,
                 ) => {
+                    // Linux has no buffered UDP receive queue to stamp arrivals, so stamp the
+                    // batch here: `rx_to_tun_written_ns` then covers decrypt plus the TUN send
+                    // queue on Linux too (#260, J582).
+                    #[cfg(target_os = "linux")]
+                    if crate::diag::PATH_TIMING.on() && !received_packets.is_empty() {
+                        crate::diag::mark_pending(
+                            &crate::diag::PENDING_UDP_RX_NS,
+                            crate::diag::udp_send_monotonic_now(),
+                        );
+                    }
                     if crate::diag::PIPELINE.on() {
                         eprintln!(
                             "pipeline stage=udp_receive packets={} error={}",
