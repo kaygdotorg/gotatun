@@ -32,7 +32,17 @@ use crate::udp::UdpSend;
 
 #[derive(Default, Debug)]
 pub struct Endpoint {
+    /// Where packets for this peer are sent: the configured address, or the source of the latest
+    /// accepted packet, including a handshake initiation that has not yet proven key possession.
     pub addr: Option<SocketAddr>,
+    /// The source of the latest packet that proved the sender holds the peer's key: decrypted
+    /// transport data (keepalives included), or the response to a handshake we initiated.
+    ///
+    /// Unlike `addr`, an initiation never moves it. An initiation can be replayed from any
+    /// address before the sender proves anything, so a caller that derives routing state from a
+    /// peer's path (for example its MTU) should read this field. It is `None` until the first
+    /// proof and is not changed by configuration.
+    pub confirmed: Option<SocketAddr>,
 }
 
 /// A handshake initiated by [`PeerState::force_handshake`].
@@ -81,7 +91,10 @@ impl PeerState {
 
         Self {
             tunnel,
-            endpoint: Endpoint { addr: endpoint },
+            endpoint: Endpoint {
+                addr: endpoint,
+                confirmed: None,
+            },
             allowed_ips,
             #[cfg(feature = "daita")]
             daita_settings,
@@ -93,8 +106,10 @@ impl PeerState {
 
     /// Process an incoming packet received from `addr`.
     ///
-    /// Any authenticated packet updates the peer endpoint to `addr`. Waiters are notified if the
-    /// packet completes a handshake that we initiated.
+    /// Any accepted packet updates the peer endpoint to `addr`. Only transport data and the
+    /// response to our own initiation also update the confirmed endpoint; an accepted initiation
+    /// does not, because it proves nothing until its sender's first data packet. Waiters are
+    /// notified if the packet completes a handshake that we initiated.
     pub fn handle_incoming_packet(&mut self, packet: WgKind, addr: SocketAddr) -> TunnResult {
         let is_handshake_resp = matches!(packet, WgKind::HandshakeResp(_));
         let result = self.tunnel.handle_incoming_packet(packet);
@@ -102,10 +117,14 @@ impl PeerState {
             TunnResult::WriteToNetwork(_) => {
                 self.endpoint.addr = Some(addr);
                 if is_handshake_resp {
+                    self.confirm_endpoint(addr);
                     self.notify_handshake_completed();
                 }
             }
-            TunnResult::WriteToTunnel(_) => self.endpoint.addr = Some(addr),
+            TunnResult::WriteToTunnel(_) => {
+                self.endpoint.addr = Some(addr);
+                self.confirm_endpoint(addr);
+            }
             // Don't update the peer endpoint on cookie replies, for consistency
             // with both the Linux kernel and wireguard-go.
             TunnResult::Done | TunnResult::Err(_) => {}
@@ -122,8 +141,20 @@ impl PeerState {
         let result = self.tunnel.complete_incoming_packet(result);
         if matches!(result, TunnResult::WriteToTunnel(_)) {
             self.endpoint.addr = Some(addr);
+            self.confirm_endpoint(addr);
         }
         result
+    }
+
+    /// Record `addr` as the confirmed endpoint after a packet proved key possession.
+    ///
+    /// This runs on every decrypted packet under the peer lock the caller already holds. It is a
+    /// compare and, only when the source moved, a store: no allocation or extra synchronisation.
+    #[inline]
+    fn confirm_endpoint(&mut self, addr: SocketAddr) {
+        if self.endpoint.confirmed != Some(addr) {
+            self.endpoint.confirmed = Some(addr);
+        }
     }
 
     /// Prepare a data packet for parallel decryption under its selected session.
@@ -247,6 +278,104 @@ impl PeerState {
 
     pub fn preshared_key(&self) -> Option<[u8; 32]> {
         self.tunnel.preshared_key()
+    }
+}
+
+#[cfg(test)]
+mod confirmed_endpoint_tests {
+    //! The confirmed endpoint moves only on packets that prove the peer's key.
+
+    use super::PeerState;
+    use crate::noise::{Tunn, TunnResult, index_table::IndexTable, rate_limiter::RateLimiter};
+    use crate::packet::{Packet, WgKind};
+    use crate::x25519::{PublicKey, StaticSecret};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    /// Build one side of a tunnel between `local` and the peer `remote`.
+    fn tunnel(local: &StaticSecret, remote: &StaticSecret) -> Tunn {
+        let public = PublicKey::from(local);
+        Tunn::new(
+            local.clone(),
+            PublicKey::from(remote),
+            None,
+            None,
+            IndexTable::from_os_rng(),
+            Arc::new(RateLimiter::new(&public, 100)),
+        )
+    }
+
+    /// Return the network packet `result` asks the caller to send.
+    fn network(result: TunnResult) -> WgKind {
+        match result {
+            TunnResult::WriteToNetwork(packet) => packet,
+            other => panic!("expected a packet for the network, got {other:?}"),
+        }
+    }
+
+    /// A replayed initiation from a new source moves `addr` but never `confirmed`;
+    /// authenticated data, and the response to our own initiation, move both (#489 J549 P1).
+    #[test]
+    fn only_authenticated_packets_move_the_confirmed_endpoint() {
+        let initiator_key = StaticSecret::random_from_rng(rand_core::OsRng);
+        let responder_key = StaticSecret::random_from_rng(rand_core::OsRng);
+        let mut initiator = PeerState::new(
+            tunnel(&initiator_key, &responder_key),
+            None,
+            &[],
+            #[cfg(feature = "daita")]
+            None,
+        );
+        let mut responder = PeerState::new(
+            tunnel(&responder_key, &initiator_key),
+            None,
+            &[],
+            #[cfg(feature = "daita")]
+            None,
+        );
+        let real: SocketAddr = "192.0.2.10:51820".parse().unwrap();
+        let forged: SocketAddr = "203.0.113.66:40000".parse().unwrap();
+        let responder_addr: SocketAddr = "198.51.100.1:51820".parse().unwrap();
+
+        // A genuine initiation: valid MAC1, valid static and timestamp, but no proof yet.
+        let init = initiator.tunnel.format_handshake_initiation(false).unwrap();
+        let response = network(responder.handle_incoming_packet(WgKind::from(init), real));
+        assert_eq!(responder.endpoint().addr, Some(real));
+        assert_eq!(responder.endpoint().confirmed, None);
+
+        // Our own completed handshake confirms the responder's address on the initiator.
+        let keepalive = network(initiator.handle_incoming_packet(response, responder_addr));
+        assert_eq!(initiator.endpoint().confirmed, Some(responder_addr));
+
+        // The initiator's first data packet proves its key to the responder.
+        assert!(matches!(
+            responder.handle_incoming_packet(keepalive, real),
+            TunnResult::WriteToTunnel(_)
+        ));
+        assert_eq!(responder.endpoint().confirmed, Some(real));
+
+        // A fresh initiation the responder has not seen, delivered from another source, as a
+        // replay would be: GotaTun accepts it and moves `addr`, `confirmed` must stay put.
+        // With the mocked clock, time stands still; a later initiation needs a later timestamp.
+        #[cfg(feature = "mock_instant")]
+        mock_instant::thread_local::MockClock::advance(std::time::Duration::from_secs(1));
+        let replayed = initiator.tunnel.format_handshake_initiation(true).unwrap();
+        let _ = network(responder.handle_incoming_packet(WgKind::from(replayed), forged));
+        assert_eq!(responder.endpoint().addr, Some(forged));
+        assert_eq!(responder.endpoint().confirmed, Some(real));
+
+        // Authenticated data from a new source is a real roam and moves the confirmed endpoint.
+        let roamed: SocketAddr = "192.0.2.20:51820".parse().unwrap();
+        let data = initiator
+            .tunnel
+            .handle_outgoing_packet(Packet::from_bytes(bytes::BytesMut::new()), None)
+            .unwrap();
+        assert!(matches!(
+            responder.handle_incoming_packet(data, roamed),
+            TunnResult::WriteToTunnel(_)
+        ));
+        assert_eq!(responder.endpoint().addr, Some(roamed));
+        assert_eq!(responder.endpoint().confirmed, Some(roamed));
     }
 }
 
