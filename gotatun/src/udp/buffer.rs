@@ -382,6 +382,21 @@ impl BufferedUdpReceive {
 #[cfg(any(not(target_os = "linux"), test))]
 const RECV_BATCH: usize = 64;
 
+/// The batch limit in force: [`RECV_BATCH`], unless a benchmark sweep sets
+/// `GOTATUN_DIAG_RECV_BATCH` to a positive count before the process starts (#260, J582).
+/// Diagnostic only; never set it in production.
+#[cfg(any(not(target_os = "linux"), test))]
+fn recv_batch() -> usize {
+    static BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BATCH.get_or_init(|| {
+        std::env::var("GOTATUN_DIAG_RECV_BATCH")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|&batch| batch > 0)
+            .unwrap_or(RECV_BATCH)
+    })
+}
+
 #[cfg(any(not(target_os = "linux"), test))]
 impl UdpRecv for BufferedUdpReceive {
     type RecvManyBuf = ();
@@ -407,7 +422,7 @@ impl UdpRecv for BufferedUdpReceive {
         packets: &mut Vec<(Packet, SocketAddr)>,
     ) -> io::Result<()> {
         packets.push(self.recv_from(pool).await?);
-        for _ in 1..RECV_BATCH {
+        for _ in 1..recv_batch() {
             let Ok(item) = self.recv_rx.try_recv() else {
                 break;
             };
