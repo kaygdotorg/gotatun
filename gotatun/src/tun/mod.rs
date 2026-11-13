@@ -41,6 +41,22 @@ pub trait IpSend: Send + Sync + 'static {
     /// Send a complete IP packet.
     // TODO: consider refactoring trait with methods that take `Packet<Ipv4>` and `Packet<Ipv6>`
     fn send(&mut self, packet: Packet<Ip>) -> impl Future<Output = io::Result<()>> + Send;
+
+    /// Send a consecutive run of complete IP packets.
+    ///
+    /// Buffered implementations can move a run across their boundary with one handoff. The
+    /// default preserves compatibility for transports that only support single-packet writes.
+    fn send_many(
+        &mut self,
+        packets: &mut Vec<Packet<Ip>>,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        async move {
+            for packet in packets.drain(..) {
+                self.send(packet).await?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// A type that let's you receive an IP packet.
