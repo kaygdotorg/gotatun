@@ -444,6 +444,8 @@ struct PreparedIncomingRun {
     peer_key: usize,
     peer_arc: Arc<Mutex<PeerState>>,
     packets: Vec<(PreparedDecryption, std::net::SocketAddr)>,
+    /// Oldest UDP receive time shared by this run's bounded crypto completions.
+    received_at: crate::diag::OldestReceiveTime,
 }
 
 #[cfg(test)]
@@ -1619,6 +1621,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         peer_arc: Arc<Mutex<PeerState>>,
         completions: Vec<Option<IncomingCompletion>>,
         mut tun_tx: impl IpSend,
+        received_at_ns: u64,
     ) -> Result<(), Error> {
         let diagnostic = crate::diag::PIPELINE.on() || crate::diag::SEND_QUEUE.on();
         let completion_count = completions.len();
@@ -1708,6 +1711,9 @@ impl<T: DeviceTransports> DeviceState<T> {
                 first_slot + completion_count as u64
             );
         }
+        let tunnel_send_started_ns =
+            (received_at_ns != 0 && tunnel_packet_count > 0)
+                .then(crate::diag::udp_send_monotonic_now);
         let result = match tunnel_packet_count {
             0 => Ok(()),
             1 => tun_tx
@@ -1719,6 +1725,13 @@ impl<T: DeviceTransports> DeviceState<T> {
                 .await
                 .map_err(Error::IoError),
         };
+        if let Some(started_at_ns) = tunnel_send_started_ns {
+            crate::diag::record_udp_to_tun_delivery(
+                received_at_ns,
+                started_at_ns,
+                crate::diag::udp_send_monotonic_now(),
+            );
+        }
         if diagnostic {
             eprintln!(
                 "pipeline stage=tun_queue_enqueue packets={tunnel_packet_count} success={}",
@@ -1744,6 +1757,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         context: IncomingRunContext<TunTx>,
         first_slot: u64,
         packets: Vec<(PreparedDecryption, std::net::SocketAddr)>,
+        received_at_ns: u64,
     ) {
         let IncomingRunContext {
             crypto,
@@ -1823,6 +1837,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                     peer_arc,
                                     completions,
                                     tun_tx,
+                                    received_at_ns,
                                 )
                                 .await
                             }
@@ -1864,6 +1879,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         }
         let diagnostic = crate::diag::PIPELINE.on() || crate::diag::SEND_QUEUE.on();
         let packet_count = run.packets.len();
+        let received_at_ns = run.received_at.get();
         let batch_count = run.packets.len().div_ceil(CRYPTO_BATCH_SIZE);
         if diagnostic {
             eprintln!(
@@ -1922,6 +1938,7 @@ impl<T: DeviceTransports> DeviceState<T> {
             },
             first_slot,
             run.packets,
+            received_at_ns,
         );
         if diagnostic {
             eprintln!(
@@ -2352,6 +2369,7 @@ impl<T: DeviceTransports> DeviceState<T> {
 
         loop {
             received_packets.clear();
+            let mut received_at_ns = 0;
             tokio::select! {
                 biased;
                 completed = incoming_pending.next(), if !incoming_pending.is_empty() => {
@@ -2370,6 +2388,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                     &mut packet_pool,
                     &mut received_packets,
                 ) => {
+                    received_at_ns = udp_rx.take_diagnostic_received_at_ns().unwrap_or_default();
                     if crate::diag::PIPELINE.on() {
                         eprintln!(
                             "pipeline stage=udp_receive packets={} error={}",
@@ -2520,8 +2539,10 @@ impl<T: DeviceTransports> DeviceState<T> {
                                             peer_key,
                                             peer_arc: Arc::clone(&peer_arc),
                                             packets: Vec::with_capacity(CRYPTO_CHUNK_SIZE),
+                                            received_at: crate::diag::OldestReceiveTime::default(),
                                         }
                                     });
+                                    run.received_at.record(received_at_ns);
                                     run.packets.push((packet, addr));
                                     run.packets.len() == CRYPTO_CHUNK_SIZE
                                 };

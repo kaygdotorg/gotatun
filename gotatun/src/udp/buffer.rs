@@ -442,7 +442,21 @@ impl UdpSend for BufferedUdpSend {
 #[cfg(any(not(target_os = "linux"), test))]
 pub struct BufferedUdpReceive {
     _recv_task: Arc<Task>,
-    recv_rx: mpsc::Receiver<io::Result<(Packet, SocketAddr)>>,
+    recv_rx: mpsc::Receiver<io::Result<BufferedUdpPacket>>,
+    /// Whether this wrapper should add timing metadata and emit its final summary.
+    diagnostics_enabled: bool,
+    /// Timestamp saved by `recv_from` for the device's diagnostic timing scope.
+    last_received_at_ns: u64,
+}
+
+/// One datagram and its optional socket-read timestamp inside the buffered receive queue.
+struct BufferedUdpPacket {
+    /// UDP payload, already decoded into the pooled packet buffer.
+    packet: Packet,
+    /// Source address reported by the socket.
+    source_addr: SocketAddr,
+    /// Process-relative monotonic socket-read time, or zero when diagnostics are disabled.
+    received_at_ns: u64,
 }
 
 #[cfg(any(not(target_os = "linux"), test))]
@@ -450,8 +464,23 @@ impl BufferedUdpReceive {
     /// Wrap a [`UdpRecv`] into a [`BufferedUdpReceive`] with `capacity`.
     pub fn new(
         capacity: usize,
+        udp_rx: impl UdpRecv + 'static,
+        recv_pool: PacketBufPool,
+    ) -> Self {
+        Self::new_with_diagnostics(
+            capacity,
+            udp_rx,
+            recv_pool,
+            crate::diag::UDP_TO_TUN_TIMING.on(),
+        )
+    }
+
+    /// Wrap a receive socket and optionally timestamp each batch before it enters the channel.
+    fn new_with_diagnostics(
+        capacity: usize,
         mut udp_rx: impl UdpRecv + 'static,
         mut recv_pool: PacketBufPool,
+        diagnostics_enabled: bool,
     ) -> Self {
         let (recv_tx, recv_rx) = mpsc::channel(capacity);
 
@@ -480,8 +509,19 @@ impl BufferedUdpReceive {
                     tokio::task::yield_now().await;
                 }
 
+                let received_at_ns = if diagnostics_enabled && !packet_bufs.is_empty() {
+                    crate::diag::udp_send_monotonic_now().max(1)
+                } else {
+                    0
+                };
+
                 for (packet_buf, src) in packet_bufs.drain(..) {
-                    match recv_tx.try_send(Ok((packet_buf, src))) {
+                    let packet = BufferedUdpPacket {
+                        packet: packet_buf,
+                        source_addr: src,
+                        received_at_ns,
+                    };
+                    match recv_tx.try_send(Ok(packet)) {
                         Ok(()) => (),
                         Err(mpsc::error::TrySendError::Full(packet)) => {
                             if recv_tx.send(packet).await.is_err() {
@@ -498,6 +538,19 @@ impl BufferedUdpReceive {
         Self {
             _recv_task: Arc::new(recv_task),
             recv_rx,
+            diagnostics_enabled,
+            last_received_at_ns: 0,
+        }
+    }
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+impl Drop for BufferedUdpReceive {
+    /// Close the handoff before writing one diagnostic summary at the end of its traffic window.
+    fn drop(&mut self) {
+        self.recv_rx.close();
+        if self.diagnostics_enabled {
+            crate::diag::write_udp_to_tun_summary();
         }
     }
 }
@@ -507,13 +560,27 @@ impl UdpRecv for BufferedUdpReceive {
     type RecvManyBuf = ();
 
     async fn recv_from(&mut self, _pool: &mut PacketBufPool) -> io::Result<(Packet, SocketAddr)> {
+        self.last_received_at_ns = 0;
         let Some(packet) = self.recv_rx.recv().await else {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "UDP receive task stopped",
             ));
         };
-        packet
+        let packet = packet?;
+        self.last_received_at_ns = packet.received_at_ns;
+        if self.last_received_at_ns != 0 {
+            crate::diag::record_buffered_udp_receive(
+                self.last_received_at_ns,
+                crate::diag::udp_send_monotonic_now(),
+            );
+        }
+        Ok((packet.packet, packet.source_addr))
+    }
+
+    fn take_diagnostic_received_at_ns(&mut self) -> Option<u64> {
+        let received_at_ns = std::mem::take(&mut self.last_received_at_ns);
+        (received_at_ns != 0).then_some(received_at_ns)
     }
 }
 
@@ -670,6 +737,50 @@ mod test {
         .expect("the valid datagram must arrive")
         .expect("a bad datagram must not be reported as a receive failure");
         assert_eq!(&packet[..], b"after-bad");
+    }
+
+    /// A diagnostic timestamp survives the buffered UDP handoff when explicitly enabled.
+    #[tokio::test]
+    async fn buffered_receive_exposes_socket_read_timestamp_when_enabled() {
+        let script = Script([Ok(datagram(b"timed"))].into());
+        let mut receiver = BufferedUdpReceive::new_with_diagnostics(
+            16,
+            script,
+            PacketBufPool::new(4),
+            true,
+        );
+
+        let (packet, _) = receiver
+            .recv_from(&mut PacketBufPool::new(1))
+            .await
+            .expect("scripted packet must arrive");
+
+        assert_eq!(&packet[..], b"timed");
+        assert!(
+            receiver
+                .take_diagnostic_received_at_ns()
+                .is_some_and(|timestamp| timestamp > 0)
+        );
+    }
+
+    /// A disabled diagnostic leaves no receive timestamp for the packet path to carry.
+    #[tokio::test]
+    async fn buffered_receive_skips_socket_read_timestamp_when_disabled() {
+        let script = Script([Ok(datagram(b"untimed"))].into());
+        let mut receiver = BufferedUdpReceive::new_with_diagnostics(
+            16,
+            script,
+            PacketBufPool::new(4),
+            false,
+        );
+
+        let (packet, _) = receiver
+            .recv_from(&mut PacketBufPool::new(1))
+            .await
+            .expect("scripted packet must arrive");
+
+        assert_eq!(&packet[..], b"untimed");
+        assert_eq!(receiver.take_diagnostic_received_at_ns(), None);
     }
 
     /// A gone socket is still reported, and the receive task then stops.

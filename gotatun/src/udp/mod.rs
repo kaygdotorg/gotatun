@@ -94,6 +94,13 @@ pub trait UdpRecv: Send + Sync {
         pool: &mut PacketBufPool,
     ) -> impl Future<Output = io::Result<(Packet, SocketAddr)>> + Send;
 
+    /// Return the monotonic receive time attached to the most recent packet, when diagnostics
+    /// carry one through an internal receive buffer. Ordinary UDP implementations return none.
+    #[doc(hidden)]
+    fn take_diagnostic_received_at_ns(&mut self) -> Option<u64> {
+        None
+    }
+
     /// The buffer type that is passed to [`UdpRecv::recv_many_from`].
     type RecvManyBuf: Default + Send;
 

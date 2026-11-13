@@ -353,6 +353,7 @@ async fn j369_control_drain_progresses_with_a_queued_device_writer() {
                         completion_peer.clone(),
                         completions,
                         tun.clone(),
+                        0,
                     )
                 })
                 .await
@@ -1564,6 +1565,7 @@ async fn j380_packet_lookup_progresses_with_a_pending_delivery_reader() {
                     completion_peer.clone(),
                     completions,
                     tun.clone(),
+                    0,
                 )
             })
             .await
