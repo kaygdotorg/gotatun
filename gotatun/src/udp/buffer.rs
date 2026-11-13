@@ -521,18 +521,24 @@ impl BufferedUdpReceive {
     }
 }
 
+/// Most datagrams one [`BufferedUdpReceive::recv_many_from`] call hands to the packet task.
+///
+/// Taking every queued datagram in one call lets the packet task decrypt them as one run and
+/// write them to the TUN together, the way Linux handles a `recvmmsg` batch, instead of paying
+/// a loop turn per datagram (#260, J582). 64 matches the macOS socket read and send batches;
+/// the bound keeps one call from holding the first datagram's TUN write behind the decryption
+/// of a whole deep queue.
 #[cfg(any(not(target_os = "linux"), test))]
-impl UdpRecv for BufferedUdpReceive {
-    type RecvManyBuf = ();
+const RECV_BATCH: usize = 64;
 
-    async fn recv_from(&mut self, _pool: &mut PacketBufPool) -> io::Result<(Packet, SocketAddr)> {
-        let Some(packet) = self.recv_rx.recv().await else {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "UDP receive task stopped",
-            ));
-        };
-        let (packet, source, received_ns) = packet?;
+#[cfg(any(not(target_os = "linux"), test))]
+impl BufferedUdpReceive {
+    /// Unwrap one queued item and, when path timing is on, record how long it waited.
+    fn take(
+        &self,
+        item: io::Result<(Packet, SocketAddr, u64)>,
+    ) -> io::Result<(Packet, SocketAddr)> {
+        let (packet, source, received_ns) = item?;
         if received_ns != 0 {
             use crate::diag::path;
             let now = crate::diag::udp_send_monotonic_now();
@@ -541,6 +547,41 @@ impl UdpRecv for BufferedUdpReceive {
             crate::diag::mark_pending(&crate::diag::PENDING_UDP_RX_NS, received_ns);
         }
         Ok((packet, source))
+    }
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+impl UdpRecv for BufferedUdpReceive {
+    type RecvManyBuf = ();
+
+    async fn recv_from(&mut self, _pool: &mut PacketBufPool) -> io::Result<(Packet, SocketAddr)> {
+        let Some(item) = self.recv_rx.recv().await else {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "UDP receive task stopped",
+            ));
+        };
+        self.take(item)
+    }
+
+    /// Wait for one datagram, then add every datagram already queued, up to [`RECV_BATCH`].
+    ///
+    /// Never waits for a second datagram, so a lone reply is not delayed. The receive task only
+    /// queues an error when the socket is gone, so an error ends the batch and is returned.
+    async fn recv_many_from(
+        &mut self,
+        _recv_buf: &mut Self::RecvManyBuf,
+        pool: &mut PacketBufPool,
+        packets: &mut Vec<(Packet, SocketAddr)>,
+    ) -> io::Result<()> {
+        packets.push(self.recv_from(pool).await?);
+        for _ in 1..RECV_BATCH {
+            let Ok(item) = self.recv_rx.try_recv() else {
+                break;
+            };
+            packets.push(self.take(item)?);
+        }
+        Ok(())
     }
 }
 
