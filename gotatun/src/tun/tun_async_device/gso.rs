@@ -1227,4 +1227,255 @@ mod tests {
         );
         assert_eq!(ipv4_udp_payload(&frames[1]), vec![64; 400]);
     }
+
+    /// Sum and fold network words without complementing, as CHECKSUM_PARTIAL requires.
+    fn j338_fold(bytes: &[u8]) -> u16 {
+        let mut sum: u32 = bytes
+            .chunks(2)
+            .map(|w| u32::from(w[0]) * 256 + u32::from(*w.get(1).unwrap_or(&0)))
+            .sum();
+        while sum >> 16 != 0 {
+            sum = (sum & 65535) + (sum >> 16);
+        }
+        sum as u16
+    }
+
+    /// Build the pseudo-header independently of production checksum helpers.
+    fn j338_pseudo(packet: &[u8]) -> Vec<u8> {
+        if packet[0] >> 4 == 4 {
+            let mut p = packet[12..20].to_vec();
+            p.extend_from_slice(&[0, packet[9]]);
+            p.extend_from_slice(&((packet.len() - 20) as u16).to_be_bytes());
+            p
+        } else {
+            let mut p = packet[8..40].to_vec();
+            p.extend_from_slice(&((packet.len() - 40) as u32).to_be_bytes());
+            p.extend_from_slice(&[0, 0, 0, packet[6]]);
+            p
+        }
+    }
+
+    /// Make routable, checksum-valid fixture packets and optionally set PSH or a chosen IPv4 ID.
+    fn j338_edit(packet: Packet<Ip>, psh: bool, id: u16) -> Packet<Ip> {
+        let mut b = packet.as_bytes().to_vec();
+        let v4 = b[0] >> 4 == 4;
+        let h = if v4 { 20 } else { 40 };
+        let tcp = b[if v4 { 9 } else { 6 }] == 6;
+        if !v4 {
+            b[24..40].copy_from_slice(&[0x20, 1, 0x0d, 0xb8, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        }
+        if psh {
+            b[h + 13] |= 8;
+        }
+        if v4 {
+            b[4..6].copy_from_slice(&id.to_be_bytes());
+            b[10..12].fill(0);
+            let c = !j338_fold(&b[..20]);
+            b[10..12].copy_from_slice(&c.to_be_bytes());
+        }
+        let off = h + if tcp { 16 } else { 6 };
+        b[off..off + 2].fill(0);
+        let mut p = j338_pseudo(&b);
+        p.extend_from_slice(&b[h..]);
+        let c = !j338_fold(&p);
+        b[off..off + 2].copy_from_slice(&c.to_be_bytes());
+        Packet::copy_from(&b[..]).try_into_ip().unwrap()
+    }
+
+    /// Export real builder output for an independent Linux forwarding/segmentation check.
+    #[test]
+    #[ignore = "manual kernel segmentation proof requires J338_FRAMES output directory"]
+    fn j338_export_kernel_frames() {
+        let dir = std::env::var("J338_FRAMES").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let cases = [
+            (
+                "tcp4",
+                vec![ipv4_tcp(1, 1000, b"first"), ipv4_tcp(1, 1005, b"other")],
+            ),
+            (
+                "tcp6",
+                vec![ipv6_tcp(1, 1000, b"first"), ipv6_tcp(1, 1005, b"other")],
+            ),
+            (
+                "tcp4tail",
+                vec![ipv4_tcp(1, 1000, b"first"), ipv4_tcp(1, 1005, b"end")],
+            ),
+            (
+                "tcp6tail",
+                vec![ipv6_tcp(1, 1000, b"first"), ipv6_tcp(1, 1005, b"end")],
+            ),
+            ("udp4", vec![ipv4_udp(1, b"first"), ipv4_udp(1, b"end")]),
+            ("udp6", vec![ipv6_udp(1, b"first"), ipv6_udp(1, b"end")]),
+        ];
+        for (name, psh, ids) in [
+            ("tcp4psh", true, [100, 101]),
+            ("tcp4ids", false, [100, 900]),
+        ] {
+            let packets = vec![
+                j338_edit(ipv4_tcp(1, 1000, b"first"), psh, ids[0]),
+                j338_edit(ipv4_tcp(1, 1005, b"other"), psh, ids[1]),
+            ];
+            for (i, p) in packets.iter().enumerate() {
+                std::fs::write(format!("{dir}/{name}-input{i}.ip"), p.as_bytes()).unwrap();
+            }
+            let frames = coalesce_packets(packets, true, true);
+            assert_eq!(frames.len(), 1);
+            std::fs::write(format!("{dir}/{name}.bin"), frames[0].as_bytes()).unwrap();
+        }
+        for (name, packets) in cases {
+            let packets: Vec<_> = packets
+                .into_iter()
+                .enumerate()
+                .map(|(i, p)| j338_edit(p, false, 100 + i as u16))
+                .collect();
+            for (i, p) in packets.iter().enumerate() {
+                std::fs::write(format!("{dir}/{name}-input{i}.ip"), p.as_bytes()).unwrap();
+            }
+            let frames = coalesce_packets(packets, true, true);
+            assert_eq!(frames.len(), 1);
+            std::fs::write(format!("{dir}/{name}.bin"), frames[0].as_bytes()).unwrap();
+        }
+    }
+
+    /// The transport checksum field must hold a folded sum, not its complement.
+    #[test]
+    fn j338_partial_seed_matches_linux() {
+        for packets in [
+            vec![ipv4_tcp(1, 1000, b"first"), ipv4_tcp(1, 1005, b"other")],
+            vec![ipv6_tcp(1, 1000, b"first"), ipv6_tcp(1, 1005, b"other")],
+            vec![ipv4_udp(1, b"first"), ipv4_udp(1, b"end")],
+            vec![ipv6_udp(1, b"first"), ipv6_udp(1, b"end")],
+        ] {
+            let frames = coalesce_packets(packets, true, true);
+            let f = &frames[0];
+            let h = frame_header(f);
+            let off = 10 + usize::from(h.csum_start) + usize::from(h.csum_offset);
+            let actual = u16::from_be_bytes(f.as_bytes()[off..off + 2].try_into().unwrap());
+            let expected = j338_fold(&j338_pseudo(&f.as_bytes()[10..]));
+            assert_eq!(
+                actual, expected,
+                "CHECKSUM_PARTIAL seed must be the uncomplemented folded pseudo-header sum"
+            );
+        }
+    }
+
+    /// PSH on an earlier segment must end a run instead of becoming a middle PSH.
+    #[test]
+    fn j338_psh_cannot_appear_in_middle() {
+        let packets = vec![
+            j338_edit(ipv4_tcp(1, 1000, b"first"), true, 100),
+            j338_edit(ipv4_tcp(1, 1005, b"other"), true, 101),
+        ];
+        assert_eq!(
+            coalesce_packets(packets, true, true).len(),
+            2,
+            "PSH packet must end a coalescing run"
+        );
+    }
+
+    /// Re-segmentation cannot represent arbitrary IPv4 identification changes.
+    #[test]
+    fn j338_nonconsecutive_ipv4_ids_stay_separate() {
+        let packets = vec![
+            j338_edit(ipv4_tcp(1, 1000, b"first"), false, 100),
+            j338_edit(ipv4_tcp(1, 1005, b"other"), false, 900),
+        ];
+        assert_eq!(
+            coalesce_packets(packets, true, true).len(),
+            2,
+            "nonconsecutive IDs cannot round-trip through GSO"
+        );
+    }
+
+    /// Exercise truncations and deterministic peer-controlled mutations without timing claims.
+    #[test]
+    fn j338_hostile_mutation_sweep() {
+        let seeds = [
+            ipv4_tcp(1, 1000, b"first"),
+            ipv6_tcp(1, 1000, b"first"),
+            ipv4_udp(1, b"first"),
+            ipv6_udp(1, b"first"),
+        ];
+        let mut accepted = 0;
+        for seed in seeds {
+            let bytes = seed.as_bytes();
+            for len in 0..=bytes.len() {
+                if let Ok(p) = Packet::copy_from(&bytes[..len]).try_into_ip() {
+                    let _ = coalesce_packets(vec![p], true, true);
+                    accepted += 1;
+                }
+            }
+            for i in 0..bytes.len() {
+                for value in 0..=255u8 {
+                    let mut b = bytes.to_vec();
+                    b[i] = value;
+                    if let Ok(p) = Packet::copy_from(&b[..]).try_into_ip() {
+                        let mut next = p.as_bytes().to_vec();
+                        // Keep a parsed TCP pair contiguous so mutations reach frame construction.
+                        if let Some(metadata) = super::packet_metadata(&next) {
+                            if let Some(sequence) = metadata.tcp_sequence {
+                                let offset = metadata.ip_header_len + 4;
+                                next[offset..offset + 4].copy_from_slice(
+                                    &sequence
+                                        .wrapping_add(metadata.payload_len as u32)
+                                        .to_be_bytes(),
+                                );
+                            }
+                        }
+                        let q = Packet::copy_from(&next[..]).try_into_ip().unwrap();
+                        let _ = coalesce_packets(vec![p, q], true, true);
+                        accepted += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("J338_MUTATION_ACCEPTED={accepted}");
+    }
+
+    /// Coalescing must stop at each header field whose value cannot be reconstructed.
+    #[test]
+    fn j338_header_guard_matrix() {
+        let cases = [
+            (8usize, 63u8),
+            (1, 1),
+            (12, 11),
+            (16, 11),
+            (20, 1),
+            (22, 1),
+            (32, 0x60),
+            (33, 0x11),
+            (33, 0x12),
+            (33, 0x14),
+            (33, 0x30),
+            (33, 0x50),
+            (6, 0x20),
+            (7, 1),
+        ];
+        for (offset, value) in cases {
+            let first = ipv4_tcp(1, 1000, b"first");
+            let second = ipv4_tcp(1, 1005, b"other");
+            let mut b = second.as_bytes().to_vec();
+            b[offset] = value;
+            let second = Packet::copy_from(&b[..]).try_into_ip().unwrap();
+            assert_eq!(
+                coalesce_packets(vec![first, second], true, true).len(),
+                2,
+                "offset {offset} value {value}"
+            );
+        }
+        for offset in [0usize, 1, 2, 3, 7, 8, 24, 40, 42] {
+            let first = ipv6_tcp(1, 1000, b"first");
+            let second = ipv6_tcp(1, 1005, b"other");
+            let mut b = second.as_bytes().to_vec();
+            b[offset] ^= 1;
+            if let Ok(second) = Packet::copy_from(&b[..]).try_into_ip() {
+                assert_eq!(
+                    coalesce_packets(vec![first, second], true, true).len(),
+                    2,
+                    "IPv6 offset {offset}"
+                );
+            }
+        }
+    }
 }
