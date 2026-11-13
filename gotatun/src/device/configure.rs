@@ -33,6 +33,10 @@ pub struct Stats {
     pub last_handshake: Option<Duration>,
     /// Total number of bytes received from this peer.
     pub rx_bytes: usize,
+    /// The source of the latest packet that proved this peer holds its key; `None` before the
+    /// first. Unlike [`Peer::endpoint`], an unconfirmed handshake initiation never changes it, so
+    /// read this before deriving routing state from the peer's network path.
+    pub confirmed_endpoint: Option<SocketAddr>,
     /// Total number of bytes sent to this peer.
     pub tx_bytes: usize,
     /// DAITA-specific statistics, if DAITA is enabled for this peer.
@@ -190,6 +194,7 @@ impl<T: DeviceTransports> DeviceRead<'_, T> {
             let stats = Stats {
                 tx_bytes,
                 rx_bytes,
+                confirmed_endpoint: p.endpoint.confirmed,
                 last_handshake,
                 #[cfg(feature = "daita")]
                 daita: daita_stats,
