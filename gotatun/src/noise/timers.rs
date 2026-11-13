@@ -119,6 +119,10 @@ pub struct Timers {
     want_handshake: Option<Duration>,
     persistent_keepalive: Option<Duration>,
     persistent_keepalive_due: bool,
+    /// An immediate keepalive was requested, for example because our own address changed and
+    /// the peer has to learn the new endpoint from an authenticated packet (#260, J561).
+    /// Cleared when the next timer pass sends it.
+    keepalive_requested: bool,
     /// Timer deadline ranges that the sampled deadlines below are drawn from.
     pub(super) params: TimerParams,
     /// Current passive keepalive deadline.
@@ -149,6 +153,7 @@ impl Timers {
             want_handshake: Default::default(),
             persistent_keepalive,
             persistent_keepalive_due: persistent_keepalive.is_some(),
+            keepalive_requested: false,
             params: TimerParams::default(),
             keepalive_timeout: Duration::ZERO,
             new_handshake_timeout: Duration::ZERO,
@@ -413,6 +418,16 @@ impl<R: rand::RngCore + Send> Tunn<R> {
                 }
 
                 if !handshake_initiation_required {
+                    // An owner asked for one keepalive now. The peer roams its endpoint on any
+                    // authenticated packet, so this is how a node whose address changed
+                    // announces itself without waiting for the 15 s silence handshake. Without
+                    // a session, `handle_outgoing_packet` queues it and starts a handshake.
+                    if self.timers.keepalive_requested {
+                        tracing::trace!("KEEPALIVE(REQUESTED)");
+                        keepalive_required = true;
+                        self.timers.keepalive_requested = false;
+                    }
+
                     // If a data packet has been received from a given peer, but we have not sent
                     // anything back within the sampled keepalive timeout (KEEPALIVE ms by
                     // default), we send an empty packet.
@@ -449,6 +464,17 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         }
 
         Ok(None)
+    }
+
+    /// Ask the next [`Tunn::update_timers`] pass to send one keepalive to this peer.
+    ///
+    /// Call this when the local endpoint changed (a new source address or port). The peer only
+    /// learns a new endpoint from an authenticated packet, and a node that is only receiving
+    /// would otherwise stay silent until the keepalive-plus-rekey timeout, about 15 s.
+    /// Requests made while a handshake is in flight wait for that handshake to finish; the
+    /// handshake itself already reaches the peer from the new endpoint.
+    pub fn request_keepalive(&mut self) {
+        self.timers.keepalive_requested = true;
     }
 
     /// Get the time elapsed since the last successful handshake.
