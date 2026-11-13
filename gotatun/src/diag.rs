@@ -31,6 +31,10 @@ pub(crate) struct UdpSendBatchDiagnostic {
     pub(crate) sequence: u64,
     /// Process-relative monotonic timestamp for the queue insertion event.
     pub(crate) enqueued_mono_ns: u64,
+    /// Time spent waiting for packet permits before the run entered the send channel.
+    pub(crate) packet_permit_wait_ns: u64,
+    /// Time spent waiting for the bounded send-channel slot before queue insertion.
+    pub(crate) channel_reserve_wait_ns: u64,
     /// Total packet permits reserved, including this run and work already being sent.
     pub(crate) outstanding_packets: usize,
     /// Number of datagrams in this queued run.
@@ -46,11 +50,15 @@ impl UdpSendBatchDiagnostic {
         outstanding_packets: usize,
         batch_packets: usize,
         batch_bytes: usize,
+        packet_permit_wait_ns: u64,
+        channel_reserve_wait_ns: u64,
     ) -> Self {
         let enqueued_mono_ns = udp_send_monotonic_now();
         Self {
             sequence,
             enqueued_mono_ns,
+            packet_permit_wait_ns,
+            channel_reserve_wait_ns,
             outstanding_packets,
             batch_packets,
             batch_bytes,

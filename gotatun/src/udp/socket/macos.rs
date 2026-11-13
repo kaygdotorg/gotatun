@@ -266,6 +266,10 @@ struct SendTimingDiagnostics {
     enobufs: AtomicU64,
     /// Queue-entry-to-syscall-start duration distribution.
     queue_to_start: TimingHistogram,
+    /// Time spent acquiring the packet permits before a run enters the send channel.
+    packet_permit_wait: TimingHistogram,
+    /// Time spent reserving a bounded send-channel slot before a run enters the queue.
+    channel_reserve_wait: TimingHistogram,
     /// Private syscall wall-time distribution.
     syscall_wall: TimingHistogram,
     /// Send-buffer occupancy sampled before the private send call.
@@ -286,6 +290,8 @@ impl Default for SendTimingDiagnostics {
             eagain: AtomicU64::new(0),
             enobufs: AtomicU64::new(0),
             queue_to_start: TimingHistogram::default(),
+            packet_permit_wait: TimingHistogram::default(),
+            channel_reserve_wait: TimingHistogram::default(),
             syscall_wall: TimingHistogram::default(),
             so_nwrite_before: SocketOccupancyStats::default(),
             so_nwrite_after: SocketOccupancyStats::default(),
@@ -302,6 +308,10 @@ struct SendBatchObservation {
     accepted: usize,
     /// Queue-entry-to-syscall-start duration, when the buffered queue supplied a timestamp.
     queue_to_start_ns: Option<u128>,
+    /// Packet-permit admission delay, when the buffered queue supplied it.
+    packet_permit_wait_ns: Option<u64>,
+    /// Bounded send-channel reservation delay, when the buffered queue supplied it.
+    channel_reserve_wait_ns: Option<u64>,
     /// Wall time spent inside the private syscall.
     syscall_wall_ns: Option<u128>,
     /// Whether this call returned EAGAIN.
@@ -336,6 +346,12 @@ impl SendTimingDiagnostics {
             self.queue_to_start
                 .record(u64::try_from(ns).unwrap_or(u64::MAX));
         }
+        if let Some(ns) = observation.packet_permit_wait_ns {
+            self.packet_permit_wait.record(ns);
+        }
+        if let Some(ns) = observation.channel_reserve_wait_ns {
+            self.channel_reserve_wait.record(ns);
+        }
         if let Some(ns) = observation.syscall_wall_ns {
             self.syscall_wall
                 .record(u64::try_from(ns).unwrap_or(u64::MAX));
@@ -362,7 +378,7 @@ impl SendTimingDiagnostics {
             return;
         }
         eprintln!(
-            "udp_sendmsg_x_summary batches={batches} offered={} accepted={} eagain={} enobufs={} queue_samples={} queue_p50_ns={:?} queue_p95_ns={:?} queue_p99_ns={:?} queue_min_ns={:?} queue_max_ns={:?} syscall_samples={} syscall_p50_ns={:?} syscall_p95_ns={:?} syscall_p99_ns={:?} syscall_min_ns={:?} syscall_max_ns={:?} so_nwrite_before_samples={} so_nwrite_before_unavailable={} so_nwrite_before_min={:?} so_nwrite_before_max={:?} so_nwrite_after_samples={} so_nwrite_after_unavailable={} so_nwrite_after_min={:?} so_nwrite_after_max={:?} queue_state_samples={} outstanding_packets_max={} batch_packets_max={} batch_bytes_max={}",
+            "udp_sendmsg_x_summary batches={batches} offered={} accepted={} eagain={} enobufs={} queue_samples={} queue_p50_ns={:?} queue_p95_ns={:?} queue_p99_ns={:?} queue_min_ns={:?} queue_max_ns={:?} packet_permit_wait_samples={} packet_permit_wait_p50_ns={:?} packet_permit_wait_p95_ns={:?} packet_permit_wait_p99_ns={:?} packet_permit_wait_min_ns={:?} packet_permit_wait_max_ns={:?} channel_reserve_wait_samples={} channel_reserve_wait_p50_ns={:?} channel_reserve_wait_p95_ns={:?} channel_reserve_wait_p99_ns={:?} channel_reserve_wait_min_ns={:?} channel_reserve_wait_max_ns={:?} syscall_samples={} syscall_p50_ns={:?} syscall_p95_ns={:?} syscall_p99_ns={:?} syscall_min_ns={:?} syscall_max_ns={:?} so_nwrite_before_samples={} so_nwrite_before_unavailable={} so_nwrite_before_min={:?} so_nwrite_before_max={:?} so_nwrite_after_samples={} so_nwrite_after_unavailable={} so_nwrite_after_min={:?} so_nwrite_after_max={:?} queue_state_samples={} outstanding_packets_max={} batch_packets_max={} batch_bytes_max={}",
             self.offered.load(Ordering::Relaxed),
             self.accepted.load(Ordering::Relaxed),
             self.eagain.load(Ordering::Relaxed),
@@ -373,6 +389,18 @@ impl SendTimingDiagnostics {
             self.queue_to_start.percentile_ns(99),
             self.queue_to_start.min_ns(),
             self.queue_to_start.max_ns(),
+            self.packet_permit_wait.count.load(Ordering::Relaxed),
+            self.packet_permit_wait.percentile_ns(50),
+            self.packet_permit_wait.percentile_ns(95),
+            self.packet_permit_wait.percentile_ns(99),
+            self.packet_permit_wait.min_ns(),
+            self.packet_permit_wait.max_ns(),
+            self.channel_reserve_wait.count.load(Ordering::Relaxed),
+            self.channel_reserve_wait.percentile_ns(50),
+            self.channel_reserve_wait.percentile_ns(95),
+            self.channel_reserve_wait.percentile_ns(99),
+            self.channel_reserve_wait.min_ns(),
+            self.channel_reserve_wait.max_ns(),
             self.syscall_wall.count.load(Ordering::Relaxed),
             self.syscall_wall.percentile_ns(50),
             self.syscall_wall.percentile_ns(95),
@@ -844,6 +872,10 @@ fn send_batch(
             offered: count,
             accepted,
             queue_to_start_ns,
+            packet_permit_wait_ns: send_diagnostic
+                .map(|diagnostic| diagnostic.packet_permit_wait_ns),
+            channel_reserve_wait_ns: send_diagnostic
+                .map(|diagnostic| diagnostic.channel_reserve_wait_ns),
             syscall_wall_ns,
             eagain,
             enobufs,
@@ -1051,7 +1083,7 @@ mod tests {
         assert!(!output.contains("udp_sendmsg_x "), "{output}");
     }
 
-    /// Report UDP timing without enabling the broader packet-pipeline traces.
+    /// Report queue admission and UDP syscall timing without broader packet-pipeline traces.
     #[test]
     fn udp_send_diagnostics_include_queue_and_syscall_measurements() {
         let output = send_diagnostic_child(true);
@@ -1070,6 +1102,10 @@ mod tests {
         assert!(
             summary.contains("queue_samples=")
                 && !summary.contains("queue_p99_ns=None")
+                && summary.contains("packet_permit_wait_samples=")
+                && !summary.contains("packet_permit_wait_p99_ns=None")
+                && summary.contains("channel_reserve_wait_samples=")
+                && !summary.contains("channel_reserve_wait_p99_ns=None")
                 && summary.contains("syscall_samples=")
                 && summary.contains("offered=5")
                 && summary.contains("accepted=3")

@@ -265,22 +265,31 @@ impl UdpSend for BufferedUdpSend {
     type SendManyBuf = ();
 
     async fn send_to(&self, packet: Packet, destination: SocketAddr) -> io::Result<()> {
+        let send_timing = crate::diag::UDP_SEND_TIMING.on();
+        let packet_permit_wait_started_ns = send_timing.then(crate::diag::udp_send_monotonic_now);
         let permit = Arc::clone(&self.packet_slots)
             .acquire_owned()
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
-        if crate::diag::UDP_SEND_TIMING.on() {
+        let packet_permit_wait_ns = packet_permit_wait_started_ns
+            .map(|started_ns| crate::diag::udp_send_monotonic_now().saturating_sub(started_ns));
+        if send_timing {
+            let channel_reserve_wait_started_ns = crate::diag::udp_send_monotonic_now();
             let queue_permit = self
                 .send_tx
                 .reserve()
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+            let channel_reserve_wait_ns = crate::diag::udp_send_monotonic_now()
+                .saturating_sub(channel_reserve_wait_started_ns);
             let diagnostic = crate::diag::UdpSendBatchDiagnostic::new(
                 0,
                 self.packet_capacity
                     .saturating_sub(self.packet_slots.available_permits()),
                 1,
                 packet.len(),
+                packet_permit_wait_ns.unwrap_or_default(),
+                channel_reserve_wait_ns,
             );
             queue_permit.send(BufferedUdpMessage::Single(
                 packet,
@@ -324,6 +333,8 @@ impl UdpSend for BufferedUdpSend {
             let count = packets.len().min(self.packet_capacity);
             let queue_trace = crate::diag::SEND_QUEUE.on();
             let send_timing = crate::diag::UDP_SEND_TIMING.on();
+            let packet_permit_wait_started_ns =
+                send_timing.then(crate::diag::udp_send_monotonic_now);
             let sequence =
                 queue_trace.then(|| NEXT_DIAGNOSTIC_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed));
             if queue_trace && let Some(sequence) = sequence {
@@ -342,6 +353,8 @@ impl UdpSend for BufferedUdpSend {
                 .acquire_many_owned(permit_count)
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+            let packet_permit_wait_ns = packet_permit_wait_started_ns
+                .map(|started_ns| crate::diag::udp_send_monotonic_now().saturating_sub(started_ns));
             if queue_trace && let Some(sequence) = sequence {
                 eprintln!(
                     "send_many permit_acquired direction=udp sequence={sequence} packets={count}"
@@ -358,14 +371,19 @@ impl UdpSend for BufferedUdpSend {
                 0
             };
             let enqueue_result = if send_timing {
+                let channel_reserve_wait_started_ns = crate::diag::udp_send_monotonic_now();
                 match self.send_tx.reserve().await {
                     Ok(queue_permit) => {
+                        let channel_reserve_wait_ns = crate::diag::udp_send_monotonic_now()
+                            .saturating_sub(channel_reserve_wait_started_ns);
                         let diagnostic = crate::diag::UdpSendBatchDiagnostic::new(
                             sequence.unwrap_or_default(),
                             self.packet_capacity
                                 .saturating_sub(self.packet_slots.available_permits()),
                             count,
                             batch_bytes,
+                            packet_permit_wait_ns.unwrap_or_default(),
+                            channel_reserve_wait_ns,
                         );
                         queue_permit.send(BufferedUdpMessage::Batch(
                             batch,
