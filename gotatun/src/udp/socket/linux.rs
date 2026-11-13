@@ -31,7 +31,18 @@ use crate::{
     },
 };
 
-/// Max number of packets/messages for sendmmsg/recvmmsg
+/// Max number of packets/messages for sendmmsg/recvmmsg.
+///
+/// Each GRO slot reserves 256 KiB, so matching the 64-segment UDP GSO limit bounds the receive
+/// reserve to 16 MiB instead of reserving 25 MiB for 100 messages.
+#[cfg(target_os = "linux")]
+const MAX_PACKET_COUNT: usize = UDP_SEGMENT_MAX_DATAGRAMS;
+
+/// Max number of packets/messages for sendmmsg on Android.
+///
+/// This file also builds for Android, which has neither the GSO segment limit nor the GRO
+/// receive reserve that the Linux cap is sized for, so it keeps the previous batch size.
+#[cfg(target_os = "android")]
 const MAX_PACKET_COUNT: usize = 100;
 
 /// Maximum UDP payload length for one IPv4 datagram, accounting for IPv4 and UDP headers.
@@ -225,11 +236,17 @@ async fn send_gso_segment(
 #[cfg(all(test, target_os = "linux"))]
 mod gso_tests {
     use super::{
-        MAX_IPV4_PAYLOAD_LEN, MAX_IPV6_PAYLOAD_LEN, UDP_SEGMENT_MAX_DATAGRAMS, UdpGsoBatch,
-        plan_udp_gso_batches, udp_gso_control_messages, udp_gso_segment_size,
+        MAX_IPV4_PAYLOAD_LEN, MAX_IPV6_PAYLOAD_LEN, MAX_PACKET_COUNT, UDP_SEGMENT_MAX_DATAGRAMS,
+        UdpGsoBatch, plan_udp_gso_batches, udp_gso_control_messages, udp_gso_segment_size,
     };
     use nix::sys::socket::ControlMessage;
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    /// Keep each Linux UDP batch within the segment limit that also bounds GRO buffer memory.
+    #[test]
+    fn message_batch_capacity_matches_udp_segment_limit() {
+        assert_eq!(MAX_PACKET_COUNT, UDP_SEGMENT_MAX_DATAGRAMS);
+    }
 
     fn target(port: u16) -> SocketAddr {
         (Ipv4Addr::LOCALHOST, port).into()
@@ -912,7 +929,7 @@ mod gro {
     impl RecvManyBuf {
         /// Discard the pages the kernel wrote into, keeping the mapping.
         ///
-        /// The buffers are reserved at 100 × 256 KiB but only touched as far as each
+        /// The buffers are reserved at 64 × 256 KiB but only touched as far as each
         /// GRO batch reaches, so after a burst several MiB stay resident for good. Dropping
         /// the pages in place (instead of freeing and reallocating the buffer) leaves the
         /// allocator alone: freeing a chunk this large would raise glibc's mmap threshold and
@@ -1079,6 +1096,8 @@ mod gro {
         use crate::udp::{UdpRecv, UdpSend};
         use std::net::{Ipv6Addr, SocketAddr};
         use std::time::Duration;
+        #[cfg(feature = "device")]
+        use {super::MAX_PACKET_COUNT, crate::udp::buffer::BufferedUdpSend, std::net::Ipv4Addr};
 
         #[test]
         fn gro_receive_splits_only_the_bytes_reported_by_recvmmsg() {
@@ -1172,6 +1191,64 @@ mod gro {
 
             assert!(!packets.is_empty(), "expected at least one IPv6 packet");
             assert_eq!(packets[0].1, sender_addr);
+        }
+
+        /// A burst of more than two batches crosses the message cap on both sides of a real
+        /// socket pair. The buffered sender splits it into `sendmmsg` calls of at most
+        /// `MAX_PACKET_COUNT` messages. Each `recvmmsg` returns at most `MAX_PACKET_COUNT`
+        /// messages and leaves the rest queued in the kernel for the next call. Every datagram
+        /// must arrive exactly once and in send order.
+        ///
+        /// GRO stays off on the receiver, so each message is one datagram and the per-call
+        /// count is the message count. Loopback would not coalesce anyway.
+        #[cfg(feature = "device")]
+        #[tokio::test]
+        async fn a_burst_larger_than_one_batch_arrives_whole_and_in_order() {
+            const BURST: usize = 2 * MAX_PACKET_COUNT + 5;
+            let opts = SockOpt {
+                recv_buffer_size: Some(4 << 20),
+                ..SockOpt::default()
+            };
+            let mut receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0).into(), opts).unwrap();
+            let recv_addr = receiver.local_addr().unwrap();
+            let sender =
+                UdpSocket::bind((Ipv4Addr::LOCALHOST, 0).into(), SockOpt::default()).unwrap();
+            let send = BufferedUdpSend::new(4 * BURST, sender);
+
+            let mut packets = (0..BURST as u32)
+                .map(|i| (Packet::from_bytes(i.to_be_bytes()[..].into()), recv_addr))
+                .collect::<Vec<_>>();
+            send.send_many_to(&mut (), &mut packets).await.unwrap();
+
+            let mut recv_pool = PacketBufPool::<4096>::new(BURST);
+            let mut recv_many_buf = RecvManyBuf::default();
+            let mut received = Vec::with_capacity(BURST);
+            let mut calls = 0;
+            while received.len() < BURST {
+                let mut batch = Vec::new();
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    receiver.recv_many_from(&mut recv_many_buf, &mut recv_pool, &mut batch),
+                )
+                .await
+                .expect("the burst stalled: a datagram was lost")
+                .unwrap();
+                assert!(
+                    batch.len() <= MAX_PACKET_COUNT,
+                    "one recvmmsg returned {} messages, more than the cap of {MAX_PACKET_COUNT}",
+                    batch.len()
+                );
+                calls += 1;
+                received.extend(batch.into_iter().map(|(packet, _)| {
+                    u32::from_be_bytes(packet[..].try_into().expect("4-byte payload"))
+                }));
+            }
+
+            assert_eq!(received, (0..BURST as u32).collect::<Vec<_>>());
+            assert!(
+                calls >= 3,
+                "{BURST} datagrams need at least 3 receive calls"
+            );
         }
 
         // A datagram larger than the pool buffer must be received in full by growing
