@@ -124,10 +124,19 @@ const PIPELINE_BUFS: usize = MAX_PACKET_BUFS;
 /// How many received datagrams the buffered UDP receive queue may hold before decryption.
 ///
 /// Only platforms without batched socket reads use that queue (Linux hands batches straight to
-/// the packet task). On macOS it is set separately from the TUN queues; see the value's history
-/// on #260.
+/// the packet task).
+///
+/// **macOS: 128, not the 512 of the TUN queues (#260, J566).** The packet task takes one
+/// datagram at a time, so when a fast peer sends to us this queue fills to its cap and every
+/// datagram, including a small reply or a keystroke, waits behind it. Measured on the Mac bench
+/// with per-stage timing: at 512 the queue sat full at p50 in both Mac-receive cells and held
+/// 7–9 ms (p50) / 11–13 ms (p99) of standing queue, while every other stage stayed under 1 ms.
+/// At 128 the wait fell to about 2.4 ms (p99), loaded p99 fell from 18/28 ms to 11/14 ms, and
+/// goodput rose, because TCP sees loss early instead of a deep queue. At 32 and 64 goodput
+/// fell. The kernel socket buffer (macOS default) stays in front of this queue; shrinking it
+/// cut latency further but cost about 25% goodput, so it is left alone.
 #[cfg(target_os = "macos")]
-const UDP_RECV_BUFS: usize = MACOS_PIPELINE_BUFS;
+const UDP_RECV_BUFS: usize = 128;
 /// How many received datagrams the buffered UDP receive queue may hold before decryption.
 #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
 const UDP_RECV_BUFS: usize = PIPELINE_BUFS;
