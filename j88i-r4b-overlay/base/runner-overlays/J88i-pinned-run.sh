@@ -285,6 +285,7 @@ run_row() {
     case $engine in
         gotatun) case_name=mesh-gotatun ;;
         kernel) case_name=mesh-netbird ;;
+        kernel-plain) case_name=mesh-kernel-plain ;;
         wireguard-go) case_name=mesh-wireguard-go ;;
         underlay) case_name=mesh-underlay ;;
         *) echo "unknown engine $engine for $tag" >&2; return 2 ;;
@@ -317,10 +318,12 @@ case $mode in
     validate)
         smoke_dir="$out/cpuset-smoke"
         mkdir -p "$smoke_dir"
+        # The overlay is installed into the harness root, beside its smoke helper.
         bash "$kit/cpuset-harness-smoke.sh" "$kit" "$smoke_dir"
         run_row validate-underlay underlay "" "" 1
         run_row validate-kernel kernel "" "" 1
-        printf 'cpuset masks, runnable-task audit, veth/namespace counters, and kernel-WireGuard smoke completed\n' \
+        run_row validate-kernel-plain kernel-plain "" "" 1
+        printf 'cpuset masks, runnable-task audit, veth/namespace counters, NetBird kernel smoke, and direct MTU-1420 kernel WireGuard smoke completed\n' \
             > "$out/validation.txt"
         ;;
     smoke)

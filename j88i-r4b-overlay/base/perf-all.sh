@@ -24,16 +24,16 @@ usage() {
     cat <<'USAGE'
 usage:
   perf-all.sh --validate [--out DIR]
-  perf-all.sh --smoke --row TAG=gotatun|kernel|wireguard-go [--binary TAG=PATH] [--source TAG=SHA] [--out DIR]
+  perf-all.sh --smoke --row TAG=gotatun|kernel|kernel-plain|wireguard-go [--binary TAG=PATH] [--source TAG=SHA] [--out DIR]
   perf-all.sh --calibration --row control-a=gotatun --row control-b=gotatun --row control-c=gotatun [--binary TAG=PATH] [--out DIR]
-  perf-all.sh --hold --label CUT --row kernel-before=kernel --row wireguard-go-before=wireguard-go \
+  perf-all.sh --hold --label CUT --row kernel-before=kernel-plain --row wireguard-go-before=wireguard-go \
     --row control-a=gotatun --row candidate-a=gotatun --row candidate-b=gotatun \
-    --row control-b=gotatun --row wireguard-go-after=wireguard-go --row kernel-after=kernel \
+    --row control-b=gotatun --row wireguard-go-after=wireguard-go --row kernel-after=kernel-plain \
     --binary TAG=PATH [--source TAG=SHA] [--out DIR]
   perf-all.sh --soak --label CUT --row control=gotatun --row candidate=gotatun \
     --binary TAG=PATH [--source TAG=SHA] [--out DIR]
 
-The full hold order is fixed: kernel, wireguard-go, current control,
+The full hold order is fixed: direct kernel WireGuard at MTU 1420, wireguard-go, current control,
 candidate twice, control, wireguard-go, kernel. All rows share one perf-run lock and distinct result dirs.
 Unpinned results are historical data and must be reported separately.
 USAGE
@@ -65,7 +65,7 @@ while (($#)); do
             (($# >= 2)) || { echo '--row needs a value' >&2; exit 2; }
             parse_pair "$2" tag engine
             [[ $tag =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid row tag: $tag" >&2; exit 2; }
-            [[ $engine == gotatun || $engine == kernel || $engine == wireguard-go || $engine == underlay ]] || {
+            [[ $engine == gotatun || $engine == kernel || $engine == kernel-plain || $engine == wireguard-go || $engine == underlay ]] || {
                 echo "invalid engine for row $tag: $engine" >&2; exit 2;
             }
             for existing in "${rows[@]}"; do
@@ -142,14 +142,14 @@ case $mode in
         ;;
     hold)
         ((${#rows[@]} == 8)) || { echo '--hold takes exactly eight rows' >&2; exit 2; }
-        check_row 0 kernel-before kernel
+        check_row 0 kernel-before kernel-plain
         check_row 1 wireguard-go-before wireguard-go
         check_row 2 control-a gotatun
         check_row 3 candidate-a gotatun
         check_row 4 candidate-b gotatun
         check_row 5 control-b gotatun
         check_row 6 wireguard-go-after wireguard-go
-        check_row 7 kernel-after kernel
+        check_row 7 kernel-after kernel-plain
         [[ -n $label ]] || { echo '--hold requires --label CUT' >&2; exit 2; }
         [[ ${binaries[control-a]:-} == "${binaries[control-b]:-}" ]] || {
             echo 'control-a and control-b must use the same binary' >&2; exit 2;
@@ -205,6 +205,7 @@ runner=${PERF_RUN:-/usr/local/bin/perf-run}
 [[ -x $runner ]] || { echo "perf runner is not executable: $runner" >&2; exit 2; }
 echo "D348 pinned $mode: $label; results $out"
 run_env=(H2H_CPUSET_AUDIT=1 H2H_RESULTS="$out" "H2H_CPUSET_HOUSEKEEPING=$housekeeping")
+[[ -z ${H2H_ETHTOOL_BIN:-} ]] || run_env+=("H2H_ETHTOOL_BIN=$H2H_ETHTOOL_BIN")
 if [[ $mode == calibration && -z ${H2H_LAN_PING_COUNT:-} ]]; then
     H2H_LAN_PING_COUNT=3600
 fi

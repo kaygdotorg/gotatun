@@ -28,6 +28,7 @@ from pathlib import Path
 OUTPUT = Path(os.environ.get("H2H_CPUSET_AUDIT_DIR", "."))
 PARENT_PID = int(os.environ.get("H2H_CPUSET_AUDIT_PARENT", "-1"))
 TEST_CPUS = {1, 2, 3, 4}
+HOUSEKEEPING_CPUS = {0, 5}
 EXPECTED_MASKS = {frozenset({1, 2}), frozenset({3, 4})}
 BOUND_WORKER_PATTERNS = (
     re.compile(r"^kworker/(\d+):"),
@@ -69,9 +70,9 @@ def classify_runnable_task(comm: str, case: str) -> str:
     if comm.startswith("ksoftirqd/"):
         return "kernel-softirq"
     if (
-        case == "mesh-netbird"
+        case in {"mesh-netbird", "mesh-kernel-plain", "mesh-kernel-wireguard"}
         and comm.startswith("kworker/")
-        and comm.endswith("wg-crypt-wt0")
+        and re.search(r"wg-crypt-(?:wt0|wgA|wgB)$", comm)
     ):
         return "kernel-wireguard-crypto"
     return "external"
@@ -103,9 +104,9 @@ def bound_percpu_worker_role(comm: str, case: str) -> str:
     if comm.startswith("ksoftirqd/"):
         return "network-softirq"
     if (
-        case == "mesh-netbird"
+        case in {"mesh-netbird", "mesh-kernel-plain", "mesh-kernel-wireguard"}
         and comm.startswith("kworker/")
-        and comm.endswith("wg-crypt-wt0")
+        and re.search(r"wg-crypt-(?:wt0|wgA|wgB)$", comm)
     ):
         return "kernel-wireguard-crypto"
     return "background"
@@ -204,6 +205,69 @@ def parse_per_cpu_counters(text: str) -> dict[str, dict[str, int]]:
     return counters
 
 
+def parse_proc_stat_steal_ticks(text: str) -> dict[str, int]:
+    """Read Linux's per-CPU stolen-time counters from `/proc/stat`.
+
+    The aggregate `cpu` row is omitted so reports can distinguish test CPUs
+    from housekeeping CPUs. Linux reports steal in clock ticks, with the value
+    in field eight after the CPU label.
+    """
+    result: dict[str, int] = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields or re.fullmatch(r"cpu\d+", fields[0]) is None or len(fields) <= 8:
+            continue
+        try:
+            result[fields[0][3:]] = int(fields[8])
+        except ValueError:
+            continue
+    return result
+
+
+def summarize_cpu_steal(
+    before_ticks: dict[str, int],
+    after_ticks: dict[str, int],
+    test_cpus: set[int],
+    housekeeping_cpus: set[int],
+    ticks_per_second: int,
+    window_duration_ns: int,
+) -> dict[str, object]:
+    """Report stolen CPU time across the measured test and housekeeping sets."""
+    required = {str(cpu) for cpu in test_cpus | housekeeping_cpus}
+    available = (
+        ticks_per_second > 0
+        and required.issubset(before_ticks)
+        and required.issubset(after_ticks)
+    )
+    deltas = {
+        cpu: max(0, after_ticks[cpu] - before_ticks[cpu])
+        for cpu in sorted(required)
+        if cpu in before_ticks and cpu in after_ticks
+    }
+    seconds_by_cpu = {
+        cpu: ticks / ticks_per_second
+        for cpu, ticks in deltas.items()
+    } if ticks_per_second > 0 else {}
+    test_seconds = sum(seconds_by_cpu.get(str(cpu), 0.0) for cpu in test_cpus)
+    housekeeping_seconds = sum(
+        seconds_by_cpu.get(str(cpu), 0.0) for cpu in housekeeping_cpus
+    )
+    window_seconds = window_duration_ns / 1_000_000_000
+    test_cpu_seconds = window_seconds * len(test_cpus)
+    return {
+        "cpu_steal_data_available": available,
+        "cpu_steal_delta_ticks_by_cpu": deltas,
+        "cpu_steal_delta_seconds_by_cpu": seconds_by_cpu,
+        "cpu_steal_test_cpu_seconds": test_seconds,
+        "cpu_steal_housekeeping_cpu_seconds": housekeeping_seconds,
+        "cpu_steal_all_cpu_seconds": test_seconds + housekeeping_seconds,
+        "cpu_steal_test_cpu_percent": (
+            test_seconds * 100 / test_cpu_seconds
+            if test_cpu_seconds > 0 else 0.0
+        ),
+    }
+
+
 def counter_deltas(before: str, after: str) -> dict[str, dict[str, int]]:
     """Return nonzero per-CPU deltas for counters present in both snapshots."""
     old = parse_per_cpu_counters(before)
@@ -226,6 +290,7 @@ def snapshot(name: str) -> None:
     for source, suffix in (
         ("/proc/interrupts", "interrupts"),
         ("/proc/softirqs", "softirqs"),
+        ("/proc/stat", "proc-stat"),
         ("/proc/schedstat", "schedstat"),
         ("/proc/pressure/cpu", "cpu-pressure"),
         ("/proc/net/softnet_stat", "softnet-stat"),
@@ -354,6 +419,9 @@ def sample() -> dict[str, object]:
         "scope_runtime_ns": runtime_ns,
         "scope_run_delay_ns": run_delay_ns,
         "cpu_pressure": read_text(Path("/proc/pressure/cpu")).strip(),
+        "proc_stat_steal_ticks_by_cpu": parse_proc_stat_steal_ticks(
+            read_text(Path("/proc/stat"))
+        ),
     }
 
 
@@ -415,6 +483,8 @@ def main() -> int:
     previous_kernel_worker_stats: dict[str, tuple[int, int]] = {}
     window_start_unix: float | None = None
     window_end_unix: float | None = None
+    first_steal_ticks: dict[str, int] = {}
+    last_steal_ticks: dict[str, int] = {}
     with (OUTPUT / "samples.jsonl").open("w") as output:
         while not STOP:
             current = sample()
@@ -422,7 +492,15 @@ def main() -> int:
             sample_time = float(current.get("time_unix", time.time()))
             if window_start_unix is None:
                 window_start_unix = sample_time
+                first_steal_ticks = {
+                    str(cpu): int(ticks)
+                    for cpu, ticks in current.get("proc_stat_steal_ticks_by_cpu", {}).items()
+                }
             window_end_unix = sample_time
+            last_steal_ticks = {
+                str(cpu): int(ticks)
+                for cpu, ticks in current.get("proc_stat_steal_ticks_by_cpu", {}).items()
+            }
             max_scope_threads = max(max_scope_threads, int(current["scope_threads"]))
             mismatch_samples += bool(current["mask_mismatches"])
             external_samples += bool(current["external_runnable"])
@@ -490,6 +568,14 @@ def main() -> int:
     if window_start_unix is not None and window_end_unix is not None:
         window_duration_ns = max(0, int((window_end_unix - window_start_unix) * 1_000_000_000))
     test_cpu_time_ns = window_duration_ns * len(TEST_CPUS)
+    steal_summary = summarize_cpu_steal(
+        first_steal_ticks,
+        last_steal_ticks,
+        TEST_CPUS,
+        HOUSEKEEPING_CPUS,
+        int(os.sysconf("SC_CLK_TCK")),
+        window_duration_ns,
+    )
     kernel_bound_runtime_limit_exceeded = kernel_worker_window_exceeds_limit(
         kernel_background_runtime_delta_ns, test_cpu_time_ns
     )
@@ -498,6 +584,7 @@ def main() -> int:
         and not external_samples
         and not kernel_bound_runtime_limit_exceeded
         and max_scope_threads > 0
+        and steal_summary["cpu_steal_data_available"]
         and interrupt_data_available
         and softirq_data_available
     )
@@ -519,6 +606,7 @@ def main() -> int:
         "kernel_background_percpu_runtime_delta_ns": kernel_background_runtime_delta_ns,
         "window_duration_ns": window_duration_ns,
         "test_cpu_time_ns": test_cpu_time_ns,
+        **steal_summary,
         "kernel_bound_percpu_runtime_limit_percent": BOUND_WORKER_RUNTIME_LIMIT_PERCENT,
         "kernel_bound_runtime_budget_role": "background",
         "kernel_bound_percpu_runtime_percent_of_test_cpu_time": (

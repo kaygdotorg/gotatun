@@ -3,7 +3,7 @@
 # Mesh data-plane case (#260, part A): one system between two network
 # namespaces on this machine, then the same probes for every system.
 #
-#   mesh.sh <underlay|infraternal|gotatun|boringtun|tailscale|netbird|netbird-userspace>
+#   mesh.sh <underlay|infraternal|gotatun|boringtun|tailscale|netbird|netbird-userspace|kernel-plain>
 #
 # Topology (all inside private namespaces; the root namespace is untouched):
 #
@@ -64,6 +64,8 @@ D=$H2H_RUN/$SYSTEM
 mkdir -p "$D"
 WATCH=""      # comma-separated PIDs whose process trees are the system's daemons
 PEER=""       # the peer's address on the system's own network
+TUN_A=""      # tunnel interface on the first measured endpoint, when present
+TUN_B=""      # tunnel interface on the second measured endpoint, when present
 
 # fifo_daemon <name> <cmd...>: a child whose stdin we hold open; it stops when
 # we close it. Its PID is left in DAEMON_PID.
@@ -97,6 +99,8 @@ start_infraternal() {
     START=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["start_ns"])' "$ready")
     PEER=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["peer_ipv4"])' "$ready")
     WATCH=$(python3 -c 'import json,sys; print(",".join(map(str, json.loads(sys.argv[1])["pids"])))' "$ready")
+    TUN_A=infraternal0
+    TUN_B=infraternal0
     note setup "$ready"
 }
 
@@ -124,6 +128,8 @@ start_tailscale() {
     for pid in "${ups[@]}"; do wait "$pid" || die "tailscale up failed: $(tail -c 600 "$D/a/up.log" "$D/b/up.log")"; done
     PEER=$(sandboxed "$B_PID" "$H2H_BIN/tailscale" --socket="$D/b/sock" ip -4)
     WATCH=$(IFS=,; echo "${pids[*]}")
+    TUN_A=tailscale0
+    TUN_B=tailscale0
     note version "{\"tailscale\":\"$("$H2H_BIN/tailscale" version | head -1)\"}"
 }
 
@@ -161,8 +167,10 @@ start_gotatun() {
     rm -f "$D/keys/"*.private
     WATCH="$GOTA_A_PID,$GOTA_B_PID"
     PEER=10.66.0.2
+    TUN_A=wgA
+    TUN_B=wgB
     gotatun_version=$("$GOTATUN_BIN" --version | head -1)
-    note version "{\"gotatun\":\"$gotatun_version\",\"source\":\"${H2H_GOTATUN_SOURCE:-unknown}\",\"binary_sha256\":\"$(sha256sum "$GOTATUN_BIN" | awk '{print $1}')\"}"
+    note version "{\"gotatun\":\"$gotatun_version\",\"source\":\"${H2H_GOTATUN_SOURCE:-unknown}\",\"binary_sha256\":\"$(sha256sum "$GOTATUN_BIN" | awk '{print $1}')\",\"mtu\":1420,\"tun_vnet_hdr\":\"attempted-with-fallback\",\"linux_udp_gso_gro_path\":true}"
 }
 
 start_wireguard_go() {
@@ -193,8 +201,10 @@ start_wireguard_go() {
     rm -f "$D/keys/"*.private
     WATCH="$WG_A_PID,$WG_B_PID"
     PEER=10.66.0.2
+    TUN_A=wgA
+    TUN_B=wgB
     version="upstream commit b3bc704ef0ee21a36298601a9e1e5ff90377ac52"
-    note version "{\"wireguard_go\":\"$version\",\"source\":\"b3bc704ef0ee21a36298601a9e1e5ff90377ac52\",\"udp_gso_gro\":true,\"tun_vnet_hdr\":true}"
+    note version "{\"wireguard_go\":\"$version\",\"source\":\"b3bc704ef0ee21a36298601a9e1e5ff90377ac52\",\"mtu\":1420,\"udp_gso_gro\":true,\"tun_vnet_hdr\":true}"
 }
 
 start_boringtun() {
@@ -225,6 +235,8 @@ start_boringtun() {
     rm -f "$D/keys/"*.private
     WATCH="$BORING_A_PID,$BORING_B_PID"
     PEER=10.66.0.2
+    TUN_A=wgA
+    TUN_B=wgB
     boringtun_version=$("$H2H_BIN/boringtun-cli" --version | head -1)
     note version "{\"boringtun\":\"$boringtun_version\",\"source\":\"boringtun-cli-0.5.2\",\"workers\":4,\"multi_queue\":true}"
 }
@@ -273,7 +285,61 @@ PY
     wait_for 60 sh -c "ip -n h2h-b -4 -o addr show dev wt0 | grep -q inet" || die "NetBird gave b no address: $(tail -c 600 "$D/b/client.log")"
     PEER=$(ip -n h2h-b -4 -o addr show dev wt0 | awk '{print $4}' | cut -d/ -f1)
     WATCH=$(IFS=,; echo "${pids[*]}")
-    note version "{\"netbird\":\"$("$H2H_BIN/netbird" version | head -1)\",\"wireguard\":\"$(ip -n h2h-a -d link show wt0 | grep -q wireguard && echo kernel || echo userspace)\"}"
+    TUN_A=wt0
+    TUN_B=wt0
+    if [[ $mode == kernel ]]; then
+        ip -n h2h-a link set wt0 mtu 1280
+        ip -n h2h-b link set wt0 mtu 1280
+    fi
+    note version "{\"netbird\":\"$("$H2H_BIN/netbird" version | head -1)\",\"wireguard\":\"$(ip -n h2h-a -d link show wt0 | grep -q wireguard && echo kernel || echo userspace)\",\"mtu\":$(ip -n h2h-a -o link show wt0 | sed -n 's/.* mtu \\([0-9][0-9]*\\).*/\\1/p')}"
+}
+
+start_kernel_plain() {
+    # Build the native WireGuard data path directly, without a coordinating daemon.
+    mkdir -p "$D/keys"
+    python3 -I "$H2H_KIT/lib/gotatun_uapi.py" keys "$D/keys"
+    START=$("$H" now)
+    ip -n h2h-a link add wgA type wireguard
+    ip -n h2h-b link add wgB type wireguard
+    ip -n h2h-a addr add 10.66.0.1/24 dev wgA
+    ip -n h2h-a link set wgA mtu 1420 up
+    ip -n h2h-b addr add 10.66.0.2/24 dev wgB
+    ip -n h2h-b link set wgB mtu 1420 up
+    ip netns exec h2h-a "$H2H_BIN/wg" set wgA \
+        private-key "$D/keys/a.private" listen-port 51820 \
+        peer "$(cat "$D/keys/b.public")" endpoint 10.220.0.2:51821 \
+        allowed-ips 10.66.0.2/32
+    ip netns exec h2h-b "$H2H_BIN/wg" set wgB \
+        private-key "$D/keys/b.private" listen-port 51821 \
+        peer "$(cat "$D/keys/a.public")" endpoint 10.220.0.1:51820 \
+        allowed-ips 10.66.0.1/32
+    ip netns exec h2h-a "$H2H_BIN/wg" show wgA
+    ip netns exec h2h-b "$H2H_BIN/wg" show wgB
+    rm -f "$D/keys/"*.private
+    TUN_A=wgA
+    TUN_B=wgB
+    PEER=10.66.0.2
+    note version '{"wireguard":"kernel","method":"ip-link-add-and-wg-set","netbird":false,"mtu":1420}'
+}
+
+record_link_offloads() {
+    local ethtool=${H2H_ETHTOOL_BIN:-}
+    local -a arguments
+    if [[ -z $ethtool ]]; then
+        ethtool=$(command -v ethtool || true)
+    fi
+    [[ -x $ethtool ]] || die "ethtool is required to record per-row link offloads"
+    arguments=(
+        --system "$SYSTEM"
+        --ethtool "$ethtool"
+        --output-dir "$H2H_RESULTS/$H2H_CASE/offloads"
+        --interface h2h-a a0 underlay
+        --interface h2h-b b0 underlay
+    )
+    [[ -z $TUN_A ]] || arguments+=(--interface h2h-a "$TUN_A" tunnel)
+    [[ -z $TUN_B ]] || arguments+=(--interface h2h-b "$TUN_B" tunnel)
+    python3 -I "$H2H_KIT/lib/link_offloads.py" "${arguments[@]}" \
+        || die "ethtool offload capture failed for $SYSTEM"
 }
 
 case $SYSTEM in
@@ -285,8 +351,11 @@ case $SYSTEM in
     tailscale) start_tailscale ;;
     netbird) start_netbird kernel ;;
     netbird-userspace) start_netbird userspace ;;
+    kernel-plain) start_kernel_plain ;;
     *) die "unknown system $SYSTEM" ;;
 esac
+
+record_link_offloads
 
 measure first-packet in_ns h2h-a "$H" net-wait --to "$PEER:5201" --since-ns "$START" --timeout-s 120
 in_ns h2h-a ip -o link show > "$H2H_RESULTS/$H2H_CASE/links-a.txt" 2>&1 || true

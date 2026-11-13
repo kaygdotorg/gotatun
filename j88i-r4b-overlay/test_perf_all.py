@@ -170,6 +170,15 @@ class PerfAllCliTest(unittest.TestCase):
             )
             self.assertIn("cpuset.cpus.effective=0-5", (output / "cpuset-restoration.txt").read_text())
 
+    def test_validation_resolves_smoke_helper_from_installed_kit_root(self) -> None:
+        """D348 validation must find the helper copied beside the installed harness kit."""
+        overlay = Path(__file__).parent
+        runner = overlay / "base/runner-overlays/J88i-pinned-run.sh"
+        helper = overlay / "cpuset-harness-smoke.sh"
+
+        self.assertTrue(helper.is_file())
+        self.assertIn('bash "$kit/cpuset-harness-smoke.sh"', runner.read_text())
+
     def test_calibration_forwards_lan_probe_count_to_measured_scope(self) -> None:
         """The 3,600-probe override must cross perf-run's sudo boundary explicitly."""
         script = Path(__file__).parent / "base/perf-all.sh"
@@ -297,6 +306,91 @@ class PerfAllCliTest(unittest.TestCase):
 
             self.assertEqual(result.returncode, 23, result.stderr)
             self.assertIn("wireguard-go\twireguard-go", (output / "rows.tsv").read_text())
+
+    def test_hold_plan_uses_plain_kernel_wireguard_as_the_matched_mtu_baseline(self) -> None:
+        """A counted cut hold must use the direct kernel row at the userspace MTU."""
+        script = Path(__file__).parent / "base/perf-all.sh"
+        with tempfile.TemporaryDirectory(prefix="j88i-kernel-mtu1420-") as temporary:
+            root = Path(temporary)
+            runner = root / "perf-run"
+            runner.write_text(
+                "#!/usr/bin/env bash\n"
+                "for arg in \"$@\"; do\n"
+                "  [[ $arg == */J88i-pinned-run.sh ]] && exit 23\n"
+                "done\n"
+                "exit 0\n"
+            )
+            runner.chmod(0o755)
+            control = root / "control"
+            candidate = root / "candidate"
+            for binary in (control, candidate):
+                binary.write_text("#!/usr/bin/env sh\\nexit 0\\n")
+                binary.chmod(0o755)
+            output = root / "hold"
+            environment = self.fake_restore_environment(root, "0-5")
+            environment["PERF_RUN"] = str(runner)
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(script),
+                    "--hold",
+                    "--label",
+                    "batch64-idle-lane",
+                    "--row",
+                    "kernel-before=kernel-plain",
+                    "--row",
+                    "wireguard-go-before=wireguard-go",
+                    "--row",
+                    "control-a=gotatun",
+                    "--row",
+                    "candidate-a=gotatun",
+                    "--row",
+                    "candidate-b=gotatun",
+                    "--row",
+                    "control-b=gotatun",
+                    "--row",
+                    "wireguard-go-after=wireguard-go",
+                    "--row",
+                    "kernel-after=kernel-plain",
+                    "--binary",
+                    f"control-a={control}",
+                    "--binary",
+                    f"control-b={control}",
+                    "--binary",
+                    f"candidate-a={candidate}",
+                    "--binary",
+                    f"candidate-b={candidate}",
+                    "--source",
+                    "control-a=1234567",
+                    "--source",
+                    "control-b=1234567",
+                    "--source",
+                    "candidate-a=7654321",
+                    "--source",
+                    "candidate-b=7654321",
+                    "--out",
+                    str(output),
+                ],
+                capture_output=True,
+                text=True,
+                env=environment,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 23, result.stderr)
+            rows = (output / "rows.tsv").read_text()
+            self.assertIn("kernel-before\tkernel-plain\t", rows)
+            self.assertIn("kernel-after\tkernel-plain\t", rows)
+            self.assertNotIn("mesh-netbird", rows)
+            runner_overlay = Path(__file__).parent / "base/runner-overlays/J88i-pinned-run.sh"
+            mesh_case = Path(__file__).parent / "base/cases/mesh.sh"
+            self.assertIn("kernel-plain) case_name=mesh-kernel-plain", runner_overlay.read_text())
+            kernel_setup = mesh_case.read_text().split("start_kernel_plain() {", 1)[1].split("\n}\n", 1)[0]
+            self.assertIn("ip -n h2h-a link add wgA type wireguard", kernel_setup)
+            self.assertIn('"$H2H_BIN/wg" set wgA', kernel_setup)
+            self.assertIn("mtu 1420", kernel_setup)
+            self.assertNotIn("start_netbird", kernel_setup)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,41 @@
+D348 pinned validate: ; results /home/claude/j88i-r4b-pinned/evidence/d348-validation
+perf-run: running in perf.slice (cpus 1-3, 6G); state: /home/claude/j88i-r4b-pinned/evidence/d348-validation/receipts/perf-run-20261105T173238-52513.{before,after}.txt
+bash: /home/claude/j88i-r4b-pinned/harness/cpuset-harness-smoke.sh: No such file or directory
+Removed '/run/systemd/transient/init.scope.d/50-AllowedCPUs.conf'.
+Removed '/run/systemd/transient/init.scope.d'.
+Removed '/run/systemd/system.control/system.slice.d/50-AllowedCPUs.conf'.
+Removed '/run/systemd/system.control/system.slice.d'.
+Removed '/run/systemd/system.control/user.slice.d/50-AllowedCPUs.conf'.
+Removed '/run/systemd/system.control/user.slice.d'.
+Removed '/run/systemd/system.control/perf.slice.d/50-AllowedCPUs.conf'.
+Removed '/run/systemd/system.control/perf.slice.d'.
+host service slices, IRQ affinities, and workqueue masks restored; perf.slice cpuset.cpus=1-3 cpuset.cpus.effective=1-3
+-- run summary --
+command: env H2H_CPUSET_AUDIT=1 H2H_RESULTS=/home/claude/j88i-r4b-pinned/evidence/d348-validation H2H_CPUSET_HOUSEKEEPING=0,5 bash /home/claude/j88i-r4b-pinned/harness/runner-overlays/J88i-pinned-run.sh /home/claude/j88i-r4b-pinned/harness /home/claude/j88i-r4b-pinned/evidence/d348-validation validate  /home/claude/j88i-r4b-pinned/evidence/d348-validation/rows.tsv
+cold: 0  exit: 127
+wall: 1.717s
+steal during run: 3 of 1026 jiffies (all cpus)
+perf-run: running in perf.slice (cpus 1-3, 6G); state: /home/claude/j88i-r4b-pinned/evidence/d348-validation/restore-receipts/perf-run-20261105T173245-53089.{before,after}.txt
+init.scope restored: cpuset.cpus=0-5 cpuset.cpus.effective=0-5 DropInPaths= (AllowedCPUs= EffectiveCPUs=0-5 informational)
+system.slice restored: cpuset.cpus=0-5 cpuset.cpus.effective=0-5 DropInPaths= (AllowedCPUs= EffectiveCPUs=0-5 informational)
+user.slice restored: cpuset.cpus=0-5 cpuset.cpus.effective=0-5 DropInPaths= (AllowedCPUs= EffectiveCPUs=0-5 informational)
+perf.slice restored: cpuset.cpus=1-3 cpuset.cpus.effective=1-3 DropInPaths= (AllowedCPUs=1-3 EffectiveCPUs=1-3 informational)
+workqueue cpumask restored: /sys/devices/virtual/workqueue/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/blkcg_punt_bio/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/scsi_tmf_0/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/scsi_tmf_1/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/scsi_tmf_2/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/scsi_tmf_3/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/scsi_tmf_4/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/scsi_tmf_5/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/scsi_tmf_6/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/scsi_tmf_7/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/writeback/cpumask=3f
+IRQ affinity restored: irq=30 cpus=0-5
+IRQ affinity restored: irq=31 cpus=0-5
+IRQ affinity restored: irq=32 cpus=0-5
+-- run summary --
+command: bash /home/claude/j88i-r4b-pinned/harness/runner-overlays/J88i-verify-restored.sh /home/claude/j88i-r4b-pinned/evidence/d348-validation/cpuset-restoration.txt /home/claude/j88i-r4b-pinned/evidence/d348-validation/cgroup-masks-before.tsv /home/claude/j88i-r4b-pinned/evidence/d348-validation/workqueue-masks-before.tsv /home/claude/j88i-r4b-pinned/evidence/d348-validation/irq-affinity-before.tsv
+cold: 0  exit: 0
+wall: 0.142s
+steal during run: 1 of 88 jiffies (all cpus)

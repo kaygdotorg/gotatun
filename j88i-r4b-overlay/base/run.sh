@@ -30,7 +30,7 @@ done
 export H2H_SMOKE=$SMOKE
 [[ $(id -u) == 0 ]] || { echo "run as root (sudo ./run.sh)" >&2; exit 2; }
 
-CASES=(mesh-underlay mesh-infraternal mesh-tailscale mesh-gotatun mesh-boringtun mesh-wireguard-go mesh-netbird mesh-netbird-userspace term-local term-wan term-loss term-scale)
+CASES=(mesh-underlay mesh-infraternal mesh-tailscale mesh-gotatun mesh-boringtun mesh-wireguard-go mesh-netbird mesh-netbird-userspace mesh-kernel-plain term-local term-wan term-loss term-scale)
 if [[ -n $ONLY ]]; then IFS=, read -r -a CASES <<< "$ONLY"; fi
 
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
