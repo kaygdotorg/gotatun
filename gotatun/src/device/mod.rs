@@ -101,7 +101,7 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100;
 /// Maximum number of packet buffers that each channel may contain
 const MAX_PACKET_BUFS: usize = 4000;
 
-/// How many packets the macOS TUN channels and UDP receive buffer may hold.
+/// How many packets the macOS TUN channels may hold.
 ///
 /// On macOS the utun write is the slowest stage when a fast peer sends to us (#260, J461). With
 /// [`MAX_PACKET_BUFS`] there, one TCP flow kept ~4,000 packets waiting between the UDP socket and
@@ -112,12 +112,32 @@ const MAX_PACKET_BUFS: usize = 4000;
 #[cfg(target_os = "macos")]
 const MACOS_PIPELINE_BUFS: usize = 512;
 
-/// Capacity of the TUN channels and the non-Linux UDP receive buffer on this platform.
+/// Capacity of the TUN channels on this platform.
 #[cfg(target_os = "macos")]
 const PIPELINE_BUFS: usize = MACOS_PIPELINE_BUFS;
-/// Capacity of the TUN channels and the non-Linux UDP receive buffer on this platform.
+/// Capacity of the TUN channels on this platform.
 #[cfg(not(target_os = "macos"))]
 const PIPELINE_BUFS: usize = MAX_PACKET_BUFS;
+
+/// How many received datagrams the buffered UDP receive queue may hold before decryption.
+///
+/// Only platforms without batched socket reads use that queue; Linux hands its batches straight
+/// to the packet task, so this constant does not exist there.
+///
+/// **macOS: 128, not the 512 of the TUN channels (#260, J566).** The packet task takes one
+/// datagram at a time, so when a fast peer sends to us this queue fills to its cap and every
+/// datagram, a small reply or a handshake included, waits behind it. Per-stage timing on the Mac
+/// bench found it full at p50 in both Mac-receive cells at 512, holding 7-9 ms (p50) and
+/// 11-13 ms (p99), while every other stage stayed under 1 ms. At 128 the wait fell to about
+/// 2.4 ms (p99), loaded p99 fell from 18/28 ms to 11/14 ms (1/8 flows) and goodput rose; at 64
+/// and 32 goodput fell. When the queue is full the receive task waits, so the excess stays in
+/// the kernel socket buffer and is dropped there, which TCP reads as congestion. Shrinking that
+/// socket buffer cut latency further but cost about 25% goodput, so it keeps the OS default.
+#[cfg(target_os = "macos")]
+const UDP_RECV_BUFS: usize = 128;
+/// How many received datagrams the buffered UDP receive queue may hold before decryption.
+#[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
+const UDP_RECV_BUFS: usize = PIPELINE_BUFS;
 
 /// How often the receive task checks for an idle link.
 ///
@@ -1144,7 +1164,7 @@ impl<T: DeviceTransports> Connection<T> {
         #[cfg(target_os = "linux")]
         let incoming_udp_rx = udp_rx;
         #[cfg(not(target_os = "linux"))]
-        let incoming_udp_rx = BufferedUdpReceive::new(PIPELINE_BUFS, udp_rx, pool.clone());
+        let incoming_udp_rx = BufferedUdpReceive::new(UDP_RECV_BUFS, udp_rx, pool.clone());
 
         // Start DAITA/hooks tasks
         #[cfg(feature = "daita")]
@@ -3084,5 +3104,17 @@ mod idle_release_tests {
         assert!(!idle_release_due(&mut busy, 0));
         assert!(!idle_release_due(&mut busy, busy_period));
         assert!(idle_release_due(&mut busy, 0));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_udp_receive_queue_tests {
+    //! Pins the macOS UDP receive-queue size that J566 measured on the Mac bench (#260).
+
+    /// The queue holds 128 datagrams: at 512 it stayed full in every Mac-receive case and held
+    /// 7-9 ms (p50) of queue; at 128 the loaded p99 roughly halved and goodput did not drop.
+    #[test]
+    fn macos_udp_receive_queue_holds_128_datagrams() {
+        assert_eq!(super::UDP_RECV_BUFS, 128);
     }
 }
