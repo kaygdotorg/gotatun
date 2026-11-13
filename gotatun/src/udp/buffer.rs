@@ -20,6 +20,9 @@ use crate::packet::{Packet, PacketBufPool};
 use crate::task::Task;
 use crate::udp::{UdpRecv, UdpSend};
 
+// Bound work handed to the device task so a large socket batch cannot monopolize it.
+const UDP_RECEIVE_BATCH_LIMIT: usize = 64;
+
 /// A [`UdpSend`] that wraps another [`UdpSend`] to provide buffering.
 ///
 /// Packets sent on this [`UdpSend::send_to`] will be buffered on a channel, and asynchronously
@@ -121,6 +124,7 @@ impl UdpSend for BufferedUdpSend {
 pub struct BufferedUdpReceive {
     _recv_task: Arc<Task>,
     recv_rx: mpsc::Receiver<io::Result<(Packet, SocketAddr)>>,
+    pending_error: Option<io::Error>,
 }
 
 impl BufferedUdpReceive {
@@ -164,14 +168,19 @@ impl BufferedUdpReceive {
         Self {
             _recv_task: Arc::new(recv_task),
             recv_rx,
+            pending_error: None,
         }
     }
 }
 
 impl UdpRecv for BufferedUdpReceive {
-    type RecvManyBuf = ();
+    type RecvManyBuf = Vec<io::Result<(Packet, SocketAddr)>>;
 
     async fn recv_from(&mut self, _pool: &mut PacketBufPool) -> io::Result<(Packet, SocketAddr)> {
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
+
         let Some(packet) = self.recv_rx.recv().await else {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -180,12 +189,152 @@ impl UdpRecv for BufferedUdpReceive {
         };
         packet
     }
+
+    fn recv_many_from(
+        &mut self,
+        recv_buf: &mut Self::RecvManyBuf,
+        _pool: &mut PacketBufPool,
+        packets: &mut Vec<(Packet, SocketAddr)>,
+    ) -> impl std::future::Future<Output = io::Result<()>> + Send {
+        async move {
+            if let Some(error) = self.pending_error.take() {
+                return Err(error);
+            }
+
+            recv_buf.clear();
+            let count = self
+                .recv_rx
+                .recv_many(recv_buf, UDP_RECEIVE_BATCH_LIMIT)
+                .await;
+            if count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "UDP receive task stopped",
+                ));
+            }
+
+            let mut received_any = false;
+            for result in recv_buf.drain(..) {
+                match result {
+                    Ok(packet) => {
+                        packets.push(packet);
+                        received_any = true;
+                    }
+                    Err(error) if received_any => {
+                        self.pending_error = Some(error);
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+
+            Ok(())
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
 mod test {
     use super::*;
     use crate::udp::socket::{SockOpt, UdpSocket};
+
+    struct BatchThenErrorUdpRecv {
+        batch_sent: bool,
+        packet_count: usize,
+    }
+
+    impl UdpRecv for BatchThenErrorUdpRecv {
+        type RecvManyBuf = ();
+
+        async fn recv_from(
+            &mut self,
+            _pool: &mut PacketBufPool,
+        ) -> io::Result<(Packet, SocketAddr)> {
+            std::future::pending().await
+        }
+
+        fn recv_many_from(
+            &mut self,
+            _recv_buf: &mut Self::RecvManyBuf,
+            pool: &mut PacketBufPool,
+            packets: &mut Vec<(Packet, SocketAddr)>,
+        ) -> impl std::future::Future<Output = io::Result<()>> + Send {
+            let batch_sent = std::mem::replace(&mut self.batch_sent, true);
+            let packet_count = self.packet_count;
+            async move {
+                if batch_sent {
+                    return Err(io::Error::other("synthetic receive error"));
+                }
+
+                let source = "127.0.0.1:51820".parse().expect("valid source address");
+                for sequence in 0..packet_count {
+                    let mut packet = pool.get();
+                    packet.buf_mut().clear();
+                    let sequence = u16::try_from(sequence).expect("test sequence fits in u16");
+                    packet.buf_mut().extend_from_slice(&sequence.to_be_bytes());
+                    packets.push((packet, source));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_udp_receive_batches_packets_in_order_before_forwarding_errors() {
+        const PACKET_COUNT: usize = 130;
+
+        let mut receiver = BufferedUdpReceive::new(
+            256,
+            BatchThenErrorUdpRecv {
+                batch_sent: false,
+                packet_count: PACKET_COUNT,
+            },
+            PacketBufPool::new(256),
+        );
+        let mut pool = PacketBufPool::new(1);
+        let mut recv_buf = Default::default();
+        let mut received = Vec::with_capacity(PACKET_COUNT);
+
+        // Let the producer fill the bounded queue so this checks batch dequeue, not arrival timing.
+        tokio::task::yield_now().await;
+
+        loop {
+            let mut batch = Vec::new();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                receiver.recv_many_from(&mut recv_buf, &mut pool, &mut batch),
+            )
+            .await
+            .expect("buffered UDP receive must not stall")
+            .map(|()| batch);
+
+            let batch = match result {
+                Ok(batch) => batch,
+                Err(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::Other);
+                    break;
+                }
+            };
+
+            assert!(!batch.is_empty(), "successful receive must return packets");
+            assert!(batch.len() <= 64, "receive batch must remain bounded");
+            if received.is_empty() {
+                assert!(
+                    batch.len() > 1,
+                    "queued datagrams should be drained together"
+                );
+            }
+
+            for (packet, _) in batch {
+                let sequence = usize::from(u16::from_be_bytes(
+                    packet[..2].try_into().expect("sequence has two bytes"),
+                ));
+                received.push(sequence);
+            }
+        }
+
+        assert_eq!(received, (0..PACKET_COUNT).collect::<Vec<_>>());
+    }
 
     #[tokio::test]
     /// Regression test for security advisory GHSA-6gxq-8xp9-742r.
