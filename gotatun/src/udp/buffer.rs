@@ -398,6 +398,16 @@ impl BufferedUdpReceive {
     }
 }
 
+/// Most datagrams one [`BufferedUdpReceive::recv_many_from`] call hands to the packet task.
+///
+/// Taking every queued datagram in one call lets the packet task decrypt them as one run and
+/// write them to the TUN together, the way Linux handles a `recvmmsg` batch, instead of paying
+/// a loop turn per datagram (#260, J582). 64 matches the macOS socket read and send batches;
+/// the bound keeps one call from holding the first datagram's TUN write behind the decryption
+/// of a whole deep queue.
+#[cfg(any(not(target_os = "linux"), test))]
+const RECV_BATCH: usize = 64;
+
 #[cfg(any(not(target_os = "linux"), test))]
 impl UdpRecv for BufferedUdpReceive {
     type RecvManyBuf = ();
@@ -410,6 +420,26 @@ impl UdpRecv for BufferedUdpReceive {
             ));
         };
         packet
+    }
+
+    /// Wait for one datagram, then add every datagram already queued, up to [`RECV_BATCH`].
+    ///
+    /// Never waits for a second datagram, so a lone reply is not delayed. The receive task only
+    /// queues an error when the socket is gone, so an error ends the batch and is returned.
+    async fn recv_many_from(
+        &mut self,
+        _recv_buf: &mut Self::RecvManyBuf,
+        pool: &mut PacketBufPool,
+        packets: &mut Vec<(Packet, SocketAddr)>,
+    ) -> io::Result<()> {
+        packets.push(self.recv_from(pool).await?);
+        for _ in 1..RECV_BATCH {
+            let Ok(item) = self.recv_rx.try_recv() else {
+                break;
+            };
+            packets.push(item?);
+        }
+        Ok(())
     }
 }
 
@@ -566,6 +596,51 @@ mod test {
         .expect("the valid datagram must arrive")
         .expect("a bad datagram must not be reported as a receive failure");
         assert_eq!(&packet[..], b"after-bad");
+    }
+
+    /// One receive call hands the packet task every datagram already queued, up to a batch of
+    /// 64, in arrival order (#260, J582). With one datagram per call, the macOS packet task
+    /// paid a full loop turn per returning ACK while it also encrypted the bulk send, so the
+    /// receive queue sat full and probe replies waited 5–15 ms (p99) in Mac-send with 8 flows.
+    #[tokio::test]
+    async fn one_receive_call_drains_the_queued_datagrams_in_order() {
+        let script = Script((0..100_u8).map(|i| Ok(datagram(&[i]))).collect());
+        let mut receiver = BufferedUdpReceive::new(128, script, PacketBufPool::new(128));
+        for _ in 0..10_000 {
+            if receiver.recv_rx.len() == 100 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            receiver.recv_rx.len(),
+            100,
+            "the receive task queues all 100"
+        );
+
+        let mut pool = PacketBufPool::new(1);
+        let mut packets = Vec::new();
+        receiver
+            .recv_many_from(&mut (), &mut pool, &mut packets)
+            .await
+            .expect("queued datagrams");
+        let first: Vec<u8> = packets.drain(..).map(|(p, _)| p[0]).collect();
+        assert_eq!(
+            first,
+            (0..64).collect::<Vec<u8>>(),
+            "a full batch, in order"
+        );
+
+        receiver
+            .recv_many_from(&mut (), &mut pool, &mut packets)
+            .await
+            .expect("queued datagrams");
+        let rest: Vec<u8> = packets.drain(..).map(|(p, _)| p[0]).collect();
+        assert_eq!(
+            rest,
+            (64..100).collect::<Vec<u8>>(),
+            "the rest, without waiting"
+        );
     }
 
     /// A gone socket is still reported, and the receive task then stops.
