@@ -18,6 +18,7 @@ pub mod configure;
 pub mod daita;
 #[cfg(test)]
 mod integration_tests;
+mod fair_queue;
 mod peer;
 mod peer_state;
 #[cfg(test)]
