@@ -1,0 +1,244 @@
+D348 pinned validate: ; results /home/claude/j88i-r4b-pinned/evidence/d348-validation-2
+perf-run: running in perf.slice (cpus 1-3, 6G); state: /home/claude/j88i-r4b-pinned/evidence/d348-validation-2/receipts/perf-run-20261105T173338-53245.{before,after}.txt
+17:33:41 [j88i-cpuset-smoke] h2h-a process masks: Cpus_allowed=06 Cpus_allowed_list=1-2, expected 1-2
+17:33:41 [j88i-cpuset-smoke] h2h-b process masks: Cpus_allowed=18 Cpus_allowed_list=3-4, expected 3-4
+17:33:42 [j88i-cpuset-smoke] background namespace PID 53511 masks: Cpus_allowed=06 Cpus_allowed_list=1-2, expected 1-2
+17:33:42 [j88i-cpuset-smoke] background namespace PID 53516 masks: Cpus_allowed=18 Cpus_allowed_list=3-4, expected 3-4
+17:33:42 [j88i-cpuset-smoke] cpuset audit started for smoke (PID 53523)
+17:33:42 [j88i-cpuset-smoke] cpuset audit preflight is clean for smoke; measured scopes may start
+{"audit_case": "j88i-cpuset-smoke", "clean": true, "expected_side_cpu_lists": [[1, 2], [3, 4]], "external_runnable_samples": 0, "interpretation": "bound kthreadd children in cgroup / named and pinned to one test CPU are measured by role and in total; only unrelated background-worker runtime is budgeted against 0.5% of test-CPU time; kernel crypto and network softirq are measured workload and are reported without using that budget; any non-kernel runnable task allowed on test CPUs rejects the window; other root kernel tasks are reported separately", "interrupt_data_available": true, "interrupt_delta_per_cpu": {"31": {"CPU5": 39}, "32": {"CPU0": 37}, "41": {"CPU5": 1}, "51": {"CPU4": 1}, "53": {"CPU2": 2}, "CAL": {"CPU0": 99, "CPU1": 10, "CPU2": 1, "CPU3": 8, "CPU4": 7, "CPU5": 93}, "LOC": {"CPU0": 460, "CPU1": 33, "CPU2": 19, "CPU3": 43, "CPU4": 22, "CPU5": 233}, "RES": {"CPU0": 3, "CPU1": 1, "CPU2": 2, "CPU3": 1, "CPU4": 1, "CPU5": 2}, "TLB": {"CPU5": 1}}, "kernel_background_percpu_runtime_delta_ns": 761942, "kernel_background_percpu_runtime_percent_of_test_cpu_time": 0.009261896800211687, "kernel_bound_percpu_runtime_delta_by_cpu_ns": {"1": 539133, "2": 129965, "3": 109064, "4": 51127}, "kernel_bound_percpu_runtime_delta_by_role_ns": {"background": 761942, "network-softirq": 67347}, "kernel_bound_percpu_runtime_delta_ns": 829289, "kernel_bound_percpu_runtime_limit_percent": 0.5, "kernel_bound_percpu_runtime_percent_of_test_cpu_time": 0.0100805430538686, "kernel_bound_percpu_workers": [{"cgroup": "/", "comm": "ksoftirqd/1", "cpus_allowed": "02", "cpus_allowed_list": "1", "parent_pid": 2, "pid": 27, "processor": 1, "role": "network-softirq", "run_delay_ns": 11789952506, "runtime_ns": 13017768650, "state": "S", "tid": 27, "worker_cpu": 1}, {"cgroup": "/", "comm": "kworker/1:0H-events_highpri", "cpus_allowed": "02", "cpus_allowed_list": "1", "parent_pid": 2, "pid": 29, "processor": 1, "role": "background", "run_delay_ns": 301, "runtime_ns": 15982, "state": "I", "tid": 29, "worker_cpu": 1}, {"cgroup": "/", "comm": "ksoftirqd/2", "cpus_allowed": "04", "cpus_allowed_list": "2", "parent_pid": 2, "pid": 33, "processor": 2, "role": "network-softirq", "run_delay_ns": 12505383772, "runtime_ns": 14917481781, "state": "S", "tid": 33, "worker_cpu": 2}, {"cgroup": "/", "comm": "kworker/2:0H-events_highpri", "cpus_allowed": "04", "cpus_allowed_list": "2", "parent_pid": 2, "pid": 35, "processor": 2, "role": "background", "run_delay_ns": 351, "runtime_ns": 21891, "state": "I", "tid": 35, "worker_cpu": 2}, {"cgroup": "/", "comm": "ksoftirqd/3", "cpus_allowed": "08", "cpus_allowed_list": "3", "parent_pid": 2, "pid": 39, "processor": 3, "role": "network-softirq", "run_delay_ns": 10248952816, "runtime_ns": 8384077902, "state": "S", "tid": 39, "worker_cpu": 3}, {"cgroup": "/", "comm": "kworker/3:0H-events_highpri", "cpus_allowed": "08", "cpus_allowed_list": "3", "parent_pid": 2, "pid": 41, "processor": 3, "role": "background", "run_delay_ns": 360, "runtime_ns": 26570, "state": "I", "tid": 41, "worker_cpu": 3}, {"cgroup": "/", "comm": "ksoftirqd/4", "cpus_allowed": "10", "cpus_allowed_list": "4", "parent_pid": 2, "pid": 45, "processor": 4, "role": "network-softirq", "run_delay_ns": 16349154042, "runtime_ns": 18186753190, "state": "S", "tid": 45, "worker_cpu": 4}, {"cgroup": "/", "comm": "kworker/4:0H-events_highpri", "cpus_allowed": "10", "cpus_allowed_list": "4", "parent_pid": 2, "pid": 47, "processor": 4, "role": "background", "run_delay_ns": 340, "runtime_ns": 22202, "state": "I", "tid": 47, "worker_cpu": 4}, {"cgroup": "/", "comm": "kworker/1:1H-kblockd", "cpus_allowed": "02", "cpus_allowed_list": "1", "parent_pid": 2, "pid": 98, "processor": 1, "role": "background", "run_delay_ns": 7304396, "runtime_ns": 50510890, "state": "I", "tid": 98, "worker_cpu": 1}, {"cgroup": "/", "comm": "kworker/4:1H-kblockd", "cpus_allowed": "10", "cpus_allowed_list": "4", "parent_pid": 2, "pid": 163, "processor": 4, "role": "background", "run_delay_ns": 3740530, "runtime_ns": 54504626, "state": "I", "tid": 163, "worker_cpu": 4}, {"cgroup": "/", "comm": "kworker/2:1H-kblockd", "cpus_allowed": "04", "cpus_allowed_list": "2", "parent_pid": 2, "pid": 201, "processor": 2, "role": "background", "run_delay_ns": 6761446, "runtime_ns": 53862798, "state": "I", "tid": 201, "worker_cpu": 2}, {"cgroup": "/", "comm": "kworker/3:1H-kblockd", "cpus_allowed": "08", "cpus_allowed_list": "3", "parent_pid": 2, "pid": 233, "processor": 3, "role": "background", "run_delay_ns": 101248256, "runtime_ns": 50880577, "state": "I", "tid": 233, "worker_cpu": 3}, {"cgroup": "/", "comm": "kworker/1:0-events_freezable", "cpus_allowed": "02", "cpus_allowed_list": "1", "parent_pid": 2, "pid": 51882, "processor": 1, "role": "background", "run_delay_ns": 7186188, "runtime_ns": 100789981, "state": "I", "tid": 51882, "worker_cpu": 1}, {"cgroup": "/", "comm": "kworker/3:2-cgroup_release", "cpus_allowed": "08", "cpus_allowed_list": "3", "parent_pid": 2, "pid": 51888, "processor": 3, "role": "background", "run_delay_ns": 7209685, "runtime_ns": 51845436, "state": "I", "tid": 51888, "worker_cpu": 3}, {"cgroup": "/", "comm": "kworker/4:0-cgroup_free", "cpus_allowed": "10", "cpus_allowed_list": "4", "parent_pid": 2, "pid": 51933, "processor": 4, "role": "background", "run_delay_ns": 89904038, "runtime_ns": 84587141, "state": "I", "tid": 51933, "worker_cpu": 4}, {"cgroup": "/", "comm": "kworker/2:1-events", "cpus_allowed": "04", "cpus_allowed_list": "2", "parent_pid": 2, "pid": 51950, "processor": 2, "role": "background", "run_delay_ns": 10246802, "runtime_ns": 22101570, "state": "I", "tid": 51950, "worker_cpu": 2}, {"cgroup": "/", "comm": "kworker/3:1-wg-crypt-wt0", "cpus_allowed": "08", "cpus_allowed_list": "3", "parent_pid": 2, "pid": 52084, "processor": 3, "role": "background", "run_delay_ns": 3277289, "runtime_ns": 21120822, "state": "I", "tid": 52084, "worker_cpu": 3}, {"cgroup": "/", "comm": "kworker/1:2-events", "cpus_allowed": "02", "cpus_allowed_list": "1", "parent_pid": 2, "pid": 52123, "processor": 1, "role": "background", "run_delay_ns": 1838786, "runtime_ns": 32668117, "state": "I", "tid": 52123, "worker_cpu": 1}, {"cgroup": "/", "comm": "kworker/2:3-wg-crypt-wt0", "cpus_allowed": "04", "cpus_allowed_list": "2", "parent_pid": 2, "pid": 52128, "processor": 2, "role": "background", "run_delay_ns": 3985380, "runtime_ns": 26619733, "state": "I", "tid": 52128, "worker_cpu": 2}, {"cgroup": "/", "comm": "kworker/4:1-cgroup_free", "cpus_allowed": "10", "cpus_allowed_list": "4", "parent_pid": 2, "pid": 52194, "processor": 4, "role": "background", "run_delay_ns": 26940, "runtime_ns": 141325, "state": "I", "tid": 52194, "worker_cpu": 4}, {"cgroup": "/", "comm": "kworker/2:0-cgroup_release", "cpus_allowed": "04", "cpus_allowed_list": "2", "parent_pid": 2, "pid": 52286, "processor": 2, "role": "background", "run_delay_ns": 2690353, "runtime_ns": 5075670, "state": "I", "tid": 52286, "worker_cpu": 2}, {"cgroup": "/", "comm": "kworker/1:1-events", "cpus_allowed": "02", "cpus_allowed_list": "1", "parent_pid": 2, "pid": 52317, "processor": 1, "role": "background", "run_delay_ns": 10871177, "runtime_ns": 24414093, "state": "I", "tid": 52317, "worker_cpu": 1}, {"cgroup": "/", "comm": "kworker/3:0-wg-crypt-wt0", "cpus_allowed": "08", "cpus_allowed_list": "3", "parent_pid": 2, "pid": 52321, "processor": 3, "role": "background", "run_delay_ns": 8498749, "runtime_ns": 13427055, "state": "I", "tid": 52321, "worker_cpu": 3}, {"cgroup": "/", "comm": "kworker/4:2-events", "cpus_allowed": "10", "cpus_allowed_list": "4", "parent_pid": 2, "pid": 52361, "processor": 4, "role": "background", "run_delay_ns": 10269016, "runtime_ns": 110762374, "state": "I", "tid": 52361, "worker_cpu": 4}, {"cgroup": "/", "comm": "kworker/3:3-mm_percpu_wq", "cpus_allowed": "08", "cpus_allowed_list": "3", "parent_pid": 2, "pid": 52362, "processor": 3, "role": "background", "run_delay_ns": 3449393, "runtime_ns": 10091024, "state": "I", "tid": 52362, "worker_cpu": 3}, {"cgroup": "/", "comm": "kworker/4:3", "cpus_allowed": "10", "cpus_allowed_list": "4", "parent_pid": 2, "pid": 52475, "processor": 4, "role": "background", "run_delay_ns": 23194, "runtime_ns": 20308, "state": "I", "tid": 52475, "worker_cpu": 4}], "kernel_bound_runtime_budget_role": "background", "kernel_bound_runtime_limit_exceeded": false, "kernel_other_runnable": [], "kernel_wireguard_crypto_runnable_samples": 0, "kernel_wireguard_crypto_workers": [], "mask_mismatch_samples": 0, "max_scope_threads": 2, "samples": 3, "scope_run_delay_delta_ns": 0, "scope_runtime_delta_ns": 10239441, "softirq_data_available": true, "softirq_delta_per_cpu": {"BLOCK": {"CPU4": 1}, "NET_RX": {"CPU0": 32, "CPU3": 1, "CPU4": 1, "CPU5": 38}, "RCU": {"CPU0": 20, "CPU1": 4, "CPU2": 4, "CPU3": 10, "CPU4": 5, "CPU5": 75}, "SCHED": {"CPU0": 130, "CPU1": 12, "CPU2": 5, "CPU3": 10, "CPU4": 5, "CPU5": 7}, "TIMER": {"CPU0": 62, "CPU1": 15, "CPU2": 8, "CPU3": 14, "CPU4": 11, "CPU5": 26}}, "test_cpu_list": [1, 2, 3, 4], "test_cpu_time_ns": 8226630208, "veth_irq_note": "veth links have no device IRQ; interrupt affinity and per-CPU softirq deltas are retained for the measured path", "window_duration_ns": 2056657552}
+head-to-head: mesh-underlay | perf VM infraternal-perf-01-backup01, x86_64; D348 A=1-2 B=3-4 housekeeping=0,5; validate ; row validate-underlay=underlay | results /home/claude/j88i-r4b-pinned/evidence/d348-validation-2/validate-underlay
+17:33:45 [j88i-cpuset-smoke] R4b cpuset helper smoke passed
+17:33:46 [mesh-underlay] first-packet: {"attempts":1,"elapsed_ms":9.523329,"ok":true}
+17:33:49 [mesh-underlay] idle: {"context_switches_per_s":0.0,"cpu_percent_of_one_core":0.0,"cpu_s":0.0,"machine_busy_s":0.01,"mem":{"count":0,"procs":[],"pss_kb":0,"rss_kb":0},"seconds":3.0}
+17:33:49 [mesh-underlay] lat-lan-64: {"interval_us":1000,"one_way_fwd_ms":{"max":0.315,"mean":0.022,"min":0.01,"n":300,"p50":0.019,"p90":0.03,"p99":0.085},"one_way_rev_ms":{"max":0.479,"mean":0.023,"min":0.01,"n":300,"p50":0.019,"p90":0.03,"p99":0.149},"payload_bytes":64,"received":300,"rtt_ms":{"max":0.52,"mean":0.046,"min":0.02,"n":300,"p50":0.038,"p90":0.059,"p99":0.186},"sent":300}
+17:33:50 [mesh-underlay] lat-lan-512: {"interval_us":1000,"one_way_fwd_ms":{"max":0.317,"mean":0.024,"min":0.01,"n":300,"p50":0.021,"p90":0.03,"p99":0.098},"one_way_rev_ms":{"max":0.082,"mean":0.022,"min":0.01,"n":300,"p50":0.022,"p90":0.027,"p99":0.061},"payload_bytes":512,"received":300,"rtt_ms":{"max":0.377,"mean":0.045,"min":0.02,"n":300,"p50":0.043,"p90":0.057,"p99":0.152},"sent":300}
+17:33:50 [mesh-underlay] lat-lan-1400: {"interval_us":1000,"one_way_fwd_ms":{"max":0.209,"mean":0.02,"min":0.01,"n":300,"p50":0.019,"p90":0.026,"p99":0.061},"one_way_rev_ms":{"max":0.133,"mean":0.021,"min":0.01,"n":300,"p50":0.019,"p90":0.027,"p99":0.065},"payload_bytes":1400,"received":300,"rtt_ms":{"max":0.25,"mean":0.041,"min":0.02,"n":300,"p50":0.038,"p90":0.053,"p99":0.158},"sent":300}
+17:33:50 [mesh-underlay] cpuset audit started for lan-1 (PID 53767)
+17:33:51 [mesh-underlay] cpuset audit preflight is clean for lan-1; measured scopes may start
+17:33:53 [mesh-underlay] tput-lan-1: {"bytes":7239892992,"flows":1,"gbit_per_s":28.905,"machine_cores_busy":2.1908895111577373,"machine_cpu_busy_s":4.39,"machine_cpu_s_per_gbit":0.07579531915821995,"seconds":2.0037523470000003,"watched_cpu_s":0.0,"watched_pss_kb_peak":0,"watched_rss_kb_peak":0}
+17:33:54 [mesh-underlay] icmp-lan-1: sent 300 lost 0 p50 0.011 p99_received 0.024 p99_loss_aware 0.024 p99.9_loss_aware 0.028 max 0.028 (ping exit 0)
+17:33:54 [mesh-underlay] cpuset audit started for lan-8 (PID 53793)
+17:33:54 [mesh-underlay] cpuset audit preflight is clean for lan-8; measured scopes may start
+17:33:56 [mesh-underlay] tput-lan-8: {"bytes":13970178048,"flows":8,"gbit_per_s":55.387,"machine_cores_busy":2.8594889931709666,"machine_cpu_busy_s":5.77,"machine_cpu_s_per_gbit":0.0516278316226081,"seconds":2.017843053,"watched_cpu_s":0.0,"watched_pss_kb_peak":0,"watched_rss_kb_peak":0}
+17:33:57 [mesh-underlay] icmp-lan-8: sent 300 lost 0 p50 0.017 p99_received 0.151 p99_loss_aware 0.151 p99.9_loss_aware 0.210 max 0.210 (ping exit 0)
+17:33:57 [mesh-underlay] mem-after-load: {"count":0,"procs":[],"pss_kb":0,"rss_kb":0}
+17:34:00 [mesh-underlay] lat-de-in-64: {"interval_us":10000,"one_way_fwd_ms":{"max":99.065,"mean":99.043,"min":99.032,"n":60,"p50":99.042,"p90":99.054,"p99":99.065},"one_way_rev_ms":{"max":99.092,"mean":99.046,"min":99.035,"n":60,"p50":99.044,"p90":99.057,"p99":99.092},"payload_bytes":64,"received":60,"rtt_ms":{"max":198.149,"mean":198.09,"min":198.068,"n":60,"p50":198.087,"p90":198.107,"p99":198.149},"sent":60}
+17:34:01 [mesh-underlay] lat-de-in-512: {"interval_us":10000,"one_way_fwd_ms":{"max":99.08,"mean":99.042,"min":99.03,"n":60,"p50":99.039,"p90":99.05,"p99":99.08},"one_way_rev_ms":{"max":99.087,"mean":99.051,"min":99.031,"n":60,"p50":99.048,"p90":99.07,"p99":99.087},"payload_bytes":512,"received":60,"rtt_ms":{"max":198.135,"mean":198.093,"min":198.07,"n":60,"p50":198.089,"p90":198.113,"p99":198.135},"sent":60}
+17:34:02 [mesh-underlay] lat-de-in-1400: {"interval_us":10000,"one_way_fwd_ms":{"max":99.074,"mean":99.043,"min":99.027,"n":60,"p50":99.041,"p90":99.057,"p99":99.074},"one_way_rev_ms":{"max":99.112,"mean":99.051,"min":99.032,"n":60,"p50":99.043,"p90":99.078,"p99":99.112},"payload_bytes":1400,"received":60,"rtt_ms":{"max":198.16,"mean":198.094,"min":198.065,"n":60,"p50":198.083,"p90":198.128,"p99":198.16},"sent":60}
+17:34:02 [mesh-underlay] cpuset audit started for de-in-1 (PID 53874)
+17:34:02 [mesh-underlay] cpuset audit preflight is clean for de-in-1; measured scopes may start
+17:34:07 [mesh-underlay] tput-de-in-1: {"bytes":38404096,"flows":1,"gbit_per_s":0.072,"machine_cores_busy":0.04685013547648991,"machine_cpu_busy_s":0.2,"machine_cpu_s_per_gbit":0.6509722296288395,"seconds":4.268931092,"watched_cpu_s":0.0,"watched_pss_kb_peak":0,"watched_rss_kb_peak":0}
+17:34:07 [mesh-underlay] icmp-de-in-1: sent 60 lost 0 p50 198.000 p99_received 198.000 p99_loss_aware 198.000 p99.9_loss_aware 198.000 max 198.000 (ping exit 0)
+17:34:08 [mesh-underlay] cpuset audit started for de-in-8 (PID 53900)
+17:34:08 [mesh-underlay] cpuset audit preflight is clean for de-in-8; measured scopes may start
+17:34:14 [mesh-underlay] tput-de-in-8: {"bytes":307232768,"flows":8,"gbit_per_s":0.576,"machine_cores_busy":0.09375485721208962,"machine_cpu_busy_s":0.4,"machine_cpu_s_per_gbit":0.16274305740720993,"seconds":4.266445621,"watched_cpu_s":0.0,"watched_pss_kb_peak":0,"watched_rss_kb_peak":0}
+17:34:14 [mesh-underlay] icmp-de-in-8: sent 60 lost 0 p50 198.000 p99_received 198.000 p99_loss_aware 198.000 p99.9_loss_aware 198.000 max 198.000 (ping exit 0)
+17:34:20 [mesh-underlay] lat-de-in-loss-64: {"interval_us":10000,"one_way_fwd_ms":{"max":99.508,"mean":99.062,"min":99.037,"n":59,"p50":99.051,"p90":99.077,"p99":99.508},"one_way_rev_ms":{"max":99.13,"mean":99.062,"min":99.04,"n":59,"p50":99.059,"p90":99.081,"p99":99.13},"payload_bytes":64,"received":59,"rtt_ms":{"max":198.581,"mean":198.124,"min":198.09,"n":59,"p50":198.113,"p90":198.145,"p99":198.581},"sent":60}
+17:34:24 [mesh-underlay] lat-de-in-loss-512: {"interval_us":10000,"one_way_fwd_ms":{"max":102.6,"mean":99.152,"min":99.023,"n":56,"p50":99.046,"p90":99.103,"p99":102.6},"one_way_rev_ms":{"max":103.577,"mean":99.265,"min":99.026,"n":56,"p50":99.067,"p90":99.418,"p99":103.577},"payload_bytes":512,"received":56,"rtt_ms":{"max":202.618,"mean":198.418,"min":198.056,"n":56,"p50":198.135,"p90":199.225,"p99":202.618},"sent":60}
+17:34:28 [mesh-underlay] lat-de-in-loss-1400: {"interval_us":10000,"one_way_fwd_ms":{"max":99.068,"mean":99.041,"min":99.033,"n":58,"p50":99.039,"p90":99.053,"p99":99.068},"one_way_rev_ms":{"max":99.087,"mean":99.042,"min":99.027,"n":58,"p50":99.041,"p90":99.05,"p99":99.087},"payload_bytes":1400,"received":58,"rtt_ms":{"max":198.126,"mean":198.083,"min":198.063,"n":58,"p50":198.08,"p90":198.106,"p99":198.126},"sent":60}
+17:34:28 [mesh-underlay] cpuset audit started for de-in-loss-1 (PID 53972)
+17:34:28 [mesh-underlay] cpuset audit preflight is clean for de-in-loss-1; measured scopes may start
+17:34:33 [mesh-underlay] tput-de-in-loss-1: {"bytes":17170432,"flows":1,"gbit_per_s":0.032,"machine_cores_busy":0.03976381884032837,"machine_cpu_busy_s":0.17,"machine_cpu_s_per_gbit":1.2375926243439888,"seconds":4.275243298,"watched_cpu_s":0.0,"watched_pss_kb_peak":0,"watched_rss_kb_peak":0}
+17:34:33 [mesh-underlay] icmp-de-in-loss-1: sent 60 lost 6 p50 198.000 p99_received 198.000 p99_loss_aware inf p99.9_loss_aware inf max 198.000 (ping exit 0)
+17:34:34 [mesh-underlay] cpuset audit started for de-in-loss-8 (PID 54000)
+17:34:34 [mesh-underlay] cpuset audit preflight is clean for de-in-loss-8; measured scopes may start
+17:34:42 [mesh-underlay] tput-de-in-loss-8: {"bytes":154796032,"flows":8,"gbit_per_s":0.199,"machine_cores_busy":0.06260252138030685,"machine_cpu_busy_s":0.39,"machine_cpu_s_per_gbit":0.3149305532586262,"seconds":6.2297810280000006,"watched_cpu_s":0.0,"watched_pss_kb_peak":0,"watched_rss_kb_peak":0}
+17:34:42 [mesh-underlay] icmp-de-in-loss-8: sent 60 lost 2 p50 198.000 p99_received 198.000 p99_loss_aware inf p99.9_loss_aware inf max 198.000 (ping exit 0)
+17:34:42 [mesh-underlay] done
+machine diff: empty
+case mesh-underlay: exit 0 in 59 s
+total: 59 s; summary: /home/claude/j88i-r4b-pinned/evidence/d348-validation-2/validate-underlay/summary.md
+# Head-to-head results: perf VM infraternal-perf-01-backup01, x86_64; D348 A=1-2 B=3-4 housekeeping=0,5; validate ; row validate-underlay=underlay
+
+infraternal-perf-01-backup01 · Debian GNU/Linux 13 (trixie) · kernel 6.12.113+deb13-amd64 · AMD Ryzen 7 3700X 8-Core Processor · 6 cores · 11899 MiB · load at start 0.00 0.00 0.00
+
+| case | exit | seconds | machine diff |
+|---|---|---|---|
+| mesh-underlay | 0 | 59 | empty |
+
+## Mesh data plane (a → b, two namespaces, one machine)
+
+| system | first packet ms | 1 flow Gbit/s | 8 flows Gbit/s | CPU s per Gbit (1 / 8) | idle CPU % | RSS idle MiB | RSS peak MiB |
+|---|---|---|---|---|---|---|---|
+| underlay | 10 | 28.91 | 55.39 | 0.08 / 0.05 | 0.000 | – | – |
+
+## Peer-state memory (RSS is summed across both endpoints)
+
+| system | RSS at 1 peer per endpoint MiB | RSS at 1,000 peers per endpoint MiB |
+|---|---:|---:|
+
+### Latency, LAN: p50 / p99 ms
+
+| system | RTT 64 B | RTT 512 B | RTT 1400 B | one-way 64 B | one-way 1400 B | loss (64/512/1400) |
+|---|---|---|---|---|---|---|
+| underlay | 0.038 / 0.186 | 0.043 / 0.152 | 0.038 / 0.158 | 0.019 / 0.085 | 0.019 / 0.061 | 0/0/0 |
+
+| system | RTT 64 B under 1 flow p50 / p99 ms | RTT 64 B under 8 flows p50 / p99 ms |
+|---|---|---|
+| underlay | – | – |
+
+### Latency, DE↔IN, 198 ms RTT netem: p50 / p99 ms
+
+| system | RTT 64 B | RTT 512 B | RTT 1400 B | one-way 64 B | one-way 1400 B | loss (64/512/1400) |
+|---|---|---|---|---|---|---|
+| underlay | 198.087 / 198.149 | 198.089 / 198.135 | 198.083 / 198.160 | 99.042 / 99.065 | 99.041 / 99.074 | 0/0/0 |
+
+| system | RTT 64 B under 1 flow p50 / p99 ms | RTT 64 B under 8 flows p50 / p99 ms |
+|---|---|---|
+| underlay | – | – |
+
+| system | 1 flow Gbit/s | 8 flows Gbit/s |
+|---|---|---|
+| underlay | 0.072 | 0.576 |
+
+### Latency, 198 ms RTT, independent 2% loss per direction: p50 / p99 ms
+
+| system | RTT 64 B | RTT 512 B | RTT 1400 B | one-way 64 B | one-way 1400 B | loss (64/512/1400) |
+|---|---|---|---|---|---|---|
+| underlay | 198.113 / 198.581 | 198.135 / 202.618 | 198.080 / 198.126 | 99.051 / 99.508 | 99.039 / 99.068 | 1/4/2 |
+
+| system | RTT 64 B under 1 flow p50 / p99 ms | RTT 64 B under 8 flows p50 / p99 ms |
+|---|---|---|
+| underlay | – | – |
+
+| system | 1 flow Gbit/s | 8 flows Gbit/s |
+|---|---|---|
+| underlay | 0.032 | 0.199 |
+head-to-head: mesh-netbird | perf VM infraternal-perf-01-backup01, x86_64; D348 A=1-2 B=3-4 housekeeping=0,5; validate ; row validate-kernel=kernel | results /home/claude/j88i-r4b-pinned/evidence/d348-validation-2/validate-kernel
+17:34:49 [mesh-netbird] first-packet: {"attempts":196,"elapsed_ms":3602.180852,"ok":true}
+17:34:52 [mesh-netbird] idle: {"context_switches_per_s":206.0,"cpu_percent_of_one_core":0.0,"cpu_s":0.0,"machine_busy_s":0.03,"mem":{"count":2,"procs":[{"comm":"netbird","pid":54355,"pss_kb":47622,"rss_kb":65448},{"comm":"netbird","pid":54474,"pss_kb":45910,"rss_kb":63736}],"pss_kb":93532,"rss_kb":129184},"seconds":3.0}
+17:34:52 [mesh-netbird] lat-lan-64: {"interval_us":1000,"one_way_fwd_ms":{"max":0.385,"mean":0.071,"min":0.041,"n":300,"p50":0.068,"p90":0.09,"p99":0.103},"one_way_rev_ms":{"max":0.095,"mean":0.058,"min":0.025,"n":300,"p50":0.06,"p90":0.075,"p99":0.09},"payload_bytes":64,"received":300,"rtt_ms":{"max":0.465,"mean":0.129,"min":0.073,"n":300,"p50":0.128,"p90":0.158,"p99":0.187},"sent":300}
+17:34:52 [mesh-netbird] lat-lan-512: {"interval_us":1000,"one_way_fwd_ms":{"max":0.589,"mean":0.078,"min":0.042,"n":300,"p50":0.074,"p90":0.095,"p99":0.158},"one_way_rev_ms":{"max":0.434,"mean":0.067,"min":0.027,"n":300,"p50":0.065,"p90":0.083,"p99":0.124},"payload_bytes":512,"received":300,"rtt_ms":{"max":0.713,"mean":0.145,"min":0.084,"n":300,"p50":0.14,"p90":0.175,"p99":0.333},"sent":300}
+17:34:53 [mesh-netbird] lat-lan-1400: {"interval_us":1000,"one_way_fwd_ms":{"max":0.214,"mean":0.078,"min":0.045,"n":300,"p50":0.078,"p90":0.095,"p99":0.124},"one_way_rev_ms":{"max":0.227,"mean":0.069,"min":0.038,"n":300,"p50":0.067,"p90":0.085,"p99":0.116},"payload_bytes":1400,"received":300,"rtt_ms":{"max":0.295,"mean":0.147,"min":0.099,"n":300,"p50":0.144,"p90":0.181,"p99":0.249},"sent":300}
+17:34:53 [mesh-netbird] cpuset audit started for lan-1 (PID 54737)
+17:34:53 [mesh-netbird] cpuset audit preflight is clean for lan-1; measured scopes may start
+17:34:56 [mesh-netbird] tput-lan-1: {"bytes":454819840,"flows":1,"gbit_per_s":1.767,"machine_cores_busy":4.044468381201943,"machine_cpu_busy_s":8.33,"machine_cpu_s_per_gbit":2.289368027568894,"seconds":2.059603195,"watched_cpu_s":0.0,"watched_pss_kb_peak":93540,"watched_rss_kb_peak":129192}
+17:34:57 [mesh-netbird] icmp-lan-1: sent 300 lost 0 p50 0.926 p99_received 2.840 p99_loss_aware 2.840 p99.9_loss_aware 4.080 max 4.080 (ping exit 0)
+17:34:57 [mesh-netbird] cpuset audit started for lan-8 (PID 54775)
+17:34:57 [mesh-netbird] cpuset audit preflight is clean for lan-8; measured scopes may start
+17:34:59 [mesh-netbird] tput-lan-8: {"bytes":500695040,"flows":8,"gbit_per_s":1.903,"machine_cores_busy":3.7620247831847147,"machine_cpu_busy_s":7.92,"machine_cpu_s_per_gbit":1.9772514622873036,"seconds":2.105249289,"watched_cpu_s":0.0,"watched_pss_kb_peak":93552,"watched_rss_kb_peak":129204}
+17:35:00 [mesh-netbird] icmp-lan-8: sent 300 lost 0 p50 4.380 p99_received 5.700 p99_loss_aware 5.700 p99.9_loss_aware 5.820 max 5.820 (ping exit 0)
+17:35:00 [mesh-netbird] mem-after-load: {"count":2,"procs":[{"comm":"netbird","pid":54355,"pss_kb":47630,"rss_kb":65456},{"comm":"netbird","pid":54474,"pss_kb":45922,"rss_kb":63748}],"pss_kb":93552,"rss_kb":129204}
+17:35:03 [mesh-netbird] lat-de-in-64: {"interval_us":10000,"one_way_fwd_ms":{"max":99.267,"mean":99.141,"min":99.095,"n":60,"p50":99.126,"p90":99.203,"p99":99.267},"one_way_rev_ms":{"max":99.301,"mean":99.151,"min":99.092,"n":60,"p50":99.141,"p90":99.197,"p99":99.301},"payload_bytes":64,"received":60,"rtt_ms":{"max":198.457,"mean":198.292,"min":198.191,"n":60,"p50":198.273,"p90":198.362,"p99":198.457},"sent":60}
+17:35:04 [mesh-netbird] lat-de-in-512: {"interval_us":10000,"one_way_fwd_ms":{"max":99.215,"mean":99.11,"min":99.089,"n":60,"p50":99.104,"p90":99.127,"p99":99.215},"one_way_rev_ms":{"max":99.164,"mean":99.112,"min":99.079,"n":60,"p50":99.111,"p90":99.142,"p99":99.164},"payload_bytes":512,"received":60,"rtt_ms":{"max":198.38,"mean":198.222,"min":198.173,"n":60,"p50":198.216,"p90":198.257,"p99":198.38},"sent":60}
+17:35:05 [mesh-netbird] lat-de-in-1400: {"interval_us":10000,"one_way_fwd_ms":{"max":99.2,"mean":99.116,"min":99.071,"n":60,"p50":99.11,"p90":99.163,"p99":99.2},"one_way_rev_ms":{"max":99.26,"mean":99.114,"min":99.074,"n":60,"p50":99.11,"p90":99.145,"p99":99.26},"payload_bytes":1400,"received":60,"rtt_ms":{"max":198.384,"mean":198.231,"min":198.154,"n":60,"p50":198.222,"p90":198.287,"p99":198.384},"sent":60}
+17:35:05 [mesh-netbird] cpuset audit started for de-in-1 (PID 54858)
+17:35:05 [mesh-netbird] cpuset audit preflight is clean for de-in-1; measured scopes may start
+17:35:10 [mesh-netbird] tput-de-in-1: {"bytes":38273024,"flows":1,"gbit_per_s":0.07,"machine_cores_busy":0.22486161646707103,"machine_cpu_busy_s":0.98,"machine_cpu_s_per_gbit":3.2006877742401536,"seconds":4.358236036,"watched_cpu_s":0.0,"watched_pss_kb_peak":93556,"watched_rss_kb_peak":129208}
+17:35:10 [mesh-netbird] icmp-de-in-1: sent 60 lost 0 p50 198.000 p99_received 201.000 p99_loss_aware 201.000 p99.9_loss_aware 201.000 max 201.000 (ping exit 0)
+17:35:11 [mesh-netbird] cpuset audit started for de-in-8 (PID 54884)
+17:35:11 [mesh-netbird] cpuset audit preflight is clean for de-in-8; measured scopes may start
+17:35:17 [mesh-netbird] tput-de-in-8: {"bytes":304349184,"flows":8,"gbit_per_s":0.558,"machine_cores_busy":1.2423911661315596,"machine_cpu_busy_s":5.42,"machine_cpu_s_per_gbit":2.226061496521049,"seconds":4.362555166,"watched_cpu_s":0.0,"watched_pss_kb_peak":93628,"watched_rss_kb_peak":129280}
+17:35:17 [mesh-netbird] icmp-de-in-8: sent 60 lost 0 p50 198.000 p99_received 198.000 p99_loss_aware 198.000 p99.9_loss_aware 198.000 max 198.000 (ping exit 0)
+17:35:23 [mesh-netbird] lat-de-in-loss-64: {"interval_us":10000,"one_way_fwd_ms":{"max":99.288,"mean":99.131,"min":99.069,"n":59,"p50":99.12,"p90":99.178,"p99":99.288},"one_way_rev_ms":{"max":99.246,"mean":99.127,"min":99.086,"n":59,"p50":99.121,"p90":99.172,"p99":99.246},"payload_bytes":64,"received":59,"rtt_ms":{"max":198.469,"mean":198.258,"min":198.176,"n":59,"p50":198.254,"p90":198.304,"p99":198.469},"sent":60}
+17:35:27 [mesh-netbird] lat-de-in-loss-512: {"interval_us":10000,"one_way_fwd_ms":{"max":99.333,"mean":99.157,"min":99.111,"n":58,"p50":99.143,"p90":99.214,"p99":99.333},"one_way_rev_ms":{"max":99.764,"mean":99.174,"min":99.092,"n":58,"p50":99.154,"p90":99.216,"p99":99.764},"payload_bytes":512,"received":58,"rtt_ms":{"max":198.938,"mean":198.332,"min":198.213,"n":58,"p50":198.299,"p90":198.437,"p99":198.938},"sent":60}
+17:35:31 [mesh-netbird] lat-de-in-loss-1400: {"interval_us":10000,"one_way_fwd_ms":{"max":99.204,"mean":99.12,"min":99.079,"n":53,"p50":99.113,"p90":99.162,"p99":99.204},"one_way_rev_ms":{"max":99.195,"mean":99.12,"min":99.066,"n":53,"p50":99.116,"p90":99.16,"p99":99.195},"payload_bytes":1400,"received":53,"rtt_ms":{"max":198.33,"mean":198.24,"min":198.165,"n":53,"p50":198.227,"p90":198.303,"p99":198.33},"sent":60}
+17:35:31 [mesh-netbird] cpuset audit started for de-in-loss-1 (PID 54956)
+17:35:31 [mesh-netbird] cpuset audit preflight is clean for de-in-loss-1; measured scopes may start
+17:35:38 [mesh-netbird] tput-de-in-loss-1: {"bytes":2359296,"flows":1,"gbit_per_s":0.003,"machine_cores_busy":0.0935221006438515,"machine_cpu_busy_s":0.58,"machine_cpu_s_per_gbit":30.729505750868054,"seconds":6.201742647,"watched_cpu_s":0.0,"watched_pss_kb_peak":93700,"watched_rss_kb_peak":129416}
+17:35:39 [mesh-netbird] icmp-de-in-loss-1: sent 60 lost 0 p50 198.000 p99_received 201.000 p99_loss_aware 201.000 p99.9_loss_aware 201.000 max 201.000 (ping exit 0)
+17:35:39 [mesh-netbird] cpuset audit started for de-in-loss-8 (PID 54982)
+17:35:39 [mesh-netbird] cpuset audit preflight is clean for de-in-loss-8; measured scopes may start
+17:35:47 [mesh-netbird] tput-de-in-loss-8: {"bytes":105250816,"flows":8,"gbit_per_s":0.145,"machine_cores_busy":0.5179846017463916,"machine_cpu_busy_s":3.0,"machine_cpu_s_per_gbit":3.5629177449797633,"seconds":5.791677957,"watched_cpu_s":0.0,"watched_pss_kb_peak":93704,"watched_rss_kb_peak":129420}
+17:35:47 [mesh-netbird] icmp-de-in-loss-8: sent 60 lost 2 p50 198.000 p99_received 198.000 p99_loss_aware inf p99.9_loss_aware inf max 198.000 (ping exit 0)
+grep: /dev/shm/h2h-54163-mesh-netbird/netbird/a/client.log: No such file or directory
+17:35:47 [mesh-netbird] done
+machine diff: empty
+case mesh-netbird: exit 0 in 69 s
+total: 69 s; summary: /home/claude/j88i-r4b-pinned/evidence/d348-validation-2/validate-kernel/summary.md
+# Head-to-head results: perf VM infraternal-perf-01-backup01, x86_64; D348 A=1-2 B=3-4 housekeeping=0,5; validate ; row validate-kernel=kernel
+
+infraternal-perf-01-backup01 · Debian GNU/Linux 13 (trixie) · kernel 6.12.113+deb13-amd64 · AMD Ryzen 7 3700X 8-Core Processor · 6 cores · 11899 MiB · load at start 0.00 0.00 0.00
+
+| case | exit | seconds | machine diff |
+|---|---|---|---|
+| mesh-netbird | 0 | 69 | empty |
+
+## Mesh data plane (a → b, two namespaces, one machine)
+
+| system | first packet ms | 1 flow Gbit/s | 8 flows Gbit/s | CPU s per Gbit (1 / 8) | idle CPU % | RSS idle MiB | RSS peak MiB |
+|---|---|---|---|---|---|---|---|
+| netbird | 3602 | 1.77 | 1.90 | 2.29 / 1.98 | 0.000 | 126.2 | 126.2 |
+
+## Peer-state memory (RSS is summed across both endpoints)
+
+| system | RSS at 1 peer per endpoint MiB | RSS at 1,000 peers per endpoint MiB |
+|---|---:|---:|
+
+### Latency, LAN: p50 / p99 ms
+
+| system | RTT 64 B | RTT 512 B | RTT 1400 B | one-way 64 B | one-way 1400 B | loss (64/512/1400) |
+|---|---|---|---|---|---|---|
+| netbird | 0.128 / 0.187 | 0.140 / 0.333 | 0.144 / 0.249 | 0.068 / 0.103 | 0.078 / 0.124 | 0/0/0 |
+
+| system | RTT 64 B under 1 flow p50 / p99 ms | RTT 64 B under 8 flows p50 / p99 ms |
+|---|---|---|
+| netbird | – | – |
+
+### Latency, DE↔IN, 198 ms RTT netem: p50 / p99 ms
+
+| system | RTT 64 B | RTT 512 B | RTT 1400 B | one-way 64 B | one-way 1400 B | loss (64/512/1400) |
+|---|---|---|---|---|---|---|
+| netbird | 198.273 / 198.457 | 198.216 / 198.380 | 198.222 / 198.384 | 99.126 / 99.267 | 99.110 / 99.200 | 0/0/0 |
+
+| system | RTT 64 B under 1 flow p50 / p99 ms | RTT 64 B under 8 flows p50 / p99 ms |
+|---|---|---|
+| netbird | – | – |
+
+| system | 1 flow Gbit/s | 8 flows Gbit/s |
+|---|---|---|
+| netbird | 0.070 | 0.558 |
+
+### Latency, 198 ms RTT, independent 2% loss per direction: p50 / p99 ms
+
+| system | RTT 64 B | RTT 512 B | RTT 1400 B | one-way 64 B | one-way 1400 B | loss (64/512/1400) |
+|---|---|---|---|---|---|---|
+| netbird | 198.254 / 198.469 | 198.299 / 198.938 | 198.227 / 198.330 | 99.120 / 99.288 | 99.113 / 99.204 | 1/2/7 |
+
+| system | RTT 64 B under 1 flow p50 / p99 ms | RTT 64 B under 8 flows p50 / p99 ms |
+|---|---|---|
+| netbird | – | – |
+
+| system | 1 flow Gbit/s | 8 flows Gbit/s |
+|---|---|---|
+| netbird | 0.003 | 0.145 |
+Removed '/run/systemd/transient/init.scope.d/50-AllowedCPUs.conf'.
+Removed '/run/systemd/transient/init.scope.d'.
+Removed '/run/systemd/system.control/system.slice.d/50-AllowedCPUs.conf'.
+Removed '/run/systemd/system.control/system.slice.d'.
+Removed '/run/systemd/system.control/user.slice.d/50-AllowedCPUs.conf'.
+Removed '/run/systemd/system.control/user.slice.d'.
+Removed '/run/systemd/system.control/perf.slice.d/50-AllowedCPUs.conf'.
+Removed '/run/systemd/system.control/perf.slice.d'.
+host service slices, IRQ affinities, and workqueue masks restored; perf.slice cpuset.cpus=1-3 cpuset.cpus.effective=1-3
+-- run summary --
+command: env H2H_CPUSET_AUDIT=1 H2H_RESULTS=/home/claude/j88i-r4b-pinned/evidence/d348-validation-2 H2H_CPUSET_HOUSEKEEPING=0,5 bash /home/claude/j88i-r4b-pinned/harness/runner-overlays/J88i-pinned-run.sh /home/claude/j88i-r4b-pinned/harness /home/claude/j88i-r4b-pinned/evidence/d348-validation-2 validate  /home/claude/j88i-r4b-pinned/evidence/d348-validation-2/rows.tsv
+cold: 0  exit: 0
+wall: 133.831s
+steal during run: 229 of 80332 jiffies (all cpus)
+perf-run: running in perf.slice (cpus 1-3, 6G); state: /home/claude/j88i-r4b-pinned/evidence/d348-validation-2/restore-receipts/perf-run-20261105T173557-55772.{before,after}.txt
+init.scope restored: cpuset.cpus=0-5 cpuset.cpus.effective=0-5 DropInPaths= (AllowedCPUs= EffectiveCPUs=0-5 informational)
+system.slice restored: cpuset.cpus=0-5 cpuset.cpus.effective=0-5 DropInPaths= (AllowedCPUs= EffectiveCPUs=0-5 informational)
+user.slice restored: cpuset.cpus=0-5 cpuset.cpus.effective=0-5 DropInPaths= (AllowedCPUs= EffectiveCPUs=0-5 informational)
+perf.slice restored: cpuset.cpus=1-3 cpuset.cpus.effective=1-3 DropInPaths= (AllowedCPUs=1-3 EffectiveCPUs=1-3 informational)
+workqueue cpumask restored: /sys/devices/virtual/workqueue/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/blkcg_punt_bio/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/scsi_tmf_0/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/scsi_tmf_1/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/scsi_tmf_2/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/scsi_tmf_3/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/scsi_tmf_4/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/scsi_tmf_5/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/scsi_tmf_6/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/scsi_tmf_7/cpumask=3f
+workqueue cpumask restored: /sys/devices/virtual/workqueue/writeback/cpumask=3f
+IRQ affinity restored: irq=30 cpus=0-5
+IRQ affinity restored: irq=31 cpus=0-5
+IRQ affinity restored: irq=32 cpus=0-5
+-- run summary --
+command: bash /home/claude/j88i-r4b-pinned/harness/runner-overlays/J88i-verify-restored.sh /home/claude/j88i-r4b-pinned/evidence/d348-validation-2/cpuset-restoration.txt /home/claude/j88i-r4b-pinned/evidence/d348-validation-2/cgroup-masks-before.tsv /home/claude/j88i-r4b-pinned/evidence/d348-validation-2/workqueue-masks-before.tsv /home/claude/j88i-r4b-pinned/evidence/d348-validation-2/irq-affinity-before.tsv
+cold: 0  exit: 0
+wall: 0.137s
+steal during run: 0 of 82 jiffies (all cpus)
+results: /home/claude/j88i-r4b-pinned/evidence/d348-validation-2

@@ -10,8 +10,10 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-// This module contains some integration tests for gotatun
-// Those tests require docker and sudo privileges to run
+//! Integration tests for gotatun that require Docker and elevated privileges.
+//!
+//! The network tests use blocking client sockets. Their Tokio runtime needs worker
+//! threads so those reads do not stall the tunnel tasks that serve them.
 #[cfg(all(test, not(target_os = "macos"), not(target_os = "windows")))]
 mod tests {
     use crate::device::{DefaultDeviceTransports, Device, DeviceBuilder};
@@ -560,7 +562,7 @@ mod tests {
     }
 
     /// Test if wireguard can handle simple ipv4 connections
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn test_wg_start_ipv4() {
         let port = next_port();
@@ -595,7 +597,7 @@ mod tests {
         assert_eq!(response, encode(PublicKey::from(&peer.key).as_bytes()));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     /// Test if wireguard can handle simple ipv6 connections
     async fn test_wg_start_ipv6() {
@@ -631,7 +633,7 @@ mod tests {
     }
 
     /// Test if wireguard can handle connection with an ipv6 endpoint
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     #[cfg(target_os = "linux")] // Can't make docker work with ipv6 on macOS ATM
     async fn test_wg_start_ipv6_endpoint() {
@@ -670,7 +672,7 @@ mod tests {
     }
 
     /// Test many concurrent connections
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn test_wg_concurrent() {
         let port = next_port();
@@ -721,7 +723,7 @@ mod tests {
     }
 
     /// Test many concurrent connections
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn test_wg_concurrent_v6() {
         let port = next_port();
