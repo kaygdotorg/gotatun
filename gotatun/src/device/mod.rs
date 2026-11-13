@@ -121,6 +121,17 @@ const PIPELINE_BUFS: usize = MACOS_PIPELINE_BUFS;
 #[cfg(not(target_os = "macos"))]
 const PIPELINE_BUFS: usize = MAX_PACKET_BUFS;
 
+/// How many received datagrams the buffered UDP receive queue may hold before decryption.
+///
+/// Only platforms without batched socket reads use that queue (Linux hands batches straight to
+/// the packet task). On macOS it is set separately from the TUN queues; see the value's history
+/// on #260.
+#[cfg(target_os = "macos")]
+const UDP_RECV_BUFS: usize = MACOS_PIPELINE_BUFS;
+/// How many received datagrams the buffered UDP receive queue may hold before decryption.
+#[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
+const UDP_RECV_BUFS: usize = PIPELINE_BUFS;
+
 /// Bound the macOS outbound UDP backlog to one 64-packet send batch.
 ///
 /// At the measured 0.32 Gbit/s Mac-send goodput, 64 full-size packets hold about 2.3 ms of
@@ -1159,7 +1170,7 @@ impl<T: DeviceTransports> Connection<T> {
         let incoming_udp_rx = udp_rx;
         #[cfg(not(target_os = "linux"))]
         let incoming_udp_rx = BufferedUdpReceive::new(
-            crate::diag::udp_rx_queue().unwrap_or(PIPELINE_BUFS),
+            crate::diag::udp_rx_queue().unwrap_or(UDP_RECV_BUFS),
             udp_rx,
             pool.clone(),
         );
@@ -3102,5 +3113,17 @@ mod idle_release_tests {
         assert!(!idle_release_due(&mut busy, 0));
         assert!(!idle_release_due(&mut busy, busy_period));
         assert!(idle_release_due(&mut busy, 0));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_udp_receive_queue_tests {
+    //! Pins the macOS UDP receive-queue size that J566 measured on the Mac bench (#260).
+
+    /// The queue holds 128 datagrams: at 512 it stayed full in every Mac-receive case and held
+    /// 7–9 ms (p50) of queue; at 128 the loaded p99 roughly halved and goodput did not drop.
+    #[test]
+    fn macos_udp_receive_queue_holds_128_datagrams() {
+        assert_eq!(super::UDP_RECV_BUFS, 128);
     }
 }
