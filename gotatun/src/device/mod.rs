@@ -36,6 +36,8 @@
 //! 5. Timers snapshot peers from packet lookup and release it before taking peer state. They
 //!    reserve under that peer mutex, skip a peer with an active handshake flush, and hold no
 //!    device, peer, or lane lock while sleeping or waiting for output.
+//!    [`Device::request_keepalives`] snapshots peers under the device read lock and releases it
+//!    before taking each peer mutex in turn; it only sets a flag and wakes the timer task.
 //!
 //! Connection setup snapshots the key pair, rate limiter, index table, MTU watcher, and lookup
 //! handle before spawning tasks. Running packet and timer tasks never reacquire the async device
@@ -1067,6 +1069,10 @@ pub(crate) struct DeviceState<T: DeviceTransports> {
     /// Strong token used by packet tasks for a lifetime check without access to this device lock.
     task_liveness: Arc<()>,
 
+    /// Wakes the timer task before its next 250 ms tick, so a requested keepalive leaves at
+    /// once. A `Notify` keeps one permit, so a wake that arrives mid-pass is not lost.
+    timer_wake: Arc<tokio::sync::Notify>,
+
     tun_tx: Arc<Mutex<T::IpSend>>,
     /// The tun device reader.
     ///
@@ -1232,6 +1238,7 @@ impl<T: DeviceTransports> Connection<T> {
                 "handle_timers",
                 DeviceState::<T>::handle_timers(
                     handles.clone(),
+                    Arc::clone(&device.timer_wake),
                     index_table,
                     rate_limiter.clone(),
                     buffered_udp_tx.clone(),
@@ -1364,6 +1371,31 @@ impl<T: DeviceTransports> Device<T> {
         }
 
         Connection::set_up(self.inner.clone()).await
+    }
+
+    /// Send every peer one keepalive now, so each peer learns our current endpoint.
+    ///
+    /// Call this after the local address or port changed. A peer updates its endpoint for us
+    /// only from an authenticated packet, and a node that is only receiving sends nothing until
+    /// its keepalive-plus-rekey timeout, about 15 s, during which the peer keeps sending to the
+    /// old address (#260, J561). The keepalives go through the normal timer path, so they keep
+    /// the per-peer output order and the session counters; peers without a session get a
+    /// handshake instead. Returns the number of peers asked.
+    pub async fn request_keepalives(&self) -> usize {
+        let (peers, wake) = {
+            let device = self.inner.read().await;
+            let peers: Vec<_> = device.peers.values().cloned().collect();
+            (peers, Arc::clone(&device.timer_wake))
+        };
+        for peer in &peers {
+            let peer_key = peer_order_key(peer);
+            let mut trace = PeerLockDiagnostic::waiting("request_keepalive", peer_key);
+            lock_peer_state(peer, "request_keepalive", peer_key, &mut trace)
+                .await
+                .request_keepalive();
+        }
+        wake.notify_one();
+        peers.len()
     }
 
     /// Wait until there is a session with the peer with `public_key` that is not yet due for
@@ -2207,6 +2239,7 @@ impl<T: DeviceTransports> DeviceState<T> {
     #[instrument(level = Level::TRACE, skip_all)]
     async fn handle_timers(
         handles: PacketTaskHandles,
+        wake: Arc<tokio::sync::Notify>,
         index_table: IndexTable,
         rate_limiter: Arc<RateLimiter>,
         udp: impl UdpSend,
@@ -2310,7 +2343,10 @@ impl<T: DeviceTransports> DeviceState<T> {
                 }
             }
 
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_millis(250)) => {}
+                () = wake.notified() => {}
+            }
         }
     }
 
