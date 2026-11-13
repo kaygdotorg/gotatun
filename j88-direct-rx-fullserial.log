@@ -1,0 +1,158 @@
+
+running 139 tests
+test device::allowed_ips::tests::test_allowed_ips_insert_find ... ok
+test device::allowed_ips::tests::test_allowed_ips_iter ... ok
+test device::allowed_ips::tests::test_allowed_ips_iter_zero_leaf_bits ... ok
+test device::allowed_ips::tests::test_allowed_ips_remove ... ok
+test device::allowed_ips::tests::test_allowed_ips_v4_kernel_compatibility ... ok
+test device::allowed_ips::tests::test_allowed_ips_v6_kernel_compatibility ... ok
+test device::builder::tests::detects_duplicate_peer_public_keys ... ok
+test device::daita::hooks::test::test_constant_packet_size_ipv4 ... ok
+test device::daita::hooks::test::test_constant_packet_size_ipv6 ... ok
+test device::daita::types::tests::test_internal_machine_timer_replace ... ok
+test device::daita::types::tests::test_machine_timers_schedule_and_remove ... ok
+test device::integration_tests::tests::test_wg_concurrent ... ignored
+test device::integration_tests::tests::test_wg_concurrent_v6 ... ignored
+test device::integration_tests::tests::test_wg_start_ipv4 ... ignored
+test device::integration_tests::tests::test_wg_start_ipv6 ... ignored
+test device::integration_tests::tests::test_wg_start_ipv6_endpoint ... ignored
+test device::integration_tests::tests::test_wireguard_get ... ignored
+test device::integration_tests::tests::test_wireguard_set ... ignored
+test device::tests::add_peers_rejects_duplicate_public_keys ... ok
+test device::tests::allowed_ip_updates_preserve_v4_v6_listing_and_routes ... ok
+test device::tests::force_handshake ... ok
+test device::tests::ipv6_isnt_used ... ok
+test device::tests::listen_port_zero_reports_bound_port ... ok
+test device::tests::modify_peer_preshared_key_reaches_tunnel ... ok
+test device::tests::modify_peer_timer_params_reach_tunnel ... ok
+test device::tests::number_of_packets ... ok
+test device::tests::one_handshake ... ok
+test device::tests::one_keepalive ... ok
+test device::tests::reconfigure_while_suspended_stays_down ... ok
+test device::tests::reverse_path_rejects_source_owned_by_another_peer ... ok
+test device::tests::suspend_and_resume ... ok
+test device::tests::test_endpoint_roaming ... ok
+test device::tests::test_indices ... FAILED
+test device::tests::update_peer_preshared_key_reaches_tunnel ... ok
+test device::tests::wg_data_length_is_x16 ... ok
+test device::uapi::tests::rejects_duplicate_peer_public_keys ... ok
+test noise::handshake::tests::chacha20_seal_rfc7530_test_vector ... ok
+test noise::handshake::tests::symmetric_chacha20_seal_open ... ok
+test noise::index_table::tests::test_reuse_on_drop ... ok
+test noise::session::tests::test_receive_rejects_counter_at_reject_after_messages ... ok
+test noise::session::tests::test_replay_counter ... ok
+test noise::tests::configured_persistent_keepalive_remains_immediate_after_reset_and_update ... ok
+test noise::tests::create_two_tunnels_linked_to_eachother ... ok
+test noise::tests::custom_timer_params_applied ... ok
+test noise::tests::full_handshake ... ok
+test noise::tests::full_handshake_plus_timers ... ok
+test noise::tests::handshake_completes_with_matching_preshared_key ... ok
+test noise::tests::handshake_fails_with_different_preshared_key ... ok
+test noise::tests::handshake_fails_with_one_sided_preshared_key ... ok
+test noise::tests::handshake_init ... ok
+test noise::tests::handshake_init_and_response ... ok
+test noise::tests::handshake_jitter_applied ... ok
+test noise::tests::handshake_no_resp_rekey_timeout ... ok
+test noise::tests::keepalive_is_not_answered_with_keepalive ... ok
+test noise::tests::new_handshake_after_two_mins ... ok
+test noise::tests::one_ip_packet ... ok
+test noise::tests::outgoing_packet_refused_after_message_limit ... ok
+test noise::tests::per_ip_rate_limiting_isolation ... ok
+test noise::tests::persistent_keepalive_uses_configured_interval_after_initial_send ... ok
+test noise::tests::reject_handshake ... ok
+test noise::tests::set_preshared_key_only_affects_next_session ... ok
+test noise::tests::time_since_last_handshake_doesnt_decrease_on_backward_jump ... ok
+test noise::tests::timers_freeze_during_backward_jump ... ok
+test noise::tests::tunnel_does_not_embed_the_session_ring ... ok
+test noise::tests::update_timers_handles_backward_time_jump ... ok
+test noise::tests::verify_cookie_reply ... ok
+test noise::tests::verify_handshake ... ok
+test packet::ipv4::tests::ipv4_checksum_rejects_truncated_options ... ok
+test packet::ipv4::tests::ipv4_decode_and_validate ... ok
+test packet::ipv4::tests::ipv4_decode_invalid_checksum ... ok
+test packet::ipv4::tests::ipv4_header_layout ... ok
+test packet::ipv4::tests::ipv4_layout ... ok
+test packet::ipv4::tests::ipv4_options_are_covered_by_header_checksum ... ok
+test packet::ipv4::tests::ipv4_total_length_must_cover_options ... ok
+test packet::ipv6::tests::ipv6_decode_and_validate ... ok
+test packet::ipv6::tests::ipv6_header_layout ... ok
+test packet::pool::tests::lazy_pool_retention_is_bounded ... ok
+test packet::pool::tests::packet_grow_beyond_capacity ... ok
+test packet::pool::tests::pool_buffer_recycle ... ok
+test packet::pool::tests::pool_lazy_allocation_and_recycle ... ok
+test packet::pool::tests::pool_prealloc ... ok
+test packet::tcp::tests::tcp_checksum_v4 ... ok
+test packet::tcp::tests::tcp_checksum_v6 ... ok
+test packet::tcp::tests::tcp_header_layout ... ok
+test packet::util::tests::test_ipv4_header_checksum ... ok
+test serialization::tests::parse_padded_and_unpadded_base64_keys ... ok
+test serialization::tests::reject_invalid_base64_keys ... ok
+test tun::channel::fragmentation::test::test_fragment_after_terminal_fragment_is_dropped ... ok
+test tun::channel::fragmentation::test::test_fragment_eviction_max_concurrent_frags ... ok
+test tun::channel::fragmentation::test::test_fragmentation_overlap ... ok
+test tun::channel::fragmentation::test::test_fragments_with_different_protocols_are_reassembled_separately ... ok
+test tun::channel::fragmentation::test::test_ipv4_defragmentation ... ok
+test tun::channel::fragmentation::test::test_ipv4_defragmentation_single_packet ... ok
+test tun::channel::fragmentation::test::test_reassembled_ipv4_packet_length_limit ... ok
+test tun::channel::fragmentation::test::test_terminal_fragment_before_buffered_fragment_is_dropped ... ok
+test tun::tun_async_device::linux::tests::failure_of_both_open_modes_returns_the_original_error ... ok
+test tun::tun_async_device::linux::tests::unsupported_tun_tso_ioctl_keeps_the_software_path_available ... ok
+test tun::tun_async_device::linux::tests::unsupported_vnet_header_retries_without_the_header ... ok
+test tun::tun_async_device::tso::tests::tso_gso_size_is_tcp_payload_mss_and_checksums_are_valid ... ok
+test tun::tun_async_device::tso::tests::tso_ipv4_options_are_preserved_and_checksums_rebuilt ... ok
+test tun::tun_async_device::tso::tests::tso_ipv4_options_at_max_packet_length_stays_within_mtu ... ok
+test tun::tun_async_device::tso::tests::tso_ipv6_at_max_payload_length_stays_within_mtu ... ok
+test tun::tun_async_device::tso::tests::tso_ipv6_rebuilds_lengths_sequences_and_checksums ... ok
+test tun::tun_async_device::tso::tests::vnet_header_completes_partial_udp_checksum_before_forwarding ... ok
+test tun::tun_async_device::tso::tests::vnet_header_completes_partial_udp_checksum_with_ipv4_options ... ok
+test tun::tun_async_device::tso::tests::vnet_header_rejects_conflicting_checksum_flags ... ok
+test tun::tun_async_device::tso::tests::vnet_header_rejects_fragmented_tcp_gso ... ok
+test tun::tun_async_device::tso::tests::vnet_header_rejects_invalid_ipv4_ihl_without_panicking ... ok
+test tun::tun_async_device::tso::tests::vnet_header_rejects_invalid_mss_and_header_length ... ok
+test tun::tun_async_device::tso::tests::vnet_header_rejects_truncated_metadata_without_panicking ... ok
+test tun::tun_async_device::tso::tests::vnet_header_rejects_unsupported_udp_gso ... ok
+test tun::tun_async_device::tso::tests::vnet_header_without_gso_preserves_one_packet ... ok
+test udp::buffer::test::buffered_udp_receive_batches_packets_in_order_before_forwarding_errors ... ok
+test udp::buffer::test::empty_loopback_datagram_mustnt_stop_buffered_udp_receive ... ok
+test udp::channel::tests::test_create_ipv4_payload_checksum ... ok
+test udp::channel::tests::test_create_ipv4_payload_checksum_zero ... ok
+test udp::channel::tests::test_create_ipv6_payload_checksum ... ok
+test udp::socket::linux::gro::tests::gro_receive_rejects_a_length_larger_than_its_iovec ... ok
+test udp::socket::linux::gro::tests::gro_receive_splits_only_the_bytes_reported_by_recvmmsg ... ok
+test udp::socket::linux::gro::tests::recv_many_from_grows_for_oversized_datagram ... ok
+test udp::socket::linux::gro::tests::recv_many_from_preserves_ipv6_source_addr ... ok
+test udp::socket::linux::gso_tests::eio_disables_udp_gso ... ok
+test udp::socket::linux::gso_tests::gso_plan_allows_short_tail_then_starts_new_batch ... ok
+test udp::socket::linux::gso_tests::gso_plan_coalesces_equal_datagrams ... ok
+test udp::socket::linux::gso_tests::gso_plan_does_not_coalesce_zero_length_datagrams ... ok
+test udp::socket::linux::gso_tests::gso_plan_splits_at_address_family_changes ... ok
+test udp::socket::linux::gso_tests::gso_plan_splits_at_destination_changes ... ok
+test udp::socket::linux::gso_tests::gso_plan_splits_at_ipv4_payload_limit ... ok
+test udp::socket::linux::gso_tests::gso_plan_splits_at_segment_count_limit ... ok
+test udp::socket::linux::gso_tests::gso_plan_uses_ipv6_payload_limit ... ok
+test udp::socket::linux::gso_tests::gso_segment_size_only_emits_for_coalesced_batches ... ok
+test udp::socket::linux::gso_tests::gso_segment_size_rejects_oversized_segment ... ok
+test udp::socket::linux::gso_tests::send_many_to_preserves_datagrams_when_gso_is_disabled ... ok
+test udp::socket::linux::gso_tests::send_many_to_records_ipv6_gso_plan ... ok
+test udp::socket::linux::gso_tests::send_many_to_records_reusable_gso_plan ... ok
+test udp::socket::linux::gso_tests::udp_gso_control_message_uses_udp_segment_size ... ok
+test udp::socket::tests::dual_stack_socket_recv ... ok
+test udp::socket::tests::dual_stack_socket_send ... ok
+test udp::socket::tests::udp_gso_disabled_state_is_shared_by_clones ... ok
+
+failures:
+
+---- device::tests::test_indices stdout ----
+2026-11-03T03:38:25.848503Z  INFO gotatun::device: Peer added
+2026-11-03T03:38:25.850529Z  INFO gotatun::device: Peer added
+
+thread 'device::tests::test_indices' (351042) panicked at gotatun/src/device/tests.rs:686:50:
+eavesdrop timeout
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    device::tests::test_indices
+
+test result: FAILED. 131 passed; 1 failed; 7 ignored; 0 measured; 0 filtered out; finished in 9.08s
+

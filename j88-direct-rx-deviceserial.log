@@ -1,0 +1,22 @@
+
+running 17 tests
+test device::tests::add_peers_rejects_duplicate_public_keys ... ok
+test device::tests::allowed_ip_updates_preserve_v4_v6_listing_and_routes ... ok
+test device::tests::force_handshake ... ok
+test device::tests::ipv6_isnt_used ... ok
+test device::tests::listen_port_zero_reports_bound_port ... ok
+test device::tests::modify_peer_preshared_key_reaches_tunnel ... ok
+test device::tests::modify_peer_timer_params_reach_tunnel ... ok
+test device::tests::number_of_packets ... ok
+test device::tests::one_handshake ... ok
+test device::tests::one_keepalive ... ok
+test device::tests::reconfigure_while_suspended_stays_down ... ok
+test device::tests::reverse_path_rejects_source_owned_by_another_peer ... ok
+test device::tests::suspend_and_resume ... ok
+test device::tests::test_endpoint_roaming ... ok
+test device::tests::test_indices ... ok
+test device::tests::update_peer_preshared_key_reaches_tunnel ... ok
+test device::tests::wg_data_length_is_x16 ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 122 filtered out; finished in 6.96s
+

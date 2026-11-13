@@ -1,0 +1,443 @@
+   Compiling proc-macro2 v1.0.103
+   Compiling quote v1.0.42
+   Compiling unicode-ident v1.0.22
+   Compiling libc v0.2.182
+   Compiling version_check v0.9.5
+   Compiling shlex v1.3.0
+   Compiling syn v2.0.111
+   Compiling jobserver v0.1.34
+   Compiling find-msvc-tools v0.1.5
+   Compiling typenum v1.19.0
+   Compiling cc v1.2.50
+   Compiling generic-array v0.14.7
+    Checking getrandom v0.2.16
+   Compiling autocfg v1.5.0
+    Checking rand_core v0.6.4
+    Checking crypto-common v0.1.7
+   Compiling zerocopy v0.8.37
+   Compiling serde_core v1.0.228
+   Compiling syn v3.0.4
+   Compiling crossbeam-utils v0.8.21
+   Compiling serde v1.0.228
+   Compiling parking_lot_core v0.9.12
+   Compiling syn v1.0.109
+   Compiling libm v0.2.15
+   Compiling getrandom v0.3.4
+   Compiling num-traits v0.2.19
+    Checking block-buffer v0.10.4
+    Checking digest v0.10.7
+   Compiling cmake v0.1.58
+   Compiling dunce v1.0.5
+   Compiling fs_extra v1.3.0
+   Compiling semver v1.0.27
+   Compiling rustc_version v0.4.1
+   Compiling aws-lc-sys v0.39.1
+    Checking parking_lot v0.12.5
+    Checking rand_core v0.9.5
+   Compiling memoffset v0.9.1
+    Checking mio v1.1.1
+    Checking socket2 v0.6.5
+    Checking signal-hook-registry v1.4.7
+   Compiling crc32fast v1.5.0
+   Compiling cfg_aliases v0.2.1
+   Compiling thiserror v2.0.20
+   Compiling nix v0.31.2
+   Compiling zerocopy-derive v0.8.37
+   Compiling zeroize_derive v1.4.2
+   Compiling serde_derive v1.0.228
+    Checking zeroize v1.8.2
+   Compiling tokio-macros v2.6.0
+   Compiling tracing-attributes v0.1.31
+    Checking ppv-lite86 v0.2.21
+    Checking rand_chacha v0.9.0
+    Checking tokio v1.50.0
+   Compiling thiserror-impl v2.0.20
+   Compiling futures-macro v0.3.34
+    Checking tracing v0.1.44
+   Compiling curve25519-dalek v4.1.3
+    Checking inout v0.1.4
+   Compiling thiserror v1.0.69
+    Checking cipher v0.4.4
+    Checking tokio-util v0.7.18
+    Checking rand v0.9.2
+   Compiling curve25519-dalek-derive v0.1.1
+    Checking futures-util v0.3.34
+   Compiling thiserror-impl v1.0.69
+   Compiling enum-map-derive v0.17.0
+   Compiling async-trait v0.1.89
+    Checking sha2 v0.10.9
+   Compiling ring v0.17.14
+    Checking universal-hash v0.5.1
+   Compiling aws-lc-rs v1.16.2
+   Compiling eyre v0.6.12
+    Checking poly1305 v0.8.0
+    Checking tracing-subscriber v0.3.22
+    Checking flate2 v1.1.5
+    Checking enum-map v2.7.3
+    Checking futures-executor v0.3.34
+    Checking rand_distr v0.5.1
+    Checking chacha20 v0.9.1
+    Checking bincode v1.3.3
+   Compiling derive-into-owned v0.2.0
+   Compiling typed-builder-macro v0.21.2
+    Checking crossbeam-epoch v0.9.18
+    Checking sha256 v1.6.0
+    Checking aead v0.5.2
+   Compiling serde_json v1.0.146
+   Compiling rayon-core v1.13.0
+    Checking chacha20poly1305 v0.10.1
+    Checking maybenot v2.2.2
+    Checking crossbeam-deque v0.8.6
+    Checking pcap-file v2.0.0
+    Checking futures v0.3.34
+    Checking x25519-dalek v2.0.1
+    Checking tun v0.8.6
+    Checking half v2.7.1
+   Compiling bitfield-struct v0.12.1
+    Checking hmac v0.12.1
+    Checking blake2 v0.10.6
+   Compiling proc-macro-error-attr v1.0.4
+   Compiling duplicate v2.0.1
+    Checking ciborium-ll v0.2.2
+   Compiling proc-macro-error v1.0.4
+    Checking rayon v1.11.0
+    Checking tinytemplate v1.2.1
+    Checking ciborium v0.2.2
+    Checking plotters v0.3.7
+   Compiling test-log-macros v0.2.19
+   Compiling libmimalloc-sys v0.1.49
+   Compiling tikv-jemalloc-sys v0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7
+   Compiling indexmap v1.9.3
+    Checking criterion v0.7.0
+    Checking test-log v0.2.19
+    Checking typed-builder v0.21.2
+    Checking gotatun v0.10.2 (/home/claude/worktrees/gotatun-j88-latency/gotatun)
+    Checking tokio-stream v0.1.18
+   Compiling heck v0.4.1
+   Compiling clap_derive v3.2.25
+    Checking crossbeam-channel v0.5.15
+    Checking atty v0.2.14
+    Checking tracing-appender v0.2.4
+    Checking mimalloc v0.1.52
+    Checking daemonize v0.5.0
+error: failed to run custom build command for `tikv-jemalloc-sys v0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7`
+
+Caused by:
+  process didn't exit successfully: `/home/claude/worktrees/gotatun-j88-latency/target/debug/build/tikv-jemalloc-sys-89c4911fb8c26200/build-script-build` (exit status: 101)
+  --- stdout
+  TARGET=x86_64-unknown-linux-gnu
+  HOST=x86_64-unknown-linux-gnu
+  NUM_JOBS=4
+  OUT_DIR="/home/claude/worktrees/gotatun-j88-latency/target/debug/build/tikv-jemalloc-sys-045a97e7358bf6f9/out"
+  BUILD_DIR="/home/claude/worktrees/gotatun-j88-latency/target/debug/build/tikv-jemalloc-sys-045a97e7358bf6f9/out/build"
+  SRC_DIR="/home/claude/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tikv-jemalloc-sys-0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
+  cargo:rustc-cfg=prefixed
+  cargo:rerun-if-env-changed=X86_64_UNKNOWN_LINUX_GNU_JEMALLOC_OVERRIDE
+  cargo:rerun-if-env-changed=JEMALLOC_OVERRIDE
+  OPT_LEVEL = Some(0)
+  OUT_DIR = Some(/home/claude/worktrees/gotatun-j88-latency/target/debug/build/tikv-jemalloc-sys-045a97e7358bf6f9/out)
+  TARGET = Some(x86_64-unknown-linux-gnu)
+  CARGO_ENCODED_RUSTFLAGS = Some()
+  HOST = Some(x86_64-unknown-linux-gnu)
+  cargo:rerun-if-env-changed=CC_x86_64-unknown-linux-gnu
+  CC_x86_64-unknown-linux-gnu = None
+  cargo:rerun-if-env-changed=CC_x86_64_unknown_linux_gnu
+  CC_x86_64_unknown_linux_gnu = None
+  cargo:rerun-if-env-changed=HOST_CC
+  HOST_CC = None
+  cargo:rerun-if-env-changed=CC
+  CC = Some(gcc)
+  cargo:rerun-if-env-changed=CC_KNOWN_WRAPPER_CUSTOM
+  CC_KNOWN_WRAPPER_CUSTOM = None
+  RUSTC_WRAPPER = None
+  cargo:rerun-if-env-changed=CC_ENABLE_DEBUG_OUTPUT
+  cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+  CRATE_CC_NO_DEFAULTS = None
+  DEBUG = Some(true)
+  CARGO_CFG_TARGET_FEATURE = Some(fxsr,sse,sse2)
+  cargo:rerun-if-env-changed=CFLAGS
+  CFLAGS = None
+  cargo:rerun-if-env-changed=HOST_CFLAGS
+  HOST_CFLAGS = None
+  cargo:rerun-if-env-changed=CFLAGS_x86_64_unknown_linux_gnu
+  CFLAGS_x86_64_unknown_linux_gnu = None
+  cargo:rerun-if-env-changed=CFLAGS_x86_64-unknown-linux-gnu
+  CFLAGS_x86_64-unknown-linux-gnu = None
+  CC="gcc"
+  CFLAGS="-O0 -ffunction-sections -fdata-sections -fPIC -g -gdwarf-4 -fno-omit-frame-pointer -m64 -Wall"
+  JEMALLOC_REPO_DIR="jemalloc"
+  cargo:rerun-if-env-changed=X86_64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_MALLOC_CONF
+  cargo:rerun-if-env-changed=JEMALLOC_SYS_WITH_MALLOC_CONF
+  --with-malloc-conf=background_thread:false
+  cargo:rerun-if-env-changed=X86_64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_PAGE
+  cargo:rerun-if-env-changed=JEMALLOC_SYS_WITH_LG_PAGE
+  cargo:rerun-if-env-changed=X86_64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_HUGEPAGE
+  cargo:rerun-if-env-changed=JEMALLOC_SYS_WITH_LG_HUGEPAGE
+  cargo:rerun-if-env-changed=X86_64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_QUANTUM
+  cargo:rerun-if-env-changed=JEMALLOC_SYS_WITH_LG_QUANTUM
+  cargo:rerun-if-env-changed=X86_64_UNKNOWN_LINUX_GNU_JEMALLOC_SYS_WITH_LG_VADDR
+  cargo:rerun-if-env-changed=JEMALLOC_SYS_WITH_LG_VADDR
+  --with-jemalloc-prefix=_rjem_
+  CARGO_FEATURE_STATS not set
+  running: cd "/home/claude/worktrees/gotatun-j88-latency/target/debug/build/tikv-jemalloc-sys-045a97e7358bf6f9/out/build" && CC="gcc" CFLAGS="-O0 -ffunction-sections -fdata-sections -fPIC -g -gdwarf-4 -fno-omit-frame-pointer -m64 -Wall" CPPFLAGS="-O0 -ffunction-sections -fdata-sections -fPIC -g -gdwarf-4 -fno-omit-frame-pointer -m64 -Wall" LDFLAGS="-O0 -ffunction-sections -fdata-sections -fPIC -g -gdwarf-4 -fno-omit-frame-pointer -m64 -Wall" "sh" "/home/claude/worktrees/gotatun-j88-latency/target/debug/build/tikv-jemalloc-sys-045a97e7358bf6f9/out/build/configure" "--with-version=5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7" "--disable-cxx" "--enable-doc=no" "--enable-shared=no" "--with-malloc-conf=background_thread:false" "--with-jemalloc-prefix=_rjem_" "--with-private-namespace=_rjem_" "--disable-stats" "--host=x86_64-unknown-linux-gnu" "--build=x86_64-unknown-linux-gnu" "--prefix=/home/claude/worktrees/gotatun-j88-latency/target/debug/build/tikv-jemalloc-sys-045a97e7358bf6f9/out"
+  checking for xsltproc... false
+  checking for x86_64-unknown-linux-gnu-gcc... gcc
+  checking whether the C compiler works... yes
+  checking for C compiler default output file name... a.out
+  checking for suffix of executables... 
+  checking whether we are cross compiling... no
+  checking for suffix of object files... o
+  checking whether we are using the GNU C compiler... yes
+  checking whether gcc accepts -g... yes
+  checking for gcc option to accept ISO C89... none needed
+  checking whether compiler is cray... no
+  checking whether compiler supports -std=gnu11... yes
+  checking whether compiler supports -Werror=unknown-warning-option... no
+  checking whether compiler supports -Wall... yes
+  checking whether compiler supports -Wextra... yes
+  checking whether compiler supports -Wshorten-64-to-32... no
+  checking whether compiler supports -Wsign-compare... yes
+  checking whether compiler supports -Wundef... yes
+  checking whether compiler supports -Wno-format-zero-length... yes
+  checking whether compiler supports -Wpointer-arith... yes
+  checking whether compiler supports -Wno-missing-braces... yes
+  checking whether compiler supports -Wno-missing-field-initializers... yes
+  checking whether compiler supports -Wno-missing-attributes... yes
+  checking whether compiler supports -pipe... yes
+  checking whether compiler supports -g3... yes
+  checking how to run the C preprocessor... gcc -E
+  checking for grep that handles long lines and -e... /nix/store/x3zjxxz8m4ki88axp0gn8q8m6bldybba-gnugrep-3.12/bin/grep
+  checking for egrep... /nix/store/x3zjxxz8m4ki88axp0gn8q8m6bldybba-gnugrep-3.12/bin/grep -E
+  checking for ANSI C header files... yes
+  checking for sys/types.h... yes
+  checking for sys/stat.h... yes
+  checking for stdlib.h... yes
+  checking for string.h... yes
+  checking for memory.h... yes
+  checking for strings.h... yes
+  checking for inttypes.h... yes
+  checking for stdint.h... yes
+  checking for unistd.h... yes
+  checking whether byte ordering is bigendian... no
+  checking size of void *... 8
+  checking size of int... 4
+  checking size of long... 8
+  checking size of long long... 8
+  checking size of intmax_t... 8
+  checking build system type... x86_64-unknown-linux-gnu
+  checking host system type... x86_64-unknown-linux-gnu
+  checking whether pause instruction is compilable... yes
+  checking number of significant virtual address bits... 48
+  checking for x86_64-unknown-linux-gnu-ar... ar
+  checking for x86_64-unknown-linux-gnu-nm... nm
+  checking for gawk... gawk
+  checking malloc.h usability... yes
+  checking malloc.h presence... yes
+  checking for malloc.h... yes
+  checking whether malloc_usable_size definition can use const argument... no
+  checking for library containing log... -lm
+  checking whether __attribute__ syntax is compilable... yes
+  checking whether compiler supports -fvisibility=hidden... yes
+  checking whether compiler supports -fvisibility=hidden... yes
+  checking whether compiler supports -Werror... yes
+  checking whether compiler supports -herror_on_warning... no
+  checking whether tls_model attribute is compilable... yes
+  checking whether compiler supports -Werror... yes
+  checking whether compiler supports -herror_on_warning... no
+  checking whether alloc_size attribute is compilable... no
+  checking whether compiler supports -Werror... yes
+  checking whether compiler supports -herror_on_warning... no
+  checking whether format(gnu_printf, ...) attribute is compilable... no
+  checking whether compiler supports -Werror... yes
+  checking whether compiler supports -herror_on_warning... no
+  checking whether format(printf, ...) attribute is compilable... no
+  checking whether compiler supports -Werror... yes
+  checking whether compiler supports -herror_on_warning... no
+  checking whether format(printf, ...) attribute is compilable... no
+  checking whether compiler supports -Wimplicit-fallthrough... yes
+  checking whether fallthrough attribute is compilable... yes
+  checking whether compiler supports -Wimplicit-fallthrough... yes
+  checking whether compiler supports -Wimplicit-fallthrough... yes
+  checking whether compiler supports -Werror... yes
+  checking whether compiler supports -herror_on_warning... no
+  checking whether cold attribute is compilable... yes
+  checking whether vm_make_tag is compilable... no
+  checking for a BSD-compatible install... /nix/store/imad8dvhp77h0pjbckp6wvmnyhp8dpgg-coreutils-9.8/bin/install -c
+  checking for x86_64-unknown-linux-gnu-ranlib... ranlib
+  checking for ld... /nix/store/vr15iyyykg9zai6fpgvhcgyw7gckl78w-gcc-wrapper-14.3.0/bin/ld
+  checking for autoconf... false
+  checking for memalign... yes
+  checking for valloc... yes
+  checking for malloc_size... no
+  checking whether compiler supports -O3... yes
+  checking whether compiler supports -O3... yes
+  checking whether compiler supports -funroll-loops... yes
+  checking configured backtracing method... N/A
+  checking for sbrk... yes
+  checking whether utrace(2) is compilable... no
+  checking whether utrace(2) with label is compilable... no
+  checking whether a program using __builtin_unreachable is compilable... yes
+  checking whether a program using __builtin_ffsl is compilable... yes
+  checking whether a program using __builtin_popcountl is compilable... yes
+  checking LG_PAGE... 12
+  checking pthread.h usability... yes
+  checking pthread.h presence... yes
+  checking for pthread.h... yes
+  checking for pthread_create in -lpthread... yes
+  checking dlfcn.h usability... yes
+  checking dlfcn.h presence... yes
+  checking for dlfcn.h... yes
+  checking for dlsym... yes
+  checking whether pthread_atfork(3) is compilable... yes
+  checking whether pthread_setname_np(3) is compilable... yes
+  checking whether pthread_getname_np(3) is compilable... yes
+  checking whether pthread_get_name_np(3) is compilable... no
+  checking for library containing clock_gettime... none required
+  checking whether clock_gettime(CLOCK_MONOTONIC_COARSE, ...) is compilable... yes
+  checking whether clock_gettime(CLOCK_MONOTONIC, ...) is compilable... yes
+  checking whether mach_absolute_time() is compilable... no
+  checking whether clock_gettime(CLOCK_REALTIME, ...) is compilable... yes
+  checking whether compiler supports -Werror... yes
+  checking whether syscall(2) is compilable... no
+  checking for secure_getenv... yes
+  checking for sched_getcpu... yes
+  checking for sched_setaffinity... yes
+  checking for issetugid... no
+  checking for _malloc_thread_cleanup... no
+  checking for _pthread_mutex_init_calloc_cb... no
+  checking for memcntl... no
+  checking for TLS... yes
+  checking whether C11 atomics is compilable... yes
+  checking whether GCC __atomic atomics is compilable... yes
+  checking whether GCC 8-bit __atomic atomics is compilable... yes
+  checking whether GCC __sync atomics is compilable... yes
+  checking whether GCC 8-bit __sync atomics is compilable... yes
+  checking whether Darwin OSAtomic*() is compilable... no
+  checking whether madvise(2) is compilable... yes
+  checking whether madvise(..., MADV_FREE) is compilable... yes
+  checking whether madvise(..., MADV_DONTNEED) is compilable... yes
+  checking whether madvise(..., MADV_DO[NT]DUMP) is compilable... yes
+  checking whether madvise(..., MADV_[NO]HUGEPAGE) is compilable... yes
+  checking whether madvise(..., MADV_[NO]CORE) is compilable... no
+  checking whether mprotect(2) is compilable... yes
+  checking for __builtin_clz... yes
+  checking whether Darwin os_unfair_lock_*() is compilable... no
+  checking whether glibc malloc hook is compilable... no
+  checking whether glibc memalign hook is compilable... no
+  checking whether pthreads adaptive mutexes is compilable... yes
+  checking whether compiler supports -D_GNU_SOURCE... yes
+  checking whether compiler supports -Werror... yes
+  checking whether compiler supports -herror_on_warning... no
+  checking whether strerror_r returns char with gnu source is compilable... no
+  checking whether strerror_r header only is compilable... no
+  running: "tail" "-n" "100" "/home/claude/worktrees/gotatun-j88-latency/target/debug/build/tikv-jemalloc-sys-045a97e7358bf6f9/out/build/config.log"
+  target_alias=''
+
+  ## ----------- ##
+  ## confdefs.h. ##
+  ## ----------- ##
+
+  /* confdefs.h */
+  #define PACKAGE_NAME ""
+  #define PACKAGE_TARNAME ""
+  #define PACKAGE_VERSION ""
+  #define PACKAGE_STRING ""
+  #define PACKAGE_BUGREPORT ""
+  #define PACKAGE_URL ""
+  #define JEMALLOC_HAS_RESTRICT
+  #define STDC_HEADERS 1
+  #define HAVE_SYS_TYPES_H 1
+  #define HAVE_SYS_STAT_H 1
+  #define HAVE_STDLIB_H 1
+  #define HAVE_STRING_H 1
+  #define HAVE_MEMORY_H 1
+  #define HAVE_STRINGS_H 1
+  #define HAVE_INTTYPES_H 1
+  #define HAVE_STDINT_H 1
+  #define HAVE_UNISTD_H 1
+  #define SIZEOF_VOID_P 8
+  #define LG_SIZEOF_PTR 3
+  #define SIZEOF_INT 4
+  #define LG_SIZEOF_INT 2
+  #define SIZEOF_LONG 8
+  #define LG_SIZEOF_LONG 3
+  #define SIZEOF_LONG_LONG 8
+  #define LG_SIZEOF_LONG_LONG 3
+  #define SIZEOF_INTMAX_T 8
+  #define LG_SIZEOF_INTMAX_T 3
+  #define HAVE_CPU_SPINWAIT 1
+  #define CPU_SPINWAIT __asm__ volatile("pause")
+  #define LG_VADDR 48
+  #define LG_VADDR 48
+  #define JEMALLOC_PURGE_MADVISE_DONTNEED_ZEROS  
+  #define JEMALLOC_HAS_ALLOCA_H  
+  #define JEMALLOC_PROC_SYS_VM_OVERCOMMIT_MEMORY  
+  #define JEMALLOC_THREADED_INIT  
+  #define JEMALLOC_USE_CXX_THROW  
+  #define HAVE_MALLOC_H 1
+  #define JEMALLOC_USABLE_SIZE_CONST 
+  #define JEMALLOC_HAVE_ATTR  
+  #define JEMALLOC_HAVE_ATTR_FALLTHROUGH  
+  #define JEMALLOC_HAVE_ATTR_COLD  
+  #define JEMALLOC_PREFIX "_rjem_"
+  #define JEMALLOC_CPREFIX "_RJEM_"
+  #define JEMALLOC_OVERRIDE_MEMALIGN  
+  #define JEMALLOC_OVERRIDE_VALLOC  
+  #define JEMALLOC_PRIVATE_NAMESPACE _rjem_je_
+  #define JEMALLOC_CONFIG_MALLOC_CONF "background_thread:false"
+  #define JEMALLOC_MAPS_COALESCE  
+  #define JEMALLOC_RETAIN  
+  #define JEMALLOC_ZERO_REALLOC_DEFAULT_FREE  
+  #define JEMALLOC_DSS  
+  #define JEMALLOC_FILL  
+  #define JEMALLOC_CACHE_OBLIVIOUS  
+  #define JEMALLOC_INTERNAL_UNREACHABLE __builtin_unreachable
+  #define JEMALLOC_INTERNAL_FFSLL __builtin_ffsll
+  #define JEMALLOC_INTERNAL_FFSL __builtin_ffsl
+  #define JEMALLOC_INTERNAL_FFS __builtin_ffs
+  #define JEMALLOC_INTERNAL_POPCOUNT __builtin_popcount
+  #define JEMALLOC_INTERNAL_POPCOUNTL __builtin_popcountl
+  #define JEMALLOC_INTERNAL_POPCOUNTLL __builtin_popcountll
+  #define LG_PAGE 12
+  #define LG_HUGEPAGE 21
+  #define JEMALLOC_HAVE_PTHREAD  
+  #define HAVE_PTHREAD_H 1
+  #define HAVE_DLFCN_H 1
+  #define JEMALLOC_HAVE_DLSYM  
+  #define JEMALLOC_HAVE_PTHREAD_ATFORK  
+  #define JEMALLOC_HAVE_PTHREAD_SETNAME_NP  
+  #define JEMALLOC_HAVE_PTHREAD_GETNAME_NP  
+  #define JEMALLOC_HAVE_CLOCK_MONOTONIC_COARSE  
+  #define JEMALLOC_HAVE_CLOCK_MONOTONIC  
+  #define JEMALLOC_HAVE_CLOCK_REALTIME  
+  #define JEMALLOC_HAVE_SECURE_GETENV  
+  #define JEMALLOC_HAVE_SCHED_GETCPU  
+  #define JEMALLOC_HAVE_SCHED_SETAFFINITY  
+  #define JEMALLOC_TLS
+  #define JEMALLOC_C11_ATOMICS  
+  #define JEMALLOC_GCC_ATOMIC_ATOMICS  
+  #define JEMALLOC_GCC_U8_ATOMIC_ATOMICS  
+  #define JEMALLOC_GCC_SYNC_ATOMICS  
+  #define JEMALLOC_GCC_U8_SYNC_ATOMICS  
+  #define JEMALLOC_HAVE_MADVISE  
+  #define JEMALLOC_PURGE_MADVISE_FREE  
+  #define JEMALLOC_PURGE_MADVISE_DONTNEED  
+  #define JEMALLOC_MADVISE_DONTDUMP  
+  #define JEMALLOC_HAVE_MADVISE_HUGE  
+  #define JEMALLOC_HAVE_MPROTECT  
+  #define JEMALLOC_HAVE_BUILTIN_CLZ  
+  #define JEMALLOC_TLS_MODEL __attribute__((tls_model("initial-exec")))
+  #define JEMALLOC_BACKGROUND_THREAD  
+  #define JEMALLOC_HAVE_PTHREAD_MUTEX_ADAPTIVE_NP  
+
+  configure: exit 1
+
+  --- stderr
+  configure: error: cannot determine return type of strerror_r
+
+  thread 'main' (4191397) panicked at /home/claude/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tikv-jemalloc-sys-0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7/build.rs:411:9:
+  command did not execute successfully: cd "/home/claude/worktrees/gotatun-j88-latency/target/debug/build/tikv-jemalloc-sys-045a97e7358bf6f9/out/build" && CC="gcc" CFLAGS="-O0 -ffunction-sections -fdata-sections -fPIC -g -gdwarf-4 -fno-omit-frame-pointer -m64 -Wall" CPPFLAGS="-O0 -ffunction-sections -fdata-sections -fPIC -g -gdwarf-4 -fno-omit-frame-pointer -m64 -Wall" LDFLAGS="-O0 -ffunction-sections -fdata-sections -fPIC -g -gdwarf-4 -fno-omit-frame-pointer -m64 -Wall" "sh" "/home/claude/worktrees/gotatun-j88-latency/target/debug/build/tikv-jemalloc-sys-045a97e7358bf6f9/out/build/configure" "--with-version=5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7" "--disable-cxx" "--enable-doc=no" "--enable-shared=no" "--with-malloc-conf=background_thread:false" "--with-jemalloc-prefix=_rjem_" "--with-private-namespace=_rjem_" "--disable-stats" "--host=x86_64-unknown-linux-gnu" "--build=x86_64-unknown-linux-gnu" "--prefix=/home/claude/worktrees/gotatun-j88-latency/target/debug/build/tikv-jemalloc-sys-045a97e7358bf6f9/out"
+  expected success, got: exit status: 1
+  note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+warning: build failed, waiting for other jobs to finish...
+J88_VALIDATION_EXIT=101
