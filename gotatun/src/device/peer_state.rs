@@ -204,6 +204,11 @@ impl PeerState {
         Ok(())
     }
 
+    /// Ask the next timer pass to send this peer one keepalive; see [`Tunn::request_keepalive`].
+    pub fn request_keepalive(&mut self) {
+        self.tunnel.request_keepalive();
+    }
+
     pub fn update_timers(&mut self) -> Result<Option<WgKind>, WireGuardError> {
         self.tunnel.update_timers()
     }
