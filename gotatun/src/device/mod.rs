@@ -1158,7 +1158,11 @@ impl<T: DeviceTransports> Connection<T> {
         #[cfg(target_os = "linux")]
         let incoming_udp_rx = udp_rx;
         #[cfg(not(target_os = "linux"))]
-        let incoming_udp_rx = BufferedUdpReceive::new(PIPELINE_BUFS, udp_rx, pool.clone());
+        let incoming_udp_rx = BufferedUdpReceive::new(
+            crate::diag::udp_rx_queue().unwrap_or(PIPELINE_BUFS),
+            udp_rx,
+            pool.clone(),
+        );
 
         // Start DAITA/hooks tasks
         #[cfg(feature = "daita")]

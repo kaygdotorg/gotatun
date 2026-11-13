@@ -158,6 +158,24 @@ pub(crate) fn rekey_after() -> Option<std::time::Duration> {
     })
 }
 
+/// Capacity override for the buffered UDP receive queue, for queue-size experiments (#260).
+///
+/// Read once from `GOTATUN_DIAG_UDP_RX_QUEUE` (a packet count of at least 1). Unset or invalid
+/// keeps the platform default. Never set it in production.
+pub(crate) fn udp_rx_queue() -> Option<usize> {
+    static QUEUE: OnceLock<Option<usize>> = OnceLock::new();
+    *QUEUE.get_or_init(|| {
+        let value = std::env::var("GOTATUN_DIAG_UDP_RX_QUEUE").ok()?;
+        match value.parse::<usize>() {
+            Ok(packets) if packets > 0 => Some(packets),
+            _ => {
+                tracing::warn!("ignoring invalid GOTATUN_DIAG_UDP_RX_QUEUE={value:?}");
+                None
+            }
+        }
+    })
+}
+
 /// Record per-stage packet-path timings and queue occupancy, printed once a second.
 ///
 /// Set `GOTATUN_DIAG_PATH_TIMING` before the process starts. Each metric is a fixed
