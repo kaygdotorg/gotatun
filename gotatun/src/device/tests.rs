@@ -302,7 +302,68 @@ async fn peer_lock_wait_polls_the_completion_queued_ahead_of_it() {
         .expect("the queued completion ran before the parent acquired the lock");
 }
 
-/// Timer output must backpressure instead of panicking when data owns the whole peer window.
+/// The control drain releases its device snapshot before a queued writer blocks delivery reads.
+#[tokio::test]
+async fn j369_control_drain_progresses_with_a_queued_device_writer() {
+    use super::parallel_crypto::OrderedCompletions;
+    let (alice, bob, _eve) = mock::device_pair().await;
+    alice.device.suspend().await;
+    bob.device.suspend().await;
+    let device = Arc::clone(&alice.device.inner);
+    let device_guard = device.read().await;
+    let peer = device_guard.peers.values().next().unwrap().clone();
+    let lane = Arc::new(OrderedCompletions::default());
+    let slot = lane.reserve_run(1).unwrap();
+    let (tun, _tx, _rx) = mock::mock_tun();
+    let delivery_device = Arc::downgrade(&device);
+    let mut writer = Box::pin(device.write());
+    assert!(futures::poll!(writer.as_mut()).is_pending());
+    let mut incoming = PendingIncoming::new();
+    let completion_lane = Arc::clone(&lane);
+    incoming.push(
+        async move {
+            completion_lane
+                .complete_run(slot, vec![None], |completions| {
+                    super::DeviceState::deliver_incoming_run(
+                        slot,
+                        delivery_device.clone(),
+                        peer.clone(),
+                        completions,
+                        tun.clone(),
+                    )
+                })
+                .await
+        }
+        .boxed(),
+    );
+    let mut drain = Box::pin(super::drain_incoming_before_control(
+        device_guard,
+        Some(Arc::clone(&lane)),
+        &mut incoming,
+    ));
+    assert!(futures::poll!(drain.as_mut()).is_pending());
+    let writer_guard = writer
+        .as_mut()
+        .now_or_never()
+        .expect("the control drain released the read guard to the queued writer");
+    drop(writer_guard);
+    let progressed = match futures::poll!(drain.as_mut()) {
+        std::task::Poll::Ready(result) => {
+            result.expect("the control drain completes after the writer releases its guard");
+            true
+        }
+        std::task::Poll::Pending => false,
+    };
+    drop(drain);
+    alice.device.stop().await;
+    bob.device.stop().await;
+    assert!(
+        progressed,
+        "the queued writer must not block the delivery callback's nested device read"
+    );
+}
+
+/// Timer output is deferred instead of panicking while the peer's bounded order window is full.
 #[tokio::test]
 async fn j369_timer_output_survives_a_full_peer_window() {
     use super::parallel_crypto::{CryptoWorkers, MAX_PEER_CRYPTO_IN_FLIGHT, OrderStore};
@@ -350,59 +411,6 @@ async fn j369_timer_output_survives_a_full_peer_window() {
     assert!(
         outcome.is_none(),
         "timer task panicked at the bounded lane's normal full state"
-    );
-}
-
-/// The control-path drain must not hold a read guard needed by its own delivery callback.
-#[tokio::test]
-async fn j369_control_drain_progresses_with_a_queued_device_writer() {
-    use super::parallel_crypto::OrderedCompletions;
-    let (alice, bob, _eve) = mock::device_pair().await;
-    alice.device.suspend().await;
-    bob.device.suspend().await;
-    let device = Arc::clone(&alice.device.inner);
-    let device_guard = device.read().await;
-    let peer = device_guard.peers.values().next().unwrap().clone();
-    let lane = Arc::new(OrderedCompletions::default());
-    let slot = lane.reserve_run(1).unwrap();
-    let (tun, _tx, _rx) = mock::mock_tun();
-    let delivery_device = Arc::downgrade(&device);
-    let mut writer = Box::pin(device.write());
-    assert!(futures::poll!(writer.as_mut()).is_pending());
-    let mut incoming = PendingIncoming::new();
-    let completion_lane = Arc::clone(&lane);
-    incoming.push(
-        async move {
-            completion_lane
-                .complete_run(slot, vec![None], |completions| {
-                    super::DeviceState::deliver_incoming_run(
-                        slot,
-                        delivery_device.clone(),
-                        peer.clone(),
-                        completions,
-                        tun.clone(),
-                    )
-                })
-                .await
-        }
-        .boxed(),
-    );
-    // This is the control branch's drain at mod.rs:2013, using its actual delivery callback.
-    let mut drain = Box::pin(async {
-        while !lane.is_idle() {
-            incoming.next().await.unwrap().unwrap();
-        }
-    });
-    let progressed = futures::poll!(drain.as_mut()).is_ready();
-    // Break the cycle before asserting so the reproducer cleans up every owned resource.
-    drop(device_guard);
-    drop(writer.await);
-    drain.await;
-    alice.device.stop().await;
-    bob.device.stop().await;
-    assert!(
-        progressed,
-        "control read guard blocks writer, which blocks its completion's nested read"
     );
 }
 

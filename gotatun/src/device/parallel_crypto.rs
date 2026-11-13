@@ -846,13 +846,16 @@ fn decrypt_run(run: Vec<(PreparedDecryption, SocketAddr)>) -> Vec<IncomingComple
 ///
 /// Each worker removes one complete contiguous run from the queue, performs its AEAD operations
 /// without per-packet handoffs, and immediately returns to the queue. The queue is bounded, and
-/// shutdown closes it before joining workers so cloned handles cannot keep parked threads alive.
+/// owner drop closes it so cloned handles cannot keep parked threads alive.
 pub(crate) struct CryptoWorkers {
     handle: CryptoHandle,
     queue: Arc<CryptoQueue>,
     threads: Vec<JoinHandle<()>>,
     #[cfg(test)]
     worker_count: usize,
+    /// Receives one notice when each test worker thread has exited.
+    #[cfg(test)]
+    worker_exit_rx: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
 }
 
 impl CryptoWorkers {
@@ -875,12 +878,16 @@ impl CryptoWorkers {
         let active_batches = Arc::new(AtomicUsize::new(0));
         #[cfg(test)]
         let worker_run_count = Arc::new(AtomicUsize::new(0));
+        #[cfg(test)]
+        let (worker_exit_tx, worker_exit_rx) = std::sync::mpsc::channel();
         let mut threads = Vec::with_capacity(worker_count);
 
         for worker_index in 0..worker_count {
             let worker_queue = Arc::clone(&queue);
             #[cfg(test)]
             let completed_runs = Arc::clone(&worker_run_count);
+            #[cfg(test)]
+            let worker_exit_tx = worker_exit_tx.clone();
             let thread = thread::Builder::new()
                 .name(format!("gotatun-crypto-{worker_index}"))
                 .spawn(move || {
@@ -898,6 +905,8 @@ impl CryptoWorkers {
                             }
                         }
                     }
+                    #[cfg(test)]
+                    let _ = worker_exit_tx.send(());
                 });
 
             match thread {
@@ -930,6 +939,8 @@ impl CryptoWorkers {
             threads,
             #[cfg(test)]
             worker_count,
+            #[cfg(test)]
+            worker_exit_rx: Arc::new(Mutex::new(worker_exit_rx)),
         })
     }
 
@@ -945,15 +956,9 @@ impl CryptoWorkers {
     }
 
     /// Close the job queue and join every worker.
-    pub(crate) async fn stop(self) {
-        let Self {
-            handle,
-            queue,
-            threads,
-            ..
-        } = self;
-        queue.close();
-        drop(handle);
+    pub(crate) async fn stop(mut self) {
+        self.queue.close();
+        let threads = std::mem::take(&mut self.threads);
 
         let join = tokio::task::spawn_blocking(move || {
             for thread in threads {
@@ -965,6 +970,13 @@ impl CryptoWorkers {
         if let Err(error) = join.await {
             tracing::error!("failed to join packet crypto workers: {error}");
         }
+    }
+}
+
+impl Drop for CryptoWorkers {
+    /// Wake the worker threads even when orderly asynchronous shutdown cannot be awaited.
+    fn drop(&mut self) {
+        self.queue.close();
     }
 }
 
@@ -1711,18 +1723,33 @@ mod tests {
         workers.stop().await;
     }
 
-    /// Dropping the owner closes the queue even if its asynchronous stop future cannot run.
+    /// Dropping the owner closes the queue and lets each parked worker thread exit.
     #[test]
     fn j369_dropping_workers_closes_the_queue() {
         let workers = CryptoWorkers::with_worker_count(2).unwrap();
         let queue = Arc::clone(&workers.queue);
+        let worker_exit_rx = Arc::clone(&workers.worker_exit_rx);
         drop(workers);
         let closed = queue.state.lock().closed;
-        // Clean up the reproduction's detached threads before reporting the missing shutdown.
-        queue.close();
+        let exited_workers = (0..2)
+            .take_while(|_| {
+                worker_exit_rx
+                    .lock()
+                    .recv_timeout(Duration::from_secs(2))
+                    .is_ok()
+            })
+            .count();
+        if !closed {
+            // Clean up the red reproduction after recording whether owner drop shut it down.
+            queue.close();
+        }
         assert!(
             closed,
             "dropping the owner leaves its crypto workers parked forever"
+        );
+        assert_eq!(
+            exited_workers, 2,
+            "dropping the owner must stop every worker thread"
         );
     }
 
