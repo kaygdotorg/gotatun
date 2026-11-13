@@ -408,6 +408,7 @@ async fn j369_timer_output_survives_a_full_peer_window() {
             lookup: packet_lookup,
             flush_requests: Arc::default(),
         },
+        Arc::default(),
         index_table,
         rate_limiter,
         udp,
@@ -952,6 +953,52 @@ async fn test_endpoint_roaming() {
     ping_pong("1.2.3.4".parse().unwrap()).await;
     ping_pong("1.3.3.7".parse().unwrap()).await;
     ping_pong("1.2.3.4".parse().unwrap()).await;
+}
+
+/// A node that only receives announces a new local address at once when asked (#260, J561).
+///
+/// Bob learns Alice's endpoint only from an authenticated packet. If Alice's address changes
+/// while she is just receiving, she sends nothing until the keepalive-plus-rekey timeout (about
+/// 15 s), and Bob keeps sending to the old address. [`Device::request_keepalives`] closes that
+/// gap: Bob roams within one timer wake, without any data from Alice.
+#[tokio::test]
+#[test_log::test]
+async fn requested_keepalive_announces_a_new_source_address() {
+    let (mut alice, mut bob, _eve) = mock::device_pair().await;
+    let packet = mock::packet(b"Hello!");
+    let bob_endpoint_of_alice = async |bob: &mock::MockDevice| {
+        let peers = bob.device.peers().await;
+        peers[0].peer.endpoint.map(|addr| addr.ip())
+    };
+
+    alice.app_tx.send(packet.clone()).await;
+    assert_eq!(bob.app_rx.recv().await.as_bytes(), packet.as_bytes());
+    let old_ip = bob_endpoint_of_alice(&bob).await;
+
+    let moved: Ipv4Addr = "1.3.3.7".parse().unwrap();
+    *alice.source_ipv4_override.lock().await = Some(moved);
+
+    // sleep: shows the gap: with no request, a receive-only Alice stays silent and Bob keeps
+    // the old endpoint (the passive keepalive is 10 s away).
+    sleep(Duration::from_millis(600)).await;
+    assert_eq!(bob_endpoint_of_alice(&bob).await, old_ip);
+
+    assert_eq!(alice.device.request_keepalives().await, 1);
+    timeout(Duration::from_secs(2), async {
+        while bob_endpoint_of_alice(&bob).await != Some(moved.into()) {
+            // sleep: polls Bob's peer table; the bound is the outer timeout.
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Bob should roam to Alice's new address after one requested keepalive");
+
+    // The keepalive carries no payload, so nothing reaches Bob's application.
+    assert!(
+        timeout(Duration::from_millis(200), bob.app_rx.recv())
+            .await
+            .is_err()
+    );
 }
 
 /// Adding peers is atomic, including when a public key is duplicated within the batch.
