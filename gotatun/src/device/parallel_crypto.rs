@@ -1530,6 +1530,202 @@ mod tests {
         assert_eq!(*naive.lock().unwrap(), vec![1, 2, 3, 0]);
     }
 
+    /// Randomized gates interleave real inline and worker AEAD while delivery remains serialized.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn j369_randomized_inline_worker_transitions_preserve_order() {
+        use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
+
+        let workers = CryptoWorkers::with_worker_count(4).unwrap();
+        for seed in 0..64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (mut sender, _) = established_tunnels();
+            let lane = Arc::new(OrderedCompletions::default());
+            let delivered = Arc::new(Mutex::new(Vec::new()));
+            let mut saw_inline = false;
+            let mut saw_worker = false;
+            for _ in 0..3 {
+                let mut gates = Vec::new();
+                let mut tasks = Vec::new();
+                for count in [32, 16, 1, 8, 32, 16, 1, 8] {
+                    let first = lane.reserve_run(count).unwrap();
+                    let force_worker = lane.should_force_worker(count);
+                    saw_worker |= force_worker;
+                    saw_inline |= !force_worker;
+                    let prepared = prepared_encryptions(&mut sender, count)
+                        .into_iter()
+                        .map(|packet| Some(PreparedOutgoing::Encrypt(packet)))
+                        .collect();
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    gates.push(tx);
+                    let crypto = workers.handle();
+                    let lane = Arc::clone(&lane);
+                    let delivered = Arc::clone(&delivered);
+                    tasks.push(tokio::spawn(async move {
+                        rx.await.unwrap();
+                        let results = crypto.encrypt_run(prepared, force_worker).await.unwrap();
+                        lane.complete_run(first, results, |packets| {
+                            let delivered = Arc::clone(&delivered);
+                            async move {
+                                for packet in packets.into_iter().flatten() {
+                                    let WgKind::Data(packet) = packet else {
+                                        panic!("expected data")
+                                    };
+                                    delivered.lock().unwrap().push(packet.header.counter.get());
+                                    tokio::task::yield_now().await;
+                                }
+                                Ok::<_, ()>(())
+                            }
+                        })
+                        .await
+                        .unwrap();
+                    }));
+                }
+                gates.shuffle(&mut rng);
+                for gate in gates {
+                    gate.send(()).unwrap();
+                    tokio::task::yield_now().await;
+                }
+                for task in tasks {
+                    task.await.unwrap();
+                }
+                assert!(lane.is_idle(), "seed {seed}");
+            }
+            let counters = delivered.lock().unwrap();
+            assert_eq!(counters.len(), 342);
+            assert!(
+                counters.windows(2).all(|pair| pair[1] == pair[0] + 1),
+                "seed {seed}"
+            );
+            assert!(saw_inline && saw_worker);
+        }
+        workers.stop().await;
+    }
+
+    /// Randomized receive schedules deliver each authenticated counter once despite duplicates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn j369_randomized_decrypt_commits_replays_only_once() {
+        use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
+
+        let workers = CryptoWorkers::with_worker_count(4).unwrap();
+        for seed in 0..64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (mut sender, mut receiver) = established_tunnels();
+            let address = "127.0.0.1:51820".parse().unwrap();
+            let mut prepared = Vec::new();
+            for sequence in 0_u64..112 {
+                let plaintext =
+                    Packet::from_bytes(BytesMut::from(sequence.to_le_bytes().as_slice()));
+                let Some(WgKind::Data(packet)) = sender.handle_outgoing_packet(plaintext, None)
+                else {
+                    panic!("expected data")
+                };
+                let replay = packet.clone();
+                for packet in [packet, replay] {
+                    let PreparedIncoming::Decrypt { packet } =
+                        receiver.prepare_incoming_packet(WgKind::Data(packet))
+                    else {
+                        panic!("expected prepared packet")
+                    };
+                    prepared.push((packet, address));
+                }
+            }
+            // Two windows avoid exceeding the peer's 128-slot cap; every counter is duplicated.
+            let lane = Arc::new(OrderedCompletions::default());
+            let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+            let delivered = Arc::new(Mutex::new(Vec::new()));
+            let rejected = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut prepared = prepared.into_iter();
+            for _ in 0..2 {
+                let mut gates = Vec::new();
+                let mut tasks = Vec::new();
+                for count in [32, 16, 8, 8, 32, 16] {
+                    let first = lane.reserve_run(count).unwrap();
+                    let force_worker = lane.should_force_worker(count);
+                    let run = prepared.by_ref().take(count).collect();
+                    let crypto = workers.handle();
+                    let lane = Arc::clone(&lane);
+                    let receiver = Arc::clone(&receiver);
+                    let delivered = Arc::clone(&delivered);
+                    let rejected = Arc::clone(&rejected);
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    gates.push(tx);
+                    tasks.push(tokio::spawn(async move {
+                        rx.await.unwrap();
+                        let results = crypto.decrypt_run(run, force_worker).await.unwrap();
+                        lane.complete_run(
+                            first,
+                            results.into_iter().map(Some).collect(),
+                            |results| {
+                                let receiver = Arc::clone(&receiver);
+                                let delivered = Arc::clone(&delivered);
+                                let rejected = Arc::clone(&rejected);
+                                async move {
+                                    let mut receiver = receiver.lock().await;
+                                    for result in results.into_iter().flatten() {
+                                        match receiver.complete_incoming_packet(result.result) {
+                                            TunnResult::WriteToTunnel(packet) => {
+                                                let sequence = u64::from_le_bytes(
+                                                    packet.as_bytes()[..8].try_into().unwrap(),
+                                                );
+                                                delivered.lock().unwrap().push(sequence);
+                                            }
+                                            TunnResult::Err(_) => {
+                                                rejected.fetch_add(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                            }
+                                            _ => panic!("unexpected receive outcome"),
+                                        }
+                                        tokio::task::yield_now().await;
+                                    }
+                                    Ok::<_, ()>(())
+                                }
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    }));
+                }
+                gates.shuffle(&mut rng);
+                for gate in gates {
+                    gate.send(()).unwrap();
+                    tokio::task::yield_now().await;
+                }
+                for task in tasks {
+                    task.await.unwrap();
+                }
+                assert!(lane.is_idle());
+            }
+            assert_eq!(
+                *delivered.lock().unwrap(),
+                (0_u64..112).collect::<Vec<_>>(),
+                "seed {seed}"
+            );
+            assert_eq!(
+                rejected.load(std::sync::atomic::Ordering::Relaxed),
+                112,
+                "seed {seed}"
+            );
+        }
+        workers.stop().await;
+    }
+
+    /// Dropping the owner closes the queue even if its asynchronous stop future cannot run.
+    #[test]
+    fn j369_dropping_workers_closes_the_queue() {
+        let workers = CryptoWorkers::with_worker_count(2).unwrap();
+        let queue = Arc::clone(&workers.queue);
+        drop(workers);
+        let closed = queue.state.lock().closed;
+        // Clean up the reproduction's detached threads before reporting the missing shutdown.
+        queue.close();
+        assert!(
+            closed,
+            "dropping the owner leaves its crypto workers parked forever"
+        );
+    }
+
     /// Keep a lone ready run inline and dispatch substantial work only when another run exists.
     #[test]
     fn worker_dispatch_requires_a_useful_run_and_peer_backlog() {

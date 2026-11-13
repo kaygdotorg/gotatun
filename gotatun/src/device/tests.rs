@@ -302,6 +302,110 @@ async fn peer_lock_wait_polls_the_completion_queued_ahead_of_it() {
         .expect("the queued completion ran before the parent acquired the lock");
 }
 
+/// Timer output must backpressure instead of panicking when data owns the whole peer window.
+#[tokio::test]
+async fn j369_timer_output_survives_a_full_peer_window() {
+    use super::parallel_crypto::{CryptoWorkers, MAX_PEER_CRYPTO_IN_FLIGHT, OrderStore};
+    let (alice, bob, _eve) = mock::device_pair().await;
+    let udp = alice
+        .device
+        .inner
+        .read()
+        .await
+        .connection
+        .as_ref()
+        .unwrap()
+        .udp
+        .clone();
+    alice.device.suspend().await;
+    bob.device.suspend().await;
+    let peer = alice
+        .device
+        .inner
+        .read()
+        .await
+        .peers
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    peer.lock().await.tunnel.set_persistent_keepalive(Some(1));
+    let order = Arc::new(OrderStore::default());
+    order
+        .reserve_run(super::peer_order_key(&peer), MAX_PEER_CRYPTO_IN_FLIGHT)
+        .unwrap();
+    let workers = CryptoWorkers::with_worker_count(2).unwrap();
+    let timers = super::DeviceState::handle_timers(
+        Arc::downgrade(&alice.device.inner),
+        udp,
+        workers.handle(),
+        order,
+    );
+    let outcome = std::panic::AssertUnwindSafe(timers)
+        .catch_unwind()
+        .now_or_never();
+    workers.stop().await;
+    alice.device.stop().await;
+    bob.device.stop().await;
+    assert!(
+        outcome.is_none(),
+        "timer task panicked at the bounded lane's normal full state"
+    );
+}
+
+/// The control-path drain must not hold a read guard needed by its own delivery callback.
+#[tokio::test]
+async fn j369_control_drain_progresses_with_a_queued_device_writer() {
+    use super::parallel_crypto::OrderedCompletions;
+    let (alice, bob, _eve) = mock::device_pair().await;
+    alice.device.suspend().await;
+    bob.device.suspend().await;
+    let device = Arc::clone(&alice.device.inner);
+    let device_guard = device.read().await;
+    let peer = device_guard.peers.values().next().unwrap().clone();
+    let lane = Arc::new(OrderedCompletions::default());
+    let slot = lane.reserve_run(1).unwrap();
+    let (tun, _tx, _rx) = mock::mock_tun();
+    let delivery_device = Arc::downgrade(&device);
+    let mut writer = Box::pin(device.write());
+    assert!(futures::poll!(writer.as_mut()).is_pending());
+    let mut incoming = PendingIncoming::new();
+    let completion_lane = Arc::clone(&lane);
+    incoming.push(
+        async move {
+            completion_lane
+                .complete_run(slot, vec![None], |completions| {
+                    super::DeviceState::deliver_incoming_run(
+                        slot,
+                        delivery_device.clone(),
+                        peer.clone(),
+                        completions,
+                        tun.clone(),
+                    )
+                })
+                .await
+        }
+        .boxed(),
+    );
+    // This is the control branch's drain at mod.rs:2013, using its actual delivery callback.
+    let mut drain = Box::pin(async {
+        while !lane.is_idle() {
+            incoming.next().await.unwrap().unwrap();
+        }
+    });
+    let progressed = futures::poll!(drain.as_mut()).is_ready();
+    // Break the cycle before asserting so the reproducer cleans up every owned resource.
+    drop(device_guard);
+    drop(writer.await);
+    drain.await;
+    alice.device.stop().await;
+    bob.device.stop().await;
+    assert!(
+        progressed,
+        "control read guard blocks writer, which blocks its completion's nested read"
+    );
+}
+
 /// Keep the data path moving and ordered while a reverse producer sends ACK-sized packets.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn threaded_reverse_traffic_preserves_order_and_progress() {
