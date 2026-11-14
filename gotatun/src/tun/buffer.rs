@@ -44,13 +44,14 @@ static NEXT_DIAGNOSTIC_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Panics if one of the locks is already taken.
 pub async fn channel<S: IpSend, R: IpRecv>(
     capacity: usize,
+    recv_capacity: usize,
     pool: PacketBufPool,
     send: Arc<Mutex<S>>,
     recv: Arc<Mutex<R>>,
 ) -> (BufferedIpSend, BufferedIpRecv<R>) {
     let token = CancellationToken::new();
     let buffer_send = BufferedIpSend::new(capacity, send, token.clone());
-    let buffer_recv = BufferedIpRecv::new(capacity, pool, recv, token).await;
+    let buffer_recv = BufferedIpRecv::new(recv_capacity, pool, recv, token).await;
     (buffer_send, buffer_recv)
 }
 
@@ -160,6 +161,19 @@ impl BufferedIpSend {
             packet_capacity: capacity,
             _task: Arc::new(task),
         }
+    }
+}
+
+impl BufferedIpSend {
+    /// Bench diagnostic (#260, J687): packets waiting to be written to the TUN device.
+    pub(crate) fn depth_probe(&self) -> crate::diag::DepthProbe {
+        let tx = self.tx.downgrade();
+        let slots = Arc::clone(&self.packet_slots);
+        let capacity = self.packet_capacity;
+        Box::new(move || {
+            tx.upgrade()?;
+            Some(capacity - slots.available_permits())
+        })
     }
 }
 
@@ -276,6 +290,8 @@ impl IpSend for BufferedIpSend {
 /// full. Any call to [`IpRecv::recv`] on _this_ object will not block unless the buffer is empty.
 pub struct BufferedIpRecv<I> {
     rx: mpsc::Receiver<Packet<Ip>>,
+    /// Bench diagnostic handle on the read-ahead channel (#260, J687); never keeps it open.
+    depth_tx: mpsc::WeakSender<Packet<Ip>>,
     rx_packet_buf: Vec<Packet<Ip>>,
     _task: Arc<Task>,
     _phantom: std::marker::PhantomData<I>,
@@ -295,6 +311,7 @@ impl<I: IpRecv> BufferedIpRecv<I> {
         token: CancellationToken,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<Packet<Ip>>(capacity);
+        let depth_tx = tx.downgrade();
 
         // We use a timeout instead of a try_lock().expect() because there may still be an old
         // BufferedIpRecv that is in the process of being dropped. Otherwise, there would be a
@@ -341,11 +358,24 @@ impl<I: IpRecv> BufferedIpRecv<I> {
 
         Self {
             rx,
+            depth_tx,
             rx_packet_buf: vec![],
             _task: Arc::new(task),
             _phantom: std::marker::PhantomData,
             mtu,
         }
+    }
+}
+
+impl<I> BufferedIpRecv<I> {
+    /// Bench diagnostic (#260, J687): packets read from the TUN device and not yet taken by
+    /// the outgoing packet task.
+    pub(crate) fn depth_probe(&self) -> crate::diag::DepthProbe {
+        let tx = self.depth_tx.clone();
+        Box::new(move || {
+            let tx = tx.upgrade()?;
+            Some(tx.max_capacity() - tx.capacity())
+        })
     }
 }
 

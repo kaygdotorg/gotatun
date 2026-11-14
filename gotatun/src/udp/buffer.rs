@@ -207,6 +207,19 @@ impl BufferedUdpSend {
     }
 }
 
+impl BufferedUdpSend {
+    /// Bench diagnostic (#260, J687): datagrams queued for the UDP socket and not yet sent.
+    pub(crate) fn depth_probe(&self) -> crate::diag::DepthProbe {
+        let tx = self.send_tx.downgrade();
+        let slots = Arc::clone(&self.packet_slots);
+        let capacity = self.packet_capacity;
+        Box::new(move || {
+            tx.upgrade()?;
+            Some(capacity - slots.available_permits())
+        })
+    }
+}
+
 impl UdpSend for BufferedUdpSend {
     type SendManyBuf = ();
 
@@ -312,6 +325,8 @@ impl UdpSend for BufferedUdpSend {
 #[cfg(any(not(target_os = "linux"), test))]
 pub struct BufferedUdpReceive {
     _recv_task: Arc<Task>,
+    /// Bench diagnostic handle on the receive queue (#260, J687); never keeps it open.
+    depth_tx: mpsc::WeakSender<io::Result<(Packet, SocketAddr)>>,
     recv_rx: mpsc::Receiver<io::Result<(Packet, SocketAddr)>>,
 }
 
@@ -324,6 +339,7 @@ impl BufferedUdpReceive {
         mut recv_pool: PacketBufPool,
     ) -> Self {
         let (recv_tx, recv_rx) = mpsc::channel(capacity);
+        let depth_tx = recv_tx.downgrade();
 
         let recv_task = Task::spawn("buffered UDP receive", async move {
             let mut recv_many_buf = Default::default();
@@ -367,8 +383,18 @@ impl BufferedUdpReceive {
 
         Self {
             _recv_task: Arc::new(recv_task),
+            depth_tx,
             recv_rx,
         }
+    }
+
+    /// Bench diagnostic (#260, J687): received datagrams waiting for the packet task.
+    pub(crate) fn depth_probe(&self) -> crate::diag::DepthProbe {
+        let tx = self.depth_tx.clone();
+        Box::new(move || {
+            let tx = tx.upgrade()?;
+            Some(tx.max_capacity() - tx.capacity())
+        })
     }
 }
 
