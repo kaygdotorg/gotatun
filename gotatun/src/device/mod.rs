@@ -3026,6 +3026,10 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 )
                                 .await?;
                             }
+                            // J691 bench (#260): let the receive task (ACKs) run between runs.
+                            if crate::diag::TX_YIELD.on() {
+                                tokio::task::yield_now().await;
+                            }
                         }
                     }
                 }

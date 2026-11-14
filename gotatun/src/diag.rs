@@ -117,3 +117,6 @@ pub(crate) static EAGER: Switch = Switch::new("GOTATUN_J691_EAGER");
 
 /// Yield the receive task after each flushed run (`GOTATUN_J691_YIELD`).
 pub(crate) static YIELD: Switch = Switch::new("GOTATUN_J691_YIELD");
+
+/// Yield the send task after each dispatched run (`GOTATUN_J691_TX_YIELD`).
+pub(crate) static TX_YIELD: Switch = Switch::new("GOTATUN_J691_TX_YIELD");
