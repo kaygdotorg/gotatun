@@ -944,7 +944,7 @@ mod tests {
     #[test]
     fn requested_keepalive_without_a_session_sends_nothing() {
         let (mut my_tun, _their_tun) = create_two_tuns();
-        my_tun.request_keepalive();
+        assert!(!my_tun.request_keepalive());
         assert!(matches!(my_tun.update_timers(), Ok(None)));
     }
 
@@ -958,7 +958,7 @@ mod tests {
         let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
         // A rekey is in flight, so the request waits for it to finish.
         let _rekey = create_handshake_init(&mut my_tun);
-        my_tun.request_keepalive();
+        assert!(my_tun.request_keepalive());
         let mut expired = false;
         for _ in 0..200 {
             MockClock::advance(Duration::from_secs(1));
