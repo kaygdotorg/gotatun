@@ -34,8 +34,28 @@ const UTUN_OPT_MAX_PENDING_PACKETS: c_int = 16;
 /// [`io::ErrorKind::InvalidInput`] for `0` (the kernel refuses it too), or the error from
 /// `setsockopt`, for example when `fd` is not a connected utun control socket.
 pub fn set_max_pending_packets(fd: BorrowedFd<'_>, packets: u32) -> io::Result<()> {
-    let _ = (fd, packets);
-    Ok(())
+    if packets == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a utun needs room for at least one pending packet",
+        ));
+    }
+    // SAFETY: `fd` is a live descriptor for the call, and the option value is a `u32` that
+    // outlives it, passed with its exact size.
+    let result = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SYSPROTO_CONTROL,
+            UTUN_OPT_MAX_PENDING_PACKETS,
+            (&raw const packets).cast(),
+            socklen_of_u32(),
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// Read back how many packets may wait on this utun control socket.
@@ -43,8 +63,35 @@ pub fn set_max_pending_packets(fd: BorrowedFd<'_>, packets: u32) -> io::Result<(
 /// # Errors
 /// The error from `getsockopt`, for example when `fd` is not a connected utun control socket.
 pub fn max_pending_packets(fd: BorrowedFd<'_>) -> io::Result<u32> {
-    let _ = fd;
-    Ok(1)
+    let mut packets: u32 = 0;
+    let mut length = socklen_of_u32();
+    // SAFETY: `fd` is a live descriptor for the call; the kernel writes at most `length` bytes
+    // into `packets`, which is exactly that size.
+    let result = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SYSPROTO_CONTROL,
+            UTUN_OPT_MAX_PENDING_PACKETS,
+            (&raw mut packets).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if length != socklen_of_u32() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "utun returned an unexpected option size",
+        ));
+    }
+    Ok(packets)
+}
+
+/// The size of a `u32` option value as `socklen_t`.
+fn socklen_of_u32() -> libc::socklen_t {
+    // A u32 is 4 bytes, which always fits.
+    mem::size_of::<u32>() as libc::socklen_t
 }
 
 #[cfg(test)]
