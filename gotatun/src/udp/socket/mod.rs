@@ -35,6 +35,8 @@ mod generic;
 /// macOS UDP sends batched through a private syscall with a runtime fallback.
 #[cfg(all(target_os = "macos", feature = "macos-batch-io"))]
 mod macos;
+#[cfg(all(target_os = "macos", feature = "macos-batch-io"))]
+pub use macos::{RecordLen, read_records};
 
 /// Implementations of [`super::UdpSend`]/[`super::UdpRecv`] for linux
 #[cfg(any(target_os = "linux", target_os = "android"))]

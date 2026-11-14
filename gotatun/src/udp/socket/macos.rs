@@ -452,6 +452,47 @@ impl UdpRecv for super::UdpSocket {
     }
 }
 
+/// One record returned by [`read_records`]: its length and whether it was cut short.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecordLen {
+    /// Bytes written into the matching buffer.
+    pub len: usize,
+    /// The record filled its whole buffer, so it may have been cut short.
+    ///
+    /// xnu's `recvmsg_x` drops the tail of an oversized record without reporting `MSG_TRUNC`
+    /// in that message's flags (it sets only a local flag word; `bsd/kern/uipc_syscalls.c`,
+    /// xnu-12377.1.9). So a full buffer is the only signal: size each buffer at least one
+    /// byte larger than the largest valid record, and treat `truncated` as a rejected record.
+    pub truncated: bool,
+}
+
+/// Read up to `bufs.len()` queued records from a non-blocking datagram descriptor in one call.
+///
+/// This is for descriptors that hand out one packet per record, such as a macOS utun control
+/// socket (#260, J673): a reader that drains a burst with one `read` per packet pays a syscall
+/// per packet plus one more that only learns the queue is empty. `recvmsg_x` takes the whole
+/// ready run in one trap, and a short result already means the queue was empty.
+///
+/// Record `i` lands in `bufs[i]` and its length in `lens[i]`; the return value is how many
+/// records were read. Only the first `min(bufs.len(), lens.len(), 256)` pairs are used (256 is
+/// the kernel's default `kern.ipc.somaxrecvmsgx`; the kernel may cap a call lower still).
+///
+/// # Errors
+/// - [`io::ErrorKind::WouldBlock`] when nothing is queued;
+/// - [`io::ErrorKind::Unsupported`] when this system has no `recvmsg_x` (callers fall back to
+///   `read`);
+/// - any other error the call reports for the descriptor (for example `EBADF`).
+///
+/// `Ok(0)` means the descriptor reached end of file.
+pub fn read_records(
+    fd: std::os::fd::BorrowedFd<'_>,
+    bufs: &mut [&mut [u8]],
+    lens: &mut [RecordLen],
+) -> io::Result<usize> {
+    let _ = (fd, bufs, lens);
+    Err(io::ErrorKind::Unsupported.into())
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -729,5 +770,63 @@ mod tests {
                 .expect("receive packet");
             assert_eq!(packet_number(&buffer[..length]), index);
         }
+    }
+
+    /// A non-blocking datagram pair: one packet per record, like a utun control socket.
+    fn record_pair() -> (std::os::unix::net::UnixDatagram, std::os::unix::net::UnixDatagram) {
+        let (reader, writer) = std::os::unix::net::UnixDatagram::pair().expect("datagram pair");
+        reader.set_nonblocking(true).expect("non-blocking reader");
+        (reader, writer)
+    }
+
+    /// `read_records` takes every queued record in one call, in order, with exact lengths.
+    #[test]
+    fn read_records_takes_a_queued_run_in_one_call() {
+        use std::os::fd::AsFd;
+        let (reader, writer) = record_pair();
+        for index in 0..5 {
+            writer.send(&payload(index)).expect("queue a record");
+        }
+        let mut storage = vec![[0u8; 64]; 8];
+        let mut bufs: Vec<&mut [u8]> = storage.iter_mut().map(|b| &mut b[..]).collect();
+        let mut lens = [RecordLen::default(); 8];
+        let count = read_records(reader.as_fd(), &mut bufs, &mut lens).expect("one batched read");
+        assert_eq!(count, 5, "every queued record comes back from one call");
+        for (index, (buf, len)) in bufs.iter().zip(lens).take(count).enumerate() {
+            assert!(!len.truncated);
+            assert_eq!(packet_number(&buf[..len.len]), index, "device order is kept");
+        }
+        let empty = read_records(reader.as_fd(), &mut bufs, &mut lens).expect_err("drained");
+        assert_eq!(empty.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    /// The batch is bounded by the buffers given; the rest stays queued for the next call.
+    #[test]
+    fn read_records_stops_at_the_buffers_given() {
+        use std::os::fd::AsFd;
+        let (reader, writer) = record_pair();
+        for index in 0..6 {
+            writer.send(&payload(index)).expect("queue a record");
+        }
+        let mut storage = vec![[0u8; 64]; 4];
+        let mut bufs: Vec<&mut [u8]> = storage.iter_mut().map(|b| &mut b[..]).collect();
+        let mut lens = [RecordLen::default(); 4];
+        assert_eq!(read_records(reader.as_fd(), &mut bufs, &mut lens).expect("first"), 4);
+        assert_eq!(read_records(reader.as_fd(), &mut bufs, &mut lens).expect("rest"), 2);
+        assert_eq!(packet_number(&bufs[1][..lens[1].len]), 5);
+    }
+
+    /// A record larger than its buffer is reported as truncated, not silently shortened.
+    #[test]
+    fn read_records_reports_a_truncated_record() {
+        use std::os::fd::AsFd;
+        let (reader, writer) = record_pair();
+        writer.send(&[7u8; 100]).expect("queue a large record");
+        let mut storage = [0u8; 16];
+        let mut bufs: Vec<&mut [u8]> = vec![&mut storage[..]];
+        let mut lens = [RecordLen::default(); 1];
+        assert_eq!(read_records(reader.as_fd(), &mut bufs, &mut lens).expect("read"), 1);
+        assert!(lens[0].truncated, "the cut is visible to the caller");
+        assert_eq!(lens[0].len, 16);
     }
 }
