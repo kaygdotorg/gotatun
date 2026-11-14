@@ -1096,6 +1096,8 @@ mod gro {
         use crate::udp::{UdpRecv, UdpSend};
         use std::net::{Ipv6Addr, SocketAddr};
         use std::time::Duration;
+        #[cfg(feature = "device")]
+        use {super::MAX_PACKET_COUNT, crate::udp::buffer::BufferedUdpSend, std::net::Ipv4Addr};
 
         #[test]
         fn gro_receive_splits_only_the_bytes_reported_by_recvmmsg() {
@@ -1189,6 +1191,64 @@ mod gro {
 
             assert!(!packets.is_empty(), "expected at least one IPv6 packet");
             assert_eq!(packets[0].1, sender_addr);
+        }
+
+        /// A burst of more than two batches crosses the message cap on both sides of a real
+        /// socket pair. The buffered sender splits it into `sendmmsg` calls of at most
+        /// `MAX_PACKET_COUNT` messages. Each `recvmmsg` returns at most `MAX_PACKET_COUNT`
+        /// messages and leaves the rest queued in the kernel for the next call. Every datagram
+        /// must arrive exactly once and in send order.
+        ///
+        /// GRO stays off on the receiver, so each message is one datagram and the per-call
+        /// count is the message count. Loopback would not coalesce anyway.
+        #[cfg(feature = "device")]
+        #[tokio::test]
+        async fn a_burst_larger_than_one_batch_arrives_whole_and_in_order() {
+            const BURST: usize = 2 * MAX_PACKET_COUNT + 5;
+            let opts = SockOpt {
+                recv_buffer_size: Some(4 << 20),
+                ..SockOpt::default()
+            };
+            let mut receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0).into(), opts).unwrap();
+            let recv_addr = receiver.local_addr().unwrap();
+            let sender =
+                UdpSocket::bind((Ipv4Addr::LOCALHOST, 0).into(), SockOpt::default()).unwrap();
+            let send = BufferedUdpSend::new(4 * BURST, sender);
+
+            let mut packets = (0..BURST as u32)
+                .map(|i| (Packet::from_bytes(i.to_be_bytes()[..].into()), recv_addr))
+                .collect::<Vec<_>>();
+            send.send_many_to(&mut (), &mut packets).await.unwrap();
+
+            let mut recv_pool = PacketBufPool::<4096>::new(BURST);
+            let mut recv_many_buf = RecvManyBuf::default();
+            let mut received = Vec::with_capacity(BURST);
+            let mut calls = 0;
+            while received.len() < BURST {
+                let mut batch = Vec::new();
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    receiver.recv_many_from(&mut recv_many_buf, &mut recv_pool, &mut batch),
+                )
+                .await
+                .expect("the burst stalled: a datagram was lost")
+                .unwrap();
+                assert!(
+                    batch.len() <= MAX_PACKET_COUNT,
+                    "one recvmmsg returned {} messages, more than the cap of {MAX_PACKET_COUNT}",
+                    batch.len()
+                );
+                calls += 1;
+                received.extend(batch.into_iter().map(|(packet, _)| {
+                    u32::from_be_bytes(packet[..].try_into().expect("4-byte payload"))
+                }));
+            }
+
+            assert_eq!(received, (0..BURST as u32).collect::<Vec<_>>());
+            assert!(
+                calls >= 3,
+                "{BURST} datagrams need at least 3 receive calls"
+            );
         }
 
         // A datagram larger than the pool buffer must be received in full by growing
