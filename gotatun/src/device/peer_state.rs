@@ -189,6 +189,24 @@ impl PeerState {
         if self.tunnel.has_active_session() {
             return Ok(None);
         }
+        self.start_handshake(false).map(Some)
+    }
+
+    /// Start a new handshake now, even while a session is active or our own initiation is in
+    /// flight.
+    ///
+    /// This is the initiation the rekey timer sends when it retries (`force_resend`): a fresh
+    /// one with a new sender index, which replaces any initiation still in flight. The current
+    /// session is not touched and keeps carrying data until the new handshake completes, so a
+    /// working session is never lost. Callers use it when the peer's endpoint has just changed,
+    /// so the first packet to the new address leaves at once instead of at the next keepalive.
+    pub fn rehandshake(&mut self) -> Result<PendingHandshake, super::Error> {
+        self.start_handshake(true)
+    }
+
+    /// Subscribe to the next completed handshake and format an initiation to the endpoint.
+    /// With `force_resend` false, the initiation is `None` while ours is already in flight.
+    fn start_handshake(&mut self, force_resend: bool) -> Result<PendingHandshake, super::Error> {
         let endpoint_addr = self.endpoint.addr.ok_or(super::Error::NoEndpoint)?;
 
         // Subscribe before creating the initiation so that a fast response cannot be missed
@@ -197,13 +215,13 @@ impl PeerState {
         // `None` means that our own initiation is already in flight
         let initiation = self
             .tunnel
-            .format_handshake_initiation(false)
+            .format_handshake_initiation(force_resend)
             .map(|packet| (packet, endpoint_addr));
 
-        Ok(Some(PendingHandshake {
+        Ok(PendingHandshake {
             completed,
             initiation,
-        }))
+        })
     }
 
     #[cfg(feature = "daita")]
