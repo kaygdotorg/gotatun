@@ -13,7 +13,7 @@
 
 use crate::packet::{
     Ip, IpNextProtocol, Ipv4, Ipv4Header, Ipv4VersionIhl, Ipv6, Ipv6Header, Packet, Tcp, TcpHeader,
-    Udp, UdpHeader,
+    Udp, UdpHeader, WgDataHeader,
     util::{
         PseudoHeaderV4, PseudoHeaderV6, checksum_ipv4_with_skip, checksum_tcp_with_skip,
         checksum_udp_with_skip,
@@ -27,6 +27,42 @@ use libc::{TUN_F_CSUM, TUN_F_TSO4, TUN_F_TSO6, TUN_F_USO4, TUN_F_USO6, TUNSETOFF
 use std::mem::offset_of;
 use std::{io, os::fd::AsRawFd};
 use zerocopy::{FromBytes, IntoBytes};
+
+/// Bytes left free in front of every TCP segment the splitter builds: room for the WireGuard
+/// data header, so encapsulation can write it in place (see [`segment_head_room`]).
+const SEGMENT_HEAD_ROOM: usize = WgDataHeader::LEN;
+
+/// Spare capacity left behind every TCP segment: up to 15 bytes of padding to a multiple of
+/// 16, plus the 16-byte AEAD tag. Rounded up to 32.
+const SEGMENT_TAIL_ROOM: usize = 32;
+
+/// Arena bytes one segment needs on top of its headers and payload.
+const SEGMENT_ROOM: usize = SEGMENT_HEAD_ROOM + SEGMENT_TAIL_ROOM;
+
+/// Reserve the header room in front of the next segment and split it off `buf`.
+///
+/// Call it while `buf` is empty, right before writing the segment. The returned bytes sit
+/// directly in front of the segment in the same allocation, so encapsulation can join them
+/// back with [`BytesMut::unsplit`] at no cost (#260). The segment itself still starts at
+/// offset 0 of `buf`.
+fn segment_head_room(buf: &mut BytesMut) -> BytesMut {
+    debug_assert!(buf.is_empty(), "head room goes in front of a new segment");
+    buf.extend_from_slice(&[0; SEGMENT_HEAD_ROOM]);
+    buf.split()
+}
+
+/// Split the finished segment off `buf`, keeping [`SEGMENT_TAIL_ROOM`] spare bytes behind it.
+///
+/// The tail room stays in the returned buffer's capacity (its length is just the segment), so
+/// padding and the tag fit later without a reallocation. Wrap it with its head room in a
+/// [`Packet::from_bytes_with_head_room`].
+fn split_segment(buf: &mut BytesMut, head_room: BytesMut) -> Packet<[u8]> {
+    let segment_len = buf.len();
+    buf.extend_from_slice(&[0; SEGMENT_TAIL_ROOM]);
+    let mut segment = buf.split();
+    segment.truncate(segment_len);
+    Packet::from_bytes_with_head_room(head_room, segment)
+}
 
 /// Enable TCP offloading on the given tun device
 ///
@@ -111,7 +147,7 @@ pub fn new_tso_iter_ipvx(ipvx_packet: Packet<IpvX>, gso_size: usize) -> io::Resu
 
                 let segment_payload_len = gso_size;
                 let segment_count = payload_len.div_ceil(segment_payload_len);
-                let capacity = header_len
+                let capacity = (header_len + SEGMENT_ROOM)
                     .checked_mul(segment_count)
                     .and_then(|headers_len| headers_len.checked_add(payload_len))
                     .ok_or_else(|| {
@@ -605,7 +641,7 @@ fn new_tso_iter_ipv4_with_options(
     let payload = packet;
 
     if payload_len <= gso_size {
-        let mut buf = BytesMut::with_capacity(expected_header_len + payload_len);
+        let mut buf = BytesMut::with_capacity(expected_header_len + payload_len + SEGMENT_ROOM);
         let packet = build_ipv4_tcp_segment(
             &mut buf,
             headers.as_ref(),
@@ -621,7 +657,7 @@ fn new_tso_iter_ipv4_with_options(
     }
 
     let segment_count = payload_len.div_ceil(gso_size);
-    let capacity = expected_header_len
+    let capacity = (expected_header_len + SEGMENT_ROOM)
         .checked_mul(segment_count)
         .and_then(|headers_len| headers_len.checked_add(payload_len))
         .ok_or_else(|| invalid_vnet("TCPv4 TSO packet size overflow"))?;
@@ -649,6 +685,7 @@ fn build_ipv4_tcp_segment(
     let total_len = headers.len() + payload.len();
     let total_len = u16::try_from(total_len).expect("TSO segment fits in the input IPv4 length");
     buf.clear();
+    let head_room = segment_head_room(buf);
     buf.extend_from_slice(headers);
     buf.extend_from_slice(payload);
 
@@ -698,7 +735,7 @@ fn build_ipv4_tcp_segment(
     let ip_checksum = checksum_ipv4_with_skip(&buf[..ip_header_len]);
     buf[ip_checksum_offset..ip_checksum_offset + 2].copy_from_slice(&ip_checksum.to_be_bytes());
 
-    Packet::from_bytes(buf.split())
+    split_segment(buf, head_room)
         .try_into_ip()
         .expect("a rebuilt IPv4 TCP segment is a valid IP packet")
 }
@@ -1032,11 +1069,13 @@ impl Iterator for TsoIter {
                     segment_headers.payload.set_psh(false);
                 }
 
-                // Copy the data into the large `buf` allocation and split it off into Packet.
+                // Copy the data into the large `buf` allocation and split it off into Packet,
+                // with room around it to be sealed in place.
+                let head_room = segment_head_room(buf);
                 buf.extend_from_slice(segment_headers.as_bytes());
                 buf.extend_from_slice(tcp_options);
                 buf.extend_from_slice(&segment_payload);
-                let packet = Packet::from_bytes(buf.split());
+                let packet = split_segment(buf, head_room);
 
                 let mut packet = packet
                     .try_into_ipvx()
@@ -1115,11 +1154,13 @@ impl Iterator for TsoIter {
                     segment_headers.payload.set_psh(false);
                 }
 
-                // Copy the data into the large `buf` allocation and split it off into Packet.
+                // Copy the data into the large `buf` allocation and split it off into Packet,
+                // with room around it to be sealed in place.
+                let head_room = segment_head_room(buf);
                 buf.extend_from_slice(segment_headers.as_bytes());
                 buf.extend_from_slice(tcp_options);
                 buf.extend_from_slice(&segment_payload);
-                let packet = Packet::from_bytes(buf.split());
+                let packet = split_segment(buf, head_room);
 
                 let mut packet = packet
                     .try_into_ipvx()
@@ -1330,6 +1371,76 @@ mod tests {
         bytes.extend_from_slice(udp_header.as_bytes());
         bytes.extend_from_slice(payload);
         Packet::from_bytes(bytes)
+    }
+
+    /// Check that `frame` splits into segments that each keep header room directly in front and
+    /// tail room in their spare capacity, all inside one arena allocation (#260, J677).
+    ///
+    /// Adjacency is what lets encapsulation seal a segment in place; consecutive segments
+    /// sitting exactly one room apart proves the arena was sized right and never reallocated.
+    fn assert_segments_keep_room_in_one_arena(frame: Packet<[u8]>, expected_segments: usize) {
+        let mut previous_end: Option<*const u8> = None;
+        let mut count = 0;
+        for mut segment in new_tso_iter_from_vnet(frame).unwrap() {
+            let head_room = segment
+                .take_head_room()
+                .expect("TCP segments keep head room");
+            assert_eq!(head_room.len(), SEGMENT_HEAD_ROOM);
+            let mut segment = segment.into_bytes();
+            let bytes = segment.buf_mut();
+            assert_eq!(
+                head_room.as_ptr().wrapping_add(SEGMENT_HEAD_ROOM),
+                bytes.as_ptr()
+            );
+            assert!(bytes.capacity() - bytes.len() >= SEGMENT_TAIL_ROOM);
+            if let Some(end) = previous_end {
+                assert_eq!(end, head_room.as_ptr(), "segments share one arena");
+            }
+            previous_end = Some(bytes.as_ptr().wrapping_add(bytes.len() + SEGMENT_TAIL_ROOM));
+            count += 1;
+        }
+        assert_eq!(count, expected_segments);
+    }
+
+    #[test]
+    fn tso_segments_keep_room_to_be_sealed_in_place() {
+        let payload: Vec<u8> = (0..=255).cycle().take(4000).collect();
+        let tcp_options = [1, 1, 1, 1];
+        let header_len = TcpHeader::LEN + tcp_options.len();
+
+        let v4 = ipv4_tcp_packet(&payload, &tcp_options);
+        let mut header = vnet_header(
+            GsoType::VIRTIO_NET_HDR_GSO_TCPV4,
+            1000,
+            (Ipv4Header::LEN + header_len) as u16,
+        );
+        header.flags = Flags::new().with_needs_csum(true);
+        header.csum_start = Ipv4Header::LEN as u16;
+        header.csum_offset = 16;
+        assert_segments_keep_room_in_one_arena(vnet_frame(header, v4.as_bytes()), 4);
+
+        let v6 = ipv6_tcp_packet(&payload, &tcp_options);
+        let mut header = vnet_header(
+            GsoType::VIRTIO_NET_HDR_GSO_TCPV6,
+            1000,
+            (Ipv6Header::LEN + header_len) as u16,
+        );
+        header.flags = Flags::new().with_needs_csum(true);
+        header.csum_start = Ipv6Header::LEN as u16;
+        header.csum_offset = 16;
+        assert_segments_keep_room_in_one_arena(vnet_frame(header, v6.as_bytes()), 4);
+
+        let ip_options = [1, 1, 1, 1];
+        let v4_options = ipv4_tcp_packet_with_ip_options(&payload, &ip_options);
+        let mut header = vnet_header(
+            GsoType::VIRTIO_NET_HDR_GSO_TCPV4,
+            1000,
+            (Ipv4Header::LEN + ip_options.len() + TcpHeader::LEN) as u16,
+        );
+        header.flags = Flags::new().with_needs_csum(true);
+        header.csum_start = (Ipv4Header::LEN + ip_options.len()) as u16;
+        header.csum_offset = 16;
+        assert_segments_keep_room_in_one_arena(vnet_frame(header, v4_options.as_ref()), 4);
     }
 
     #[test]
