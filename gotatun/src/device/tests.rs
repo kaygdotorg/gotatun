@@ -1029,6 +1029,9 @@ async fn requested_keepalive_does_not_handshake_a_sessionless_peer() {
 /// Alice has one peer with a session (Bob) and 999 configured peers that never handshook. A
 /// request flags exactly one peer, and after a timer wake Bob has heard one keepalive while no
 /// idle peer got an initiation.
+///
+/// Bob's hearing is observed as his roam to Alice's moved source address. A keepalive carries
+/// no payload, so it never moves Bob's `rx_bytes`, which counts decapsulated bytes.
 #[tokio::test]
 #[test_log::test]
 async fn requested_keepalives_at_1000_peers_reach_only_live_sessions() {
@@ -1052,12 +1055,18 @@ async fn requested_keepalives_at_1000_peers_reach_only_live_sessions() {
     let packet = mock::packet(b"Hello!");
     alice.app_tx.send(packet.clone()).await;
     assert_eq!(bob.app_rx.recv().await.as_bytes(), packet.as_bytes());
-    let received_before = bob.device.peers().await[0].stats.rx_bytes;
 
+    let moved: Ipv4Addr = "1.3.3.7".parse().unwrap();
+    *alice.source_ipv4_override.lock().await = Some(moved);
     assert_eq!(alice.device.request_keepalives().await, 1);
     timeout(Duration::from_secs(2), async {
-        while bob.device.peers().await[0].stats.rx_bytes == received_before {
-            // sleep: polls Bob's counters; the bound is the outer timeout.
+        while bob.device.peers().await[0]
+            .peer
+            .endpoint
+            .map(|addr| addr.ip())
+            != Some(moved.into())
+        {
+            // sleep: polls Bob's peer table; the bound is the outer timeout.
             sleep(Duration::from_millis(10)).await;
         }
     })
