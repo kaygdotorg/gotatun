@@ -127,6 +127,19 @@ struct PacketInner {
     // If the [BytesMut] was allocated by a [PacketBufPool], this will return the buffer to be
     // re-used later.
     _return_to_pool: Option<ReturnToPool>,
+
+    /// Spare bytes that sit directly in front of `buf` in the same allocation, if any.
+    ///
+    /// The Linux TSO splitter leaves room for the WireGuard data header in front of every
+    /// segment it builds (and room for padding and the tag behind it, in `buf`'s spare
+    /// capacity). Encapsulation then joins the two with [`BytesMut::unsplit`] and seals the
+    /// segment where it already is, instead of allocating, zeroing and copying a new buffer for
+    /// every outgoing packet (#260). It travels with the packet through every typed cast.
+    ///
+    /// INVARIANT: nothing else reads or writes these bytes. If `buf` has since been advanced
+    /// or reallocated, the two are no longer adjacent and `unsplit` falls back to a copy, so
+    /// the result is still correct, only slower.
+    head_room: Option<BytesMut>,
 }
 
 /// Plain ol' data. A helper trait for types that can be cast to/from bytes.
@@ -147,6 +160,13 @@ impl<T: IntoBytes + KnownLayout + Immutable + ?Sized> Packet<T> {
 }
 
 impl<T: IntoBytes + KnownLayout + Immutable + ?Sized> Packet<T> {
+    /// Take the spare bytes reserved in front of this packet, if it has any.
+    ///
+    /// Encapsulation uses them to write its header in place. See [`PacketInner`].
+    pub(crate) fn take_head_room(&mut self) -> Option<BytesMut> {
+        self.inner.head_room.take()
+    }
+
     /// Discard the type of this packet and treat it as a pile of bytes.
     pub fn into_bytes(self) -> Packet<[u8]> {
         self.cast()
@@ -165,6 +185,7 @@ impl<T: IntoBytes + FromBytes + KnownLayout + Immutable + ?Sized> Packet<T> {
             inner: PacketInner {
                 buf: BytesMut::from(payload.as_bytes()),
                 _return_to_pool: None,
+                head_room: None,
             },
             _kind: PhantomData::<T>,
         }
@@ -255,6 +276,7 @@ impl Default for Packet<[u8]> {
             inner: PacketInner {
                 buf: BytesMut::default(),
                 _return_to_pool: None,
+                head_room: None,
             },
             _kind: PhantomData,
         }
@@ -271,6 +293,7 @@ impl Packet<[u8]> {
             inner: PacketInner {
                 buf: bytes,
                 _return_to_pool: Some(return_to_pool),
+                head_room: None,
             },
             _kind: PhantomData::<[u8]>,
         }
@@ -282,9 +305,22 @@ impl Packet<[u8]> {
             inner: PacketInner {
                 buf: bytes,
                 _return_to_pool: None,
+                head_room: None,
             },
             _kind: PhantomData::<[u8]>,
         }
+    }
+
+    /// Create a packet from `bytes` that keeps `head_room`, the spare bytes directly in front
+    /// of it in the same allocation, for an in-place header later.
+    ///
+    /// `head_room` must have been split off just before `bytes` (see [`PacketInner`]'s
+    /// invariant). Give `bytes` spare capacity for anything appended later, such as padding
+    /// and an AEAD tag, so the in-place path never reallocates.
+    pub(crate) fn from_bytes_with_head_room(head_room: BytesMut, bytes: BytesMut) -> Self {
+        let mut packet = Self::from_bytes(bytes);
+        packet.inner.head_room = Some(head_room);
+        packet
     }
 
     /// See [`BytesMut::truncate`].
@@ -515,6 +551,7 @@ impl<Kind: ?Sized> Clone for Packet<Kind> {
             inner: PacketInner {
                 buf: self.inner.buf.clone(),
                 _return_to_pool: None, // Clone does not return to pool
+                head_room: None,
             },
             _kind: PhantomData,
         }
