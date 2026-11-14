@@ -1375,6 +1375,31 @@ impl<T: DeviceTransports> Device<T> {
     ///
     /// Returns [`Error::PeerNotFound`] if the peer does not exist or is removed while waiting.
     pub async fn force_handshake(&self, public_key: &x25519::PublicKey) -> Result<(), Error> {
+        self.handshake(public_key, false).await
+    }
+
+    /// Send a new handshake initiation to the peer with `public_key` now, then wait until a
+    /// handshake initiated by us completes.
+    ///
+    /// Unlike [`Self::force_handshake`], this sends even while a session is active or an
+    /// initiation is in flight: it is the initiation the rekey timer's retry sends, early. The
+    /// active session is kept and carries data until the new handshake completes. Use it right
+    /// after moving a peer's endpoint, when the peer may only answer once this side has sent to
+    /// its new address (a filtering NAT), so that waiting for the next keepalive is not needed.
+    /// Note that this function never times out.
+    ///
+    /// Returns [`Error::PeerNotFound`] if the peer does not exist or is removed while waiting,
+    /// and [`Error::NoEndpoint`] if the peer has no endpoint.
+    pub async fn rehandshake(&self, public_key: &x25519::PublicKey) -> Result<(), Error> {
+        self.handshake(public_key, true).await
+    }
+
+    /// The body of [`Self::force_handshake`] (`rehandshake` false) and [`Self::rehandshake`].
+    async fn handshake(
+        &self,
+        public_key: &x25519::PublicKey,
+        rehandshake: bool,
+    ) -> Result<(), Error> {
         let (peer_arc, udp, packet_lookup) = {
             let device = self.inner.read().await;
             let connection = device.connection.as_ref().ok_or(Error::NotConnected)?;
@@ -1393,10 +1418,15 @@ impl<T: DeviceTransports> Device<T> {
         if !packet_lookup.contains_peer(&peer_arc) {
             return Err(Error::PeerNotFound);
         }
+        let pending = if rehandshake {
+            Some(peer.rehandshake()?)
+        } else {
+            peer.force_handshake()?
+        };
         let Some(PendingHandshake {
             mut completed,
             initiation,
-        }) = peer.force_handshake()?
+        }) = pending
         else {
             return Ok(());
         };
