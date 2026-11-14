@@ -433,7 +433,11 @@ impl UdpRecv for BufferedUdpReceive {
         packets: &mut Vec<(Packet, SocketAddr)>,
     ) -> io::Result<()> {
         packets.push(self.recv_from(pool).await?);
-        for _ in 1..RECV_BATCH {
+        // Bench override (#260, J687): GOTATUN_BENCH_UDP_RX_BATCH=1 restores one datagram per call.
+        static BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let batch = *BATCH
+            .get_or_init(|| crate::diag::capacity("GOTATUN_BENCH_UDP_RX_BATCH", RECV_BATCH));
+        for _ in 1..batch {
             let Ok(item) = self.recv_rx.try_recv() else {
                 break;
             };
