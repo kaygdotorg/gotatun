@@ -169,7 +169,25 @@ fn setup_console_logging(level: Level) {
 fn with_tokio_runtime(f: impl Future<Output = Result<()>>) -> Result<()> {
     // Note: We must spawn the tokio runtime after forking the process.
     // Otherwise, we see issues with file descriptors being bad, etc.
-    let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
+    // J691 bench knobs (#260): GOTATUN_J691_RT_WORKERS sets the worker thread count, and
+    // GOTATUN_J691_NO_LIFO (tokio_unstable builds only) disables the LIFO slot, to test whether
+    // light tasks woken behind a long poll cause the ACK clumps. Unset = Runtime::new().
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    if let Some(n) = std::env::var("GOTATUN_J691_RT_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        eprintln!("diagnostic: GOTATUN_J691_RT_WORKERS={n}");
+        builder.worker_threads(n);
+    }
+    #[cfg(tokio_unstable)]
+    if std::env::var_os("GOTATUN_J691_NO_LIFO").is_some() {
+        eprintln!("diagnostic: GOTATUN_J691_NO_LIFO");
+        builder.disable_lifo_slot();
+    }
+    let rt = builder.build().context("Failed to create tokio runtime")?;
     rt.block_on(f)
 }
 
