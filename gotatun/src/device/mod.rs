@@ -1373,29 +1373,40 @@ impl<T: DeviceTransports> Device<T> {
         Connection::set_up(self.inner.clone()).await
     }
 
-    /// Send every peer one keepalive now, so each peer learns our current endpoint.
+    /// Send every peer that has a current session one keepalive now, so it learns our current
+    /// endpoint.
     ///
     /// Call this after the local address or port changed. A peer updates its endpoint for us
     /// only from an authenticated packet, and a node that is only receiving sends nothing until
     /// its keepalive-plus-rekey timeout, about 15 s, during which the peer keeps sending to the
     /// old address (#260, J561). The keepalives go through the normal timer path, so they keep
-    /// the per-peer output order and the session counters; peers without a session get a
-    /// handshake instead. Returns the number of peers asked.
+    /// the per-peer output order and the session counters.
+    ///
+    /// Peers without a session get nothing: they have no flow to move, and a handshake with
+    /// every idle or offline peer on each address change would flood a large mesh (#483, J633).
+    /// The timer task is woken only when at least one peer took the request. Returns the number
+    /// of peers that will send a keepalive.
     pub async fn request_keepalives(&self) -> usize {
         let (peers, wake) = {
             let device = self.inner.read().await;
             let peers: Vec<_> = device.peers.values().cloned().collect();
             (peers, Arc::clone(&device.timer_wake))
         };
+        let mut requested = 0;
         for peer in &peers {
             let peer_key = peer_order_key(peer);
             let mut trace = PeerLockDiagnostic::waiting("request_keepalive", peer_key);
-            lock_peer_state(peer, "request_keepalive", peer_key, &mut trace)
+            if lock_peer_state(peer, "request_keepalive", peer_key, &mut trace)
                 .await
-                .request_keepalive();
+                .request_keepalive()
+            {
+                requested += 1;
+            }
         }
-        wake.notify_one();
-        peers.len()
+        if requested > 0 {
+            wake.notify_one();
+        }
+        requested
     }
 
     /// Wait until there is a session with the peer with `public_key` that is not yet due for
