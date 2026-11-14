@@ -263,6 +263,20 @@ async fn yield_between_runs() {
     tokio::task::yield_now().await;
 }
 
+/// Finish every receive run whose decryption is already done, without waiting for the others.
+///
+/// The receive task otherwise polls finished runs only when it waits for capacity or between
+/// receive batches, so decrypted packets can sit behind the rest of a large batch before they
+/// reach the TUN writer. Polling here hands each run to TUN as soon as it is ready (#260, J691).
+/// Ordered delivery is unchanged: a run that finished early still waits for its turn in the
+/// peer's lane inside its own future.
+fn deliver_ready_runs(pending: &mut PendingIncoming) -> Result<(), Error> {
+    while let Some(Some(result)) = pending.next().now_or_never() {
+        result?;
+    }
+    Ok(())
+}
+
 /// Drain prior data completions before a control packet mutates the same peer tunnel state.
 async fn drain_incoming_before_control(
     lane: Option<Arc<OrderedCompletions<IncomingCompletion>>>,
@@ -2560,6 +2574,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                             .expect("the receive run reached its bound"),
                                     )
                                     .await?;
+                                    deliver_ready_runs(&mut incoming_pending)?;
                                     yield_between_runs().await;
                                 }
                             }
