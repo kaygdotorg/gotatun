@@ -489,8 +489,65 @@ pub fn read_records(
     bufs: &mut [&mut [u8]],
     lens: &mut [RecordLen],
 ) -> io::Result<usize> {
-    let _ = (fd, bufs, lens);
-    Err(io::ErrorKind::Unsupported.into())
+    /// Most records one call asks for: the kernel's default `kern.ipc.somaxrecvmsgx`.
+    const MAX_RECORDS: usize = 256;
+
+    let Some(recv) = resolve_recv() else {
+        return Err(io::ErrorKind::Unsupported.into());
+    };
+    let count = bufs.len().min(lens.len()).min(MAX_RECORDS);
+    if count == 0 {
+        return Ok(0);
+    }
+    let mut iovs: Vec<libc::iovec> = bufs[..count]
+        .iter_mut()
+        .map(|buf| libc::iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        })
+        .collect();
+    let mut headers: Vec<MsghdrX> = iovs
+        .iter_mut()
+        .map(|iov| MsghdrX {
+            msg_iov: iov,
+            msg_iovlen: 1,
+            ..MsghdrX::EMPTY
+        })
+        .collect();
+    let wanted = c_uint::try_from(count).expect("at most 256 records");
+
+    // SAFETY: `headers` holds `count` initialised headers, each pointing at one live iovec in
+    // `iovs`, which points into a distinct `&mut` buffer from `bufs`. All of them outlive the
+    // call, and the kernel writes at most `iov_len` bytes into each buffer.
+    let result = unsafe { recv(fd.as_raw_fd(), headers.as_mut_ptr(), wanted, libc::MSG_DONTWAIT) };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        return Err(if is_unsupported(&error) {
+            io::ErrorKind::Unsupported.into()
+        } else {
+            error
+        });
+    }
+    let read = usize::try_from(result).expect("non-negative record count");
+    if read > count {
+        return Err(io::Error::other(
+            "recvmsg_x returned more records than were asked for",
+        ));
+    }
+    for ((header, buf), len) in headers.iter().zip(bufs.iter()).zip(lens.iter_mut()).take(read) {
+        let size = header.msg_datalen.min(buf.len());
+        *len = RecordLen {
+            len: size,
+            truncated: size == buf.len() || header.msg_flags & libc::MSG_TRUNC != 0,
+        };
+    }
+    Ok(read)
+}
+
+/// Resolve only the receive call, for descriptors that are not this module's UDP sockets.
+fn resolve_recv() -> Option<RecvMsgXFn> {
+    static RECV: OnceLock<Option<RecvMsgXFn>> = OnceLock::new();
+    *RECV.get_or_init(|| lookup_recv(c"recvmsg_x"))
 }
 
 #[cfg(test)]
