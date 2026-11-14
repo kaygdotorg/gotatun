@@ -1452,6 +1452,67 @@ async fn force_handshake() {
     ));
 }
 
+/// [`Device::rehandshake`] sends a new initiation even while a session is active, where
+/// [`Device::force_handshake`] sends nothing, and that handshake completes. infraternal calls it
+/// after moving a peer to a new address, so the first packet through a filtering NAT leaves at
+/// once (#515, J604).
+#[tokio::test]
+#[test_log::test]
+async fn rehandshake_sends_over_an_active_session() {
+    use crate::device::Error;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let (alice, _bob, eve) = mock::device_pair().await;
+    let mut inits = std::pin::pin!(eve.wg_handshake_init());
+    let bob_public_key = get_first_and_only_peer(&alice).await.public_key;
+
+    timeout(
+        Duration::from_secs(2),
+        alice.device.force_handshake(&bob_public_key),
+    )
+    .await
+    .expect("session should be established")
+    .expect("first handshake should succeed");
+    assert!(
+        timeout(Duration::from_secs(1), inits.next())
+            .await
+            .expect("the first handshake init should be observed")
+            .is_some()
+    );
+
+    // An active session: `force_handshake` stays silent, `rehandshake` sends and completes.
+    alice
+        .device
+        .force_handshake(&bob_public_key)
+        .await
+        .expect("wait with a fresh session should succeed");
+    assert!(
+        timeout(Duration::from_millis(500), inits.next())
+            .await
+            .is_err(),
+        "force_handshake must not send over an active session"
+    );
+    timeout(
+        Duration::from_secs(2),
+        alice.device.rehandshake(&bob_public_key),
+    )
+    .await
+    .expect("the new handshake should complete")
+    .expect("rehandshake should succeed");
+    assert!(
+        timeout(Duration::from_secs(1), inits.next())
+            .await
+            .expect("rehandshake should send an init over the active session")
+            .is_some()
+    );
+
+    let unknown_peer = PublicKey::from(&StaticSecret::random());
+    assert!(matches!(
+        alice.device.rehandshake(&unknown_peer).await,
+        Err(Error::PeerNotFound)
+    ));
+}
+
 /// Deadline for one device-pair exchange in [`test_device_pair`]: the handshake, every packet
 /// from [`mock::packets_of_every_size`], and shutdown.
 ///
