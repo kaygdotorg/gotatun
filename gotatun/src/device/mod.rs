@@ -139,6 +139,11 @@ const UDP_RECV_BUFS: usize = 128;
 #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
 const UDP_RECV_BUFS: usize = PIPELINE_BUFS;
 
+/// How many datagrams the buffered UDP send queue may hold before the socket send.
+///
+/// Every platform uses [`MAX_PACKET_BUFS`] here today.
+const UDP_SEND_BUFS: usize = MAX_PACKET_BUFS;
+
 /// How often the receive task checks for an idle link.
 ///
 /// After a load the packet pool, the allocator and the UDP receive buffers keep about
@@ -1157,7 +1162,7 @@ impl<T: DeviceTransports> Connection<T> {
         )
         .await;
 
-        let buffered_udp_tx = BufferedUdpSend::new(MAX_PACKET_BUFS, udp_tx.clone());
+        let buffered_udp_tx = BufferedUdpSend::new(UDP_SEND_BUFS, udp_tx.clone());
 
         // Linux sockets already return recvmmsg/GRO batches here. Avoid queueing them across a
         // second worker handoff before packet processing.
@@ -3116,5 +3121,30 @@ mod macos_udp_receive_queue_tests {
     #[test]
     fn macos_udp_receive_queue_holds_128_datagrams() {
         assert_eq!(super::UDP_RECV_BUFS, 128);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_udp_send_queue_tests {
+    //! Pins the macOS outbound UDP queue size measured on the Mac bench (#260, J461c, J590).
+
+    /// The send queue holds one 64-datagram send batch on macOS, separate from the 512-packet
+    /// TUN channels: at 4,000 (and at 512) the Mac-send cells kept a full outbound queue and its
+    /// wait showed up in loaded p99.
+    #[test]
+    fn macos_udp_send_queue_holds_one_batch() {
+        assert_eq!(super::UDP_SEND_BUFS, 64);
+        assert_eq!(super::PIPELINE_BUFS, 512);
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod udp_send_queue_tests {
+    //! Keeps the outbound UDP queue capacity unchanged off macOS (#260, J590).
+
+    /// Linux and the other targets keep the 4,000-packet outbound queue.
+    #[test]
+    fn udp_send_queue_keeps_existing_capacity_off_macos() {
+        assert_eq!(super::UDP_SEND_BUFS, super::MAX_PACKET_BUFS);
     }
 }
