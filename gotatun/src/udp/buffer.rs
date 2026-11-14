@@ -51,10 +51,42 @@ pub struct BufferedUdpSend {
 }
 
 /// One queued datagram or one ordered run of datagrams.
-/// A batch id is present only for opt-in send-queue diagnostics.
+/// A batch id is present only for opt-in send-queue diagnostics. The last `u64` is the
+/// queue-entry time on [`crate::diag::udp_send_monotonic_now`]'s clock, 0 unless
+/// `GOTATUN_DIAG_PATH_TIMING` is on.
 enum BufferedUdpMessage {
-    Single(Packet, SocketAddr, OwnedSemaphorePermit),
-    Batch(Vec<(Packet, SocketAddr)>, OwnedSemaphorePermit, Option<u64>),
+    Single(Packet, SocketAddr, OwnedSemaphorePermit, u64),
+    Batch(Vec<(Packet, SocketAddr)>, OwnedSemaphorePermit, Option<u64>, u64),
+}
+
+/// Record a run's UDP send queue wait when path timing stamped it (#260, J594).
+fn record_udp_queue_wait(enqueued_ns: u64) {
+    if enqueued_ns != 0 {
+        crate::diag::path::UDP_TX_QUEUE_WAIT_NS
+            .record(crate::diag::udp_send_monotonic_now().saturating_sub(enqueued_ns));
+    }
+}
+
+/// Start path timing for one run entering the send queue: returns the permit-wait start.
+fn udp_entry_started() -> u64 {
+    if crate::diag::PATH_TIMING.on() {
+        crate::diag::udp_send_monotonic_now().max(1)
+    } else {
+        0
+    }
+}
+
+/// Finish path timing at queue entry: record the permit wait and the queue's reserved datagrams,
+/// and return the queue-entry stamp (0 when path timing is off).
+fn udp_entry_stamp(started_ns: u64, slots: &Semaphore, capacity: usize) -> u64 {
+    if started_ns == 0 {
+        return 0;
+    }
+    let now = crate::diag::udp_send_monotonic_now().max(1);
+    crate::diag::path::UDP_TX_PERMIT_WAIT_NS.record(now.saturating_sub(started_ns));
+    crate::diag::path::UDP_TX_QUEUE_PKTS
+        .record(capacity.saturating_sub(slots.available_permits()) as u64);
+    now
 }
 
 /// Send one same-family UDP run through the transport's reusable send buffer.
@@ -65,6 +97,24 @@ async fn flush_udp_packets<U: UdpSend>(
 ) {
     let diagnostic = crate::diag::PIPELINE.on();
     let packet_count = packets.len();
+    let timed = (packet_count > 0 && crate::diag::PATH_TIMING.on())
+        .then(crate::diag::udp_send_monotonic_now);
+    flush_udp_packets_inner(udp_tx, send_buf, packets, diagnostic, packet_count).await;
+    if let Some(started) = timed {
+        crate::diag::path::UDP_SEND_NS
+            .record(crate::diag::udp_send_monotonic_now().saturating_sub(started));
+        crate::diag::path::UDP_SEND_PKTS.record(packet_count as u64);
+    }
+}
+
+/// The untimed body of [`flush_udp_packets`].
+async fn flush_udp_packets_inner<U: UdpSend>(
+    udp_tx: &U,
+    send_buf: &mut U::SendManyBuf,
+    packets: &mut Vec<(Packet, SocketAddr)>,
+    diagnostic: bool,
+    packet_count: usize,
+) {
     if crate::diag::UDP_SINGLE_SENDS.on() {
         let mut sent = 0;
         for (packet, address) in packets.drain(..) {
@@ -157,7 +207,8 @@ impl BufferedUdpSend {
 
                 for message in buf.drain(..) {
                     match message {
-                        BufferedUdpMessage::Single(packet, addr, permit) => {
+                        BufferedUdpMessage::Single(packet, addr, permit, enqueued_ns) => {
+                            record_udp_queue_wait(enqueued_ns);
                             if singles.first().is_some_and(|(_, first_addr)| {
                                 matches!(first_addr, SocketAddr::V4(..))
                                     != matches!(addr, SocketAddr::V4(..))
@@ -172,7 +223,8 @@ impl BufferedUdpSend {
                                 single_permits.clear();
                             }
                         }
-                        BufferedUdpMessage::Batch(packets, permit, sequence) => {
+                        BufferedUdpMessage::Batch(packets, permit, sequence, enqueued_ns) => {
+                            record_udp_queue_wait(enqueued_ns);
                             let packet_count = packets.len();
                             if let Some(sequence) = sequence {
                                 eprintln!(
@@ -211,14 +263,22 @@ impl UdpSend for BufferedUdpSend {
     type SendManyBuf = ();
 
     async fn send_to(&self, packet: Packet, destination: SocketAddr) -> io::Result<()> {
+        let started = udp_entry_started();
         let permit = Arc::clone(&self.packet_slots)
             .acquire_owned()
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+        let stamp = udp_entry_stamp(started, &self.packet_slots, self.packet_capacity);
         self.send_tx
-            .send(BufferedUdpMessage::Single(packet, destination, permit))
+            .send(BufferedUdpMessage::Single(packet, destination, permit, stamp))
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+        if stamp != 0 {
+            crate::diag::take_pending(
+                &crate::diag::PENDING_TUN_RX_NS,
+                &crate::diag::path::TUN_RX_TO_UDP_QUEUE_NS,
+            );
+        }
         Ok(())
     }
 
@@ -257,6 +317,7 @@ impl UdpSend for BufferedUdpSend {
                     format!("UDP run is too large: {e}"),
                 )
             })?;
+            let started = udp_entry_started();
             let permit = Arc::clone(&self.packet_slots)
                 .acquire_many_owned(permit_count)
                 .await
@@ -266,6 +327,7 @@ impl UdpSend for BufferedUdpSend {
                     "send_many permit_acquired direction=udp sequence={sequence} packets={count}"
                 );
             }
+            let stamp = udp_entry_stamp(started, &self.packet_slots, self.packet_capacity);
             let batch = if count == packets.len() {
                 std::mem::take(packets)
             } else {
@@ -273,11 +335,11 @@ impl UdpSend for BufferedUdpSend {
             };
             if let Err(error) = self
                 .send_tx
-                .send(BufferedUdpMessage::Batch(batch, permit, sequence))
+                .send(BufferedUdpMessage::Batch(batch, permit, sequence, stamp))
                 .await
             {
                 let mut unsent = match error.0 {
-                    BufferedUdpMessage::Batch(batch, _, _) => batch,
+                    BufferedUdpMessage::Batch(batch, _, _, _) => batch,
                     BufferedUdpMessage::Single(..) => unreachable!("send_many_to queues a batch"),
                 };
                 if let Some(sequence) = sequence {
@@ -294,6 +356,12 @@ impl UdpSend for BufferedUdpSend {
             }
             if let Some(sequence) = sequence {
                 eprintln!("send_many enqueued direction=udp sequence={sequence} packets={count}");
+            }
+            if stamp != 0 {
+                crate::diag::take_pending(
+                    &crate::diag::PENDING_TUN_RX_NS,
+                    &crate::diag::path::TUN_RX_TO_UDP_QUEUE_NS,
+                );
             }
         }
         Ok(())

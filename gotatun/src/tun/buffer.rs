@@ -68,10 +68,62 @@ pub struct BufferedIpSend {
 }
 
 /// A single packet or an ordered run crossing the buffered TUN boundary.
-/// A batch id is present only for opt-in send-queue diagnostics.
+/// A batch id is present only for opt-in send-queue diagnostics; the [`PathStamp`] only for
+/// opt-in path timing.
 enum BufferedIpMessage {
-    Single(Packet<Ip>, OwnedSemaphorePermit),
-    Batch(Vec<Packet<Ip>>, OwnedSemaphorePermit, Option<u64>),
+    Single(Packet<Ip>, OwnedSemaphorePermit, Option<PathStamp>),
+    Batch(
+        Vec<Packet<Ip>>,
+        OwnedSemaphorePermit,
+        Option<u64>,
+        Option<PathStamp>,
+    ),
+}
+
+/// Times attached to a TUN send message when `GOTATUN_DIAG_PATH_TIMING` is on.
+#[derive(Clone, Copy)]
+struct PathStamp {
+    /// When the message entered the TUN send queue.
+    enqueued_ns: u64,
+    /// Oldest UDP receive completion behind this message (0 when unknown).
+    udp_received_ns: u64,
+}
+
+impl PathStamp {
+    /// Stamp a message entering the queue and record the queue's reserved packets.
+    fn enter(slots: &Semaphore, capacity: usize) -> Option<Self> {
+        if !crate::diag::PATH_TIMING.on() {
+            return None;
+        }
+        crate::diag::path::TUN_TX_QUEUE_PKTS
+            .record(capacity.saturating_sub(slots.available_permits()) as u64);
+        Some(Self {
+            enqueued_ns: crate::diag::udp_send_monotonic_now(),
+            udp_received_ns: crate::diag::PENDING_UDP_RX_NS
+                .swap(0, std::sync::atomic::Ordering::Relaxed),
+        })
+    }
+
+    /// Record the queue wait at dequeue and return the inner write's start time.
+    fn dequeued(stamp: Option<Self>) -> Option<(Self, u64)> {
+        let stamp = stamp?;
+        let now = crate::diag::udp_send_monotonic_now();
+        crate::diag::path::TUN_TX_QUEUE_WAIT_NS.record(now.saturating_sub(stamp.enqueued_ns));
+        Some((stamp, now))
+    }
+
+    /// Record the inner write's duration and, when known, UDP receive → write finished.
+    fn written(started: Option<(Self, u64)>) {
+        let Some((stamp, write_started_ns)) = started else {
+            return;
+        };
+        let now = crate::diag::udp_send_monotonic_now();
+        crate::diag::path::TUN_WRITE_NS.record(now.saturating_sub(write_started_ns));
+        if stamp.udp_received_ns != 0 {
+            crate::diag::path::RX_TO_TUN_WRITTEN_NS
+                .record(now.saturating_sub(stamp.udp_received_ns));
+        }
+    }
 }
 
 impl BufferedIpSend {
@@ -98,13 +150,16 @@ impl BufferedIpSend {
             while let Some(message) = rx.recv().await {
                 let diagnostic = crate::diag::PIPELINE.on();
                 let (result, refused_packets) = match message {
-                    BufferedIpMessage::Single(packet, _permit) => {
+                    BufferedIpMessage::Single(packet, _permit, stamp) => {
                         if diagnostic {
                             eprintln!("pipeline stage=tun_buffer_dequeue mode=single packets=1");
                         }
-                        (inner.send(packet).await, 1)
+                        let started = PathStamp::dequeued(stamp);
+                        let result = inner.send(packet).await;
+                        PathStamp::written(started);
+                        (result, 1)
                     }
-                    BufferedIpMessage::Batch(mut packets, _permit, sequence) => {
+                    BufferedIpMessage::Batch(mut packets, _permit, sequence, stamp) => {
                         let batch_len = packets.len() as u64;
                         if let Some(sequence) = sequence {
                             eprintln!(
@@ -116,7 +171,9 @@ impl BufferedIpSend {
                                 "pipeline stage=tun_buffer_dequeue mode=batch packets={batch_len}"
                             );
                         }
+                        let started = PathStamp::dequeued(stamp);
                         let result = inner.send_many(&mut packets).await;
+                        PathStamp::written(started);
                         if let Some(sequence) = sequence {
                             eprintln!(
                                 "send_many complete direction=tun sequence={sequence} packets={batch_len} success={}",
@@ -179,8 +236,9 @@ impl IpSend for BufferedIpSend {
         if diagnostic {
             eprintln!("pipeline stage=tun_buffer_permit_acquired packets=1 mode=single");
         }
+        let stamp = PathStamp::enter(&self.packet_slots, self.packet_capacity);
         self.tx
-            .send(BufferedIpMessage::Single(packet, permit))
+            .send(BufferedIpMessage::Single(packet, permit, stamp))
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
         if diagnostic {
@@ -238,13 +296,14 @@ impl IpSend for BufferedIpSend {
             } else {
                 packets.drain(..count).collect()
             };
+            let stamp = PathStamp::enter(&self.packet_slots, self.packet_capacity);
             if let Err(error) = self
                 .tx
-                .send(BufferedIpMessage::Batch(batch, permit, sequence))
+                .send(BufferedIpMessage::Batch(batch, permit, sequence, stamp))
                 .await
             {
                 let mut unsent = match error.0 {
-                    BufferedIpMessage::Batch(batch, _, _) => batch,
+                    BufferedIpMessage::Batch(batch, _, _, _) => batch,
                     BufferedIpMessage::Single(..) => unreachable!("send_many queues a batch"),
                 };
                 if let Some(sequence) = sequence {
@@ -275,8 +334,10 @@ impl IpSend for BufferedIpSend {
 /// This will spawn a background task that continuously calls [`IpRecv::recv`] until the buffer is
 /// full. Any call to [`IpRecv::recv`] on _this_ object will not block unless the buffer is empty.
 pub struct BufferedIpRecv<I> {
-    rx: mpsc::Receiver<Packet<Ip>>,
-    rx_packet_buf: Vec<Packet<Ip>>,
+    /// Packets in device order, each with the time the inner `recv` returned it on the
+    /// [`crate::diag::udp_send_monotonic_now`] clock (0 unless path timing is on).
+    rx: mpsc::Receiver<(Packet<Ip>, u64)>,
+    rx_packet_buf: Vec<(Packet<Ip>, u64)>,
     _task: Arc<Task>,
     _phantom: std::marker::PhantomData<I>,
     mtu: MtuWatcher,
@@ -294,7 +355,7 @@ impl<I: IpRecv> BufferedIpRecv<I> {
         inner: Arc<Mutex<I>>,
         token: CancellationToken,
     ) -> Self {
-        let (tx, rx) = mpsc::channel::<Packet<Ip>>(capacity);
+        let (tx, rx) = mpsc::channel::<(Packet<Ip>, u64)>(capacity);
 
         // We use a timeout instead of a try_lock().expect() because there may still be an old
         // BufferedIpRecv that is in the process of being dropped. Otherwise, there would be a
@@ -312,8 +373,13 @@ impl<I: IpRecv> BufferedIpRecv<I> {
             loop {
                 match inner.recv(&mut pool).await {
                     Ok(packets) => {
+                        let received_ns = if crate::diag::PATH_TIMING.on() {
+                            crate::diag::udp_send_monotonic_now().max(1)
+                        } else {
+                            0
+                        };
                         for packet in packets {
-                            if tx.send(packet).await.is_err() {
+                            if tx.send((packet, received_ns)).await.is_err() {
                                 return;
                             }
                         }
@@ -363,7 +429,16 @@ impl<I: IpRecv> IpRecv for BufferedIpRecv<I> {
                 "channel closed",
             ));
         }
-        Ok(self.rx_packet_buf.drain(..n))
+        if let Some((_, oldest_ns)) = self.rx_packet_buf.first()
+            && *oldest_ns != 0
+        {
+            use crate::diag::path;
+            let now = crate::diag::udp_send_monotonic_now();
+            path::TUN_RX_QUEUE_WAIT_NS.record(now.saturating_sub(*oldest_ns));
+            path::TUN_RX_QUEUE_PKTS.record((n + self.rx.len()) as u64);
+            crate::diag::mark_pending(&crate::diag::PENDING_TUN_RX_NS, now);
+        }
+        Ok(self.rx_packet_buf.drain(..n).map(|(packet, _)| packet))
     }
 
     fn mtu(&self) -> MtuWatcher {
