@@ -1012,7 +1012,8 @@ async fn requested_keepalive_announces_a_new_source_address() {
 #[test_log::test]
 async fn requested_keepalive_does_not_handshake_a_sessionless_peer() {
     let (alice, bob, _eve) = mock::device_pair().await;
-    assert_eq!(alice.device.request_keepalives().await, 1);
+    // No session yet, so no peer takes the request.
+    assert_eq!(alice.device.request_keepalives().await, 0);
     // sleep: a timer wake plus one in-memory handshake round trip finishes well inside this.
     sleep(Duration::from_millis(500)).await;
     let peers = bob.device.peers().await;
@@ -1020,6 +1021,56 @@ async fn requested_keepalive_does_not_handshake_a_sessionless_peer() {
         peers[0].stats.last_handshake.is_none(),
         "a requested keepalive opened a session with an idle peer"
     );
+}
+
+/// At mesh design scale, one underlay change costs one keepalive per live session and nothing
+/// for idle peers (infraternal D393: designed for 1,000 peers; #483, J633).
+///
+/// Alice has one peer with a session (Bob) and 999 configured peers that never handshook. A
+/// request flags exactly one peer, and after a timer wake Bob has heard one keepalive while no
+/// idle peer got an initiation.
+#[tokio::test]
+#[test_log::test]
+async fn requested_keepalives_at_1000_peers_reach_only_live_sessions() {
+    use crate::device::Peer;
+    use ipnetwork::Ipv4Network;
+    use std::net::Ipv4Addr;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let (mut alice, mut bob, _eve) = mock::device_pair().await;
+    let idle = (0..999_u32).map(|index| {
+        let [_, _, high, low] = index.to_be_bytes();
+        Peer::new(PublicKey::from(&StaticSecret::random())).with_allowed_ip(
+            Ipv4Network::new(Ipv4Addr::new(10, 200, high, low), 32)
+                .unwrap()
+                .into(),
+        )
+    });
+    assert!(alice.device.add_peers(idle).await.unwrap());
+    assert_eq!(alice.device.peers().await.len(), 1000);
+
+    let packet = mock::packet(b"Hello!");
+    alice.app_tx.send(packet.clone()).await;
+    assert_eq!(bob.app_rx.recv().await.as_bytes(), packet.as_bytes());
+    let received_before = bob.device.peers().await[0].stats.rx_bytes;
+
+    assert_eq!(alice.device.request_keepalives().await, 1);
+    timeout(Duration::from_secs(2), async {
+        while bob.device.peers().await[0].stats.rx_bytes == received_before {
+            // sleep: polls Bob's counters; the bound is the outer timeout.
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Bob should hear the requested keepalive");
+    let started = alice
+        .device
+        .peers()
+        .await
+        .into_iter()
+        .filter(|peer| peer.stats.last_handshake.is_some() || peer.stats.tx_bytes > 0)
+        .count();
+    assert_eq!(started, 1, "only the live session may send anything");
 }
 
 /// Adding peers is atomic, including when a public key is duplicated within the batch.

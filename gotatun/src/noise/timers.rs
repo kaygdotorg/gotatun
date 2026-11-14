@@ -121,7 +121,10 @@ pub struct Timers {
     persistent_keepalive_due: bool,
     /// An immediate keepalive was requested, for example because our own address changed and
     /// the peer has to learn the new endpoint from an authenticated packet (#260, J561).
-    /// Cleared when the next timer pass sends it.
+    ///
+    /// Set only while a session exists. Cleared when the next timer pass sends it, when that
+    /// pass finds the session gone, and whenever the connection expires (`clear`), so a request
+    /// never turns into a handshake and never fires on a later session (#483, J633).
     keepalive_requested: bool,
     /// Timer deadline ranges that the sampled deadlines below are drawn from.
     pub(super) params: TimerParams,
@@ -188,6 +191,7 @@ impl Timers {
         }
         self.want_handshake = None;
         self.want_keepalive = None;
+        self.keepalive_requested = false;
         self.persistent_keepalive_due = self.persistent_keepalive.is_some();
         self.dangerously_set_params(self.params.clone());
     }
@@ -335,6 +339,8 @@ impl<R: rand::RngCore + Send> Tunn<R> {
 
         {
             if self.handshake.is_expired() {
+                // An expired connection has no session to announce on.
+                self.timers.keepalive_requested = false;
                 return Err(WireGuardError::ConnectionExpired);
             }
 
@@ -420,12 +426,15 @@ impl<R: rand::RngCore + Send> Tunn<R> {
                 if !handshake_initiation_required {
                     // An owner asked for one keepalive now. The peer roams its endpoint on any
                     // authenticated packet, so this is how a node whose address changed
-                    // announces itself without waiting for the 15 s silence handshake. Without
-                    // a session, `handle_outgoing_packet` queues it and starts a handshake.
-                    if self.timers.keepalive_requested {
+                    // announces itself without waiting for the 15 s silence handshake. The
+                    // session may have expired since the request (`update_session_timers`
+                    // above); then the request is dropped, because `handle_outgoing_packet`
+                    // would queue the keepalive and start a handshake with an idle peer.
+                    if std::mem::take(&mut self.timers.keepalive_requested)
+                        && self.has_current_session()
+                    {
                         tracing::trace!("KEEPALIVE(REQUESTED)");
                         keepalive_required = true;
-                        self.timers.keepalive_requested = false;
                     }
 
                     // If a data packet has been received from a given peer, but we have not sent
@@ -466,15 +475,24 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         Ok(None)
     }
 
-    /// Ask the next [`Tunn::update_timers`] pass to send one keepalive to this peer.
+    /// Ask the next [`Tunn::update_timers`] pass to send one keepalive to this peer, if it has a
+    /// current session. Returns whether the request was taken.
     ///
     /// Call this when the local endpoint changed (a new source address or port). The peer only
     /// learns a new endpoint from an authenticated packet, and a node that is only receiving
     /// would otherwise stay silent until the keepalive-plus-rekey timeout, about 15 s.
     /// Requests made while a handshake is in flight wait for that handshake to finish; the
     /// handshake itself already reaches the peer from the new endpoint.
-    pub fn request_keepalive(&mut self) {
+    ///
+    /// A peer without a session is left alone: it has no flow to move, and a handshake per idle
+    /// peer per address change would flood a large mesh (#483, J633). It learns the new endpoint
+    /// from its own next handshake to us, or out of band.
+    pub fn request_keepalive(&mut self) -> bool {
+        if !self.has_current_session() {
+            return false;
+        }
         self.timers.keepalive_requested = true;
+        true
     }
 
     /// Get the time elapsed since the last successful handshake.
