@@ -2376,6 +2376,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                     &mut packet_pool,
                     &mut received_packets,
                 ) => {
+                    crate::diag::UDP_RECV_BATCH.record(received_packets.len());
                     if crate::diag::PIPELINE.on() {
                         eprintln!(
                             "pipeline stage=udp_receive packets={} error={}",

@@ -65,6 +65,9 @@ async fn flush_udp_packets<U: UdpSend>(
 ) {
     let diagnostic = crate::diag::PIPELINE.on();
     let packet_count = packets.len();
+    if packet_count > 0 {
+        crate::diag::UDP_SEND_RUN.record(packet_count);
+    }
     if crate::diag::UDP_SINGLE_SENDS.on() {
         let mut sent = 0;
         for (packet, address) in packets.drain(..) {
@@ -266,6 +269,8 @@ impl UdpSend for BufferedUdpSend {
                     "send_many permit_acquired direction=udp sequence={sequence} packets={count}"
                 );
             }
+            crate::diag::UDP_SEND_OCCUPANCY
+                .record(self.packet_capacity - self.packet_slots.available_permits());
             let batch = if count == packets.len() {
                 std::mem::take(packets)
             } else {

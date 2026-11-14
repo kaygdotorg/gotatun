@@ -230,6 +230,8 @@ impl IpSend for BufferedIpSend {
                     "send_many permit_acquired direction=tun sequence={sequence} packets={count}"
                 );
             }
+            crate::diag::TUN_WRITE_OCCUPANCY
+                .record(self.packet_capacity - self.packet_slots.available_permits());
             if diagnostic {
                 eprintln!("pipeline stage=tun_buffer_permit_acquired packets={count} mode=batch");
             }
@@ -312,11 +314,16 @@ impl<I: IpRecv> BufferedIpRecv<I> {
             loop {
                 match inner.recv(&mut pool).await {
                     Ok(packets) => {
+                        let mut read = 0;
                         for packet in packets {
                             if tx.send(packet).await.is_err() {
                                 return;
                             }
+                            read += 1;
                         }
+                        crate::diag::TUN_READ_BATCH.record(read);
+                        crate::diag::TUN_READ_OCCUPANCY
+                            .record(tx.max_capacity() - tx.capacity());
                     }
                     Err(e) => {
                         if is_fatal_tun_error(&e) {
@@ -356,6 +363,7 @@ impl<I: IpRecv> IpRecv for BufferedIpRecv<I> {
     ) -> io::Result<impl Iterator<Item = Packet<Ip>> + 'a> {
         let max_n = self.rx.max_capacity();
         let n = self.rx.recv_many(&mut self.rx_packet_buf, max_n).await;
+        crate::diag::OUTGOING_TAKE.record(n);
         if n == 0 {
             // Channel is closed
             return Err(io::Error::new(
