@@ -519,7 +519,14 @@ pub fn read_records(
     // SAFETY: `headers` holds `count` initialised headers, each pointing at one live iovec in
     // `iovs`, which points into a distinct `&mut` buffer from `bufs`. All of them outlive the
     // call, and the kernel writes at most `iov_len` bytes into each buffer.
-    let result = unsafe { recv(fd.as_raw_fd(), headers.as_mut_ptr(), wanted, libc::MSG_DONTWAIT) };
+    let result = unsafe {
+        recv(
+            fd.as_raw_fd(),
+            headers.as_mut_ptr(),
+            wanted,
+            libc::MSG_DONTWAIT,
+        )
+    };
     if result < 0 {
         let error = io::Error::last_os_error();
         return Err(if is_unsupported(&error) {
@@ -534,7 +541,12 @@ pub fn read_records(
             "recvmsg_x returned more records than were asked for",
         ));
     }
-    for ((header, buf), len) in headers.iter().zip(bufs.iter()).zip(lens.iter_mut()).take(read) {
+    for ((header, buf), len) in headers
+        .iter()
+        .zip(bufs.iter())
+        .zip(lens.iter_mut())
+        .take(read)
+    {
         let size = header.msg_datalen.min(buf.len());
         *len = RecordLen {
             len: size,
@@ -830,7 +842,10 @@ mod tests {
     }
 
     /// A non-blocking datagram pair: one packet per record, like a utun control socket.
-    fn record_pair() -> (std::os::unix::net::UnixDatagram, std::os::unix::net::UnixDatagram) {
+    fn record_pair() -> (
+        std::os::unix::net::UnixDatagram,
+        std::os::unix::net::UnixDatagram,
+    ) {
         let (reader, writer) = std::os::unix::net::UnixDatagram::pair().expect("datagram pair");
         reader.set_nonblocking(true).expect("non-blocking reader");
         (reader, writer)
@@ -851,7 +866,11 @@ mod tests {
         assert_eq!(count, 5, "every queued record comes back from one call");
         for (index, (buf, len)) in bufs.iter().zip(lens).take(count).enumerate() {
             assert!(!len.truncated);
-            assert_eq!(packet_number(&buf[..len.len]), index, "device order is kept");
+            assert_eq!(
+                packet_number(&buf[..len.len]),
+                index,
+                "device order is kept"
+            );
         }
         let empty = read_records(reader.as_fd(), &mut bufs, &mut lens).expect_err("drained");
         assert_eq!(empty.kind(), io::ErrorKind::WouldBlock);
@@ -868,8 +887,14 @@ mod tests {
         let mut storage = vec![[0u8; 64]; 4];
         let mut bufs: Vec<&mut [u8]> = storage.iter_mut().map(|b| &mut b[..]).collect();
         let mut lens = [RecordLen::default(); 4];
-        assert_eq!(read_records(reader.as_fd(), &mut bufs, &mut lens).expect("first"), 4);
-        assert_eq!(read_records(reader.as_fd(), &mut bufs, &mut lens).expect("rest"), 2);
+        assert_eq!(
+            read_records(reader.as_fd(), &mut bufs, &mut lens).expect("first"),
+            4
+        );
+        assert_eq!(
+            read_records(reader.as_fd(), &mut bufs, &mut lens).expect("rest"),
+            2
+        );
         assert_eq!(packet_number(&bufs[1][..lens[1].len]), 5);
     }
 
@@ -882,7 +907,10 @@ mod tests {
         let mut storage = [0u8; 16];
         let mut bufs: Vec<&mut [u8]> = vec![&mut storage[..]];
         let mut lens = [RecordLen::default(); 1];
-        assert_eq!(read_records(reader.as_fd(), &mut bufs, &mut lens).expect("read"), 1);
+        assert_eq!(
+            read_records(reader.as_fd(), &mut bufs, &mut lens).expect("read"),
+            1
+        );
         assert!(lens[0].truncated, "the cut is visible to the caller");
         assert_eq!(lens[0].len, 16);
     }
