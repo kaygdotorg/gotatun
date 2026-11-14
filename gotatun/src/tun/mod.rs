@@ -23,6 +23,10 @@ use std::io;
 pub(crate) mod buffer;
 pub mod channel;
 
+/// Socket options for macOS utun control sockets (#260).
+#[cfg(target_os = "macos")]
+pub mod macos_utun;
+
 #[cfg(feature = "pcap")]
 pub mod pcap;
 
