@@ -1001,6 +1001,27 @@ async fn requested_keepalive_announces_a_new_source_address() {
     );
 }
 
+/// A requested keepalive never opens a session with an idle peer (infraternal #483, J633 P1).
+///
+/// The owner asks for keepalives whenever the local underlay changes. In a 1,000-peer mesh most
+/// peers have no session (idle past `REJECT_AFTER_TIME * 3`, or offline), and they learn our new
+/// endpoint from the coordinator. A handshake per sessionless peer per change, retried every 5 s
+/// for 90 s against offline peers, is a flood with nothing to move. Only a live session has a
+/// flow whose return path needs the new endpoint now.
+#[tokio::test]
+#[test_log::test]
+async fn requested_keepalive_does_not_handshake_a_sessionless_peer() {
+    let (alice, bob, _eve) = mock::device_pair().await;
+    assert_eq!(alice.device.request_keepalives().await, 1);
+    // sleep: a timer wake plus one in-memory handshake round trip finishes well inside this.
+    sleep(Duration::from_millis(500)).await;
+    let peers = bob.device.peers().await;
+    assert!(
+        peers[0].stats.last_handshake.is_none(),
+        "a requested keepalive opened a session with an idle peer"
+    );
+}
+
 /// Adding peers is atomic, including when a public key is duplicated within the batch.
 #[tokio::test]
 #[test_log::test]
