@@ -35,7 +35,15 @@ use crate::{
 ///
 /// Each GRO slot reserves 256 KiB, so matching the 64-segment UDP GSO limit bounds the receive
 /// reserve to 16 MiB instead of reserving 25 MiB for 100 messages.
+#[cfg(target_os = "linux")]
 const MAX_PACKET_COUNT: usize = UDP_SEGMENT_MAX_DATAGRAMS;
+
+/// Max number of packets/messages for sendmmsg on Android.
+///
+/// This file also builds for Android, which has neither the GSO segment limit nor the GRO
+/// receive reserve that the Linux cap is sized for, so it keeps the previous batch size.
+#[cfg(target_os = "android")]
+const MAX_PACKET_COUNT: usize = 100;
 
 /// Maximum UDP payload length for one IPv4 datagram, accounting for IPv4 and UDP headers.
 #[cfg(target_os = "linux")]
