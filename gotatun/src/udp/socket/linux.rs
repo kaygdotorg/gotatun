@@ -1007,7 +1007,7 @@ mod gro {
                     let results = nix::sys::socket::recvmmsg(
                         fd,
                         headers,
-                        &mut io_slices[..MAX_PACKET_COUNT],
+                        &mut io_slices[..crate::diag::udp_recv_msgs().unwrap_or(MAX_PACKET_COUNT).min(MAX_PACKET_COUNT)],
                         MsgFlags::MSG_DONTWAIT,
                         None,
                     )?;

@@ -89,6 +89,18 @@ pub(crate) fn tun_read_queue() -> Option<usize> {
     })
 }
 
+/// Messages per Linux `recvmmsg` for a receive-batch sweep (#260, J657).
+///
+/// Read once from `GOTATUN_DIAG_UDP_RECV_MSGS`; a positive count below the platform cap
+/// replaces it. Each message can carry up to 64 GRO segments. Never set it in production.
+pub(crate) fn udp_recv_msgs() -> Option<usize> {
+    static MSGS: OnceLock<Option<usize>> = OnceLock::new();
+    *MSGS.get_or_init(|| {
+        let value = std::env::var("GOTATUN_DIAG_UDP_RECV_MSGS").ok()?;
+        value.parse::<usize>().ok().filter(|n| *n > 0)
+    })
+}
+
 /// Sample queue occupancy and batch sizes along the packet path (#260, J639).
 ///
 /// When `GOTATUN_DIAG_QUEUE_DEPTH` is set, each stage records one value per batch into a

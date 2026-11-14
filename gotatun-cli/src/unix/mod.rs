@@ -216,8 +216,8 @@ async fn setup_device(args: Args) -> eyre::Result<Device<DefaultDeviceTransports
         .with_default_udp()
         // Use 7MB socket buffers. Empirically this seems to be more perfomant than the default OS
         // socket buffer sizes.
-        .udp_recv_buffer_size(7 * 1024 * 1024)
-        .udp_send_buffer_size(7 * 1024 * 1024)
+        .udp_recv_buffer_size(diag_buffer_bytes("GOTATUN_DIAG_UDP_RCVBUF"))
+        .udp_send_buffer_size(diag_buffer_bytes("GOTATUN_DIAG_UDP_SNDBUF"))
         .with_ip(tun)
         .build()
         .await
@@ -273,4 +273,14 @@ mod test {
         assert!(check_tun_name("utun-1").is_err());
         assert!(check_tun_name("utun123abc").is_err());
     }
+}
+
+/// UDP socket buffer size in bytes: 7 MiB, or the diagnostic override in `var` for a
+/// buffer-size sweep (#260, J657). Never set the override in production.
+fn diag_buffer_bytes(var: &str) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(7 * 1024 * 1024)
 }
