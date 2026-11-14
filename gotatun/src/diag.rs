@@ -77,6 +77,18 @@ pub(crate) fn rekey_after() -> Option<std::time::Duration> {
     })
 }
 
+/// Capacity of the TUN-read channel for a queue-size sweep (#260, J639).
+///
+/// Read once from `GOTATUN_DIAG_TUN_READ_QUEUE`; a positive packet count replaces the platform's
+/// TUN-read channel capacity. Never set it in production.
+pub(crate) fn tun_read_queue() -> Option<usize> {
+    static QUEUE: OnceLock<Option<usize>> = OnceLock::new();
+    *QUEUE.get_or_init(|| {
+        let value = std::env::var("GOTATUN_DIAG_TUN_READ_QUEUE").ok()?;
+        value.parse::<usize>().ok().filter(|n| *n > 0)
+    })
+}
+
 /// Sample queue occupancy and batch sizes along the packet path (#260, J639).
 ///
 /// When `GOTATUN_DIAG_QUEUE_DEPTH` is set, each stage records one value per batch into a

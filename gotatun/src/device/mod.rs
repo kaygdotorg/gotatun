@@ -1151,6 +1151,7 @@ impl<T: DeviceTransports> Connection<T> {
 
         let (buffered_ip_tx, buffered_ip_rx) = crate::tun::buffer::channel(
             PIPELINE_BUFS,
+            crate::diag::tun_read_queue().unwrap_or(PIPELINE_BUFS),
             pool.clone(),
             Arc::clone(&device.tun_tx),
             Arc::clone(&device.tun_rx),

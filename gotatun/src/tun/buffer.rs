@@ -34,7 +34,8 @@ use tokio_util::sync::CancellationToken;
 /// Identifies buffered TUN runs only when GOTATUN_DIAG_SEND_QUEUE is enabled.
 static NEXT_DIAGNOSTIC_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Create a pair of [`BufferedIpSend`] and [`BufferedIpRecv`] with `capacity`.
+/// Create a pair of [`BufferedIpSend`] holding up to `send_capacity` packets and
+/// [`BufferedIpRecv`] holding up to `recv_capacity` packets.
 ///
 /// This takes an `Arc<Mutex<S>>` and `Arc<Mutex<R>>` because the inner `S` and `R` will be re-used
 /// after [BufferedIpSend] or [BufferedIpRecv] is dropped. We will take the mutex lock when this
@@ -43,14 +44,15 @@ static NEXT_DIAGNOSTIC_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// # Panics
 /// Panics if one of the locks is already taken.
 pub async fn channel<S: IpSend, R: IpRecv>(
-    capacity: usize,
+    send_capacity: usize,
+    recv_capacity: usize,
     pool: PacketBufPool,
     send: Arc<Mutex<S>>,
     recv: Arc<Mutex<R>>,
 ) -> (BufferedIpSend, BufferedIpRecv<R>) {
     let token = CancellationToken::new();
-    let buffer_send = BufferedIpSend::new(capacity, send, token.clone());
-    let buffer_recv = BufferedIpRecv::new(capacity, pool, recv, token).await;
+    let buffer_send = BufferedIpSend::new(send_capacity, send, token.clone());
+    let buffer_recv = BufferedIpRecv::new(recv_capacity, pool, recv, token).await;
     (buffer_send, buffer_recv)
 }
 
