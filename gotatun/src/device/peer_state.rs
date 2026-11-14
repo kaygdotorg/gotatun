@@ -204,9 +204,10 @@ impl PeerState {
         Ok(())
     }
 
-    /// Ask the next timer pass to send this peer one keepalive; see [`Tunn::request_keepalive`].
-    pub fn request_keepalive(&mut self) {
-        self.tunnel.request_keepalive();
+    /// Ask the next timer pass to send this peer one keepalive if it has a current session;
+    /// see [`Tunn::request_keepalive`]. Returns whether the request was taken.
+    pub fn request_keepalive(&mut self) -> bool {
+        self.tunnel.request_keepalive()
     }
 
     pub fn update_timers(&mut self) -> Result<Option<WgKind>, WireGuardError> {
