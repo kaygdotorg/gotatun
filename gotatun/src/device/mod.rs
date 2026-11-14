@@ -124,9 +124,10 @@ const PIPELINE_BUFS: usize = MAX_PACKET_BUFS;
 /// Only platforms without batched socket reads use that queue; Linux hands its batches straight
 /// to the packet task, so this constant does not exist there.
 ///
-/// **macOS: 128, not the 512 of the TUN channels (#260, J566).** The packet task takes one
-/// datagram at a time, so when a fast peer sends to us this queue fills to its cap and every
-/// datagram, a small reply or a handshake included, waits behind it. Per-stage timing on the Mac
+/// **macOS: 128, not the 512 of the TUN channels (#260, J566).** When a fast peer sends to us
+/// this queue fills to its cap and every datagram, a small reply or a handshake included, waits
+/// behind it. (J566 measured this while the packet task still took one datagram per turn; it now
+/// takes every queued datagram, up to 64, per turn, see `BufferedUdpReceive`.) Per-stage timing on the Mac
 /// bench found it full at p50 in both Mac-receive cells at 512, holding 7-9 ms (p50) and
 /// 11-13 ms (p99), while every other stage stayed under 1 ms. At 128 the wait fell to about
 /// 2.4 ms (p99), loaded p99 fell from 18/28 ms to 11/14 ms (1/8 flows) and goodput rose; at 64
