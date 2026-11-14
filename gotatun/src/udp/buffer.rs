@@ -387,13 +387,15 @@ impl UdpRecv for BufferedUdpReceive {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+// The scripted tests run on every target: macOS is where BufferedUdpReceive carries real
+// traffic (Linux reads its socket batches directly), so its behaviour must be checked there
+// too (#260, J687). Only the loopback-socket test stays Linux-only.
+#[cfg(test)]
 mod test {
     use super::*;
-    use crate::udp::{
-        UdpSend,
-        socket::{SockOpt, UdpSocket},
-    };
+    use crate::udp::UdpSend;
+    #[cfg(target_os = "linux")]
+    use crate::udp::socket::{SockOpt, UdpSocket};
     use std::time::Duration;
     use tokio::sync::mpsc;
     use zerocopy::IntoBytes;
@@ -581,6 +583,7 @@ mod test {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     /// Regression test for security advisory GHSA-6gxq-8xp9-742r.
     async fn empty_loopback_datagram_mustnt_stop_buffered_udp_receive() {
