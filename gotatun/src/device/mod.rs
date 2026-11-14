@@ -247,6 +247,22 @@ type PendingOutgoing = FuturesUnordered<BoxFuture<'static, ()>>;
 /// Futures that finish one incoming worker result and release it toward the TUN in order.
 type PendingIncoming = FuturesUnordered<BoxFuture<'static, Result<(), Error>>>;
 
+/// Give the runtime back after one bounded crypto run is handed off, so delivery stays smooth.
+///
+/// The UDP receive task and the TUN read task each turn one large batch (a recvmmsg/GRO read can
+/// hold over a thousand datagrams under load) into a series of 64-packet runs. Without a pause,
+/// one task can keep its Tokio worker for the whole batch, because most of its awaits complete
+/// at once. Meanwhile the opposite direction's task, the TUN writer and the UDP sender wait, and
+/// so do the TCP ACKs they carry. The ACKs then reach the sending host in clumps. BBR reads
+/// clumped ACKs as ACK aggregation and raises its cwnd (#260, J657: about 16x the path's 2 x BDP
+/// at 8 flows), and the extra in-flight data queues inside the tunnel.
+///
+/// Yielding once per run bounds that wait to one run's work. It costs one scheduler round trip
+/// per 64 packets.
+async fn yield_between_runs() {
+    tokio::task::yield_now().await;
+}
+
 /// Drain prior data completions before a control packet mutates the same peer tunnel state.
 async fn drain_incoming_before_control(
     lane: Option<Arc<OrderedCompletions<IncomingCompletion>>>,
@@ -2544,6 +2560,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                             .expect("the receive run reached its bound"),
                                     )
                                     .await?;
+                                    yield_between_runs().await;
                                 }
                             }
                         }
@@ -3014,6 +3031,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                 )
                                 .await?;
                             }
+                            yield_between_runs().await;
                         }
                     }
                 }
