@@ -101,6 +101,52 @@ pub(crate) fn udp_recv_msgs() -> Option<usize> {
     })
 }
 
+/// Trace ICMP echo probes through each pipeline stage (#260, J657).
+///
+/// When `GOTATUN_DIAG_PROBE_TRACE` is set, every IPv4 ICMP echo request or reply that passes a
+/// stage prints `probe STAGE TYPE ID SEQ REALTIME_NS` to stderr, and every encrypted datagram
+/// shorter than 200 bytes prints `wire STAGE LEN REALTIME_NS` (the probe's ciphertext, which is
+/// not readable). Both ends of the bench share one clock, so a probe's lines from the two
+/// processes join on (ID, SEQ) into a per-stage one-way breakdown. Never set it in production.
+pub(crate) static PROBE_TRACE: Switch = Switch::new("GOTATUN_DIAG_PROBE_TRACE");
+
+fn realtime_ns() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// Mark an inner IP packet at `stage` if it is an IPv4 ICMP echo request or reply.
+#[inline]
+pub(crate) fn probe_ip<P: zerocopy::IntoBytes + zerocopy::Immutable + ?Sized>(stage: &str, ip: &P) {
+    if !PROBE_TRACE.on() {
+        return;
+    }
+    let ip = ip.as_bytes();
+    if ip.len() < 28 || ip[0] >> 4 != 4 || ip[9] != 1 {
+        return;
+    }
+    let ihl = usize::from(ip[0] & 0x0f) * 4;
+    let Some(icmp) = ip.get(ihl..ihl + 8) else {
+        return;
+    };
+    if icmp[0] != 8 && icmp[0] != 0 {
+        return;
+    }
+    let id = u16::from_be_bytes([icmp[4], icmp[5]]);
+    let seq = u16::from_be_bytes([icmp[6], icmp[7]]);
+    eprintln!("probe {stage} {} {id} {seq} {}", icmp[0], realtime_ns());
+}
+
+/// Mark an encrypted datagram at `stage` if it is short enough to be a probe.
+#[inline]
+pub(crate) fn probe_wire(stage: &str, len: usize) {
+    if PROBE_TRACE.on() && len < 200 {
+        eprintln!("wire {stage} {len} {}", realtime_ns());
+    }
+}
+
 /// Sample queue occupancy and batch sizes along the packet path (#260, J639).
 ///
 /// When `GOTATUN_DIAG_QUEUE_DEPTH` is set, each stage records one value per batch into a

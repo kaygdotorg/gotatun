@@ -65,6 +65,11 @@ async fn flush_udp_packets<U: UdpSend>(
 ) {
     let diagnostic = crate::diag::PIPELINE.on();
     let packet_count = packets.len();
+    if crate::diag::PROBE_TRACE.on() {
+        for (packet, _) in packets.iter() {
+            crate::diag::probe_wire("udp_send", packet.len());
+        }
+    }
     if packet_count > 0 {
         crate::diag::UDP_SEND_RUN.record(packet_count);
     }

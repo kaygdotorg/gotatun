@@ -896,12 +896,14 @@ mod gro {
             }
 
             for segment in received.chunks(gro_size) {
+                crate::diag::probe_wire("udp_recv", segment.len());
                 let mut packet = pool.get();
                 packet.buf_mut().clear();
                 packet.buf_mut().extend_from_slice(segment);
                 packets.push((packet, source_addr));
             }
         } else {
+            crate::diag::probe_wire("udp_recv", received.len());
             let mut packet = pool.get();
             packet.buf_mut().clear();
             packet.buf_mut().extend_from_slice(received);

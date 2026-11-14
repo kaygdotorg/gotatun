@@ -101,6 +101,7 @@ impl BufferedIpSend {
                 let diagnostic = crate::diag::PIPELINE.on();
                 let (result, refused_packets) = match message {
                     BufferedIpMessage::Single(packet, _permit) => {
+                        crate::diag::probe_ip("tun_deq", &*packet);
                         if diagnostic {
                             eprintln!("pipeline stage=tun_buffer_dequeue mode=single packets=1");
                         }
@@ -118,7 +119,20 @@ impl BufferedIpSend {
                                 "pipeline stage=tun_buffer_dequeue mode=batch packets={batch_len}"
                             );
                         }
+                        let mut probes = Vec::new();
+                        if crate::diag::PROBE_TRACE.on() {
+                            for packet in packets.iter() {
+                                crate::diag::probe_ip("tun_deq", &**packet);
+                                let bytes = zerocopy::IntoBytes::as_bytes(&**packet);
+                                if bytes.len() >= 28 && bytes[9] == 1 {
+                                    probes.push(bytes[..28].to_vec());
+                                }
+                            }
+                        }
                         let result = inner.send_many(&mut packets).await;
+                        for probe in &probes {
+                            crate::diag::probe_ip("tun_written", probe.as_slice());
+                        }
                         if let Some(sequence) = sequence {
                             eprintln!(
                                 "send_many complete direction=tun sequence={sequence} packets={batch_len} success={}",
@@ -242,6 +256,11 @@ impl IpSend for BufferedIpSend {
             } else {
                 packets.drain(..count).collect()
             };
+            if crate::diag::PROBE_TRACE.on() {
+                for packet in batch.iter() {
+                    crate::diag::probe_ip("tun_enq", &**packet);
+                }
+            }
             if let Err(error) = self
                 .tx
                 .send(BufferedIpMessage::Batch(batch, permit, sequence))
@@ -318,6 +337,7 @@ impl<I: IpRecv> BufferedIpRecv<I> {
                     Ok(packets) => {
                         let mut read = 0;
                         for packet in packets {
+                            crate::diag::probe_ip("tun_read", &*packet);
                             if tx.send(packet).await.is_err() {
                                 return;
                             }
@@ -372,6 +392,11 @@ impl<I: IpRecv> IpRecv for BufferedIpRecv<I> {
                 io::ErrorKind::UnexpectedEof,
                 "channel closed",
             ));
+        }
+        if crate::diag::PROBE_TRACE.on() {
+            for packet in &self.rx_packet_buf[..n] {
+                crate::diag::probe_ip("out_take", &**packet);
+            }
         }
         Ok(self.rx_packet_buf.drain(..n))
     }
