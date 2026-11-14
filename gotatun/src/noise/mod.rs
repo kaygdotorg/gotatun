@@ -938,6 +938,46 @@ mod tests {
         ));
     }
 
+    /// A requested keepalive needs a current session; without one it sends nothing at all
+    /// (infraternal #483, J633 P1). A handshake per idle peer per local address change would
+    /// flood a 1,000-peer mesh.
+    #[test]
+    fn requested_keepalive_without_a_session_sends_nothing() {
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        my_tun.request_keepalive();
+        assert!(matches!(my_tun.update_timers(), Ok(None)));
+    }
+
+    /// A request latched behind an in-flight rekey dies with that handshake (infraternal #483,
+    /// J633 P1). Otherwise it fires on whatever session comes next, long after the address change
+    /// it announced.
+    #[test]
+    #[cfg(feature = "mock_instant")]
+    fn requested_keepalive_does_not_outlive_an_expired_handshake() {
+        MockClock::set_time(Duration::ZERO);
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        // A rekey is in flight, so the request waits for it to finish.
+        let _rekey = create_handshake_init(&mut my_tun);
+        my_tun.request_keepalive();
+        let mut expired = false;
+        for _ in 0..200 {
+            MockClock::advance(Duration::from_secs(1));
+            if matches!(
+                my_tun.update_timers(),
+                Err(WireGuardError::ConnectionExpired)
+            ) {
+                expired = true;
+                break;
+            }
+        }
+        assert!(expired, "the unanswered rekey should expire the connection");
+        complete_handshake(&mut my_tun, &mut their_tun);
+        assert!(
+            matches!(my_tun.update_timers(), Ok(None)),
+            "a keepalive requested before the expiry fired on the next session"
+        );
+    }
+
     #[test]
     // Verify that a valid hanshake is accepted by two linked peers when rate limiting is not
     // applied.
