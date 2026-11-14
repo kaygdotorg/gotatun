@@ -358,25 +358,47 @@ impl Session {
         packet: Packet,
         sending_key_counter: u64,
     ) -> Packet<WgData> {
+        let mut packet = packet;
         let len = WgData::OVERHEAD + packet.len();
 
-        // Prepare a buffer to hold our the WgData packet and our encapsulated payload.
-        // TODO: we can remove this allocation by pre-allocating some extra
-        // space at the beginning of `packet`s allocation, and using that.
-        let mut buf = Packet::from_bytes(BytesMut::zeroed(len));
+        let buf = match packet.take_head_room() {
+            // In place: the TSO splitter left header room in front of this segment and room
+            // for the tag behind it, in the same allocation. Joining them costs no allocation
+            // and no copy; only the 16 tag bytes are written here. This used to be the biggest
+            // avoidable cost on the sending side (#260: allocator, memset and copy were about
+            // 12% of the sending daemon's cycles at 8 TCP flows).
+            Some(mut head_room) if head_room.len() == WgDataHeader::LEN => {
+                // O(1) when the two are still adjacent; otherwise `unsplit` copies.
+                head_room.unsplit(std::mem::take(packet.buf_mut()));
+                // Within the spare capacity the splitter reserved, so this does not reallocate.
+                head_room.resize(len, 0);
+                let mut buf = Packet::from_bytes(head_room);
+                let data = WgData::mut_from_bytes(buf.buf_mut())
+                    .expect("buffer size is at least WgData::OVERHEAD");
+                data.header = WgDataHeader::new()
+                    .with_receiver_idx(self.sending_index)
+                    .with_counter(sending_key_counter);
+                buf
+            }
+            // Any other packet: build the data message in a new buffer and copy the payload in.
+            _ => {
+                let mut buf = Packet::from_bytes(BytesMut::zeroed(len));
 
-        let data = WgData::mut_from_bytes(buf.buf_mut())
-            .expect("buffer size is at least WgData::OVERHEAD");
+                let data = WgData::mut_from_bytes(buf.buf_mut())
+                    .expect("buffer size is at least WgData::OVERHEAD");
 
-        // Initialize wireguard header.
-        data.header = WgDataHeader::new()
-            .with_receiver_idx(self.sending_index)
-            .with_counter(sending_key_counter);
+                // Initialize wireguard header.
+                data.header = WgDataHeader::new()
+                    .with_receiver_idx(self.sending_index)
+                    .with_counter(sending_key_counter);
 
-        // Copy inner packet into place.
-        debug_assert_eq!(packet.len(), data.encrypted_encapsulated_packet_mut().len());
-        data.encrypted_encapsulated_packet_mut()
-            .copy_from_slice(&packet);
+                // Copy inner packet into place.
+                debug_assert_eq!(packet.len(), data.encrypted_encapsulated_packet_mut().len());
+                data.encrypted_encapsulated_packet_mut()
+                    .copy_from_slice(&packet);
+                buf
+            }
+        };
 
         // Keep the reserved counter in the header until a worker applies AEAD.
         let packet = buf.try_into_wg().expect("is a wireguard packet");
@@ -484,6 +506,61 @@ mod tests {
     fn test_session() -> Session {
         let table: IndexTable = IndexTable::from_os_rng();
         Session::new(table.new_index(), 0, [0u8; 32], [0u8; 32])
+    }
+
+    /// Build `payload` the way the TSO splitter does: header room split off directly in front,
+    /// and 32 spare bytes of capacity behind it.
+    fn packet_with_room(payload: &[u8]) -> (Packet, *const u8) {
+        let mut arena = BytesMut::with_capacity(WgDataHeader::LEN + payload.len() + 32);
+        arena.extend_from_slice(&[0; WgDataHeader::LEN]);
+        let head_room = arena.split();
+        arena.extend_from_slice(payload);
+        arena.extend_from_slice(&[0; 32]);
+        let mut segment = arena.split();
+        segment.truncate(payload.len());
+        let start = head_room.as_ptr();
+        (Packet::from_bytes_with_head_room(head_room, segment), start)
+    }
+
+    /// A packet that carries head room is sealed where it already is, and the result is byte for
+    /// byte what the copying path produces for the same key and counter (#260, J677).
+    #[test]
+    fn a_packet_with_head_room_is_sealed_in_place_with_identical_bytes() {
+        for len in [0usize, 1, 15, 16, 1379, 1420] {
+            let payload: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+
+            let (with_room, start) = packet_with_room(&payload);
+            let in_place = test_session()
+                .format_packet_data(with_room)
+                .unwrap_or_else(|_| panic!("counter available"));
+            let copied = test_session()
+                .format_packet_data(Packet::copy_from(payload.as_slice()))
+                .unwrap_or_else(|_| panic!("counter available"));
+
+            assert_eq!(in_place.as_bytes(), copied.as_bytes(), "len {len}");
+            assert_eq!(in_place.as_bytes().len(), WgData::OVERHEAD + len);
+            assert_eq!(
+                in_place.as_bytes().as_ptr(),
+                start,
+                "len {len}: sealed in place"
+            );
+        }
+    }
+
+    /// Head room that is no longer adjacent (the payload was moved) still gives a correct
+    /// message: `unsplit` falls back to copying.
+    #[test]
+    fn head_room_that_is_not_adjacent_still_seals_correctly() {
+        let payload: Vec<u8> = (0..100u8).collect();
+        let head_room = BytesMut::zeroed(WgDataHeader::LEN);
+        let detached = Packet::from_bytes_with_head_room(head_room, BytesMut::from(&payload[..]));
+        let sealed = test_session()
+            .format_packet_data(detached)
+            .unwrap_or_else(|_| panic!("counter available"));
+        let copied = test_session()
+            .format_packet_data(Packet::copy_from(payload.as_slice()))
+            .unwrap_or_else(|_| panic!("counter available"));
+        assert_eq!(sealed.as_bytes(), copied.as_bytes());
     }
 
     /// Craft a (cryptographically invalid) `WgData` packet with a chosen receiver index and
