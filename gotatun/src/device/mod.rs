@@ -2544,6 +2544,18 @@ impl<T: DeviceTransports> DeviceState<T> {
                                             .expect("the receive run reached its bound"),
                                     )
                                     .await?;
+                                    // J691 bench (#260): hand finished runs to the TUN writer
+                                    // before dispatching the rest of this receive batch.
+                                    if crate::diag::EAGER.on() {
+                                        while let Some(Some(result)) =
+                                            incoming_pending.next().now_or_never()
+                                        {
+                                            result?;
+                                        }
+                                    }
+                                    if crate::diag::YIELD.on() {
+                                        tokio::task::yield_now().await;
+                                    }
                                 }
                             }
                         }

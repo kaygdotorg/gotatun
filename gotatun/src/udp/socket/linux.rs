@@ -992,8 +992,11 @@ mod gro {
                     // Use a generic sockaddr storage here because this path serves both the IPv4
                     // and IPv6 UDP sockets. Using `SockaddrIn` corrupts IPv6 source addresses and
                     // can poison the peer runtime endpoint with an unspecified IPv4 address.
+                    // J691 bench knob (#260): fewer messages per call bounds one receive cycle.
+                    let messages = crate::diag::rx_msgs()
+                        .map_or(MAX_PACKET_COUNT, |m| m.min(MAX_PACKET_COUNT));
                     let headers = &mut MultiHeaders::<SockaddrStorage>::preallocate(
-                        MAX_PACKET_COUNT,
+                        messages,
                         Some(cmsg_space!(i32)),
                     );
 
@@ -1007,7 +1010,7 @@ mod gro {
                     let results = nix::sys::socket::recvmmsg(
                         fd,
                         headers,
-                        &mut io_slices[..MAX_PACKET_COUNT],
+                        &mut io_slices[..messages],
                         MsgFlags::MSG_DONTWAIT,
                         None,
                     )?;

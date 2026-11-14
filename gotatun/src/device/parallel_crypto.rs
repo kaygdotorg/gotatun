@@ -92,6 +92,19 @@ pub(crate) const fn should_force_worker(packet_count: usize, peer_backlog_packet
     packet_count >= MIN_PARALLEL_RUN_SIZE && peer_backlog_packets >= PARALLEL_DISPATCH_HIGH_WATER
 }
 
+/// The per-peer in-flight slot bound for lanes carrying `T`.
+///
+/// [`MAX_PEER_CRYPTO_IN_FLIGHT`] unless a J691 bench knob (`GOTATUN_J691_RX_INFLIGHT` for
+/// receive lanes, `GOTATUN_J691_TX_INFLIGHT` for send lanes) overrides it (#260).
+fn in_flight_cap<T>() -> usize {
+    let knob = if std::any::type_name::<T>().ends_with("IncomingCompletion") {
+        crate::diag::rx_in_flight()
+    } else {
+        crate::diag::tx_in_flight()
+    };
+    knob.unwrap_or(MAX_PEER_CRYPTO_IN_FLIGHT)
+}
+
 /// A decrypted packet and the session metadata applied at its ordered release point.
 pub(crate) struct IncomingCompletion {
     /// The verified AEAD result whose replay update waits for ordered release.
@@ -151,6 +164,9 @@ impl AdaptiveDispatch {
 pub(crate) struct OrderedCompletions<T> {
     /// Distinguishes this lane generation when allocator addresses are later reused.
     lane_id: u64,
+    /// Outstanding slot bound for this lane ([`MAX_PEER_CRYPTO_IN_FLIGHT`] unless a J691 bench
+    /// knob overrides it for this direction).
+    cap: usize,
     state: Mutex<CompletionState>,
     delivery: AsyncMutex<()>,
     progress: Notify,
@@ -162,6 +178,7 @@ impl<T> Default for OrderedCompletions<T> {
     fn default() -> Self {
         Self {
             lane_id: NEXT_ORDERED_LANE_ID.fetch_add(1, Ordering::Relaxed),
+            cap: in_flight_cap::<T>(),
             state: Mutex::new(CompletionState {
                 next_slot: 0,
                 next_release: 0,
@@ -187,11 +204,11 @@ impl<T> OrderedCompletions<T> {
 
     /// Reserve `count` consecutive slots with one peer-lane lock acquisition.
     pub(crate) fn reserve_run(&self, count: usize) -> Option<u64> {
-        if count == 0 || count > MAX_PEER_CRYPTO_IN_FLIGHT {
+        if count == 0 || count > self.cap {
             return None;
         }
         let mut state = self.state.lock();
-        if count > MAX_PEER_CRYPTO_IN_FLIGHT - state.in_flight {
+        if count > self.cap - state.in_flight {
             return None;
         }
 
@@ -452,7 +469,7 @@ impl<T> OrderedCompletions<T> {
 
     /// Remaining sequence slots before this peer reaches its in-flight bound.
     pub(crate) fn available(&self) -> usize {
-        MAX_PEER_CRYPTO_IN_FLIGHT - self.state.lock().in_flight
+        self.cap - self.state.lock().in_flight
     }
 
     /// Wait until an ordered completion releases at least one slot in this peer's window.
@@ -572,7 +589,7 @@ impl<T> OrderStore<T> {
         self.lanes
             .lock()
             .get(&peer)
-            .map_or(MAX_PEER_CRYPTO_IN_FLIGHT, |lane| lane.available())
+            .map_or(in_flight_cap::<T>(), |lane| lane.available())
     }
 
     /// Mark a handshake-queue drain for this peer, unless one is already marked.

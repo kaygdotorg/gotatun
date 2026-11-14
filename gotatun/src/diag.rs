@@ -76,3 +76,44 @@ pub(crate) fn rekey_after() -> Option<std::time::Duration> {
         }
     })
 }
+
+/// A numeric bench knob read once from the environment (#260, J691).
+///
+/// Returns `None` when the variable is unset or not a positive integer. Bench builds use these
+/// to try several delivery shapes with one binary; production code never depends on them.
+pub(crate) fn knob(name: &'static str, cell: &'static OnceLock<Option<usize>>) -> Option<usize> {
+    *cell.get_or_init(|| {
+        let value = std::env::var(name).ok()?;
+        let parsed = value.parse::<usize>().ok().filter(|&n| n > 0);
+        if parsed.is_none() {
+            tracing::warn!("ignoring invalid {name}={value:?}");
+        } else {
+            eprintln!("diagnostic: {name}={value}");
+        }
+        parsed
+    })
+}
+
+/// Per-peer in-flight slot cap for the receive direction (`GOTATUN_J691_RX_INFLIGHT`).
+pub(crate) fn rx_in_flight() -> Option<usize> {
+    static CELL: OnceLock<Option<usize>> = OnceLock::new();
+    knob("GOTATUN_J691_RX_INFLIGHT", &CELL)
+}
+
+/// Per-peer in-flight slot cap for the send direction (`GOTATUN_J691_TX_INFLIGHT`).
+pub(crate) fn tx_in_flight() -> Option<usize> {
+    static CELL: OnceLock<Option<usize>> = OnceLock::new();
+    knob("GOTATUN_J691_TX_INFLIGHT", &CELL)
+}
+
+/// Maximum recvmmsg messages per receive call (`GOTATUN_J691_RX_MSGS`).
+pub(crate) fn rx_msgs() -> Option<usize> {
+    static CELL: OnceLock<Option<usize>> = OnceLock::new();
+    knob("GOTATUN_J691_RX_MSGS", &CELL)
+}
+
+/// Deliver ready receive runs between flushes of one receive batch (`GOTATUN_J691_EAGER`).
+pub(crate) static EAGER: Switch = Switch::new("GOTATUN_J691_EAGER");
+
+/// Yield the receive task after each flushed run (`GOTATUN_J691_YIELD`).
+pub(crate) static YIELD: Switch = Switch::new("GOTATUN_J691_YIELD");
