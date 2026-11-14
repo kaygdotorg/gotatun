@@ -1166,13 +1166,17 @@ impl<T: DeviceTransports> Connection<T> {
 
         let (buffered_ip_tx, buffered_ip_rx) = crate::tun::buffer::channel(
             PIPELINE_BUFS,
+            crate::diag::capacity("GOTATUN_BENCH_OUT_BUFS", PIPELINE_BUFS),
             pool.clone(),
             Arc::clone(&device.tun_tx),
             Arc::clone(&device.tun_rx),
         )
         .await;
 
-        let buffered_udp_tx = BufferedUdpSend::new(MAX_PACKET_BUFS, udp_tx.clone());
+        let buffered_udp_tx = BufferedUdpSend::new(
+            crate::diag::capacity("GOTATUN_BENCH_UDP_TX_BUFS", MAX_PACKET_BUFS),
+            udp_tx.clone(),
+        );
 
         // Linux sockets already return recvmmsg/GRO batches here. Avoid queueing them across a
         // second worker handoff before packet processing.
@@ -1180,6 +1184,14 @@ impl<T: DeviceTransports> Connection<T> {
         let incoming_udp_rx = udp_rx;
         #[cfg(not(target_os = "linux"))]
         let incoming_udp_rx = BufferedUdpReceive::new(UDP_RECV_BUFS, udp_rx, pool.clone());
+
+        crate::diag::spawn_queue_sampler(vec![
+            ("out_tun", buffered_ip_rx.depth_probe()),
+            ("udp_tx", buffered_udp_tx.depth_probe()),
+            #[cfg(not(target_os = "linux"))]
+            ("udp_rx", incoming_udp_rx.depth_probe()),
+            ("in_tun", buffered_ip_tx.depth_probe()),
+        ]);
 
         // Start DAITA/hooks tasks
         #[cfg(feature = "daita")]

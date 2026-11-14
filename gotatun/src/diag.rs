@@ -76,3 +76,86 @@ pub(crate) fn rekey_after() -> Option<std::time::Duration> {
         }
     })
 }
+
+/// Bench override of one packet-queue capacity, read once from the environment (#260, J687).
+///
+/// Returns `default` unless the variable `name` holds a positive integer. Used only to sweep the
+/// macOS pipeline capacities without rebuilding; never set it in production.
+pub(crate) fn capacity(name: &'static str, default: usize) -> usize {
+    match std::env::var(name).ok().map(|value| value.parse::<usize>()) {
+        Some(Ok(value)) if value > 0 => {
+            eprintln!("diag capacity {name}={value} (default {default})");
+            value
+        }
+        _ => default,
+    }
+}
+
+/// How full one packet queue is right now, or `None` once the queue is gone.
+pub(crate) type DepthProbe = Box<dyn Fn() -> Option<usize> + Send>;
+
+/// Start the queue-depth sampler when `GOTATUN_DIAG_QUEUES` is set (#260, J687).
+///
+/// The variable's value is the sampling period in microseconds (default 1000). A plain OS
+/// thread reads each named probe every period, so the sampler adds no wakes to the packet
+/// runtime. Once per second it prints one line to stderr:
+///
+/// ```text
+/// diag queues t_ms=<unix ms> n=<samples> out_tun=<p50>/<p99>/<max> udp_tx=... udp_rx=... in_tun=...
+/// ```
+///
+/// The thread ends when every probe reports its queue gone. Bench builds only: it costs a
+/// thread and a few hundred reads a second.
+pub(crate) fn spawn_queue_sampler(probes: Vec<(&'static str, DepthProbe)>) {
+    let Some(period) = std::env::var("GOTATUN_DIAG_QUEUES").ok() else {
+        return;
+    };
+    let period = std::time::Duration::from_micros(period.parse().unwrap_or(1000).max(50));
+    let spawned = std::thread::Builder::new()
+        .name("diag-queues".into())
+        .spawn(move || {
+            let mut samples: Vec<Vec<usize>> = vec![Vec::with_capacity(2048); probes.len()];
+            let mut second = std::time::Instant::now();
+            loop {
+                let mut alive = false;
+                for ((_, probe), values) in probes.iter().zip(samples.iter_mut()) {
+                    if let Some(depth) = probe() {
+                        alive = true;
+                        values.push(depth);
+                    }
+                }
+                if !alive {
+                    return;
+                }
+                if second.elapsed() >= std::time::Duration::from_secs(1) {
+                    second = std::time::Instant::now();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis());
+                    let mut line = format!("diag queues t_ms={now}");
+                    for ((name, _), values) in probes.iter().zip(samples.iter_mut()) {
+                        values.sort_unstable();
+                        let at = |q: usize| {
+                            values
+                                .get((values.len() * q / 100).min(values.len().saturating_sub(1)))
+                                .copied()
+                                .unwrap_or(0)
+                        };
+                        line.push_str(&format!(
+                            " {name}={}/{}/{} n_{name}={}",
+                            at(50),
+                            at(99),
+                            values.last().copied().unwrap_or(0),
+                            values.len()
+                        ));
+                        values.clear();
+                    }
+                    eprintln!("{line}");
+                }
+                std::thread::sleep(period);
+            }
+        });
+    if let Err(error) = spawned {
+        eprintln!("diag queues: no sampler thread: {error}");
+    }
+}
