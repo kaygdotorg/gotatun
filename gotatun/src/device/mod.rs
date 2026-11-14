@@ -141,7 +141,20 @@ const UDP_RECV_BUFS: usize = PIPELINE_BUFS;
 
 /// How many datagrams the buffered UDP send queue may hold before the socket send.
 ///
-/// Every platform uses [`MAX_PACKET_BUFS`] here today.
+/// **macOS: 64, one send batch (#260, J461b, J461c).** When the Mac sends faster than the
+/// socket drains (bulk upload), a 4,000-packet queue kept ~4,000 encrypted datagrams waiting,
+/// and even at 512 the Mac-send loaded p99 stayed at 18.7 ms with 8 flows. 64 full-size
+/// datagrams are about 2.3 ms at the measured 0.32 Gbit/s Mac send rate and match the
+/// `sendmsg_x` batch, so a full queue is one syscall's worth. When it is full the packet task
+/// waits, so the backlog stays in the TUN channel and TCP sees it as delay. The TUN channels
+/// and the receive queue keep their own, separately measured sizes.
+#[cfg(target_os = "macos")]
+const UDP_SEND_BUFS: usize = 64;
+/// How many datagrams the buffered UDP send queue may hold before the socket send.
+///
+/// Off macOS the outbound queue keeps [`MAX_PACKET_BUFS`]; nothing has measured a smaller
+/// bound there.
+#[cfg(not(target_os = "macos"))]
 const UDP_SEND_BUFS: usize = MAX_PACKET_BUFS;
 
 /// How often the receive task checks for an idle link.
