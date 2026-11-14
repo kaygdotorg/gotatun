@@ -964,7 +964,7 @@ async fn test_endpoint_roaming() {
 #[tokio::test]
 #[test_log::test]
 async fn requested_keepalive_announces_a_new_source_address() {
-    let (mut alice, mut bob, _eve) = mock::device_pair().await;
+    let (alice, mut bob, _eve) = mock::device_pair().await;
     let packet = mock::packet(b"Hello!");
     let bob_endpoint_of_alice = async |bob: &mock::MockDevice| {
         let peers = bob.device.peers().await;
@@ -1037,7 +1037,7 @@ async fn requested_keepalives_at_1000_peers_reach_only_live_sessions() {
     use std::net::Ipv4Addr;
     use x25519_dalek::{PublicKey, StaticSecret};
 
-    let (mut alice, mut bob, _eve) = mock::device_pair().await;
+    let (alice, mut bob, _eve) = mock::device_pair().await;
     let idle = (0..999_u32).map(|index| {
         let [_, _, high, low] = index.to_be_bytes();
         Peer::new(PublicKey::from(&StaticSecret::random())).with_allowed_ip(
