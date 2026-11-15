@@ -95,9 +95,7 @@ pub(crate) const fn receive_run_goes_to_worker(
     packet_count: usize,
     inline_max: usize,
 ) -> bool {
-    // Red (J744): the limit is ignored.
-    let _ = (packet_count, inline_max);
-    lane_says_worker
+    lane_says_worker && packet_count > inline_max
 }
 
 /// Receive runs up to this many packets stay inline: `GOTATUN_BENCH_RX_INLINE_MAX=<n>`, read once
