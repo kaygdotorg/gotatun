@@ -31,6 +31,10 @@ mod generic;
 #[cfg(target_os = "macos")]
 mod macos_connected;
 
+/// Who holds a UDP port, from the kernel's socket list (macOS, #260, J815, J827).
+#[cfg(target_os = "macos")]
+mod macos_port_audit;
+
 /// Implementations of [`super::UdpSend`]/[`super::UdpRecv`] for linux
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
@@ -101,6 +105,12 @@ pub struct UdpSocket {
     recv_view: macos_connected::RecvView,
 }
 
+/// Every WireGuard socket this process bound, for [`UdpSocket::underlay_changed_everywhere`]
+/// (macOS, #260 J763). Dead entries are pruned on each bind.
+#[cfg(target_os = "macos")]
+static LIVE_SOCKETS: std::sync::Mutex<Vec<std::sync::Weak<UdpSocketState>>> =
+    std::sync::Mutex::new(Vec::new());
+
 struct UdpSocketState {
     socket: tokio::net::UdpSocket,
     /// Connected per-endpoint send sockets, shared by every clone (#260, J744).
@@ -126,8 +136,9 @@ pub struct SockOpt {
     pub send_buffer_size: Option<usize>,
     /// If `Some`, set `IPV6_V6ONLY` on the socket.
     pub only_v6: Option<bool>,
-    /// macOS: send through connected per-endpoint sockets (#260, J744). `None` follows the
-    /// `GOTATUN_BENCH_MAC_CONNECTED` bench switch (off unless it is `1`).
+    /// macOS: send through connected per-endpoint sockets (#260, J744, J763). `None` follows the
+    /// default: off, unless `GOTATUN_BENCH_MAC_CONNECTED` is set to something other than `0`
+    /// (J789: the shared-port window is a race another local user can win).
     #[cfg(target_os = "macos")]
     pub mac_connected: Option<bool>,
 }
@@ -188,7 +199,9 @@ impl UdpSocket {
         }
 
         // Connected per-endpoint sockets share this port, which needs SO_REUSEPORT on every
-        // socket that binds it (#260, J744). Only set when the feature is on.
+        // socket that binds it (#260, J744). It is set only while one of ours binds and cleared
+        // again at once, because macOS lets a process of any user join a port that carries it
+        // (J763; see `macos_connected`).
         #[cfg(target_os = "macos")]
         let connected = opts.mac_connected.unwrap_or_else(macos_connected::wanted);
         #[cfg(target_os = "macos")]
@@ -198,12 +211,23 @@ impl UdpSocket {
 
         udp_sock.bind(&addr.into())?;
 
+        #[cfg(target_os = "macos")]
+        if connected {
+            udp_sock.set_reuse_port(false)?;
+        } else {
+            // The exclusive bind can succeed beside a socket another user bound to the port
+            // earlier with SO_REUSEPORT (`0.0.0.0:<port>` beside our `[::]:<port>`), which would
+            // then receive the port's IPv4 datagrams. Refuse the port as if it were held, which
+            // it is (#260, J815, J827).
+            macos_port_audit::ensure_alone(&udp_sock)?;
+        }
+
         #[cfg(target_os = "linux")]
         let udp_gso_supported = getsockopt(&udp_sock, sockopt::UdpGsoSegment).is_ok();
 
         let inner = tokio::net::UdpSocket::from_std(udp_sock.into())?;
 
-        Ok(Self {
+        let socket = Self {
             inner: Arc::new(UdpSocketState {
                 socket: inner,
                 #[cfg(target_os = "linux")]
@@ -216,7 +240,16 @@ impl UdpSocket {
             map_ipv4_to_ipv6: addr.is_ipv6() && opts.only_v6 == Some(false),
             #[cfg(target_os = "macos")]
             recv_view: macos_connected::RecvView::default(),
-        })
+        };
+        #[cfg(target_os = "macos")]
+        {
+            let mut live = LIVE_SOCKETS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            live.retain(|state| state.strong_count() > 0);
+            live.push(Arc::downgrade(&socket.inner));
+        }
+        Ok(socket)
     }
 
     /// Get the inner [`tokio::net::UdpSocket`].
@@ -230,7 +263,32 @@ impl UdpSocket {
         self.inner.socket.local_addr()
     }
 
-    /// Tell the socket that the host's network changed (red stub, #260 J763).
+    /// Tell every WireGuard socket of this process that the host's network changed.
+    ///
+    /// The same as [`UdpSocket::underlay_changed`] on each live socket, for an owner that holds
+    /// no socket handle itself (the CLI's `SIGUSR1`). Elsewhere than macOS it does nothing.
+    pub fn underlay_changed_everywhere() {
+        #[cfg(target_os = "macos")]
+        {
+            let live: Vec<_> = LIVE_SOCKETS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .collect();
+            for state in live {
+                state.connected.underlay_changed();
+            }
+        }
+    }
+
+    /// Tell the socket that the host's network changed (an address, route or link moved).
+    ///
+    /// On macOS this closes the connected per-endpoint send sockets (#260, J763), which keep the
+    /// source address chosen when they connected; the next datagram to each endpoint reconnects
+    /// on the current route. Call it from the owner's network-change signal before asking live
+    /// sessions to announce their endpoint, so those announcements already leave from the new
+    /// source. Every clone shares the effect. Elsewhere it does nothing.
     pub fn underlay_changed(&self) {
         #[cfg(target_os = "macos")]
         self.inner.connected.underlay_changed();
@@ -652,5 +710,143 @@ mod tests {
         let rcvbuf = getsockopt(socket.socket(), sockopt::RcvBuf).unwrap();
         let sndbuf = getsockopt(socket.socket(), sockopt::SndBuf).unwrap();
         assert!(rcvbuf > 0 && sndbuf > 0, "rcvbuf={rcvbuf} sndbuf={sndbuf}");
+    }
+}
+
+/// The WireGuard port is never shared with a socket that was on it first (macOS, #260, J815,
+/// J827).
+///
+/// xnu lets an exclusive bind (no `SO_REUSEPORT`, connected sends off) of `[::]:<port>` succeed
+/// beside a socket that another user bound earlier to `0.0.0.0:<port>` with `SO_REUSEPORT`, and
+/// that socket then receives the port's IPv4 datagrams (J815 probe on #260). These tests bind
+/// such a socket from another process before the WireGuard socket and expect the WireGuard bind
+/// to fail with `EADDRINUSE`, whether the kernel refuses it or our audit does.
+#[cfg(all(test, target_os = "macos"))]
+mod shared_port_tests {
+    use std::{
+        io::{BufRead, BufReader},
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+        os::unix::process::CommandExt,
+        process::{Child, Command, Stdio},
+    };
+
+    use super::{SockOpt, UdpSocket};
+
+    /// `nobody` on macOS. Under root the squatter runs as this user, so the test is the real
+    /// cross-user case; otherwise it runs as the test's own user, in another process.
+    const NOBODY: u32 = 4_294_967_294;
+
+    /// Binds `$ARGV[0]:0` with `SO_REUSEPORT`, prints the port and holds it until stdin closes.
+    const SQUAT: &str = r#"
+        use Socket qw(:all);
+        # Taint mode is on when the squatter runs as another user: untaint the address.
+        my ($addr) = $ARGV[0] =~ /^([0-9a-f.:]+)$/ or die "bad address";
+        my $v6 = $addr =~ /:/;
+        socket(my $s, $v6 ? AF_INET6 : AF_INET, SOCK_DGRAM, IPPROTO_UDP) or die "socket: $!";
+        setsockopt($s, SOL_SOCKET, eval { SO_REUSEPORT() } // 0x0200, 1) or die "reuseport: $!";
+        my $sa = $v6 ? pack_sockaddr_in6(0, inet_pton(AF_INET6, $addr))
+                     : pack_sockaddr_in(0, inet_aton($addr));
+        bind($s, $sa) or die "bind: $!";
+        my ($port) = $v6 ? unpack_sockaddr_in6(getsockname($s)) : unpack_sockaddr_in(getsockname($s));
+        $| = 1;
+        print "$port\n";
+        my $wait = <STDIN>;
+    "#;
+
+    /// A squatter process holding `address` with `SO_REUSEPORT` on a port the kernel picks.
+    /// Dropping it closes its stdin, which ends it.
+    struct Squatter {
+        child: Child,
+        port: u16,
+        uid: u32,
+    }
+
+    impl Squatter {
+        fn bind(address: IpAddr) -> Self {
+            let mut command = Command::new("/usr/bin/perl");
+            command
+                .args(["-e", SQUAT, &address.to_string()])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped());
+            // SAFETY: `geteuid` has no preconditions and cannot fail.
+            let uid = if unsafe { libc::geteuid() } == 0 {
+                command.uid(NOBODY).gid(NOBODY);
+                NOBODY
+            } else {
+                // SAFETY: as above.
+                unsafe { libc::geteuid() }
+            };
+            let mut child = command.spawn().expect("start the squatter");
+            let mut line = String::new();
+            BufReader::new(child.stdout.take().expect("stdout"))
+                .read_line(&mut line)
+                .expect("read the squatter's port");
+            let port = line
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("squatter on {address} printed {line:?}"));
+            Self { child, port, uid }
+        }
+    }
+
+    impl Drop for Squatter {
+        fn drop(&mut self) {
+            drop(self.child.stdin.take());
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Bind the WireGuard socket the way the product does, with connected sends off.
+    fn wireguard_bind(address: SocketAddr) -> std::io::Result<UdpSocket> {
+        let opts = SockOpt {
+            only_v6: address.is_ipv6().then_some(false),
+            mac_connected: Some(false),
+            ..SockOpt::default()
+        };
+        UdpSocket::bind(address, opts)
+    }
+
+    /// Every squatter address, against the dual-stack bind and the IPv4-only fallback bind:
+    /// the WireGuard bind fails with `EADDRINUSE` in every case.
+    #[tokio::test]
+    async fn a_port_another_process_bound_first_is_refused() {
+        let squats: [IpAddr; 4] = [
+            Ipv4Addr::UNSPECIFIED.into(),
+            Ipv4Addr::LOCALHOST.into(),
+            Ipv6Addr::UNSPECIFIED.into(),
+            Ipv6Addr::LOCALHOST.into(),
+        ];
+        let ours: [IpAddr; 2] = [Ipv6Addr::UNSPECIFIED.into(), Ipv4Addr::UNSPECIFIED.into()];
+        let mut shared = Vec::new();
+        for squat in squats {
+            for wildcard in ours {
+                let squatter = Squatter::bind(squat);
+                let result = wireguard_bind((wildcard, squatter.port).into());
+                let outcome = match &result {
+                    Ok(_) => "BOUND beside it".to_owned(),
+                    Err(error) => format!("refused: {error}"),
+                };
+                eprintln!(
+                    "squatter uid {} on {squat} (SO_REUSEPORT), WireGuard {wildcard}:{}: {outcome}",
+                    squatter.uid, squatter.port
+                );
+                match result {
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+                    _ => shared.push(format!("{squat} vs {wildcard}: {outcome}")),
+                }
+            }
+        }
+        assert!(shared.is_empty(), "the port was shared: {shared:#?}");
+    }
+
+    /// Without a squatter the bind succeeds, on a fixed port too: the audit refuses only ports
+    /// that someone else holds.
+    #[tokio::test]
+    async fn a_free_port_binds() {
+        let first = wireguard_bind((Ipv6Addr::UNSPECIFIED, 0).into()).expect("bind a free port");
+        let port = first.local_addr().expect("local").port();
+        drop(first);
+        wireguard_bind((Ipv6Addr::UNSPECIFIED, port).into()).expect("bind the same port again");
+        wireguard_bind((Ipv4Addr::UNSPECIFIED, 0).into()).expect("bind IPv4 only");
     }
 }
