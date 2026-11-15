@@ -1455,21 +1455,53 @@ mod tests {
         assert_eq!(*writes.lock().unwrap(), 1);
     }
 
-    /// Interleaved flows retain input order and do not coalesce across one another.
+    /// Interleaved flows merge per flow, never across one another, and leave in the order each
+    /// flow first appeared (J764, #260: 8 flows from one peer arrive interleaved, so adjacency
+    /// alone merged about one segment per frame).
     #[test]
-    fn interleaved_tcp_flows_keep_order_without_cross_flow_coalescing() {
+    fn interleaved_tcp_flows_merge_per_flow_in_first_seen_order() {
+        let packets = vec![
+            ipv4_tcp(1, 1000, b"aaaaa"),
+            ipv4_tcp(2, 2000, b"bbbbb"),
+            ipv4_tcp(1, 1005, b"ccccc"),
+            ipv4_tcp(2, 2005, b"ddddd"),
+            ipv4_tcp(1, 1010, b"eeeee"),
+        ];
+
+        let frames = coalesce_packets(packets, true, false);
+
+        assert_eq!(frames.len(), 2);
+        assert_eq!(
+            frame_header(&frames[0]).gso_type,
+            GsoType::VIRTIO_NET_HDR_GSO_TCPV4
+        );
+        assert_eq!(ipv4_tcp_payload(&frames[0]).as_slice(), b"aaaaaccccceeeee");
+        assert_eq!(ipv4_tcp_payload(&frames[1]).as_slice(), b"bbbbbddddd");
+        assert_eq!(
+            ip_packet(&frames[0]).as_bytes()[15],
+            1,
+            "flow 1 leaves first"
+        );
+    }
+
+    /// Grouping by flow never moves a packet past another packet of its own flow: a pure ACK
+    /// between two data segments still splits them, and both stay on their side of it.
+    #[test]
+    fn grouping_keeps_each_flows_own_order_around_unmergeable_packets() {
         let packets = vec![
             ipv4_tcp(1, 1000, b"first"),
             ipv4_tcp(2, 2000, b"other"),
+            ipv4_tcp(1, 1005, b""),
             ipv4_tcp(1, 1005, b"later"),
         ];
 
         let frames = coalesce_packets(packets, true, false);
 
-        assert_eq!(frames.len(), 3);
+        assert_eq!(frames.len(), 4);
         assert_eq!(ipv4_tcp_payload(&frames[0]).as_slice(), b"first");
-        assert_eq!(ipv4_tcp_payload(&frames[1]).as_slice(), b"other");
+        assert_eq!(ipv4_tcp_payload(&frames[1]).as_slice(), b"");
         assert_eq!(ipv4_tcp_payload(&frames[2]).as_slice(), b"later");
+        assert_eq!(ipv4_tcp_payload(&frames[3]).as_slice(), b"other");
     }
 
     /// IPv4 options and IPv6 extension headers remain unchanged as single TUN packets.
