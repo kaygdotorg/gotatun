@@ -70,8 +70,22 @@ pub(crate) const PARALLEL_DISPATCH_HIGH_WATER: usize = CRYPTO_CHUNK_SIZE / 2;
 /// Return to inline dispatch after this peer's older backlog drains below one minimum run.
 pub(crate) const PARALLEL_DISPATCH_LOW_WATER: usize = MIN_PARALLEL_RUN_SIZE;
 
+/// Full worker chunks one peer may have in flight per direction before its producer waits.
+///
+/// Each chunk is one read run handed to a crypto worker. With only two chunks (the earlier
+/// 128-slot bound), a busy peer stalls its producer whenever one finished run waits for ordered
+/// delivery while the next is still being sealed or opened: the receive pipeline becomes
+/// latency-bound with two runs in flight and the workers idle between them. Eight chunks let the
+/// producer keep reading while several runs are sealed in parallel and one is written out.
+pub(crate) const PEER_CRYPTO_CHUNKS_IN_FLIGHT: usize = 8;
+
 /// Maximum outstanding completion slots for one peer and one direction.
-pub(crate) const MAX_PEER_CRYPTO_IN_FLIGHT: usize = 128;
+///
+/// Every slot holds one pooled packet buffer (4 KiB) until its ordered release, so a fully busy
+/// peer can pin up to `2 × 512 × 4 KiB` = 4 MiB at once. Only peers with traffic in flight hold
+/// any: an idle peer's lane keeps no slots, so the bound costs nothing at mesh scale, and the
+/// device's shared packet pool still caps how many returned buffers stay allocated.
+pub(crate) const MAX_PEER_CRYPTO_IN_FLIGHT: usize = PEER_CRYPTO_CHUNKS_IN_FLIGHT * CRYPTO_CHUNK_SIZE;
 
 /// Bound on worker runs waiting in the shared queue. Every run is already full when submitted;
 /// workers never wait to fill it, so a short packet cannot be held behind a packet-count target.
@@ -2316,6 +2330,23 @@ mod tests {
         let completions = OrderedCompletions::<()>::default();
         for expected in 0..super::MAX_PEER_CRYPTO_IN_FLIGHT {
             assert_eq!(completions.reserve(), Some(expected as u64));
+        }
+        assert_eq!(completions.reserve(), None);
+    }
+
+    /// A busy peer can keep eight full worker chunks in flight before its producer must wait.
+    ///
+    /// With two chunks the receive pipeline stalled on ordered delivery and lost 8-flow
+    /// throughput on the #260 bench host (J691, J712).
+    #[test]
+    fn a_peer_keeps_eight_worker_chunks_in_flight() {
+        let completions = OrderedCompletions::<()>::default();
+        for chunk in 0..8 {
+            assert_eq!(
+                completions.reserve_run(super::CRYPTO_CHUNK_SIZE),
+                Some((chunk * super::CRYPTO_CHUNK_SIZE) as u64),
+                "chunk {chunk} must fit the peer's in-flight window"
+            );
         }
         assert_eq!(completions.reserve(), None);
     }
