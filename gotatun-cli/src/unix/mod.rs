@@ -177,10 +177,26 @@ async fn wait_for_shutdown(mut device: Device<DefaultDeviceTransports>) {
     let mut sigint = signal(SignalKind::interrupt()).expect("Failed to set up SIGINT handler");
     let mut sigterm = signal(SignalKind::terminate()).expect("Failed to set up SIGTERM handler");
 
-    tokio::select! {
-        _ = device.wait() => error!("An error occurred. Shutting down."),
-        _ = sigint.recv() => info!("SIGINT received"),
-        _ = sigterm.recv() => info!("SIGTERM received"),
+    // macOS: SIGUSR1 means "the network changed" and makes the connected per-endpoint send
+    // sockets reconnect on the current route (#260, J763). The infraternal app hears this from
+    // its routing-socket listener; the CLI has none, so an operator or a test sends the signal.
+    #[cfg(target_os = "macos")]
+    let mut sigusr1 = signal(SignalKind::user_defined1()).expect("Failed to set up SIGUSR1 handler");
+
+    loop {
+        #[cfg(target_os = "macos")]
+        let network_changed = sigusr1.recv();
+        #[cfg(not(target_os = "macos"))]
+        let network_changed = std::future::pending::<Option<()>>();
+        tokio::select! {
+            _ = device.wait() => { error!("An error occurred. Shutting down."); break }
+            _ = sigint.recv() => { info!("SIGINT received"); break }
+            _ = sigterm.recv() => { info!("SIGTERM received"); break }
+            _ = network_changed => {
+                info!("SIGUSR1 received: the network changed");
+                gotatun::udp::socket::UdpSocket::underlay_changed_everywhere();
+            }
+        }
     }
 
     info!("GotaTun is shutting down");
