@@ -177,6 +177,19 @@ impl BufferedUdpSend {
         udp_tx: impl UdpSend + 'static,
         reply_lane: bool,
     ) -> Self {
+        Self::with_send_turn(capacity, udp_tx, reply_lane, 0)
+    }
+
+    /// Like [`Self::with_reply_lane`], plus a send-turn budget (#260, J728): after
+    /// `yield_every` datagrams reach the socket, the send task yields so the runtime polls I/O
+    /// before it sends more. `0` turns the budget off.
+    pub(crate) fn with_send_turn(
+        capacity: usize,
+        udp_tx: impl UdpSend + 'static,
+        reply_lane: bool,
+        yield_every: usize,
+    ) -> Self {
+        let _ = yield_every;
         let (send_tx, mut send_rx) = mpsc::channel::<BufferedUdpMessage>(capacity);
         let packet_slots = Arc::new(Semaphore::new(capacity));
         let (reply_tx, mut reply_rx) = if reply_lane {
@@ -973,6 +986,54 @@ mod reply_lane_test {
     async fn small_datagrams_overtake_queued_send_runs() {
         assert_eq!(sent_order(false).await, [1, 2, 3, 4, 5, 6]);
         assert_eq!(sent_order(true).await, [1, 2, 6, 3, 4, 5]);
+    }
+
+    /// Logs `s` for every datagram that reaches the socket.
+    #[derive(Clone)]
+    struct LoggingSend(Arc<std::sync::Mutex<String>>);
+
+    impl UdpSend for LoggingSend {
+        type SendManyBuf = ();
+
+        async fn send_to(&self, _packet: Packet, _destination: SocketAddr) -> io::Result<()> {
+            self.0.lock().expect("log").push('s');
+            Ok(())
+        }
+    }
+
+    /// The longest unbroken run of sends while a competing task (`o`, standing in for the
+    /// receive task a reply wakes) wants the same current-thread runtime.
+    async fn longest_send_run(yield_every: usize) -> (usize, String) {
+        let log = Arc::new(std::sync::Mutex::new(String::new()));
+        let send =
+            BufferedUdpSend::with_send_turn(64, LoggingSend(Arc::clone(&log)), false, yield_every);
+        let mut run = (1..=8).map(|id| datagram(1452, id)).collect::<Vec<_>>();
+        send.send_many_to(&mut (), &mut run).await.expect("queued");
+        let competitor_log = Arc::clone(&log);
+        let competitor = tokio::spawn(async move {
+            while competitor_log.lock().expect("log").matches('s').count() < 8 {
+                competitor_log.lock().expect("log").push('o');
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), competitor)
+            .await
+            .expect("all eight are sent")
+            .expect("the competitor never panics");
+        let log = log.lock().expect("log").clone();
+        (log.split('o').map(str::len).max().unwrap_or(0), log)
+    }
+
+    /// With a send-turn budget, the send task gives the runtime back after that many datagrams,
+    /// so a ready receive runs between them. Without it, one queued run leaves in one turn.
+    /// Tokio wakes the tasks deferred by a yield as one batch, so two budgets may still run back
+    /// to back (the Mac VM logged `ssoossssooss`); the bound is therefore twice the budget.
+    #[tokio::test]
+    async fn send_turn_budget_lets_other_tasks_run_between_datagrams() {
+        let (off, log) = longest_send_run(0).await;
+        assert_eq!(off, 8, "{log}");
+        let (on, log) = longest_send_run(2).await;
+        assert!(on <= 4, "{log}");
     }
 
     /// With the lane, small datagrams queued behind bulk ones are handed over first, each class
