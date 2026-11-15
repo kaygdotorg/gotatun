@@ -133,7 +133,8 @@ pub struct SockOpt {
     /// If `Some`, set `IPV6_V6ONLY` on the socket.
     pub only_v6: Option<bool>,
     /// macOS: send through connected per-endpoint sockets (#260, J744, J763). `None` follows the
-    /// default: on, unless `GOTATUN_BENCH_MAC_CONNECTED=0` turns it off for diagnosis.
+    /// default: off, unless `GOTATUN_BENCH_MAC_CONNECTED` is set to something other than `0`
+    /// (J789: the shared-port window is a race another local user can win).
     #[cfg(target_os = "macos")]
     pub mac_connected: Option<bool>,
 }
