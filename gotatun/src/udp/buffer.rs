@@ -138,7 +138,24 @@ async fn flush_udp_run<U: UdpSend>(
 
 impl BufferedUdpSend {
     /// Wrap a [`UdpSend`] into a [`BufferedUdpSend`] with `capacity`.
+    ///
+    /// Small datagrams get their own lane when `GOTATUN_BENCH_REPLIES_FIRST` names `tx`
+    /// (#260, J720; see [`crate::priority`]).
     pub fn new(capacity: usize, udp_tx: impl UdpSend + 'static) -> Self {
+        Self::with_reply_lane(capacity, udp_tx, crate::priority::mode().tx)
+    }
+
+    /// Like [`Self::new`], with the reply lane chosen by the caller (`reply_lane`).
+    ///
+    /// With the lane, a datagram of at most [`crate::priority::REPLY_MAX`] bytes skips the
+    /// queued runs: the send task sends every queued reply before its next queued run, so a
+    /// probe or ACK no longer waits behind a full send queue of bulk datagrams.
+    pub(crate) fn with_reply_lane(
+        capacity: usize,
+        udp_tx: impl UdpSend + 'static,
+        reply_lane: bool,
+    ) -> Self {
+        let _ = reply_lane;
         let (send_tx, mut send_rx) = mpsc::channel::<BufferedUdpMessage>(capacity);
         let packet_slots = Arc::new(Semaphore::new(capacity));
 
@@ -816,6 +833,69 @@ mod reply_lane_test {
             ids.extend(packets.drain(..).map(|(p, _)| p[0]));
         }
         ids
+    }
+
+    /// Records the first byte of every datagram that reaches the socket. Each send call first
+    /// takes a permit from `gate`, so the test can hold the first run in flight while more queue.
+    #[derive(Clone)]
+    struct GatedSend {
+        gate: Arc<Semaphore>,
+        sent: mpsc::UnboundedSender<u8>,
+    }
+
+    impl UdpSend for GatedSend {
+        type SendManyBuf = ();
+
+        async fn send_to(&self, packet: Packet, _destination: SocketAddr) -> io::Result<()> {
+            self.gate.acquire().await.expect("open gate").forget();
+            self.sent.send(packet[0]).expect("the test listens");
+            Ok(())
+        }
+    }
+
+    async fn sent_order(lane: bool) -> Vec<u8> {
+        let gate = Arc::new(Semaphore::new(0));
+        let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+        let send = BufferedUdpSend::with_reply_lane(
+            64,
+            GatedSend {
+                gate: Arc::clone(&gate),
+                sent: sent_tx,
+            },
+            lane,
+        );
+        let mut buf = ();
+        // A bulk run the send task takes and holds at the gate.
+        send.send_many_to(&mut buf, &mut vec![datagram(1452, 1), datagram(1452, 2)])
+            .await
+            .expect("queued");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Queued while it waits: another bulk run, then a run with a probe reply.
+        send.send_many_to(&mut buf, &mut vec![datagram(1452, 3), datagram(1452, 4)])
+            .await
+            .expect("queued");
+        send.send_many_to(&mut buf, &mut vec![datagram(1452, 5), datagram(124, 6)])
+            .await
+            .expect("queued");
+        gate.add_permits(16);
+        let mut order = Vec::new();
+        while order.len() < 6 {
+            order.push(
+                tokio::time::timeout(std::time::Duration::from_secs(2), sent_rx.recv())
+                    .await
+                    .expect("all six are sent")
+                    .expect("the send task holds the sender"),
+            );
+        }
+        order
+    }
+
+    /// With the lane, a small datagram queued behind bulk runs is sent before them (the run in
+    /// flight finishes first). Without it, the send queue is a FIFO.
+    #[tokio::test]
+    async fn small_datagrams_overtake_queued_send_runs() {
+        assert_eq!(sent_order(false).await, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(sent_order(true).await, [1, 2, 6, 3, 4, 5]);
     }
 
     /// With the lane, small datagrams queued behind bulk ones are handed over first, each class
