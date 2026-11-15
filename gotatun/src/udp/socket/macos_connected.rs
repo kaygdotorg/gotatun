@@ -606,18 +606,20 @@ mod tests {
             .expect("send");
     }
 
-    /// The switch: on when unset, off only for `0` (J763 makes it the macOS default).
+    /// The switch: off when unset, on only for a value other than `0` (J789: off by default until
+    /// the port cannot be taken over during a connected socket's bind; see the module docs).
     #[test]
-    fn connected_sends_are_on_unless_switched_off() {
-        assert!(super::switch_on(None));
+    fn connected_sends_are_off_unless_switched_on() {
+        assert!(!super::switch_on(None));
         assert!(super::switch_on(Some("1")));
         assert!(!super::switch_on(Some("0")));
         assert!(!super::switch_on(Some(" 0\n")));
     }
 
-    /// Binding the WireGuard socket the default way (no explicit choice) turns them on.
+    /// Binding the WireGuard socket the default way (no explicit choice) keeps `sendto`, so no
+    /// socket of ours ever carries the shared-port option.
     #[tokio::test]
-    async fn a_default_socket_sends_through_connected_sockets() {
+    async fn a_default_socket_keeps_sendto() {
         if std::env::var_os("GOTATUN_BENCH_MAC_CONNECTED").is_some() {
             return; // The switch decides; the default is what this test checks.
         }
@@ -629,7 +631,7 @@ mod tests {
         let (a, a_address) = peer().await;
         send(&wireguard, &data(64), a_address).await;
         peer_recv(&a).await;
-        assert_eq!(wireguard.inner.connected.len(), 1);
+        assert_eq!(wireguard.inner.connected.len(), 0);
     }
 
     /// The first data send to an endpoint gives it a connected socket on the WireGuard port. The
