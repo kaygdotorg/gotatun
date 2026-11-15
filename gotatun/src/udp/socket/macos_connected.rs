@@ -72,7 +72,7 @@ use std::{
     io,
     net::SocketAddr,
     sync::{
-        Arc, OnceLock,
+        Arc, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
@@ -146,12 +146,17 @@ pub(crate) struct ConnectedSends {
 }
 
 /// A receiver's copy of the entries plus where its next round of polls starts.
+///
+/// The copy holds weak references: the table alone owns each socket, so removing an entry closes
+/// its socket at once even while a receive task is parked on it. Otherwise the old socket would
+/// stay open until the receiver next ran, and a reconnect to the same endpoint over the same
+/// route would collide with it (one connected socket per 4-tuple).
 #[derive(Clone, Default)]
 pub(crate) struct RecvView {
     /// The `generation` that `entries` was copied at.
     generation: u64,
     /// The connected sockets this receiver polls after the wildcard socket.
-    entries: Vec<Arc<Entry>>,
+    entries: Vec<Weak<Entry>>,
     /// Rotates the first socket polled, so one busy endpoint cannot starve the others.
     next: usize,
 }
@@ -200,7 +205,7 @@ impl ConnectedSends {
         let closed = entries.len();
         entries.clear();
         drop(entries);
-        self.generation.fetch_add(1, Ordering::Release);
+        self.changed();
         tracing::debug!("macOS UDP: network changed; closed {closed} connected sockets");
     }
 
@@ -254,7 +259,7 @@ impl ConnectedSends {
         self.receiver.register(cx.waker());
         let generation = self.generation.load(Ordering::Acquire);
         if generation != view.generation {
-            view.entries = self.entries.lock().clone();
+            view.entries = self.entries.lock().iter().map(Arc::downgrade).collect();
             view.generation = generation;
         }
 
@@ -269,9 +274,12 @@ impl ConnectedSends {
                 }
                 continue;
             }
-            let socket = &view.entries[index - 1].socket;
+            // Gone since the copy was made: its removal bumped the generation and woke us.
+            let Some(entry) = view.entries[index - 1].upgrade() else {
+                continue;
+            };
             loop {
-                match poll_one(socket, cx, buf) {
+                match poll_one(&entry.socket, cx, buf) {
                     Poll::Ready(Err(error)) if is_icmp_error(&error) => continue,
                     // Any other error stays with this endpoint's socket; the wildcard socket
                     // and the other endpoints keep receiving.
@@ -331,7 +339,7 @@ impl ConnectedSends {
                 );
                 if evict.is_some() {
                     drop(entries);
-                    self.generation.fetch_add(1, Ordering::Release);
+                    self.changed();
                 }
                 return None;
             }
@@ -344,7 +352,7 @@ impl ConnectedSends {
                 }
                 if evict.is_some() {
                     drop(entries);
-                    self.generation.fetch_add(1, Ordering::Release);
+                    self.changed();
                 }
                 return None;
             }
@@ -357,8 +365,7 @@ impl ConnectedSends {
         });
         entries.push(Arc::clone(&entry));
         drop(entries);
-        self.generation.fetch_add(1, Ordering::Release);
-        self.receiver.wake();
+        self.changed();
         Some(entry)
     }
 
@@ -383,8 +390,15 @@ impl ConnectedSends {
         entries.retain(|other| !matches(other));
         if entries.len() != before {
             drop(entries);
-            self.generation.fetch_add(1, Ordering::Release);
+            self.changed();
         }
+    }
+
+    /// Tell receivers that the entries changed: they copy the table again on their next poll,
+    /// and the parked one is woken now so it starts (or stops) polling the changed sockets.
+    fn changed(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
+        self.receiver.wake();
     }
 }
 
