@@ -238,6 +238,190 @@ pub(crate) struct Codel {
     last_count: u32,
     /// Whether the controller is in its signalling state.
     signalling: bool,
+    /// Signals CoDel made due that landed on a sparse flow's packet and are still owed to the
+    /// next packet of a queue-heavy flow (at most [`MAX_OWED_SIGNALS`]).
+    owed: u8,
+    /// Recent bytes per flow while the queue stands above target, to tell queue-heavy flows from
+    /// sparse ones (see [`FlowShares`]).
+    flows: FlowShares,
+}
+
+/// How many skipped signals may wait for a queue-heavy packet. A few cover the rare case of
+/// sparse packets landing on several due signals in a row; more would turn into a burst of
+/// signals on one bulk packet run, which CoDel's spacing exists to avoid.
+const MAX_OWED_SIGNALS: u8 = 4;
+
+/// How many flows [`FlowShares`] tracks per peer. Eight bulk flows and their probes fit with
+/// room to spare; with more concurrent flows the smallest entry is replaced, so a heavy flow
+/// can at worst be exempt for a moment after it re-enters.
+const TRACKED_FLOWS: usize = 16;
+
+/// A flow needs at least this many recent bytes (decayed, see [`FlowShares`]) to count as
+/// queue-heavy. It sits far above what latency probes, keystrokes and DNS put on a link in one
+/// interval (a 145 probes/s ping is ~2 KiB/s), and far below one bulk flow (5 Gbit/s is
+/// ~6 MiB per 10 ms interval).
+const HEAVY_FLOOR_BYTES: u32 = 16 * 1024;
+
+/// Per-peer byte counts of the flows that crossed the queue recently, the sparse-flow
+/// exemption's memory (orchestrator decision on #260, J747).
+///
+/// Why: a sender that never backs off (BBRv1 ignores CE and loss) keeps CoDel signalling for
+/// the whole load, and a signal lands on whichever packet reaches the TUN when it is due. With
+/// one queue per peer that is sometimes a Not-ECT latency probe, a keystroke or a DNS reply,
+/// which ECN mode then has to drop although that flow put almost nothing in the queue (J711:
+/// 10–19 of 8,000 probes). This table lets a due signal skip such packets and go to the next
+/// packet of a flow that actually fills the queue, without per-flow queues.
+///
+/// How: flows are keyed by a 64-bit hash of the inner 5-tuple (addresses, protocol, ports when
+/// the packet carries them), so two flows practically never share an entry. Bytes are only
+/// counted while the sojourn stands above target, so an idle or uncongested peer pays nothing,
+/// and they are halved once per CoDel interval, so the counts follow the last few intervals.
+/// A flow is heavy when its count is at least [`HEAVY_FLOOR_BYTES`] and at least half the
+/// average of the tracked flows. Eight equal bulk flows are all heavy; a probe next to them
+/// never is.
+#[derive(Debug, Default)]
+pub(crate) struct FlowShares {
+    /// Flow hash of each entry; 0 marks a free entry (a real hash of 0 is folded to 1).
+    keys: [u64; TRACKED_FLOWS],
+    /// Decayed recent bytes of each entry.
+    bytes: [u32; TRACKED_FLOWS],
+    /// When the counts are next halved, in the same clock as the packet times.
+    next_decay_ns: u64,
+    /// The entry the previous packet used. Packets of one flow arrive in runs (one GRO batch,
+    /// one TSO segment), so this usually skips the scan.
+    last: usize,
+}
+
+impl FlowShares {
+    /// Halve the counts once per elapsed interval since the last decay.
+    fn decay(&mut self, now_ns: u64, interval_ns: u64) {
+        if now_ns < self.next_decay_ns {
+            return;
+        }
+        let elapsed = (now_ns - self.next_decay_ns) / interval_ns.max(1) + 1;
+        let shift = u32::try_from(elapsed.min(32)).unwrap_or(32);
+        for (key, bytes) in self.keys.iter_mut().zip(self.bytes.iter_mut()) {
+            *bytes = bytes.checked_shr(shift).unwrap_or(0);
+            if *bytes == 0 {
+                *key = 0;
+            }
+        }
+        self.next_decay_ns = now_ns.saturating_add(interval_ns);
+    }
+
+    /// Count `len` bytes for flow `key` and return its entry. A new flow takes a free entry or
+    /// replaces the one with the fewest bytes, starting from its own bytes only (never the
+    /// evicted count), so a sparse newcomer can't inherit a heavy flow's share.
+    fn account(&mut self, key: u64, len: usize, now_ns: u64, interval_ns: u64) -> usize {
+        self.decay(now_ns, interval_ns);
+        let len = u32::try_from(len).unwrap_or(u32::MAX);
+        let hit = (self.keys[self.last] == key)
+            .then_some(self.last)
+            .or_else(|| self.keys.iter().position(|&entry| entry == key));
+        let index = match hit {
+            Some(index) => index,
+            None => {
+                let index = self
+                    .bytes
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|&(_, &bytes)| bytes)
+                    .map_or(0, |(index, _)| index);
+                self.keys[index] = key;
+                self.bytes[index] = 0;
+                index
+            }
+        };
+        self.bytes[index] = self.bytes[index].saturating_add(len);
+        self.last = index;
+        index
+    }
+
+    /// Whether the flow in entry `index` is queue-heavy (see the type docs). Only called when a
+    /// signal is due, so the scan over the table costs nothing on ordinary packets.
+    fn is_heavy(&self, index: usize) -> bool {
+        let bytes = u64::from(self.bytes[index]);
+        if bytes < u64::from(HEAVY_FLOOR_BYTES) {
+            return false;
+        }
+        let (total, active) = self
+            .bytes
+            .iter()
+            .filter(|&&count| count > 0)
+            .fold((0_u64, 0_u64), |(total, active), &count| {
+                (total + u64::from(count), active + 1)
+            });
+        // bytes ≥ (total / active) / 2, without division.
+        bytes * 2 * active >= total
+    }
+}
+
+/// A 64-bit hash of the packet's inner flow: addresses, protocol and, for TCP, UDP, UDP-Lite,
+/// SCTP and DCCP packets that are not later IPv4 fragments, the two ports. Never 0 (0 marks a
+/// free [`FlowShares`] entry). Anything that is not an IP packet hashes as one "other" flow.
+///
+/// IPv6 extension headers are not walked: a packet behind one hashes by addresses and its
+/// first next-header value, which still separates it from a bulk TCP flow between the same
+/// hosts. The hash only needs to tell flows apart within one peer, not resist an attacker: a
+/// peer that forges flows can only make its own packets exempt or signalled.
+pub(crate) fn flow_key(packet: &[u8]) -> u64 {
+    /// Port-carrying protocols, whose first four transport bytes are source and destination port.
+    fn has_ports(protocol: u8) -> bool {
+        matches!(protocol, 6 | 17 | 33 | 132 | 136)
+    }
+    let mut hash = Fold::default();
+    match packet.first().map(|first| first >> 4) {
+        Some(4) if packet.len() >= 20 => {
+            let header_len = usize::from(packet[0] & 0x0f) * 4;
+            let protocol = packet[9];
+            hash.add(&packet[12..20]);
+            hash.add(&[4, protocol]);
+            let later_fragment = u16::from_be_bytes([packet[6], packet[7]]) & 0x1fff != 0;
+            if has_ports(protocol)
+                && !later_fragment
+                && let Some(ports) = packet.get(header_len..header_len + 4)
+            {
+                hash.add(ports);
+            }
+        }
+        Some(6) if packet.len() >= 40 => {
+            let next_header = packet[6];
+            hash.add(&packet[8..40]);
+            hash.add(&[6, next_header]);
+            if has_ports(next_header)
+                && let Some(ports) = packet.get(40..44)
+            {
+                hash.add(ports);
+            }
+        }
+        _ => hash.add(&[0]),
+    }
+    hash.finish().max(1)
+}
+
+/// A small multiply-rotate hash over byte slices, enough to tell a peer's flows apart. Not a
+/// keyed hash on purpose: see [`flow_key`].
+#[derive(Default)]
+struct Fold(u64);
+
+impl Fold {
+    /// Mix `bytes` into the hash, eight at a time.
+    fn add(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0_u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(word))
+                .wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+    }
+
+    /// The final mixed value.
+    fn finish(&self) -> u64 {
+        let mut value = self.0;
+        value ^= value >> 33;
+        value = value.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        value ^ (value >> 33)
+    }
 }
 
 impl Codel {
@@ -246,6 +430,12 @@ impl Codel {
     fn control_law(from_ns: u64, interval_ns: u64, count: u32) -> u64 {
         let spacing = interval_ns as f64 / f64::from(count.max(1)).sqrt();
         from_ns.saturating_add(spacing as u64)
+    }
+
+    /// Whether the last judged packet found the queue standing above target (the window in
+    /// which the sparse-flow exemption counts bytes).
+    fn above_target(&self) -> bool {
+        self.first_above_ns != 0
     }
 
     /// Whether the packet dequeued at `now_ns` with `sojourn_ns` of queueing should be signalled.
@@ -333,9 +523,25 @@ fn judge_with(
         SOJOURN_MAX_US.fetch_max(sojourn_us, Ordering::Relaxed);
     }
 
-    if !codel.should_signal(now_ns, sojourn_ns, config) {
+    let due = codel.should_signal(now_ns, sojourn_ns, config);
+    if !codel.above_target() {
+        // The queue drained: nothing is owed to anyone any more.
+        codel.owed = 0;
         return Verdict::Pass;
     }
+    // Sparse-flow exemption (see `FlowShares`): count this packet's flow, and hand a due signal
+    // only to a queue-heavy flow. A signal that lands on a sparse packet waits for the next
+    // heavy one instead of being spent on a flow that didn't build the queue.
+    let entry = codel
+        .flows
+        .account(flow_key(packet), packet.len(), now_ns, config.interval_ns);
+    if due {
+        codel.owed = codel.owed.saturating_add(1).min(MAX_OWED_SIGNALS);
+    }
+    if codel.owed == 0 || !codel.flows.is_heavy(entry) {
+        return Verdict::Pass;
+    }
+    codel.owed -= 1;
     if config.mode == AqmMode::Ecn && set_ce(packet) {
         MARKS.fetch_add(1, Ordering::Relaxed);
         return Verdict::Marked;
@@ -569,5 +775,217 @@ mod tests {
         let traffic_class = ((ipv6[0] & 0x0f) << 4) | (ipv6[1] >> 4);
         assert_eq!(traffic_class, 0xbb);
         assert_eq!(ipv6[1] & 0x0f, 0x01, "flow label is preserved");
+    }
+
+    /// A 1,400-byte IPv4 TCP segment of the flow `10.0.0.1:sport → 10.0.0.2:5201` with the given
+    /// ECN field, as a bulk sender would put on the wire.
+    fn tcp_v4(sport: u16, ecn: u8, len: usize) -> Vec<u8> {
+        let mut packet = ipv4_header(ecn);
+        packet[2..4].copy_from_slice(&u16::try_from(len).unwrap().to_be_bytes());
+        packet.resize(len, 0);
+        packet[20..22].copy_from_slice(&sport.to_be_bytes());
+        packet[22..24].copy_from_slice(&5201_u16.to_be_bytes());
+        packet
+    }
+
+    /// An 84-byte Not-ECT ICMP echo, the shape of the kit's latency probes.
+    fn icmp_probe() -> Vec<u8> {
+        let mut packet = ipv4_header(0);
+        packet[9] = 1;
+        packet.resize(84, 0);
+        packet
+    }
+
+    /// The working configuration: ECN mode, 1 ms target, 10 ms interval.
+    fn ecn_1_10() -> AqmConfig {
+        AqmConfig {
+            mode: AqmMode::Ecn,
+            target_ns: MS,
+            interval_ns: 10 * MS,
+            stats_ms: None,
+        }
+    }
+
+    /// Drive `flows` interleaved bulk flows (one packet each per 10 µs step, sojourn 3 ms) for
+    /// `duration_ms`, starting at `start_ns`. Returns the verdicts per flow and the end time.
+    fn drive_bulk(
+        codel: &mut Codel,
+        config: &AqmConfig,
+        flows: u16,
+        ecn: u8,
+        start_ns: u64,
+        duration_ms: u64,
+    ) -> (Vec<Vec<Verdict>>, u64) {
+        let mut verdicts = vec![Vec::new(); usize::from(flows)];
+        let mut now = start_ns;
+        let end = start_ns + duration_ms * MS;
+        while now < end {
+            for flow in 0..flows {
+                let mut packet = tcp_v4(40_000 + flow, ecn, 1_400);
+                let verdict = judge_with(codel, &mut packet, now - 3 * MS, now, config);
+                verdicts[usize::from(flow)].push(verdict);
+                now += 10_000;
+            }
+        }
+        (verdicts, now)
+    }
+
+    #[test]
+    fn a_sparse_packet_never_takes_a_due_signal_the_next_bulk_packet_does() {
+        let config = ecn_1_10();
+        let mut codel = Codel::default();
+        // An ECN bulk sender that never backs off (BBRv1) keeps the controller signalling.
+        let (verdicts, now) = drive_bulk(&mut codel, &config, 1, 0b10, 10 * MS, 200);
+        assert!(
+            verdicts[0].contains(&Verdict::Marked),
+            "the bulk flow is signalled"
+        );
+        assert!(codel.signalling);
+        // The next signal is due exactly when a Not-ECT probe reaches the TUN.
+        let due = codel.signal_next_ns.max(now);
+        let mut probe = icmp_probe();
+        assert_eq!(
+            judge_with(&mut codel, &mut probe, due - 3 * MS, due, &config),
+            Verdict::Pass,
+            "a probe sharing the tunnel with bulk is never dropped for the bulk's queue"
+        );
+        let mut bulk = tcp_v4(40_000, 0b10, 1_400);
+        assert_eq!(
+            judge_with(
+                &mut codel,
+                &mut bulk,
+                due - 3 * MS + 10_000,
+                due + 10_000,
+                &config
+            ),
+            Verdict::Marked,
+            "the signal the probe skipped goes to the queue-heavy flow"
+        );
+    }
+
+    #[test]
+    fn probes_beside_a_bulk_flow_that_never_backs_off_are_never_dropped() {
+        let config = ecn_1_10();
+        let mut codel = Codel::default();
+        let mut now = 10 * MS;
+        let mut probe_drops = 0;
+        let mut marks = 0;
+        // 2 s of bulk at one packet per 10 µs, a probe every 0.25 ms, and the probe placed
+        // right on the due signal whenever one is pending (the worst case for the probe).
+        for step in 0..200_000_u64 {
+            if step % 25 == 0 {
+                let at = if codel.signalling {
+                    codel.signal_next_ns.max(now)
+                } else {
+                    now
+                };
+                let mut probe = icmp_probe();
+                if judge_with(&mut codel, &mut probe, at - 3 * MS, at, &config) == Verdict::Drop {
+                    probe_drops += 1;
+                }
+                now = at;
+            }
+            let mut bulk = tcp_v4(40_000, 0b01, 1_400);
+            if judge_with(&mut codel, &mut bulk, now - 3 * MS, now, &config) == Verdict::Marked {
+                marks += 1;
+            }
+            now += 10_000;
+        }
+        assert_eq!(probe_drops, 0);
+        assert!(marks > 1_000, "the bulk flow keeps being marked: {marks}");
+    }
+
+    #[test]
+    fn a_not_ect_bulk_flow_is_dropped_when_it_fills_the_queue() {
+        let config = ecn_1_10();
+        let mut codel = Codel::default();
+        let (verdicts, _) = drive_bulk(&mut codel, &config, 1, 0, 10 * MS, 200);
+        assert!(verdicts[0].contains(&Verdict::Drop));
+        assert!(!verdicts[0].contains(&Verdict::Marked));
+    }
+
+    #[test]
+    fn every_one_of_eight_equal_bulk_flows_is_signalled() {
+        let config = ecn_1_10();
+        let mut codel = Codel::default();
+        let (verdicts, _) = drive_bulk(&mut codel, &config, 8, 0b10, 10 * MS, 500);
+        for (flow, flow_verdicts) in verdicts.iter().enumerate() {
+            let marks = flow_verdicts
+                .iter()
+                .filter(|v| **v == Verdict::Marked)
+                .count();
+            assert!(marks > 10, "flow {flow} escaped the bound: {marks} marks");
+        }
+    }
+
+    #[test]
+    fn pure_acks_of_a_reverse_bulk_flow_are_never_dropped() {
+        let config = ecn_1_10();
+        let mut codel = Codel::default();
+        let mut now = 10 * MS;
+        let mut ack_drops = 0;
+        for step in 0..100_000_u64 {
+            if step % 4 == 0 {
+                let at = if codel.signalling {
+                    codel.signal_next_ns.max(now)
+                } else {
+                    now
+                };
+                // A 52-byte Not-ECT pure ACK of another TCP connection (RFC 3168 §6.1.4).
+                let mut ack = tcp_v4(22, 0, 52);
+                if judge_with(&mut codel, &mut ack, at - 3 * MS, at, &config) == Verdict::Drop {
+                    ack_drops += 1;
+                }
+                now = at;
+            }
+            let mut bulk = tcp_v4(40_000, 0b10, 1_400);
+            judge_with(&mut codel, &mut bulk, now - 3 * MS, now, &config);
+            now += 10_000;
+        }
+        assert_eq!(ack_drops, 0);
+    }
+
+    #[test]
+    fn flow_keys_separate_ports_protocols_and_fragments() {
+        let a = flow_key(&tcp_v4(40_000, 0, 1_400));
+        assert_eq!(
+            a,
+            flow_key(&tcp_v4(40_000, 0b10, 60)),
+            "ECN and length don't matter"
+        );
+        assert_ne!(a, flow_key(&tcp_v4(40_001, 0, 1_400)));
+        assert_ne!(a, flow_key(&icmp_probe()));
+        let mut fragment = tcp_v4(40_000, 0, 1_400);
+        fragment[7] = 0x10; // fragment offset 16: no ports in this packet
+        assert_ne!(a, flow_key(&fragment));
+        let mut ipv6 = vec![0_u8; 60];
+        ipv6[0] = 0x60;
+        ipv6[6] = 6;
+        ipv6[40..42].copy_from_slice(&40_000_u16.to_be_bytes());
+        let v6 = flow_key(&ipv6);
+        ipv6[40..42].copy_from_slice(&40_001_u16.to_be_bytes());
+        assert_ne!(v6, flow_key(&ipv6));
+        assert_ne!(flow_key(&[]), 0);
+    }
+
+    #[test]
+    fn owed_signals_are_forgotten_once_the_queue_drains() {
+        let config = ecn_1_10();
+        let mut codel = Codel::default();
+        let (_, now) = drive_bulk(&mut codel, &config, 1, 0b10, 10 * MS, 100);
+        let due = codel.signal_next_ns.max(now);
+        let mut probe = icmp_probe();
+        assert_eq!(
+            judge_with(&mut codel, &mut probe, due - 3 * MS, due, &config),
+            Verdict::Pass
+        );
+        assert_eq!(codel.owed, 1);
+        // The queue empties: the next bulk packet sees no sojourn and nothing is owed any more.
+        let mut bulk = tcp_v4(40_000, 0b10, 1_400);
+        assert_eq!(
+            judge_with(&mut codel, &mut bulk, due + 10_000, due + 10_000, &config),
+            Verdict::Pass
+        );
+        assert_eq!(codel.owed, 0);
     }
 }
