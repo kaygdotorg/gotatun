@@ -83,6 +83,28 @@ const WORKER_SPIN_COUNT: usize = 128;
 /// Assigns a diagnostic identity that stays unique after a drained lane is retired.
 static NEXT_ORDERED_LANE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Whether a receive run of `packet_count` packets goes to a crypto worker (#260, J744).
+///
+/// `lane_says_worker` is the peer lane's own choice ([`OrderedCompletions::should_force_worker`]).
+/// A run of at most `inline_max` packets is decrypted inline anyway. On the Mac the device runs on
+/// one current-thread runtime: handing a 16-datagram receive batch to the workers costs about
+/// 4k cross-thread wakes per second at 1 Gbit/s and +4–13% CPU per Gbit (J728), while the runtime
+/// itself has time to spare in that direction. `inline_max == 0` keeps the lane's choice.
+pub(crate) const fn receive_run_goes_to_worker(
+    lane_says_worker: bool,
+    packet_count: usize,
+    inline_max: usize,
+) -> bool {
+    lane_says_worker && packet_count > inline_max
+}
+
+/// Receive runs up to this many packets stay inline: `GOTATUN_BENCH_RX_INLINE_MAX=<n>`, read once
+/// (#260, J744). Off (`0`) by default; a bench switch until the sweep decides a default.
+pub(crate) fn receive_inline_max() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| crate::diag::capacity("GOTATUN_BENCH_RX_INLINE_MAX", 0))
+}
+
 /// Whether a ready run has enough queued work behind it to justify entering parallel dispatch.
 ///
 /// The backlog is measured in older reserved packet slots for this peer. A large lone run cannot
@@ -2027,6 +2049,17 @@ mod tests {
             exited_workers, 2,
             "dropping the owner must stop every worker thread"
         );
+    }
+
+    /// A receive run within the inline limit stays inline even when its lane would hand it to a
+    /// worker; larger runs and the default limit (0) keep the lane's choice (#260, J744).
+    #[test]
+    fn small_receive_runs_stay_inline_under_the_limit() {
+        assert!(!super::receive_run_goes_to_worker(true, 16, 16));
+        assert!(!super::receive_run_goes_to_worker(true, 1, 16));
+        assert!(super::receive_run_goes_to_worker(true, 17, 16));
+        assert!(super::receive_run_goes_to_worker(true, 16, 0));
+        assert!(!super::receive_run_goes_to_worker(false, 64, 16));
     }
 
     /// Keep a lone ready run inline and dispatch substantial work only when another run exists.
