@@ -66,6 +66,10 @@ pub struct PeerState {
 
     /// Notified whenever a handshake that we initiated completes.
     handshake_completed: watch::Sender<()>,
+
+    /// CoDel state for this peer's receive path (J711 prototype; idle unless `GOTATUN_J711_AQM`
+    /// is set). Lives here because in-order delivery already holds the peer lock.
+    pub(crate) aqm: crate::aqm::Codel,
 }
 
 /// Canonicalizes and deduplicates route metadata while preserving the old trie iteration order.
@@ -101,6 +105,7 @@ impl PeerState {
             #[cfg(feature = "daita")]
             daita: None,
             handshake_completed: watch::Sender::new(()),
+            aqm: crate::aqm::Codel::default(),
         }
     }
 
