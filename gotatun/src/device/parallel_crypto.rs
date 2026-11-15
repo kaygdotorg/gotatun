@@ -70,8 +70,23 @@ pub(crate) const PARALLEL_DISPATCH_HIGH_WATER: usize = CRYPTO_CHUNK_SIZE / 2;
 /// Return to inline dispatch after this peer's older backlog drains below one minimum run.
 pub(crate) const PARALLEL_DISPATCH_LOW_WATER: usize = MIN_PARALLEL_RUN_SIZE;
 
+/// Full worker chunks one peer may have in flight per direction before its producer waits.
+///
+/// Each chunk is one read run handed to a crypto worker. With only two chunks (the earlier
+/// 128-slot bound), a busy peer stalls its producer whenever one finished run waits for ordered
+/// delivery while the next is still being sealed or opened: the receive pipeline becomes
+/// latency-bound with two runs in flight and the workers idle between them. Eight chunks let the
+/// producer keep reading while several runs are sealed in parallel and one is written out.
+pub(crate) const PEER_CRYPTO_CHUNKS_IN_FLIGHT: usize = 8;
+
 /// Maximum outstanding completion slots for one peer and one direction.
-pub(crate) const MAX_PEER_CRYPTO_IN_FLIGHT: usize = 128;
+///
+/// Every slot holds one pooled packet buffer (4 KiB) until its ordered release, so a fully busy
+/// peer can pin up to `2 × 512 × 4 KiB` = 4 MiB at once. Only peers with traffic in flight hold
+/// any: an idle peer's lane keeps no slots, so the bound costs nothing at mesh scale, and the
+/// device's shared packet pool still caps how many returned buffers stay allocated.
+pub(crate) const MAX_PEER_CRYPTO_IN_FLIGHT: usize =
+    PEER_CRYPTO_CHUNKS_IN_FLIGHT * CRYPTO_CHUNK_SIZE;
 
 /// Bound on worker runs waiting in the shared queue. Every run is already full when submitted;
 /// workers never wait to fill it, so a short packet cannot be held behind a packet-count target.
@@ -1544,10 +1559,16 @@ mod tests {
     }
 
     /// Keep another peer moving while a slow peer has filled its ordered slot window.
+    ///
+    /// Sized from the slot bound: the slow peer has two more runs than its window holds, and the
+    /// shared window has room for those two, so the scheduler must skip to the fast peer instead
+    /// of overfilling the slow one (which `reserve_run` would refuse).
     #[tokio::test]
     async fn profile_window_does_not_overfill_a_slow_peers_slot_capacity() {
+        let slow_runs_that_fit = MAX_PEER_CRYPTO_IN_FLIGHT / PROFILE_READ_PACKETS_PER_PEER;
+        let window = slow_runs_that_fit + 2;
         let peers = vec![
-            vec![(); PROFILE_READ_PACKETS_PER_PEER * 4],
+            vec![(); PROFILE_READ_PACKETS_PER_PEER * window],
             vec![(); PROFILE_READ_PACKETS_PER_PEER * 4],
         ];
         let lanes = (0..peers.len())
@@ -1557,7 +1578,7 @@ mod tests {
         let mut slow_peer_gate = Some(release_slow_peer_rx);
         let (fast_peer_done_tx, mut fast_peer_done_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let mut task = tokio::spawn(run_profile_peer_window(peers, 4, move |read| {
+        let mut task = tokio::spawn(run_profile_peer_window(peers, window, move |read| {
             let lane = Arc::clone(&lanes[read.peer_index]);
             let run_len = read.packets.len();
             let first_slot = lane
@@ -1601,7 +1622,7 @@ mod tests {
             .expect("the slow peer is still waiting");
         assert_eq!(
             task.await.expect("the profile scheduler completes"),
-            vec![(), (), (), (), (), (), (), ()]
+            vec![(); window + 4]
         );
     }
 
@@ -1915,7 +1936,7 @@ mod tests {
                     prepared.push((packet, address));
                 }
             }
-            // Two windows avoid exceeding the peer's 128-slot cap; every counter is duplicated.
+            // Two windows stay within the peer's slot cap; every counter is duplicated.
             let lane = Arc::new(OrderedCompletions::default());
             let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
             let delivered = Arc::new(Mutex::new(Vec::new()));
@@ -2316,6 +2337,23 @@ mod tests {
         let completions = OrderedCompletions::<()>::default();
         for expected in 0..super::MAX_PEER_CRYPTO_IN_FLIGHT {
             assert_eq!(completions.reserve(), Some(expected as u64));
+        }
+        assert_eq!(completions.reserve(), None);
+    }
+
+    /// A busy peer can keep eight full worker chunks in flight before its producer must wait.
+    ///
+    /// With two chunks the receive pipeline stalled on ordered delivery and lost 8-flow
+    /// throughput on the #260 bench host (J691, J712).
+    #[test]
+    fn a_peer_keeps_eight_worker_chunks_in_flight() {
+        let completions = OrderedCompletions::<()>::default();
+        for chunk in 0..8 {
+            assert_eq!(
+                completions.reserve_run(super::CRYPTO_CHUNK_SIZE),
+                Some((chunk * super::CRYPTO_CHUNK_SIZE) as u64),
+                "chunk {chunk} must fit the peer's in-flight window"
+            );
         }
         assert_eq!(completions.reserve(), None);
     }
@@ -2799,7 +2837,7 @@ mod tests {
     /// host with the shared benchmark lock and `taskset`. Set `GOTATUN_PROFILE_WORKERS` to run one
     /// worker count at a time so its affinity can match the pool size. Packet preparation is outside
     /// the timed interval. The ordered-stage profile places eight inner IP flows on each of two
-    /// peers, and schedules their contiguous reads only when each run fits in that peer's 128-slot
+    /// peers, and schedules their contiguous reads only when each run fits in that peer's slot
     /// window. A full peer stream does not occupy the shared worker window. Its latency runs from
     /// read readiness through in-order release, including worker queueing and the bounded batch.
     /// The loaded stage keeps twice as many bounded reads ready as workers so dispatch observes
