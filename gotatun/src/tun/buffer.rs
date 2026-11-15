@@ -34,6 +34,27 @@ use tokio_util::sync::CancellationToken;
 /// Identifies buffered TUN runs only when GOTATUN_DIAG_SEND_QUEUE is enabled.
 static NEXT_DIAGNOSTIC_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Most packets the TUN writer takes from its queue for one write call (J764, #260).
+///
+/// The writer never waits to fill this: it only takes runs that are already queued. A bigger
+/// call lets a Linux TUN with virtio headers merge more of a flow's segments into one GSO frame
+/// (64 segments at most, `gso::MAX_GSO_SEGMENTS`), so two full runs from 8 flows still leave about
+/// 16 segments per flow. The bound keeps one call from holding the head of a deep queue for long.
+const TUN_MERGE_PACKETS: usize = 128;
+
+/// The writer's per-call packet budget: [`TUN_MERGE_PACKETS`], or `GOTATUN_BENCH_TUN_MERGE`
+/// for A/B runs in one binary (`1` restores one queued run per call). Read once per process.
+fn tun_merge_budget() -> usize {
+    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("GOTATUN_BENCH_TUN_MERGE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&budget| budget > 0)
+            .unwrap_or(TUN_MERGE_PACKETS)
+    })
+}
+
 /// Create a pair of [`BufferedIpSend`] and [`BufferedIpRecv`] with `capacity`.
 ///
 /// This takes an `Arc<Mutex<S>>` and `Arc<Mutex<R>>` because the inner `S` and `R` will be re-used
@@ -94,38 +115,82 @@ impl BufferedIpSend {
                 .await
                 .expect("Deadlock on IpSend. There must be no more than one IpSend active at any given time.");
 
+            let merge_budget = tun_merge_budget();
             let mut refused: u64 = 0;
+            let mut packets = Vec::new();
+            let mut permits = Vec::new();
+            let mut sequences = Vec::new();
             while let Some(message) = rx.recv().await {
                 let diagnostic = crate::diag::PIPELINE.on();
-                let (result, refused_packets) = match message {
-                    BufferedIpMessage::Single(packet, _permit) => {
+                // A lone packet with nothing queued behind it keeps the single-packet path.
+                let message = match message {
+                    BufferedIpMessage::Single(packet, permit) if rx.is_empty() => {
                         if diagnostic {
                             eprintln!("pipeline stage=tun_buffer_dequeue mode=single packets=1");
                         }
-                        (inner.send(packet).await, 1)
+                        let result = inner.send(packet).await;
+                        drop(permit);
+                        if let Err(e) = result {
+                            if is_fatal_tun_error(&e) {
+                                tracing::error!("TUN device was deleted: {e}");
+                                break;
+                            }
+                            refused = refused.saturating_add(1);
+                            if refused.is_power_of_two() {
+                                tracing::warn!(
+                                    "Dropped IP packet(s) the TUN device refused ({refused} so far): {e}"
+                                );
+                            }
+                        }
+                        continue;
                     }
-                    BufferedIpMessage::Batch(mut packets, _permit, sequence) => {
-                        let batch_len = packets.len() as u64;
-                        if let Some(sequence) = sequence {
-                            eprintln!(
-                                "send_many dequeue direction=tun sequence={sequence} packets={batch_len}"
-                            );
-                        }
-                        if diagnostic {
-                            eprintln!(
-                                "pipeline stage=tun_buffer_dequeue mode=batch packets={batch_len}"
-                            );
-                        }
-                        let result = inner.send_many(&mut packets).await;
-                        if let Some(sequence) = sequence {
-                            eprintln!(
-                                "send_many complete direction=tun sequence={sequence} packets={batch_len} success={}",
-                                result.is_ok()
-                            );
-                        }
-                        (result, batch_len)
-                    }
+                    message => message,
                 };
+                // Take every run that is already queued, up to the budget, and write them in one
+                // call. Nothing waits for more packets: on an idle link this is the one run that
+                // arrived. Behind a slow write it is the backlog, and one call lets the device
+                // merge each flow's segments across runs (J764, #260). The permits stay held until
+                // the write returns, so the channel's packet bound still covers in-service packets.
+                let mut next = Some(message);
+                while let Some(message) = next.take() {
+                    match message {
+                        BufferedIpMessage::Single(packet, permit) => {
+                            packets.push(packet);
+                            permits.push(permit);
+                        }
+                        BufferedIpMessage::Batch(mut run, permit, sequence) => {
+                            if let Some(sequence) = sequence {
+                                eprintln!(
+                                    "send_many dequeue direction=tun sequence={sequence} packets={}",
+                                    run.len()
+                                );
+                                sequences.push(sequence);
+                            }
+                            packets.append(&mut run);
+                            permits.push(permit);
+                        }
+                    }
+                    if packets.len() < merge_budget {
+                        next = rx.try_recv().ok();
+                    }
+                }
+                let batch_len = packets.len() as u64;
+                if diagnostic {
+                    eprintln!(
+                        "pipeline stage=tun_buffer_dequeue mode=batch packets={batch_len} runs={}",
+                        permits.len()
+                    );
+                }
+                let result = inner.send_many(&mut packets).await;
+                packets.clear();
+                permits.clear();
+                for sequence in sequences.drain(..) {
+                    eprintln!(
+                        "send_many complete direction=tun sequence={sequence} packets={batch_len} success={}",
+                        result.is_ok()
+                    );
+                }
+                let (result, refused_packets) = (result, batch_len);
                 if diagnostic {
                     eprintln!(
                         "pipeline stage=tun_device_write packets={refused_packets} success={}",
