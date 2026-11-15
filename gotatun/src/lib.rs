@@ -24,6 +24,9 @@ mod crypto;
 pub mod device;
 #[cfg(feature = "device")]
 mod diag;
+/// Receive-side AQM prototype (J711); see the module docs.
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
+pub(crate) mod aqm;
 pub mod noise;
 pub mod packet;
 pub mod tun;
