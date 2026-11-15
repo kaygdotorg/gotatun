@@ -101,6 +101,12 @@ pub struct UdpSocket {
     recv_view: macos_connected::RecvView,
 }
 
+/// Every WireGuard socket this process bound, for [`UdpSocket::underlay_changed_everywhere`]
+/// (macOS, #260 J763). Dead entries are pruned on each bind.
+#[cfg(target_os = "macos")]
+static LIVE_SOCKETS: std::sync::Mutex<Vec<std::sync::Weak<UdpSocketState>>> =
+    std::sync::Mutex::new(Vec::new());
+
 struct UdpSocketState {
     socket: tokio::net::UdpSocket,
     /// Connected per-endpoint send sockets, shared by every clone (#260, J744).
@@ -210,7 +216,7 @@ impl UdpSocket {
 
         let inner = tokio::net::UdpSocket::from_std(udp_sock.into())?;
 
-        Ok(Self {
+        let socket = Self {
             inner: Arc::new(UdpSocketState {
                 socket: inner,
                 #[cfg(target_os = "linux")]
@@ -223,7 +229,14 @@ impl UdpSocket {
             map_ipv4_to_ipv6: addr.is_ipv6() && opts.only_v6 == Some(false),
             #[cfg(target_os = "macos")]
             recv_view: macos_connected::RecvView::default(),
-        })
+        };
+        #[cfg(target_os = "macos")]
+        {
+            let mut live = LIVE_SOCKETS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            live.retain(|state| state.strong_count() > 0);
+            live.push(Arc::downgrade(&socket.inner));
+        }
+        Ok(socket)
     }
 
     /// Get the inner [`tokio::net::UdpSocket`].
@@ -235,6 +248,25 @@ impl UdpSocket {
     /// Returns the local address that this socket is bound to.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.inner.socket.local_addr()
+    }
+
+    /// Tell every WireGuard socket of this process that the host's network changed.
+    ///
+    /// The same as [`UdpSocket::underlay_changed`] on each live socket, for an owner that holds
+    /// no socket handle itself (the CLI's `SIGUSR1`). Elsewhere than macOS it does nothing.
+    pub fn underlay_changed_everywhere() {
+        #[cfg(target_os = "macos")]
+        {
+            let live: Vec<_> = LIVE_SOCKETS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .collect();
+            for state in live {
+                state.connected.underlay_changed();
+            }
+        }
     }
 
     /// Tell the socket that the host's network changed (an address, route or link moved).
