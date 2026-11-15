@@ -24,7 +24,8 @@
 //! promises no order. A small encrypted datagram can overtake up to one receive queue of bulk
 //! datagrams of the same session, far inside WireGuard's replay window.
 //!
-//! Bench switch: `GOTATUN_BENCH_REPLIES_FIRST` = `tun`, `udp` or `both`. Unset, nothing moves.
+//! Bench switch: `GOTATUN_BENCH_REPLIES_FIRST` = a comma list of `tun`, `udp` and `tx` (the UDP
+//! send queue), or `both` (`tun,udp`) or `all`. Unset, nothing moves.
 
 use std::sync::OnceLock;
 
@@ -47,26 +48,26 @@ pub(crate) struct Mode {
     pub(crate) tun: bool,
     /// Give small received datagrams their own lane (the receive path, non-Linux only).
     pub(crate) udp: bool,
+    /// Give small encrypted datagrams their own lane in the UDP send queue (the send path).
+    pub(crate) tx: bool,
 }
 
 impl Mode {
-    /// Parse the switch value; anything unknown leaves both queues as they are.
+    /// Parse the switch value: a comma list of `tun`, `udp` and `tx`, or `both` (`tun,udp`) or
+    /// `all`. Anything unknown leaves every queue as it is.
     pub(crate) fn parse(value: Option<&str>) -> Self {
-        match value {
-            Some("tun") => Self {
-                tun: true,
-                udp: false,
-            },
-            Some("udp") => Self {
-                tun: false,
-                udp: true,
-            },
-            Some("both") => Self {
-                tun: true,
-                udp: true,
-            },
-            _ => Self::default(),
+        let mut mode = Self::default();
+        for part in value.unwrap_or_default().split(',') {
+            match part {
+                "tun" => mode.tun = true,
+                "udp" => mode.udp = true,
+                "tx" => mode.tx = true,
+                "both" => (mode.tun, mode.udp) = (true, true),
+                "all" => (mode.tun, mode.udp, mode.tx) = (true, true, true),
+                _ => return Self::default(),
+            }
         }
+        mode
     }
 }
 
@@ -77,7 +78,10 @@ pub(crate) fn mode() -> Mode {
         let value = std::env::var("GOTATUN_BENCH_REPLIES_FIRST").ok();
         let mode = Mode::parse(value.as_deref());
         if mode != Mode::default() {
-            eprintln!("diag replies_first tun={} udp={}", mode.tun, mode.udp);
+            eprintln!(
+                "diag replies_first tun={} udp={} tx={}",
+                mode.tun, mode.udp, mode.tx
+            );
         }
         mode
     })
@@ -236,16 +240,15 @@ mod tests {
 
     #[test]
     fn the_switch_is_off_unless_named() {
+        let on = |tun, udp, tx| Mode { tun, udp, tx };
         assert_eq!(Mode::parse(None), Mode::default());
         assert_eq!(Mode::parse(Some("yes")), Mode::default());
-        assert!(Mode::parse(Some("tun")).tun && !Mode::parse(Some("tun")).udp);
-        assert!(Mode::parse(Some("udp")).udp && !Mode::parse(Some("udp")).tun);
-        assert_eq!(
-            Mode::parse(Some("both")),
-            Mode {
-                tun: true,
-                udp: true
-            }
-        );
+        assert_eq!(Mode::parse(Some("tun,nope")), Mode::default());
+        assert_eq!(Mode::parse(Some("tun")), on(true, false, false));
+        assert_eq!(Mode::parse(Some("udp")), on(false, true, false));
+        assert_eq!(Mode::parse(Some("tx")), on(false, false, true));
+        assert_eq!(Mode::parse(Some("both")), on(true, true, false));
+        assert_eq!(Mode::parse(Some("tun,tx")), on(true, false, true));
+        assert_eq!(Mode::parse(Some("all")), on(true, true, true));
     }
 }
