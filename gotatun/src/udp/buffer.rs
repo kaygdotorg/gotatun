@@ -333,11 +333,25 @@ pub struct BufferedUdpReceive {
 #[cfg(any(not(target_os = "linux"), test))]
 impl BufferedUdpReceive {
     /// Wrap a [`UdpRecv`] into a [`BufferedUdpReceive`] with `capacity`.
-    pub fn new(
+    ///
+    /// Small datagrams get their own lane when `GOTATUN_BENCH_REPLIES_FIRST` names `udp`
+    /// (#260, J720; see [`crate::priority`]).
+    pub fn new(capacity: usize, udp_rx: impl UdpRecv + 'static, recv_pool: PacketBufPool) -> Self {
+        Self::with_reply_lane(capacity, udp_rx, recv_pool, crate::priority::mode().udp)
+    }
+
+    /// Like [`Self::new`], with the reply lane chosen by the caller (`reply_lane`).
+    ///
+    /// With the lane, a datagram of at most [`crate::priority::REPLY_MAX`] bytes waits in its
+    /// own queue of `capacity`, and every receive call takes that queue first. A probe reply or
+    /// ACK then no longer waits behind a full queue of bulk datagrams.
+    pub(crate) fn with_reply_lane(
         capacity: usize,
         mut udp_rx: impl UdpRecv + 'static,
         mut recv_pool: PacketBufPool,
+        reply_lane: bool,
     ) -> Self {
+        let _ = reply_lane;
         let (recv_tx, recv_rx) = mpsc::channel(capacity);
         let depth_tx = recv_tx.downgrade();
 
@@ -435,8 +449,8 @@ impl UdpRecv for BufferedUdpReceive {
         packets.push(self.recv_from(pool).await?);
         // Bench override (#260, J687): GOTATUN_BENCH_UDP_RX_BATCH=1 restores one datagram per call.
         static BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let batch = *BATCH
-            .get_or_init(|| crate::diag::capacity("GOTATUN_BENCH_UDP_RX_BATCH", RECV_BATCH));
+        let batch =
+            *BATCH.get_or_init(|| crate::diag::capacity("GOTATUN_BENCH_UDP_RX_BATCH", RECV_BATCH));
         for _ in 1..batch {
             let Ok(item) = self.recv_rx.try_recv() else {
                 break;
@@ -704,5 +718,78 @@ mod test {
         .await
         .expect("the receive task must stop promptly")
         .expect("the panicked receive task must not close its channel");
+    }
+}
+
+/// Reply lane tests (#260, J720). These run on every target, the Mac included.
+#[cfg(test)]
+mod reply_lane_test {
+    use super::*;
+
+    /// Hands out scripted datagrams, then waits forever.
+    struct Script(std::collections::VecDeque<(Packet, SocketAddr)>);
+
+    impl UdpRecv for Script {
+        type RecvManyBuf = ();
+
+        async fn recv_from(
+            &mut self,
+            _pool: &mut PacketBufPool,
+        ) -> io::Result<(Packet, SocketAddr)> {
+            match self.0.pop_front() {
+                Some(item) => Ok(item),
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    /// A datagram of `len` bytes whose first byte is `id`.
+    fn datagram(len: usize, id: u8) -> (Packet, SocketAddr) {
+        let mut bytes = bytes::BytesMut::zeroed(len);
+        bytes[0] = id;
+        (
+            Packet::from_bytes(bytes),
+            "192.0.2.1:51820".parse().unwrap(),
+        )
+    }
+
+    async fn drained(lane: bool) -> Vec<u8> {
+        let script = [
+            datagram(1452, 1),
+            datagram(1452, 2),
+            datagram(96, 3),
+            datagram(1452, 4),
+            datagram(156, 5),
+        ];
+        let mut receiver = BufferedUdpReceive::with_reply_lane(
+            16,
+            Script(script.into()),
+            PacketBufPool::new(8),
+            lane,
+        );
+        // The receive task queues all five before the first call takes them.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut pool = PacketBufPool::new(1);
+        let mut packets = Vec::new();
+        let mut ids = Vec::new();
+        while ids.len() < 5 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                receiver.recv_many_from(&mut (), &mut pool, &mut packets),
+            )
+            .await
+            .expect("queued datagrams")
+            .expect("the script never fails");
+            ids.extend(packets.drain(..).map(|(p, _)| p[0]));
+        }
+        ids
+    }
+
+    /// With the lane, small datagrams queued behind bulk ones are handed over first, each class
+    /// in arrival order. Without it, the queue is a FIFO.
+    #[tokio::test]
+    async fn small_datagrams_overtake_queued_bulk() {
+        assert_eq!(drained(false).await, [1, 2, 3, 4, 5]);
+        assert_eq!(drained(true).await, [3, 5, 1, 2, 4]);
     }
 }
