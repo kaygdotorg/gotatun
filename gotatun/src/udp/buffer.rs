@@ -48,6 +48,8 @@ pub struct BufferedUdpSend {
     send_tx: mpsc::Sender<BufferedUdpMessage>,
     packet_slots: Arc<Semaphore>,
     packet_capacity: usize,
+    /// Small datagrams, sent before the next queued run (#260, J720); `None` without the lane.
+    reply_tx: Option<mpsc::Sender<(Packet, SocketAddr)>>,
 }
 
 /// One queued datagram or one ordered run of datagrams.
@@ -136,6 +138,26 @@ async fn flush_udp_run<U: UdpSend>(
     }
 }
 
+/// Send `replies` and every reply already queued on `reply_rx`, one address family per call.
+async fn flush_replies<U: UdpSend>(
+    reply_rx: &mut mpsc::Receiver<(Packet, SocketAddr)>,
+    udp_tx: &U,
+    send_buf: &mut U::SendManyBuf,
+    replies: &mut Vec<(Packet, SocketAddr)>,
+    max_packet_count: usize,
+) {
+    while let Ok(reply) = reply_rx.try_recv() {
+        let other_family = replies.first().is_some_and(|(_, first)| {
+            matches!(first, SocketAddr::V4(..)) != matches!(reply.1, SocketAddr::V4(..))
+        });
+        if other_family || replies.len() == max_packet_count {
+            flush_udp_packets(udp_tx, send_buf, replies).await;
+        }
+        replies.push(reply);
+    }
+    flush_udp_packets(udp_tx, send_buf, replies).await;
+}
+
 impl BufferedUdpSend {
     /// Wrap a [`UdpSend`] into a [`BufferedUdpSend`] with `capacity`.
     ///
@@ -155,9 +177,14 @@ impl BufferedUdpSend {
         udp_tx: impl UdpSend + 'static,
         reply_lane: bool,
     ) -> Self {
-        let _ = reply_lane;
         let (send_tx, mut send_rx) = mpsc::channel::<BufferedUdpMessage>(capacity);
         let packet_slots = Arc::new(Semaphore::new(capacity));
+        let (reply_tx, mut reply_rx) = if reply_lane {
+            let (tx, rx) = mpsc::channel(capacity);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
 
         let send_task = Task::spawn("buffered UDP send", async move {
             let mut buf = vec![];
@@ -165,14 +192,37 @@ impl BufferedUdpSend {
             let mut send_many_buf = Default::default();
             let mut singles = Vec::with_capacity(max_packet_count);
             let mut single_permits = Vec::with_capacity(max_packet_count);
+            let mut replies = Vec::with_capacity(max_packet_count);
 
             loop {
-                let count = send_rx.recv_many(&mut buf, max_packet_count).await;
+                let count = match &mut reply_rx {
+                    Some(reply_rx) => tokio::select! {
+                        biased;
+                        Some(reply) = reply_rx.recv() => {
+                            replies.push(reply);
+                            flush_replies(reply_rx, &udp_tx, &mut send_many_buf, &mut replies, max_packet_count).await;
+                            continue;
+                        }
+                        count = send_rx.recv_many(&mut buf, max_packet_count) => count,
+                    },
+                    None => send_rx.recv_many(&mut buf, max_packet_count).await,
+                };
                 if count == 0 {
                     break;
                 }
 
                 for message in buf.drain(..) {
+                    // Replies queued since the last run leave before the next one.
+                    if let Some(reply_rx) = &mut reply_rx {
+                        flush_replies(
+                            reply_rx,
+                            &udp_tx,
+                            &mut send_many_buf,
+                            &mut replies,
+                            max_packet_count,
+                        )
+                        .await;
+                    }
                     match message {
                         BufferedUdpMessage::Single(packet, addr, permit) => {
                             if singles.first().is_some_and(|(_, first_addr)| {
@@ -220,6 +270,7 @@ impl BufferedUdpSend {
             send_tx,
             packet_slots,
             packet_capacity: capacity,
+            reply_tx,
         }
     }
 }
@@ -241,6 +292,14 @@ impl UdpSend for BufferedUdpSend {
     type SendManyBuf = ();
 
     async fn send_to(&self, packet: Packet, destination: SocketAddr) -> io::Result<()> {
+        if let Some(reply_tx) = &self.reply_tx
+            && crate::priority::datagram_is_reply(packet.len())
+        {
+            return reply_tx
+                .send((packet, destination))
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e));
+        }
         let permit = Arc::clone(&self.packet_slots)
             .acquire_owned()
             .await
@@ -269,6 +328,24 @@ impl UdpSend for BufferedUdpSend {
                 io::ErrorKind::InvalidInput,
                 "a UDP run cannot mix address families",
             ));
+        }
+        if let Some(reply_tx) = &self.reply_tx
+            && packets
+                .iter()
+                .any(|(packet, _)| crate::priority::datagram_is_reply(packet.len()))
+        {
+            let mut bulk = Vec::with_capacity(packets.len());
+            for (packet, address) in packets.drain(..) {
+                if crate::priority::datagram_is_reply(packet.len()) {
+                    reply_tx
+                        .send((packet, address))
+                        .await
+                        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+                } else {
+                    bulk.push((packet, address));
+                }
+            }
+            *packets = bulk;
         }
         while !packets.is_empty() {
             let count = packets.len().min(self.packet_capacity);
