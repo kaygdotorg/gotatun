@@ -396,6 +396,11 @@ impl<I: IpRecv> IpRecv for BufferedIpRecv<I> {
                 "channel closed",
             ));
         }
+        if self.replies_first {
+            crate::priority::replies_first(&mut self.rx_packet_buf, |packet| {
+                crate::priority::ip_is_reply(zerocopy::IntoBytes::as_bytes(&**packet))
+            });
+        }
         Ok(self.rx_packet_buf.drain(..n))
     }
 

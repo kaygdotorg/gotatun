@@ -328,6 +328,8 @@ pub struct BufferedUdpReceive {
     /// Bench diagnostic handle on the receive queue (#260, J687); never keeps it open.
     depth_tx: mpsc::WeakSender<io::Result<(Packet, SocketAddr)>>,
     recv_rx: mpsc::Receiver<io::Result<(Packet, SocketAddr)>>,
+    /// Small datagrams, taken before `recv_rx` (#260, J720); `None` without the reply lane.
+    reply_rx: Option<mpsc::Receiver<(Packet, SocketAddr)>>,
 }
 
 #[cfg(any(not(target_os = "linux"), test))]
@@ -351,8 +353,13 @@ impl BufferedUdpReceive {
         mut recv_pool: PacketBufPool,
         reply_lane: bool,
     ) -> Self {
-        let _ = reply_lane;
         let (recv_tx, recv_rx) = mpsc::channel(capacity);
+        let (reply_tx, reply_rx) = if reply_lane {
+            let (tx, rx) = mpsc::channel(capacity);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let depth_tx = recv_tx.downgrade();
 
         let recv_task = Task::spawn("buffered UDP receive", async move {
@@ -381,6 +388,14 @@ impl BufferedUdpReceive {
                 }
 
                 for (packet_buf, src) in packet_bufs.drain(..) {
+                    if let Some(reply_tx) = &reply_tx
+                        && crate::priority::datagram_is_reply(packet_buf.len())
+                    {
+                        if reply_tx.send((packet_buf, src)).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
                     match recv_tx.try_send(Ok((packet_buf, src))) {
                         Ok(()) => (),
                         Err(mpsc::error::TrySendError::Full(packet)) => {
@@ -399,6 +414,7 @@ impl BufferedUdpReceive {
             _recv_task: Arc::new(recv_task),
             depth_tx,
             recv_rx,
+            reply_rx,
         }
     }
 
@@ -427,6 +443,19 @@ impl UdpRecv for BufferedUdpReceive {
     type RecvManyBuf = ();
 
     async fn recv_from(&mut self, _pool: &mut PacketBufPool) -> io::Result<(Packet, SocketAddr)> {
+        if let Some(reply_rx) = &mut self.reply_rx {
+            // Replies first; a closed lane only means the receive task is gone, and the bulk
+            // queue then reports how it ended.
+            tokio::select! {
+                biased;
+                Some(reply) = reply_rx.recv() => return Ok(reply),
+                packet = self.recv_rx.recv() => {
+                    return packet.unwrap_or_else(|| {
+                        Err(io::Error::new(io::ErrorKind::BrokenPipe, "UDP receive task stopped"))
+                    });
+                }
+            }
+        }
         let Some(packet) = self.recv_rx.recv().await else {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -452,6 +481,10 @@ impl UdpRecv for BufferedUdpReceive {
         let batch =
             *BATCH.get_or_init(|| crate::diag::capacity("GOTATUN_BENCH_UDP_RX_BATCH", RECV_BATCH));
         for _ in 1..batch {
+            if let Some(reply) = self.reply_rx.as_mut().and_then(|rx| rx.try_recv().ok()) {
+                packets.push(reply);
+                continue;
+            }
             let Ok(item) = self.recv_rx.try_recv() else {
                 break;
             };
