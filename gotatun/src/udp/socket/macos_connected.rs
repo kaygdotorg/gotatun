@@ -30,8 +30,17 @@
 //! ([`ReusePortWindow`]). With it cleared, other users' binds are refused exactly as they are
 //! without this feature (`EADDRINUSE`, same probe), and root can bind a specific address either
 //! way. What remains is the window itself: a few system calls each time a connected socket is
-//! created, which happens on the first data to an endpoint, after a network change and after a
-//! handshake initiation (about every two minutes per active endpoint).
+//! created, which happens on the first data to an endpoint, after a network change and after each
+//! keepalive or handshake message.
+//!
+//! **That window is a race another user wins, so the feature is off by default (J789).** With
+//! the real code as a root holder on macOS 26.5.2, a process of another user that loops `bind`
+//! with `SO_REUSEPORT` took `127.0.0.1:<port>` within 2 ms and `0.0.0.0:<port>` within a few
+//! attempts, then received every datagram for the port that no connected socket matched
+//! (handshake replies, new and roaming peers). Without the feature the same loop never binds.
+//! Binding each connected socket to its specific source address with `SO_REUSEADDR` on that
+//! socket alone, and nothing on the wildcard socket, also lost the race. Until a scheme with no
+//! such window exists, a default socket keeps `sendto`.
 //!
 //! **A stale source.** `connect` fixes the source address the route chose at that moment, and
 //! xnu keeps it. If the network changes, the socket would keep sending from the old address:
@@ -69,7 +78,8 @@
 //!   that datagram uses `sendto` and the next one tries again.
 //! - Datagrams still queued on a closed entry are lost, which WireGuard tolerates.
 //!
-//! On by default on macOS. `GOTATUN_BENCH_MAC_CONNECTED=0` turns it off for diagnosis.
+//! Off by default (J789, above). `GOTATUN_BENCH_MAC_CONNECTED=1` turns it on for measurement on
+//! a host with no other local users.
 
 use std::{
     io,
@@ -101,18 +111,20 @@ pub(crate) const ACTIVE_SENDS: u64 = 1024;
 /// Datagrams this small or smaller never use a connected socket.
 const KEEPALIVE_LEN: usize = 32;
 
-/// Whether the switch's value turns connected sends on: anything but `0` (or no value) does.
+/// Whether the switch's value turns connected sends on: a set value other than `0` does; no
+/// value keeps them off (J789: the shared-port window is a race another local user can win).
 pub(crate) fn switch_on(value: Option<&str>) -> bool {
-    value.is_none_or(|value| value.trim() != "0")
+    value.is_some_and(|value| value.trim() != "0")
 }
 
-/// Whether connected sends are on for this process: on unless `GOTATUN_BENCH_MAC_CONNECTED=0`.
+/// Whether connected sends are on for this process: off unless `GOTATUN_BENCH_MAC_CONNECTED` is
+/// set to something other than `0`.
 pub(crate) fn wanted() -> bool {
     static WANTED: OnceLock<bool> = OnceLock::new();
     *WANTED.get_or_init(|| {
         let on = switch_on(std::env::var("GOTATUN_BENCH_MAC_CONNECTED").ok().as_deref());
-        if !on {
-            eprintln!("diag mac_connected off (GOTATUN_BENCH_MAC_CONNECTED=0)");
+        if on {
+            eprintln!("diag mac_connected on (GOTATUN_BENCH_MAC_CONNECTED)");
         }
         on
     })
