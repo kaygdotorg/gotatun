@@ -766,6 +766,28 @@ mod tests {
         assert_eq!(wireguard.inner.connected.connects(), before + 1);
     }
 
+    /// Keepalives and handshake responses also leave through the wildcard socket and close their
+    /// endpoint's connected socket (J789). A Mac that is idle or only receives sends nothing but
+    /// keepalives, and a responder sends no initiation. If these rode a stale connected socket,
+    /// nothing would move the session to the current source until it expired (up to 9 minutes).
+    /// Through `sendto` they leave from the current source, so the peer roams to it.
+    #[tokio::test]
+    async fn keepalives_and_responses_reconnect_their_endpoint() {
+        let wireguard = wireguard_socket(true);
+        let (a, a_address) = peer().await;
+        let mut response = vec![0u8; 92];
+        response[0] = 2;
+        for (name, message) in [("keepalive", data(32)), ("handshake response", response)] {
+            send(&wireguard, &data(64), a_address).await;
+            peer_recv(&a).await;
+            assert_eq!(wireguard.inner.connected.len(), 1, "data made an entry before the {name}");
+
+            send(&wireguard, &message, a_address).await;
+            assert_eq!(peer_recv(&a).await.0, message);
+            assert_eq!(wireguard.inner.connected.len(), 0, "the {name} closed the entry");
+        }
+    }
+
     /// Keepalives and handshake messages never create a connected socket.
     #[tokio::test]
     async fn keepalives_and_handshakes_do_not_create_sockets() {
