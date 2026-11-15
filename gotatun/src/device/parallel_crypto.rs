@@ -98,16 +98,32 @@ pub(crate) const fn receive_run_goes_to_worker(
     lane_says_worker && packet_count > inline_max
 }
 
-/// Red stub (J763): J744's parse, off by default everywhere.
+/// The default inline limit for receive runs: 16 on macOS, where J744 measured −68% CPU per Gbit
+/// in Mac-receive with it (one current-thread runtime, so worker hand-offs are pure wake cost),
+/// and off (`0`) elsewhere, where the Linux worker hand-off is a measured throughput win.
+pub(crate) const DEFAULT_RECEIVE_INLINE_MAX: usize = if cfg!(target_os = "macos") { 16 } else { 0 };
+
+/// The inline limit `value` (the `GOTATUN_BENCH_RX_INLINE_MAX` variable) asks for: a number,
+/// `0` included, replaces the default; anything else keeps it.
 pub(crate) fn inline_max_from(value: Option<&str>) -> usize {
-    value.and_then(|value| value.trim().parse().ok()).filter(|&value| value > 0).unwrap_or(0)
+    value
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(DEFAULT_RECEIVE_INLINE_MAX)
 }
 
-/// Receive runs up to this many packets stay inline: `GOTATUN_BENCH_RX_INLINE_MAX=<n>`, read once
-/// (#260, J744). Off (`0`) by default; a bench switch until the sweep decides a default.
+/// Receive runs up to this many packets stay inline, read once (#260, J744, J763).
+///
+/// [`DEFAULT_RECEIVE_INLINE_MAX`] unless `GOTATUN_BENCH_RX_INLINE_MAX=<n>` overrides it for
+/// diagnosis (`0` turns it off).
 pub(crate) fn receive_inline_max() -> usize {
     static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MAX.get_or_init(|| crate::diag::capacity("GOTATUN_BENCH_RX_INLINE_MAX", 0))
+    *MAX.get_or_init(|| {
+        let max = inline_max_from(std::env::var("GOTATUN_BENCH_RX_INLINE_MAX").ok().as_deref());
+        if max != DEFAULT_RECEIVE_INLINE_MAX {
+            eprintln!("diag rx_inline_max={max} (default {DEFAULT_RECEIVE_INLINE_MAX})");
+        }
+        max
+    })
 }
 
 /// Whether a ready run has enough queued work behind it to justify entering parallel dispatch.
