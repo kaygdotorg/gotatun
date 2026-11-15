@@ -24,8 +24,15 @@ impl UdpSend for super::UdpSocket {
 
     async fn send_to(&self, packet: Packet, dest: SocketAddr) -> io::Result<()> {
         let dest = self.map_dst(dest);
-        self.socket().send_to(&packet, dest).await?;
-        Ok(())
+        // macOS: an endpoint's connected socket skips xnu's per-datagram route and policy
+        // decision (#260, J744; see `macos_connected`). Off, this is the plain `sendto`.
+        #[cfg(target_os = "macos")]
+        return self.inner.connected.send(self.socket(), &packet, dest).await;
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.socket().send_to(&packet, dest).await?;
+            Ok(())
+        }
     }
 
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
@@ -38,6 +45,18 @@ impl UdpRecv for super::UdpSocket {
 
     async fn recv_from(&mut self, pool: &mut PacketBufPool) -> io::Result<(Packet, SocketAddr)> {
         let mut buf = pool.get();
+        // macOS: an endpoint with a connected socket receives on it, so read those too.
+        #[cfg(target_os = "macos")]
+        let (n, src) = {
+            let this = &mut *self;
+            std::future::poll_fn(|cx| {
+                this.inner
+                    .connected
+                    .poll_recv(&this.inner.socket, &mut this.recv_view, cx, &mut buf)
+            })
+            .await?
+        };
+        #[cfg(not(target_os = "macos"))]
         let (n, src) = self.socket().recv_from(&mut buf).await?;
         buf.truncate(n);
         let src = self.map_src(src);
