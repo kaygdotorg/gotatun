@@ -44,17 +44,20 @@
 //!   host, `ENETUNREACH`, `ENETDOWN`; `EHOSTUNREACH` after one retry, since it can also be a
 //!   stale ICMP report) drops the entry, and that datagram leaves through `sendto` in the same
 //!   call.
-//! - Every handshake initiation drops its endpoint's entry and leaves through `sendto`, which
-//!   picks the current source. WireGuard starts one after 15 s without a reply to sent data
-//!   (and retries every 5 s), so even an unsignalled, error-free stale path ends at the
-//!   protocol's own recovery point, and the reply's arrival then completes the session on the new
-//!   path.
+//! - Every message that is not data (handshake messages, cookie replies and keepalives) drops
+//!   its endpoint's entry and leaves through `sendto`, which picks the current source. A Mac that
+//!   sends data starts a handshake after 15 s without a reply (and retries every 5 s); an idle or
+//!   receive-only Mac sends a keepalive at least every persistent-keepalive interval. So even an
+//!   unsignalled, error-free stale path ends at the protocol's own recovery point, and the peer
+//!   then roams to the current source. Keepalives matter as much as initiations here (J789):
+//!   a Mac that sends no data never initiates, so if its keepalives rode the stale socket, the
+//!   peer's endpoint for it would stay on the dead path until the session expired (180 s).
 //!
 //! **Bounded.** At most [`MAX_CONNECTED`] endpoints hold a connected socket (one file descriptor
 //! and one reactor registration each). Keepalives, handshake messages and cookie replies never
 //! create one; only data does, so a large mostly-idle mesh does not churn sockets. When the table
 //! is full, the least recently used entry makes room only if it has been idle for at least
-//! [`ACTIVE_SENDS`] sends; when all of them are busier than that, the new endpoint keeps using
+//! [`ACTIVE_SENDS`] data sends; when all of them are busier than that, the new endpoint keeps using
 //! `sendto` (today's path, ~14 µs per datagram) instead of evicting a busy one, so more than
 //! sixteen busy endpoints never thrash socket creation.
 //!
@@ -95,11 +98,8 @@ pub(crate) const MAX_CONNECTED: usize = 16;
 pub(crate) const ACTIVE_SENDS: u64 = 1024;
 
 /// The size of a WireGuard keepalive: a data header and an empty, authenticated payload.
-/// Datagrams this small or smaller never create a connected socket.
+/// Datagrams this small or smaller never use a connected socket.
 const KEEPALIVE_LEN: usize = 32;
-
-/// The size of a WireGuard handshake initiation.
-const HANDSHAKE_INIT_LEN: usize = 148;
 
 /// Whether the switch's value turns connected sends on: anything but `0` (or no value) does.
 pub(crate) fn switch_on(value: Option<&str>) -> bool {
@@ -211,9 +211,11 @@ impl ConnectedSends {
 
     /// Send `payload` to `destination` (already mapped for the wildcard socket).
     ///
-    /// Uses the endpoint's connected socket, creating it first if this is data and the table
-    /// allows it, and falls back to `sendto` on the wildcard socket whenever no connected socket
-    /// can be used.
+    /// Data uses the endpoint's connected socket, creating it first if the table allows it.
+    /// Everything else (handshake messages, cookie replies, keepalives) closes the endpoint's
+    /// connected socket and leaves through `sendto`, so it picks the current source; the next data
+    /// reconnects after it. Data also falls back to `sendto` whenever no connected socket can be
+    /// used.
     pub(crate) async fn send(
         &self,
         wildcard: &tokio::net::UdpSocket,
@@ -221,10 +223,10 @@ impl ConnectedSends {
         destination: SocketAddr,
     ) -> io::Result<()> {
         if self.enabled.load(Ordering::Relaxed) {
-            if is_handshake_initiation(payload) {
+            if !carries_data(payload) {
                 // `sendto` picks the current source; the next data reconnects after it.
                 self.forget_destination(destination);
-            } else if let Some(entry) = self.entry_for(wildcard, payload, destination) {
+            } else if let Some(entry) = self.entry_for(wildcard, destination) {
                 match entry.socket.send(payload).await {
                     Ok(_) => return Ok(()),
                     // A pending ICMP error is reported once and cleared; the datagram was not
@@ -295,12 +297,11 @@ impl ConnectedSends {
         Poll::Pending
     }
 
-    /// The connected socket for `destination`, created on first use when `payload` is data and
-    /// the table has room for it.
+    /// The connected socket for `destination`, created on first use when the table has room for
+    /// it. Only called for data ([`carries_data`]).
     fn entry_for(
         &self,
         wildcard: &tokio::net::UdpSocket,
-        payload: &[u8],
         destination: SocketAddr,
     ) -> Option<Arc<Entry>> {
         let now = self.sends.fetch_add(1, Ordering::Relaxed);
@@ -308,9 +309,6 @@ impl ConnectedSends {
         if let Some(entry) = entries.iter().find(|entry| entry.destination == destination) {
             entry.last_used.store(now, Ordering::Relaxed);
             return Some(Arc::clone(entry));
-        }
-        if payload.len() <= KEEPALIVE_LEN || !is_data(payload) {
-            return None;
         }
         let evict = if entries.len() < MAX_CONNECTED {
             None
@@ -499,14 +497,10 @@ fn connect(
     tokio::net::UdpSocket::from_std(socket.into()).map_err(shared)
 }
 
-/// Whether `payload` is a WireGuard handshake initiation.
-fn is_handshake_initiation(payload: &[u8]) -> bool {
-    payload.len() == HANDSHAKE_INIT_LEN && payload.first() == Some(&WgPacketType::HandshakeInit.0)
-}
-
-/// Whether `payload` is a WireGuard data message (keepalives included).
-fn is_data(payload: &[u8]) -> bool {
-    payload.first() == Some(&WgPacketType::Data.0)
+/// Whether `payload` is a WireGuard data message that carries a packet: the only kind that uses
+/// a connected socket. Keepalives (an empty data message) and handshake messages do not.
+fn carries_data(payload: &[u8]) -> bool {
+    payload.len() > KEEPALIVE_LEN && payload.first() == Some(&WgPacketType::Data.0)
 }
 
 /// An error a connected UDP socket reports for an ICMP message about an earlier datagram.
