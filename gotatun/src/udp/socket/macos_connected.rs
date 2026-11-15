@@ -4,7 +4,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-//! Connected per-endpoint send sockets for macOS (#260, J744).
+//! Connected per-endpoint send sockets for macOS (#260, J744, J763).
 //!
 //! **Why.** On macOS a `sendto` on an unconnected socket bound to the wildcard address costs
 //! about 14 µs of kernel time per datagram on our Mac VM, because xnu re-decides the route and
@@ -14,26 +14,59 @@
 //! largest per-datagram cost on the Mac send path. The private batch call `sendmsg_x` saves only
 //! about 3% on the same socket, so no private API is used here.
 //!
-//! **How.** The WireGuard socket keeps its wildcard bind and is created with `SO_REUSEPORT`.
-//! The first datagram to an endpoint creates one more socket bound to the same address and port
-//! (also `SO_REUSEPORT`) and connected to that endpoint; later datagrams to it use `send` on that
-//! socket. The kernel delivers an arriving datagram to the most specific matching socket, so the
-//! endpoint's replies now land on its connected socket rather than the wildcard one: the
-//! receive side therefore reads every connected socket as well as the wildcard socket.
+//! **How.** The WireGuard socket keeps its wildcard bind. The first data datagram to an endpoint
+//! creates one more socket bound to the same address and port and connected to that endpoint;
+//! later datagrams to it use `send` on that socket. The kernel delivers an arriving datagram to
+//! the most specific matching socket, so the endpoint's replies now land on its connected socket
+//! rather than the wildcard one: the receive side therefore reads every connected socket as well
+//! as the wildcard socket.
 //!
-//! **Invariants.**
-//! - At most [`MAX_CONNECTED`] endpoints get a connected socket. When the table is full, the
-//!   oldest entry is closed to make room (an endpoint that roamed away no longer sends to it).
-//!   Datagrams still queued on a closed entry are lost, which WireGuard tolerates.
+//! **Sharing the port without opening it to others.** Two sockets can bind one port only while
+//! `SO_REUSEPORT` is set on the sockets already there. On macOS that check has no same-user rule:
+//! J763 measured on macOS 26.5.2 that while our port carries the option, a process of *any* user
+//! can bind it too, including a specific address such as `127.0.0.1:<port>`, which then wins the
+//! delivery of every datagram sent to that address. So the option is set only for the moment a
+//! socket of ours binds and is cleared on every socket of ours right after
+//! ([`ReusePortWindow`]). With it cleared, other users' binds are refused exactly as they are
+//! without this feature (`EADDRINUSE`, same probe), and root can bind a specific address either
+//! way. What remains is the window itself: a few system calls each time a connected socket is
+//! created, which happens on the first data to an endpoint, after a network change and after a
+//! handshake initiation (about every two minutes per active endpoint).
+//!
+//! **A stale source.** `connect` fixes the source address the route chose at that moment, and
+//! xnu keeps it. If the network changes, the socket would keep sending from the old address:
+//! still working while that address and its path live, a black hole when the path is gone but the
+//! address is not. Three things replace an entry, none of them a timer (D81):
+//! - [`ConnectedSends::underlay_changed`]: the owner's network-change signal (the product's
+//!   macOS routing-socket listener) closes every connected socket at once, so the next datagram
+//!   reconnects on the current route and source.
+//! - A send error that says the path is gone (`EADDRNOTAVAIL` once the source address left the
+//!   host, `ENETUNREACH`, `ENETDOWN`; `EHOSTUNREACH` after one retry, since it can also be a
+//!   stale ICMP report) drops the entry, and that datagram leaves through `sendto` in the same
+//!   call.
+//! - Every handshake initiation drops its endpoint's entry and leaves through `sendto`, which
+//!   picks the current source. WireGuard starts one after 15 s without a reply to sent data
+//!   (and retries every 5 s), so even an unsignalled, error-free stale path ends at the
+//!   protocol's own recovery point, and the reply's arrival then completes the session on the new
+//!   path.
+//!
+//! **Bounded.** At most [`MAX_CONNECTED`] endpoints hold a connected socket (one file descriptor
+//! and one reactor registration each). Keepalives, handshake messages and cookie replies never
+//! create one; only data does, so a large mostly-idle mesh does not churn sockets. When the table
+//! is full, the least recently used entry makes room only if it has been idle for at least
+//! [`ACTIVE_SENDS`] sends; when all of them are busier than that, the new endpoint keeps using
+//! `sendto` (today's path, ~14 µs per datagram) instead of evicting a busy one, so more than
+//! sixteen busy endpoints never thrash socket creation.
+//!
+//! **Other invariants.**
 //! - A connected socket reports ICMP errors (`ECONNREFUSED` and friends) on its next call. On
-//!   receive they are skipped; on send the datagram is retried once, then the entry is dropped and
-//!   the datagram falls back to the wildcard socket, as it would have gone before.
-//! - Any failure to create a connected socket turns the feature off for this socket and logs once,
-//!   so a host that refuses the shared port keeps the old path.
-//! - No timers (D81): entries change only on sends and errors.
+//!   receive they are skipped; on send the datagram is retried once.
+//! - A failure to share the port turns the feature off for this socket and logs once, so a host
+//!   that refuses it keeps the old path. A failure to *connect* (no route right now) does not:
+//!   that datagram uses `sendto` and the next one tries again.
+//! - Datagrams still queued on a closed entry are lost, which WireGuard tolerates.
 //!
-//! The feature is off by default. `GOTATUN_BENCH_MAC_CONNECTED=1` turns it on for bench runs until
-//! the owner decides (#260).
+//! On by default on macOS. `GOTATUN_BENCH_MAC_CONNECTED=0` turns it off for diagnosis.
 
 use std::{
     io,
@@ -49,27 +82,37 @@ use futures::task::AtomicWaker;
 use parking_lot::Mutex;
 use tokio::io::ReadBuf;
 
+use crate::packet::WgPacketType;
+
 /// The most endpoints that get their own connected socket.
 ///
 /// A device usually talks to a handful of endpoints at once; each entry is one file descriptor
 /// and one reactor registration, and every receive poll visits each entry.
 pub(crate) const MAX_CONNECTED: usize = 16;
 
-/// Whether the switch's value turns connected sends on (red stub: J744's off-unless-`1`).
-pub(crate) fn switch_on(value: Option<&str>) -> bool {
-    value.is_some_and(|value| value.trim() == "1")
-}
-
-/// Red stub (J763): the table bound J763 changes.
+/// An entry used within this many sends (to any endpoint) counts as busy and is never evicted
+/// to make room for a new endpoint.
 pub(crate) const ACTIVE_SENDS: u64 = 1024;
 
-/// Whether the bench switch asks for connected sends, read once per process.
+/// The size of a WireGuard keepalive: a data header and an empty, authenticated payload.
+/// Datagrams this small or smaller never create a connected socket.
+const KEEPALIVE_LEN: usize = 32;
+
+/// The size of a WireGuard handshake initiation.
+const HANDSHAKE_INIT_LEN: usize = 148;
+
+/// Whether the switch's value turns connected sends on: anything but `0` (or no value) does.
+pub(crate) fn switch_on(value: Option<&str>) -> bool {
+    value.is_none_or(|value| value.trim() != "0")
+}
+
+/// Whether connected sends are on for this process: on unless `GOTATUN_BENCH_MAC_CONNECTED=0`.
 pub(crate) fn wanted() -> bool {
     static WANTED: OnceLock<bool> = OnceLock::new();
     *WANTED.get_or_init(|| {
-        let on = std::env::var("GOTATUN_BENCH_MAC_CONNECTED").is_ok_and(|value| value.trim() == "1");
-        if on {
-            eprintln!("diag mac_connected on max={MAX_CONNECTED}");
+        let on = switch_on(std::env::var("GOTATUN_BENCH_MAC_CONNECTED").ok().as_deref());
+        if !on {
+            eprintln!("diag mac_connected off (GOTATUN_BENCH_MAC_CONNECTED=0)");
         }
         on
     })
@@ -81,16 +124,22 @@ struct Entry {
     destination: SocketAddr,
     /// A socket bound to the WireGuard address and port and connected to `destination`.
     socket: tokio::net::UdpSocket,
+    /// The table's send counter at this entry's last send, for least-recently-used eviction.
+    last_used: AtomicU64,
 }
 
 /// The connected sockets of one WireGuard socket, shared by all of its clones.
 pub(crate) struct ConnectedSends {
-    /// Cleared for good after a connected socket cannot be created.
+    /// Cleared for good after the port could not be shared.
     enabled: AtomicBool,
     /// The current entries, oldest first.
     entries: Mutex<Vec<Arc<Entry>>>,
     /// Bumped whenever `entries` changes, so a receiver refreshes its copy only then.
     generation: AtomicU64,
+    /// Counts sends through [`ConnectedSends::send`]; entries record it as their last use.
+    sends: AtomicU64,
+    /// How many connected sockets were ever created (tests and diagnostics).
+    connects: AtomicU64,
     /// The receive task waiting on the current entries; woken when a new entry appears so it
     /// starts polling that socket too.
     receiver: AtomicWaker,
@@ -108,20 +157,28 @@ pub(crate) struct RecvView {
 }
 
 impl ConnectedSends {
-    /// A table for a socket that was (`enabled`) or was not created with `SO_REUSEPORT`.
+    /// A table for a socket on which connected sends are (`enabled`) or are not wanted.
     pub(crate) fn new(enabled: bool) -> Self {
         Self {
             enabled: AtomicBool::new(enabled),
             entries: Mutex::new(Vec::with_capacity(if enabled { MAX_CONNECTED } else { 0 })),
             generation: AtomicU64::new(0),
+            sends: AtomicU64::new(0),
+            connects: AtomicU64::new(0),
             receiver: AtomicWaker::new(),
         }
     }
 
-    /// Red stub (J763): connected sockets created so far are not counted yet.
+    /// How many endpoints have a connected socket right now.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.lock().len()
+    }
+
+    /// How many connected sockets this table has created so far.
     #[cfg(test)]
     pub(crate) fn connects(&self) -> u64 {
-        0
+        self.connects.load(Ordering::Relaxed)
     }
 
     /// Whether connected sends are still on for this socket.
@@ -130,35 +187,50 @@ impl ConnectedSends {
         self.enabled.load(Ordering::Relaxed)
     }
 
-    /// Red stub (J763): a network change does nothing yet.
-    pub(crate) fn underlay_changed(&self) {}
-
-    /// How many endpoints have a connected socket right now.
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.entries.lock().len()
+    /// The host's network changed: close every connected socket.
+    ///
+    /// Each one keeps the source address and route chosen when it connected, which may be gone
+    /// now. The next data datagram to each endpoint reconnects on the current route. Call this
+    /// from the owner's network-change signal, before asking sessions to announce themselves.
+    pub(crate) fn underlay_changed(&self) {
+        let mut entries = self.entries.lock();
+        if entries.is_empty() {
+            return;
+        }
+        let closed = entries.len();
+        entries.clear();
+        drop(entries);
+        self.generation.fetch_add(1, Ordering::Release);
+        tracing::debug!("macOS UDP: network changed; closed {closed} connected sockets");
     }
 
     /// Send `payload` to `destination` (already mapped for the wildcard socket).
     ///
-    /// Uses the endpoint's connected socket, creating it first if needed, and falls back to
-    /// `sendto` on the wildcard socket whenever no connected socket can be used.
+    /// Uses the endpoint's connected socket, creating it first if this is data and the table
+    /// allows it, and falls back to `sendto` on the wildcard socket whenever no connected socket
+    /// can be used.
     pub(crate) async fn send(
         &self,
         wildcard: &tokio::net::UdpSocket,
         payload: &[u8],
         destination: SocketAddr,
     ) -> io::Result<()> {
-        if let Some(entry) = self.entry_for(wildcard, destination) {
-            match entry.socket.send(payload).await {
-                Ok(_) => return Ok(()),
-                // A pending ICMP error is reported once and cleared; the datagram was not sent.
-                Err(error) if is_icmp_error(&error) => match entry.socket.send(payload).await {
+        if self.enabled.load(Ordering::Relaxed) {
+            if is_handshake_initiation(payload) {
+                // `sendto` picks the current source; the next data reconnects after it.
+                self.forget_destination(destination);
+            } else if let Some(entry) = self.entry_for(wildcard, payload, destination) {
+                match entry.socket.send(payload).await {
                     Ok(_) => return Ok(()),
-                    Err(error) => self.forget(&entry, &error),
-                },
-                Err(error) if is_path_error(&error) => self.forget(&entry, &error),
-                Err(error) => return Err(error),
+                    // A pending ICMP error is reported once and cleared; the datagram was not
+                    // sent.
+                    Err(error) if is_icmp_error(&error) => match entry.socket.send(payload).await {
+                        Ok(_) => return Ok(()),
+                        Err(error) => self.forget(&entry, &error),
+                    },
+                    Err(error) if is_path_error(&error) => self.forget(&entry, &error),
+                    Err(error) => return Err(error),
+                }
             }
         }
         wildcard.send_to(payload, destination).await.map(|_| ())
@@ -215,36 +287,73 @@ impl ConnectedSends {
         Poll::Pending
     }
 
-    /// The connected socket for `destination`, created on first use while the table allows it.
+    /// The connected socket for `destination`, created on first use when `payload` is data and
+    /// the table has room for it.
     fn entry_for(
         &self,
         wildcard: &tokio::net::UdpSocket,
+        payload: &[u8],
         destination: SocketAddr,
     ) -> Option<Arc<Entry>> {
-        if !self.enabled.load(Ordering::Relaxed) {
-            return None;
-        }
+        let now = self.sends.fetch_add(1, Ordering::Relaxed);
         let mut entries = self.entries.lock();
         if let Some(entry) = entries.iter().find(|entry| entry.destination == destination) {
+            entry.last_used.store(now, Ordering::Relaxed);
             return Some(Arc::clone(entry));
         }
-        let socket = match connect(wildcard, destination) {
+        if payload.len() <= KEEPALIVE_LEN || !is_data(payload) {
+            return None;
+        }
+        let evict = if entries.len() < MAX_CONNECTED {
+            None
+        } else {
+            let (index, idle) = entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    (index, now.saturating_sub(entry.last_used.load(Ordering::Relaxed)))
+                })
+                .max_by_key(|&(_, idle)| idle)?;
+            if idle < ACTIVE_SENDS {
+                // Every entry is busy: this endpoint keeps `sendto` rather than evict one.
+                return None;
+            }
+            Some(index)
+        };
+        if let Some(index) = evict {
+            entries.remove(index);
+        }
+        let socket = match connect(wildcard, &entries, destination) {
             Ok(socket) => socket,
-            Err(error) => {
+            Err(ConnectError::Route(error)) => {
+                tracing::debug!(
+                    "macOS UDP: no connected socket to {destination} for now ({error}); using sendto"
+                );
+                if evict.is_some() {
+                    drop(entries);
+                    self.generation.fetch_add(1, Ordering::Release);
+                }
+                return None;
+            }
+            Err(ConnectError::Shared(error)) => {
                 if self.enabled.swap(false, Ordering::Relaxed) {
                     tracing::warn!(
-                        "macOS UDP: cannot connect a send socket to {destination} ({error}); using sendto"
+                        "macOS UDP: cannot share the WireGuard port for connected sends ({error}); \
+                         using sendto"
                     );
+                }
+                if evict.is_some() {
+                    drop(entries);
+                    self.generation.fetch_add(1, Ordering::Release);
                 }
                 return None;
             }
         };
-        if entries.len() == MAX_CONNECTED {
-            entries.remove(0);
-        }
+        self.connects.fetch_add(1, Ordering::Relaxed);
         let entry = Arc::new(Entry {
             destination,
             socket,
+            last_used: AtomicU64::new(now),
         });
         entries.push(Arc::clone(&entry));
         drop(entries);
@@ -259,9 +368,19 @@ impl ConnectedSends {
             "macOS UDP: dropping the connected socket to {} ({error})",
             entry.destination
         );
+        self.remove_where(|other| Arc::ptr_eq(other, entry));
+    }
+
+    /// Drop the entry for `destination`, if there is one.
+    fn forget_destination(&self, destination: SocketAddr) {
+        self.remove_where(|other| other.destination == destination);
+    }
+
+    /// Remove the entries `matches` selects and tell receivers when anything went.
+    fn remove_where(&self, matches: impl Fn(&Arc<Entry>) -> bool) {
         let mut entries = self.entries.lock();
         let before = entries.len();
-        entries.retain(|other| !Arc::ptr_eq(other, entry));
+        entries.retain(|other| !matches(other));
         if entries.len() != before {
             drop(entries);
             self.generation.fetch_add(1, Ordering::Release);
@@ -281,30 +400,99 @@ fn poll_one(
         .map(|result| result.map(|source| (read.filled().len(), source)))
 }
 
+/// Why a connected socket could not be created.
+enum ConnectError {
+    /// The port could not be shared (socket options or the bind): this host refuses the
+    /// feature, so the caller turns it off.
+    Shared(io::Error),
+    /// The kernel has no route or source for the endpoint right now (`connect` failed): only
+    /// this datagram falls back.
+    Route(io::Error),
+}
+
+/// Sets `SO_REUSEPORT` on every socket of ours that holds the port for as long as it lives, and
+/// clears it again on drop, so no other process can join the port outside that moment.
+struct ReusePortWindow<'a> {
+    /// The wildcard socket and the current connected sockets.
+    sockets: Vec<socket2::SockRef<'a>>,
+}
+
+impl<'a> ReusePortWindow<'a> {
+    /// Open the window on `sockets`; on error, whatever was set is cleared again.
+    fn open(sockets: Vec<socket2::SockRef<'a>>) -> io::Result<Self> {
+        let mut window = Self {
+            sockets: Vec::with_capacity(sockets.len()),
+        };
+        for socket in sockets {
+            socket.set_reuse_port(true)?;
+            window.sockets.push(socket);
+        }
+        Ok(window)
+    }
+}
+
+impl Drop for ReusePortWindow<'_> {
+    fn drop(&mut self) {
+        for socket in &self.sockets {
+            if let Err(error) = socket.set_reuse_port(false) {
+                tracing::warn!("macOS UDP: could not clear SO_REUSEPORT ({error})");
+            }
+        }
+    }
+}
+
 /// Create a socket that shares the wildcard socket's address and port and is connected to
-/// `destination`. The wildcard socket must have been created with `SO_REUSEPORT`.
+/// `destination`. `entries` are the connected sockets already on the port; the shared-port
+/// option is set on all of them only while the new socket binds.
 fn connect(
     wildcard: &tokio::net::UdpSocket,
+    entries: &[Arc<Entry>],
     destination: SocketAddr,
-) -> io::Result<tokio::net::UdpSocket> {
-    let local = wildcard.local_addr()?;
+) -> Result<tokio::net::UdpSocket, ConnectError> {
+    let shared = ConnectError::Shared;
+    let local = wildcard.local_addr().map_err(shared)?;
     let template = socket2::SockRef::from(wildcard);
     let socket = socket2::Socket::new(
         socket2::Domain::for_address(local),
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
-    )?;
-    socket.set_nonblocking(true)?;
+    )
+    .map_err(shared)?;
+    socket.set_nonblocking(true).map_err(shared)?;
     if local.is_ipv6() {
-        socket.set_only_v6(template.only_v6()?)?;
+        socket
+            .set_only_v6(template.only_v6().map_err(shared)?)
+            .map_err(shared)?;
     }
-    socket.set_reuse_port(true)?;
     // Match the wildcard socket's buffers, since this socket now carries the endpoint's traffic.
-    socket.set_recv_buffer_size(template.recv_buffer_size()?)?;
-    socket.set_send_buffer_size(template.send_buffer_size()?)?;
-    socket.bind(&local.into())?;
-    socket.connect(&destination.into())?;
-    tokio::net::UdpSocket::from_std(socket.into())
+    socket
+        .set_recv_buffer_size(template.recv_buffer_size().map_err(shared)?)
+        .map_err(shared)?;
+    socket
+        .set_send_buffer_size(template.send_buffer_size().map_err(shared)?)
+        .map_err(shared)?;
+    {
+        let mut ours = Vec::with_capacity(entries.len() + 2);
+        ours.push(socket2::SockRef::from(wildcard));
+        ours.extend(entries.iter().map(|entry| socket2::SockRef::from(&entry.socket)));
+        ours.push(socket2::SockRef::from(&socket));
+        let _window = ReusePortWindow::open(ours).map_err(shared)?;
+        socket.bind(&local.into()).map_err(shared)?;
+    }
+    socket
+        .connect(&destination.into())
+        .map_err(ConnectError::Route)?;
+    tokio::net::UdpSocket::from_std(socket.into()).map_err(shared)
+}
+
+/// Whether `payload` is a WireGuard handshake initiation.
+fn is_handshake_initiation(payload: &[u8]) -> bool {
+    payload.len() == HANDSHAKE_INIT_LEN && payload.first() == Some(&WgPacketType::HandshakeInit.0)
+}
+
+/// Whether `payload` is a WireGuard data message (keepalives included).
+fn is_data(payload: &[u8]) -> bool {
+    payload.first() == Some(&WgPacketType::Data.0)
 }
 
 /// An error a connected UDP socket reports for an ICMP message about an earlier datagram.

@@ -25,7 +25,7 @@ impl UdpSend for super::UdpSocket {
     async fn send_to(&self, packet: Packet, dest: SocketAddr) -> io::Result<()> {
         let dest = self.map_dst(dest);
         // macOS: an endpoint's connected socket skips xnu's per-datagram route and policy
-        // decision (#260, J744; see `macos_connected`). Off, this is the plain `sendto`.
+        // decision (#260, J744, J763; see `macos_connected`). Off, this is the plain `sendto`.
         #[cfg(target_os = "macos")]
         return self.inner.connected.send(self.socket(), &packet, dest).await;
         #[cfg(not(target_os = "macos"))]

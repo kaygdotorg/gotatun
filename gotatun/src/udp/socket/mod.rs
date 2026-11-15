@@ -126,8 +126,8 @@ pub struct SockOpt {
     pub send_buffer_size: Option<usize>,
     /// If `Some`, set `IPV6_V6ONLY` on the socket.
     pub only_v6: Option<bool>,
-    /// macOS: send through connected per-endpoint sockets (#260, J744). `None` follows the
-    /// `GOTATUN_BENCH_MAC_CONNECTED` bench switch (off unless it is `1`).
+    /// macOS: send through connected per-endpoint sockets (#260, J744, J763). `None` follows the
+    /// default: on, unless `GOTATUN_BENCH_MAC_CONNECTED=0` turns it off for diagnosis.
     #[cfg(target_os = "macos")]
     pub mac_connected: Option<bool>,
 }
@@ -188,7 +188,9 @@ impl UdpSocket {
         }
 
         // Connected per-endpoint sockets share this port, which needs SO_REUSEPORT on every
-        // socket that binds it (#260, J744). Only set when the feature is on.
+        // socket that binds it (#260, J744). It is set only while one of ours binds and cleared
+        // again at once, because macOS lets a process of any user join a port that carries it
+        // (J763; see `macos_connected`).
         #[cfg(target_os = "macos")]
         let connected = opts.mac_connected.unwrap_or_else(macos_connected::wanted);
         #[cfg(target_os = "macos")]
@@ -197,6 +199,11 @@ impl UdpSocket {
         }
 
         udp_sock.bind(&addr.into())?;
+
+        #[cfg(target_os = "macos")]
+        if connected {
+            udp_sock.set_reuse_port(false)?;
+        }
 
         #[cfg(target_os = "linux")]
         let udp_gso_supported = getsockopt(&udp_sock, sockopt::UdpGsoSegment).is_ok();
@@ -230,7 +237,13 @@ impl UdpSocket {
         self.inner.socket.local_addr()
     }
 
-    /// Tell the socket that the host's network changed (red stub, #260 J763).
+    /// Tell the socket that the host's network changed (an address, route or link moved).
+    ///
+    /// On macOS this closes the connected per-endpoint send sockets (#260, J763), which keep the
+    /// source address chosen when they connected; the next datagram to each endpoint reconnects
+    /// on the current route. Call it from the owner's network-change signal before asking live
+    /// sessions to announce their endpoint, so those announcements already leave from the new
+    /// source. Every clone shares the effect. Elsewhere it does nothing.
     pub fn underlay_changed(&self) {
         #[cfg(target_os = "macos")]
         self.inner.connected.underlay_changed();
