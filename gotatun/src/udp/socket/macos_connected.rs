@@ -787,15 +787,15 @@ mod tests {
     async fn keepalives_and_handshakes_do_not_create_sockets() {
         let wireguard = wireguard_socket(true);
         let (a, a_address) = peer().await;
-        send(&wireguard, &data(32), a_address).await;
-        send(&wireguard, &initiation(), a_address).await;
         let mut response = vec![0u8; 92];
         response[0] = 2;
-        send(&wireguard, &response, a_address).await;
-        for _ in 0..3 {
-            peer_recv(&a).await;
+        // Checked after each message: a later handshake message closes an entry, so one check at
+        // the end would not see a socket that the keepalive created (J789 mutation run).
+        for message in [data(32), initiation(), response] {
+            send(&wireguard, &message, a_address).await;
+            assert_eq!(peer_recv(&a).await.0, message);
+            assert_eq!(wireguard.inner.connected.len(), 0, "{} bytes made no entry", message.len());
         }
-        assert_eq!(wireguard.inner.connected.len(), 0);
     }
 
     /// An endpoint the kernel cannot reach right now gets `sendto` for that datagram, and
@@ -842,6 +842,109 @@ mod tests {
         let (b, b_address) = peer().await;
         b.send_to(b"from-b", (Ipv4Addr::LOCALHOST, port)).await.expect("b sends");
         assert_eq!(recv(&mut wireguard).await, (b"from-b".to_vec(), b_address));
+    }
+
+    /// A freshly bound WireGuard socket refuses other sockets on its port before it has sent
+    /// anything: the shared-port option it needed for its own bind is cleared at once, not at the
+    /// first connected socket (J789 mutation run; an idle device may never create one).
+    #[tokio::test]
+    async fn a_fresh_socket_keeps_its_port_closed() {
+        let wireguard = wireguard_socket(true);
+        let port = wireguard.local_addr().expect("local").port();
+        for address in [
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+        ] {
+            let other = socket2::Socket::new(
+                socket2::Domain::for_address(address),
+                socket2::Type::DGRAM,
+                None,
+            )
+            .expect("socket");
+            other.set_reuse_port(true).expect("SO_REUSEPORT");
+            assert!(
+                other.bind(&address.into()).is_err(),
+                "another socket must not bind {address} beside a fresh WireGuard socket"
+            );
+        }
+    }
+
+    /// A receive task that is already parked starts reading a connected socket created after it
+    /// parked: the endpoint's replies now arrive on that socket, not on the wildcard one, so a
+    /// receiver that is not woken would miss them until some other datagram woke it (J789
+    /// mutation run).
+    #[tokio::test]
+    async fn a_parked_receiver_reads_a_new_connected_socket() {
+        let wireguard = wireguard_socket(true);
+        let port = wireguard.local_addr().expect("local").port();
+        let mut receiver = wireguard.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let mut pool = PacketBufPool::new(4);
+            while let Ok((packet, source)) = receiver.recv_from(&mut pool).await {
+                if tx.send((packet.to_vec(), source)).is_err() {
+                    break;
+                }
+            }
+        });
+        // sleep: let the receive task park on the wildcard socket before any entry exists.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (a, a_address) = peer().await;
+        send(&wireguard, &data(64), a_address).await;
+        peer_recv(&a).await;
+        assert_eq!(wireguard.inner.connected.len(), 1);
+        a.send_to(b"reply", (Ipv4Addr::LOCALHOST, port)).await.expect("a replies");
+        let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the parked receiver reads the new connected socket")
+            .expect("receiver alive");
+        assert_eq!(received, (b"reply".to_vec(), a_address));
+        task.abort();
+    }
+
+    /// A pending ICMP error on a connected socket is skipped by every receive, whichever socket
+    /// the receive polls first (the first socket rotates), and never ends the receive loop
+    /// (J789 mutation run: polling the wildcard socket first hid the error path).
+    #[tokio::test]
+    async fn an_icmp_error_never_reaches_the_receiver() {
+        let mut wireguard = wireguard_socket(true);
+        let port = wireguard.local_addr().expect("local").port();
+        let (closed, closed_address) = peer().await;
+        drop(closed);
+        send(&wireguard, &data(64), closed_address).await;
+        assert_eq!(wireguard.inner.connected.len(), 1);
+        let (b, b_address) = peer().await;
+        for round in 0..4 {
+            // A fresh send whose port-unreachable report waits on the connected socket.
+            send(&wireguard, &data(64), closed_address).await;
+            // sleep: give the kernel time to queue the ICMP error on the connected socket.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            b.send_to(b"from-b", (Ipv4Addr::LOCALHOST, port)).await.expect("b sends");
+            assert_eq!(
+                recv(&mut wireguard).await,
+                (b"from-b".to_vec(), b_address),
+                "round {round}"
+            );
+        }
+    }
+
+    /// The send errors that mean "this socket's address or route is gone" (J763), and the ones
+    /// that are a report about an earlier datagram instead (J789 mutation run).
+    #[test]
+    fn send_errors_are_classified() {
+        let error = |code| std::io::Error::from_raw_os_error(code);
+        for code in [libc::EADDRNOTAVAIL, libc::ENETUNREACH, libc::ENETDOWN, libc::EDESTADDRREQ] {
+            assert!(super::is_path_error(&error(code)), "path error {code}");
+            assert!(!super::is_icmp_error(&error(code)), "not an ICMP report {code}");
+        }
+        for code in [libc::ECONNREFUSED, libc::EHOSTDOWN, libc::EHOSTUNREACH] {
+            assert!(super::is_icmp_error(&error(code)), "ICMP report {code}");
+            assert!(!super::is_path_error(&error(code)), "not a path error {code}");
+        }
+        for code in [libc::ENOBUFS, libc::EAGAIN, libc::EPERM] {
+            assert!(!super::is_path_error(&error(code)) && !super::is_icmp_error(&error(code)));
+        }
     }
 
     /// The table holds at most `MAX_CONNECTED` endpoints. Past it, a new endpoint evicts only an
