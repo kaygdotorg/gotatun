@@ -1782,7 +1782,12 @@ impl<T: DeviceTransports> DeviceState<T> {
             let batch = packets.by_ref().take(CRYPTO_BATCH_SIZE).collect::<Vec<_>>();
             let batch_len = batch.len();
             let batch_first_slot = first_slot + offset;
-            let force_worker = lane.should_force_worker(batch_len);
+            // The lane's choice is made first so its backlog latch still sees every run.
+            let force_worker = parallel_crypto::receive_run_goes_to_worker(
+                lane.should_force_worker(batch_len),
+                batch_len,
+                parallel_crypto::receive_inline_max(),
+            );
             let crypto = crypto.clone();
             let ordered = Arc::clone(&ordered);
             let lane = Arc::clone(&lane);
