@@ -27,6 +27,10 @@ use super::{UdpRecv, UdpTransportFactory, UdpTransportFactoryParams};
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
 mod generic;
 
+/// Connected per-endpoint send sockets for macOS (#260, J744).
+#[cfg(target_os = "macos")]
+mod macos_connected;
+
 /// Implementations of [`super::UdpSend`]/[`super::UdpRecv`] for linux
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
@@ -65,6 +69,8 @@ impl UdpTransportFactory for UdpSocketFactory {
             recv_buffer_size: self.recv_buffer_size,
             send_buffer_size: self.send_buffer_size,
             only_v6,
+            #[cfg(target_os = "macos")]
+            mac_connected: None,
         };
 
         let addr = params.addr.unwrap_or(Ipv6Addr::UNSPECIFIED.into());
@@ -90,10 +96,16 @@ impl UdpTransportFactory for UdpSocketFactory {
 pub struct UdpSocket {
     inner: Arc<UdpSocketState>,
     map_ipv4_to_ipv6: bool,
+    /// This clone's copy of the connected sockets it receives from (#260, J744).
+    #[cfg(target_os = "macos")]
+    recv_view: macos_connected::RecvView,
 }
 
 struct UdpSocketState {
     socket: tokio::net::UdpSocket,
+    /// Connected per-endpoint send sockets, shared by every clone (#260, J744).
+    #[cfg(target_os = "macos")]
+    connected: macos_connected::ConnectedSends,
     #[cfg(target_os = "linux")]
     udp_gso_supported: bool,
     #[cfg(target_os = "linux")]
@@ -114,6 +126,10 @@ pub struct SockOpt {
     pub send_buffer_size: Option<usize>,
     /// If `Some`, set `IPV6_V6ONLY` on the socket.
     pub only_v6: Option<bool>,
+    /// macOS: send through connected per-endpoint sockets (#260, J744). `None` follows the
+    /// `GOTATUN_BENCH_MAC_CONNECTED` bench switch (off unless it is `1`).
+    #[cfg(target_os = "macos")]
+    pub mac_connected: Option<bool>,
 }
 
 impl UdpSocket {
@@ -171,6 +187,15 @@ impl UdpSocket {
             }
         }
 
+        // Connected per-endpoint sockets share this port, which needs SO_REUSEPORT on every
+        // socket that binds it (#260, J744). Only set when the feature is on.
+        #[cfg(target_os = "macos")]
+        let connected = opts.mac_connected.unwrap_or_else(macos_connected::wanted);
+        #[cfg(target_os = "macos")]
+        if connected {
+            udp_sock.set_reuse_port(true)?;
+        }
+
         udp_sock.bind(&addr.into())?;
 
         #[cfg(target_os = "linux")]
@@ -185,8 +210,12 @@ impl UdpSocket {
                 udp_gso_supported,
                 #[cfg(target_os = "linux")]
                 udp_gso_disabled: AtomicBool::new(false),
+                #[cfg(target_os = "macos")]
+                connected: macos_connected::ConnectedSends::new(connected),
             }),
             map_ipv4_to_ipv6: addr.is_ipv6() && opts.only_v6 == Some(false),
+            #[cfg(target_os = "macos")]
+            recv_view: macos_connected::RecvView::default(),
         })
     }
 
