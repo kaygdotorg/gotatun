@@ -181,7 +181,8 @@ async fn wait_for_shutdown(mut device: Device<DefaultDeviceTransports>) {
     // sockets reconnect on the current route (#260, J763). The infraternal app hears this from
     // its routing-socket listener; the CLI has none, so an operator or a test sends the signal.
     #[cfg(target_os = "macos")]
-    let mut sigusr1 = signal(SignalKind::user_defined1()).expect("Failed to set up SIGUSR1 handler");
+    let mut sigusr1 =
+        signal(SignalKind::user_defined1()).expect("Failed to set up SIGUSR1 handler");
 
     loop {
         #[cfg(target_os = "macos")]
