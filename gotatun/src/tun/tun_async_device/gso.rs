@@ -128,6 +128,11 @@ pub(super) fn coalesce_packets(
     tcp_tso: bool,
     udp_uso: bool,
 ) -> Vec<CoalescedFrame> {
+    let packets = if tcp_tso || udp_uso {
+        group_by_flow(packets)
+    } else {
+        packets
+    };
     let mut pending = packets.into_iter().peekable();
     let mut frames = Vec::with_capacity(pending.size_hint().0);
 
@@ -181,6 +186,83 @@ pub(super) fn coalesce_packets(
     }
 
     frames
+}
+
+/// Most distinct flows [`group_by_flow`] tracks in one batch. Past this, the remaining packets
+/// keep their input positions; a batch is at most a few hundred packets, so this only bounds
+/// the linear key search for a pathological many-flow batch.
+const MAX_GROUPED_FLOWS: usize = 64;
+
+/// The fields that name one flow for grouping: IP version, protocol, both addresses, and the
+/// ports of an unfragmented TCP or UDP packet (zero otherwise, so all fragments and all other
+/// protocols between two hosts share one group and keep their order).
+type FlowKey = [u8; 38];
+
+/// Return the grouping key of an IP packet, or `None` when its header cannot be read.
+fn flow_key(bytes: &[u8]) -> Option<FlowKey> {
+    let mut key = [0_u8; 38];
+    let (protocol, ports_at) = match bytes.first()? >> 4 {
+        4 => {
+            let ip_header_len = usize::from(bytes.first()? & 0x0f) * 4;
+            key[2..6].copy_from_slice(bytes.get(12..16)?);
+            key[18..22].copy_from_slice(bytes.get(16..20)?);
+            let fragmented = read_u16(bytes, 6)? & 0x3fff != 0;
+            (*bytes.get(9)?, (!fragmented).then_some(ip_header_len))
+        }
+        6 => {
+            key[2..18].copy_from_slice(bytes.get(8..24)?);
+            key[18..34].copy_from_slice(bytes.get(24..40)?);
+            (*bytes.get(6)?, Some(Ipv6Header::LEN))
+        }
+        _ => return None,
+    };
+    key[0] = bytes[0] >> 4;
+    key[1] = protocol;
+    if let (6 | 17, Some(offset)) = (protocol, ports_at) {
+        key[34..38].copy_from_slice(bytes.get(offset..offset + 4)?);
+    }
+    Some(key)
+}
+
+/// Reorder a write batch so each flow's packets sit together, in the order the flows first
+/// appear (J764, #260).
+///
+/// [`coalesce_packets`] merges only adjacent packets, and the flows of one peer arrive
+/// interleaved: with 8 TCP flows a batch of 128 packets gave about one segment per frame. This is
+/// a stable grouping: packets of one flow (same key, see [`FlowKey`]) never change their
+/// relative order, so a pure ACK or an unmergeable segment still splits its flow exactly where
+/// it did. Only packets of different flows change order, which TCP and UDP never depend on.
+/// Packets whose header cannot be read form their own group at their own position.
+fn group_by_flow(packets: Vec<Packet<Ip>>) -> Vec<Packet<Ip>> {
+    // `GOTATUN_BENCH_TUN_NO_FLOW_GROUP` turns grouping off for A/B runs in one binary.
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let off = *OFF.get_or_init(|| std::env::var_os("GOTATUN_BENCH_TUN_NO_FLOW_GROUP").is_some());
+    if off || packets.len() < 3 {
+        return packets;
+    }
+    let mut flows: Vec<(FlowKey, usize)> = Vec::new();
+    let mut groups = Vec::with_capacity(packets.len());
+    for (index, packet) in packets.iter().enumerate() {
+        let group = match flow_key(packet.as_bytes()) {
+            Some(key) => match flows.iter().find(|(known, _)| *known == key) {
+                Some(&(_, first_index)) => first_index,
+                None if flows.len() < MAX_GROUPED_FLOWS => {
+                    flows.push((key, index));
+                    index
+                }
+                None => index,
+            },
+            None => index,
+        };
+        groups.push(group);
+    }
+    // Already grouped (one flow, or flows that arrived in runs): keep the batch as it is.
+    if groups.windows(2).all(|pair| pair[0] <= pair[1]) {
+        return packets;
+    }
+    let mut keyed: Vec<(usize, Packet<Ip>)> = groups.into_iter().zip(packets).collect();
+    keyed.sort_by_key(|(group, _)| *group);
+    keyed.into_iter().map(|(_, packet)| packet).collect()
 }
 
 /// Parse a direct TCP or UDP packet without accepting IP fragments or extension headers.
