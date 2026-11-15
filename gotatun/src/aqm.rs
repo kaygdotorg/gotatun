@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Receive-side active queue management, a measurement prototype (infraternal #260, J711).
+//! Receive-side active queue management: GotaTun bounds its own queue (infraternal D397, #260).
 //!
 //! # Why this exists
 //! A TUN device orphans every skb when the kernel hands it to us, so TCP Small Queues never sees
@@ -16,21 +16,25 @@
 //! the moment the in-order packet is about to be written to the TUN. That interval covers the
 //! socket backlog and the engine's own pipeline. A CoDel controller (RFC 8289) then signals
 //! congestion at that dequeue point when the sojourn stays above `target` for at least
-//! `interval`: either by dropping the packet, or (RFC 3168) by setting CE on an ECN-capable
-//! inner packet and dropping only packets that are not ECN-capable.
+//! `interval`: by default (RFC 3168) by setting CE on an ECN-capable inner packet, and by
+//! dropping only packets that are not ECN-capable.
 //!
-//! # How to use it
-//! Off unless `GOTATUN_J711_AQM` is set, so a default build behaves exactly like the pin:
-//! - `GOTATUN_J711_AQM=codel` drops; `=ecn` marks ECT packets CE and drops the rest.
-//! - `GOTATUN_J711_TARGET_US` (default 5000) and `GOTATUN_J711_INTERVAL_US` (default 100000)
-//!   are the CoDel target and interval, in microseconds.
-//! - `GOTATUN_J711_STATS_MS` (default 1000) prints one `j711-aqm …` line per period with the
-//!   cumulative drops, CE marks and the sojourn mean/max of that period, so a bench can report
-//!   them next to its own counters. The lines go to stderr, or are appended to
-//!   `$GOTATUN_J711_STATS_PATH.<pid>` when that is set (a harness may own the engine's stderr).
+//! # Defaults and how to turn it off
+//! On by default where the kernel gives us receive stamps (Linux), in ECN mode, with a 1 ms
+//! target and a 10 ms interval. J711 measured those on backup01: RFC 8289's 5 ms / 100 ms barely
+//! fires, because one receive batch alone spends ~2.5 ms in the pipeline. Elsewhere there is no
+//! stamp to judge, so the bound stays off and the data path is unchanged.
 //!
-//! Prototype only: the knobs are environment variables so one binary can sweep values on the
-//! perf VM. It is not proposed for the product pin.
+//! The environment of the process that runs the device can change it, read once at start:
+//! - `GOTATUN_AQM=off` turns the bound off (diagnosis: the engine behaves as it did before the
+//!   bound); `=drop` drops instead of marking; `=ecn` is the default.
+//! - `GOTATUN_AQM_TARGET_US` (default 1000) and `GOTATUN_AQM_INTERVAL_US` (default 10000) are
+//!   the CoDel target and interval, in microseconds.
+//! - `GOTATUN_AQM_STATS_MS` and/or `GOTATUN_AQM_STATS_PATH` turn on a counter line per period
+//!   (default 1000 ms) with the cumulative packets seen, drops, CE marks and the sojourn mean/max
+//!   of that period. The lines go to stderr, or are appended to `$GOTATUN_AQM_STATS_PATH.<pid>`
+//!   when that is set (a harness may own the engine's stderr). Without either variable the data
+//!   path keeps only the drop and mark counters, which move once per signal, not per packet.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,7 +43,7 @@ use std::time::Duration;
 /// How the controller signals congestion once CoDel decides to act on a packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AqmMode {
-    /// No AQM: every packet passes, as on the pin.
+    /// No AQM: every packet passes, as before the bound existed.
     Off,
     /// Drop the packet CoDel picks.
     Drop,
@@ -47,8 +51,17 @@ pub(crate) enum AqmMode {
     Ecn,
 }
 
+/// Whether this platform's UDP receive path records kernel receive stamps. Without them no
+/// sojourn can be measured, so the bound is off whatever the environment says.
+const STAMPS_SUPPORTED: bool = cfg!(target_os = "linux");
+
+/// The default CoDel target, 1 ms (J711, see the module docs).
+const DEFAULT_TARGET_US: u64 = 1_000;
+/// The default CoDel interval, 10 ms (J711, see the module docs).
+const DEFAULT_INTERVAL_US: u64 = 10_000;
+
 /// The process-wide AQM settings, read once from the environment.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AqmConfig {
     /// What to do with a packet CoDel picks.
     pub(crate) mode: AqmMode,
@@ -57,83 +70,103 @@ pub(crate) struct AqmConfig {
     /// How long the sojourn must stay above target before the first signal, in nanoseconds.
     /// It is also the base of CoDel's control law (`interval / sqrt(count)`).
     pub(crate) interval_ns: u64,
+    /// The stats period in milliseconds, or `None` when no stats were asked for. Per-packet
+    /// sojourn counters only run when this is set, so the default path pays no shared atomics.
+    pub(crate) stats_ms: Option<u64>,
 }
 
 impl AqmConfig {
-    /// Read the configuration from `GOTATUN_J711_*` (see the module docs).
-    fn from_env() -> Self {
-        let mode = match std::env::var("GOTATUN_J711_AQM").as_deref() {
-            Ok("codel" | "drop") => AqmMode::Drop,
-            Ok("ecn") => AqmMode::Ecn,
-            _ => AqmMode::Off,
+    /// Read the configuration through `lookup` (the environment in production, a map in tests).
+    /// Unset, empty or unparsable numbers fall back to the defaults; an unknown mode keeps the
+    /// default ECN mode, so a typo never turns the bound off silently (it logs a warning).
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let mode = match lookup("GOTATUN_AQM").as_deref().map(str::trim) {
+            None | Some("" | "ecn" | "on" | "1") => AqmMode::Ecn,
+            Some("off" | "0" | "none") => AqmMode::Off,
+            Some("drop" | "codel") => AqmMode::Drop,
+            Some(other) => {
+                tracing::warn!("GOTATUN_AQM={other:?} is not off|ecn|drop; keeping ecn");
+                AqmMode::Ecn
+            }
         };
-        let micros = |name: &str, default: u64| {
-            std::env::var(name)
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
+        let positive = |name: &str| {
+            lookup(name)
+                .and_then(|value| value.trim().parse::<u64>().ok())
                 .filter(|&value| value > 0)
-                .unwrap_or(default)
-                * 1_000
+        };
+        let stats_ms = match (
+            positive("GOTATUN_AQM_STATS_MS"),
+            lookup("GOTATUN_AQM_STATS_PATH").is_some(),
+        ) {
+            (Some(period), _) => Some(period),
+            (None, true) => Some(1_000),
+            (None, false) => None,
         };
         Self {
             mode,
-            target_ns: micros("GOTATUN_J711_TARGET_US", 5_000),
-            interval_ns: micros("GOTATUN_J711_INTERVAL_US", 100_000),
+            target_ns: positive("GOTATUN_AQM_TARGET_US").unwrap_or(DEFAULT_TARGET_US) * 1_000,
+            interval_ns: positive("GOTATUN_AQM_INTERVAL_US").unwrap_or(DEFAULT_INTERVAL_US) * 1_000,
+            stats_ms,
         }
+    }
+
+    /// Whether the bound judges packets at all: a mode other than off, on a platform with
+    /// receive stamps.
+    fn active(&self) -> bool {
+        STAMPS_SUPPORTED && self.mode != AqmMode::Off
     }
 }
 
-/// The settings for this process. The first call reads the environment and, when AQM is on,
-/// starts the stats printer.
+/// The settings for this process. The first call reads the environment and, when stats were
+/// asked for, starts the stats printer.
 pub(crate) fn config() -> &'static AqmConfig {
     static CONFIG: OnceLock<AqmConfig> = OnceLock::new();
     CONFIG.get_or_init(|| {
-        let config = AqmConfig::from_env();
-        if config.mode != AqmMode::Off {
-            start_stats_printer(config);
+        let config = AqmConfig::from_lookup(|name| std::env::var(name).ok());
+        if config.active()
+            && let Some(period_ms) = config.stats_ms
+        {
+            start_stats_printer(config, period_ms);
         }
         config
     })
 }
 
-/// Whether receive timestamps are needed at all. Cheap after the first call.
+/// Whether receive timestamps are needed and packets are judged. Cheap after the first call.
 pub(crate) fn enabled() -> bool {
-    config().mode != AqmMode::Off
+    config().active()
 }
 
 /// Packets dropped by the controller, since start.
 static DROPS: AtomicU64 = AtomicU64::new(0);
 /// Packets marked CE by the controller, since start.
 static MARKS: AtomicU64 = AtomicU64::new(0);
-/// Packets the controller looked at, since start.
+/// Packets the controller looked at, since start (stats only).
 static SEEN: AtomicU64 = AtomicU64::new(0);
-/// Packets that arrived without a kernel timestamp and so could not be judged.
+/// Packets that arrived without a kernel timestamp and so could not be judged (stats only).
 static UNSTAMPED: AtomicU64 = AtomicU64::new(0);
-/// Sum of sojourn times in the current stats period, in microseconds.
+/// Sum of sojourn times in the current stats period, in microseconds (stats only).
 static SOJOURN_SUM_US: AtomicU64 = AtomicU64::new(0);
-/// Number of sojourn samples in the current stats period.
+/// Number of sojourn samples in the current stats period (stats only).
 static SOJOURN_COUNT: AtomicU64 = AtomicU64::new(0);
-/// Largest sojourn in the current stats period, in microseconds.
+/// Largest sojourn in the current stats period, in microseconds (stats only).
 static SOJOURN_MAX_US: AtomicU64 = AtomicU64::new(0);
 
 /// Print one cumulative counter line per period on a plain thread, so the data path never pays
-/// for formatting. The thread lives as long as the process; that is fine for a bench binary.
-fn start_stats_printer(config: AqmConfig) {
+/// for formatting. The thread lives as long as the process; it only exists when asked for.
+fn start_stats_printer(config: AqmConfig, period_ms: u64) {
     use std::io::Write as _;
-    let mut file = std::env::var("GOTATUN_J711_STATS_PATH").ok().and_then(|path| {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(format!("{path}.{}", std::process::id()))
-            .ok()
-    });
-    let period_ms = std::env::var("GOTATUN_J711_STATS_MS")
+    let mut file = std::env::var("GOTATUN_AQM_STATS_PATH")
         .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|&value| value > 0)
-        .unwrap_or(1_000);
+        .and_then(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(format!("{path}.{}", std::process::id()))
+                .ok()
+        });
     let spawned = std::thread::Builder::new()
-        .name("j711-aqm-stats".into())
+        .name("gotatun-aqm-stats".into())
         .spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_millis(period_ms));
@@ -141,7 +174,7 @@ fn start_stats_printer(config: AqmConfig) {
                 let sum = SOJOURN_SUM_US.swap(0, Ordering::Relaxed);
                 let max = SOJOURN_MAX_US.swap(0, Ordering::Relaxed);
                 let line = format!(
-                    "j711-aqm t={:.3} mode={:?} target_us={} interval_us={} seen={} drops={} marks={} unstamped={} sojourn_mean_us={} sojourn_max_us={max}",
+                    "gotatun-aqm t={:.3} mode={:?} target_us={} interval_us={} seen={} drops={} marks={} unstamped={} sojourn_mean_us={} sojourn_max_us={max}",
                     realtime_ns() as f64 / 1e9,
                     config.mode,
                     config.target_ns / 1_000,
@@ -161,7 +194,7 @@ fn start_stats_printer(config: AqmConfig) {
             }
         });
     if let Err(err) = spawned {
-        tracing::warn!("j711 AQM stats printer did not start: {err}");
+        tracing::warn!("AQM stats printer did not start: {err}");
     }
 }
 
@@ -216,7 +249,12 @@ impl Codel {
     }
 
     /// Whether the packet dequeued at `now_ns` with `sojourn_ns` of queueing should be signalled.
-    pub(crate) fn should_signal(&mut self, now_ns: u64, sojourn_ns: u64, config: &AqmConfig) -> bool {
+    pub(crate) fn should_signal(
+        &mut self,
+        now_ns: u64,
+        sojourn_ns: u64,
+        config: &AqmConfig,
+    ) -> bool {
         // Step 1: has the queue stood above target for at least one interval?
         let persistent = if sojourn_ns < config.target_ns {
             self.first_above_ns = 0;
@@ -246,8 +284,8 @@ impl Codel {
             self.signalling = true;
             // Re-entering within 16 intervals of the last signal keeps most of the old rate.
             let delta = self.count.saturating_sub(self.last_count);
-            let recent = now_ns.saturating_sub(self.signal_next_ns)
-                < config.interval_ns.saturating_mul(16);
+            let recent =
+                now_ns.saturating_sub(self.signal_next_ns) < config.interval_ns.saturating_mul(16);
             self.count = if delta > 1 && recent { delta } else { 1 };
             self.last_count = self.count;
             self.signal_next_ns = Self::control_law(now_ns, config.interval_ns, self.count);
@@ -262,20 +300,38 @@ impl Codel {
 /// from [`realtime_ns`] once per delivered run.
 pub(crate) fn judge(codel: &mut Codel, packet: &mut [u8], rx_ns: u64, now_ns: u64) -> Verdict {
     let config = config();
-    if config.mode == AqmMode::Off {
+    if !config.active() {
         return Verdict::Pass;
     }
-    SEEN.fetch_add(1, Ordering::Relaxed);
+    judge_with(codel, packet, rx_ns, now_ns, config)
+}
+
+/// [`judge`] with an explicit configuration, assumed active; tests drive the controller here.
+fn judge_with(
+    codel: &mut Codel,
+    packet: &mut [u8],
+    rx_ns: u64,
+    now_ns: u64,
+    config: &AqmConfig,
+) -> Verdict {
+    let stats = config.stats_ms.is_some();
+    if stats {
+        SEEN.fetch_add(1, Ordering::Relaxed);
+    }
     if rx_ns == 0 {
-        UNSTAMPED.fetch_add(1, Ordering::Relaxed);
+        if stats {
+            UNSTAMPED.fetch_add(1, Ordering::Relaxed);
+        }
         return Verdict::Pass;
     }
     // A wall-clock step backwards reads as zero sojourn; that only delays a signal.
     let sojourn_ns = now_ns.saturating_sub(rx_ns);
-    let sojourn_us = sojourn_ns / 1_000;
-    SOJOURN_SUM_US.fetch_add(sojourn_us, Ordering::Relaxed);
-    SOJOURN_COUNT.fetch_add(1, Ordering::Relaxed);
-    SOJOURN_MAX_US.fetch_max(sojourn_us, Ordering::Relaxed);
+    if stats {
+        let sojourn_us = sojourn_ns / 1_000;
+        SOJOURN_SUM_US.fetch_add(sojourn_us, Ordering::Relaxed);
+        SOJOURN_COUNT.fetch_add(1, Ordering::Relaxed);
+        SOJOURN_MAX_US.fetch_max(sojourn_us, Ordering::Relaxed);
+    }
 
     if !codel.should_signal(now_ns, sojourn_ns, config) {
         return Verdict::Pass;
@@ -348,7 +404,53 @@ mod tests {
             mode,
             target_ns: 5 * MS,
             interval_ns: 100 * MS,
+            stats_ms: None,
         }
+    }
+
+    /// The configuration a process would read from exactly these environment variables.
+    fn from_vars(vars: &[(&str, &str)]) -> AqmConfig {
+        AqmConfig::from_lookup(|name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        })
+    }
+
+    #[test]
+    fn default_is_ecn_one_ms_target_ten_ms_interval_without_stats() {
+        let config = from_vars(&[]);
+        assert_eq!(config.mode, AqmMode::Ecn);
+        assert_eq!(config.target_ns, MS);
+        assert_eq!(config.interval_ns, 10 * MS);
+        assert_eq!(config.stats_ms, None);
+        assert_eq!(config.active(), cfg!(target_os = "linux"));
+    }
+
+    #[test]
+    fn the_off_switch_turns_the_bound_off() {
+        for value in ["off", "0", "none", " off "] {
+            let config = from_vars(&[("GOTATUN_AQM", value)]);
+            assert_eq!(config.mode, AqmMode::Off, "{value:?}");
+            assert!(!config.active());
+        }
+    }
+
+    #[test]
+    fn modes_and_knobs_are_read_and_typos_keep_ecn() {
+        let config = from_vars(&[
+            ("GOTATUN_AQM", "drop"),
+            ("GOTATUN_AQM_TARGET_US", "2500"),
+            ("GOTATUN_AQM_INTERVAL_US", "50000"),
+            ("GOTATUN_AQM_STATS_PATH", "/tmp/x"),
+        ]);
+        assert_eq!(config.mode, AqmMode::Drop);
+        assert_eq!(config.target_ns, 2_500_000);
+        assert_eq!(config.interval_ns, 50 * MS);
+        assert_eq!(config.stats_ms, Some(1_000));
+        let typo = from_vars(&[("GOTATUN_AQM", "of"), ("GOTATUN_AQM_TARGET_US", "0")]);
+        assert_eq!(typo.mode, AqmMode::Ecn);
+        assert_eq!(typo.target_ns, MS, "zero falls back to the default");
     }
 
     /// A one's-complement IPv4 header checksum over the 20-byte header, for checking.
@@ -365,8 +467,8 @@ mod tests {
 
     fn ipv4_header(tos: u8) -> Vec<u8> {
         let mut header = vec![
-            0x45, tos, 0x00, 0x28, 0x12, 0x34, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, 10, 0, 0, 1,
-            10, 0, 0, 2,
+            0x45, tos, 0x00, 0x28, 0x12, 0x34, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, 10, 0, 0, 1, 10,
+            0, 0, 2,
         ];
         let mut sum: u32 = header
             .chunks(2)

@@ -122,7 +122,7 @@ pub trait UdpRecv: Send + Sync {
     /// The kernel receive time, in `CLOCK_REALTIME` nanoseconds, of the datagram that became
     /// `packets[index]` in the last [`UdpRecv::recv_many_from`] call, or 0 if unknown.
     ///
-    /// Only the Linux socket records it, and only while the J711 AQM prototype is on (see
+    /// Only the Linux socket records it, and only while the receive-side queue bound is on (see
     /// `crate::aqm`); every other receiver keeps this default.
     fn rx_timestamp_ns(recv_buf: &Self::RecvManyBuf, index: usize) -> u64 {
         let _ = (recv_buf, index);

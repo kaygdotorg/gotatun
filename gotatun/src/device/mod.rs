@@ -451,7 +451,7 @@ struct PreparedIncomingRun {
     peer_arc: Arc<Mutex<PeerState>>,
     packets: Vec<(PreparedDecryption, std::net::SocketAddr)>,
     /// Kernel receive time (ns) of each packet's datagram, aligned with `packets`; empty when the
-    /// J711 AQM prototype is off.
+    /// receive-side queue bound is off.
     rx_stamps: Vec<u64>,
 }
 
@@ -1713,7 +1713,7 @@ impl<T: DeviceTransports> DeviceState<T> {
             }
             let mut packet: crate::packet::Packet<crate::packet::Ip> = packet;
             if aqm_on {
-                // J711: CoDel at the point the in-order packet leaves the engine's queue. The
+                // The queue bound: CoDel at the point the in-order packet leaves the engine's queue. The
                 // replay window has already accepted it, so a drop here is plain loss to TCP.
                 let rx_ns = rx_stamps.get(index).copied().unwrap_or(0);
                 match crate::aqm::judge(

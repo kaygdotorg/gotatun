@@ -19,14 +19,14 @@
 // `RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features`
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+/// The receive-side queue bound (CoDel with ECN, D397); see the module docs.
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
+pub(crate) mod aqm;
 mod crypto;
 #[cfg(feature = "device")]
 pub mod device;
 #[cfg(feature = "device")]
 mod diag;
-/// Receive-side AQM prototype (J711); see the module docs.
-#[cfg_attr(not(feature = "device"), allow(dead_code))]
-pub(crate) mod aqm;
 pub mod noise;
 pub mod packet;
 pub mod tun;

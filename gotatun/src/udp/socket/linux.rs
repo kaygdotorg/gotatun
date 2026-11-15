@@ -914,7 +914,7 @@ mod gro {
     pub struct RecvManyBuf {
         pub(crate) gro_bufs: Box<[BytesMut; MAX_PACKET_COUNT]>,
         /// Kernel receive timestamps (`SO_TIMESTAMPNS`, ns), one per output packet index of the
-        /// last call; empty unless the J711 AQM prototype is on.
+        /// last call; empty when the receive-side queue bound is off.
         pub(crate) rx_stamps: Vec<u64>,
     }
 
@@ -1114,7 +1114,7 @@ mod gro {
                 &true,
             )?;
             if crate::aqm::enabled() {
-                // The J711 AQM prototype measures sojourn from the kernel's receive time.
+                // The receive-side queue bound measures sojourn from the kernel's receive time.
                 nix::sys::socket::setsockopt(
                     &self.as_fd(),
                     nix::sys::socket::sockopt::ReceiveTimestampns,
