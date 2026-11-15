@@ -494,6 +494,74 @@ mod tests {
         assert!(single_rx.try_recv().is_err());
     }
 
+    /// Records each `send_many` like [`RecordingIpSend`], but holds the first call until the test
+    /// opens `gate`, so later runs queue up behind a busy TUN write.
+    struct GatedIpSend {
+        gate: Arc<tokio::sync::Semaphore>,
+        batches: mpsc::UnboundedSender<Vec<u16>>,
+    }
+
+    impl IpSend for GatedIpSend {
+        async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
+            self.send_many(&mut vec![packet]).await
+        }
+
+        async fn send_many(&mut self, packets: &mut Vec<Packet<Ip>>) -> io::Result<()> {
+            self.gate
+                .acquire()
+                .await
+                .expect("the test never closes the gate")
+                .forget();
+            let ids = packets.iter().map(packet_id).collect();
+            self.batches
+                .send(ids)
+                .expect("the test receiver remains open");
+            packets.clear();
+            Ok(())
+        }
+    }
+
+    /// Runs that queue while the TUN write is busy reach the device as one ordered write call.
+    ///
+    /// This is what lets the device merge a flow's segments across receive runs (J764, #260):
+    /// when decrypted runs back up behind a slow TUN write, the next write takes all of them.
+    #[tokio::test]
+    async fn runs_queued_behind_a_busy_write_are_written_together() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (batch_tx, mut batch_rx) = mpsc::unbounded_channel();
+        let inner = Arc::new(Mutex::new(GatedIpSend {
+            gate: Arc::clone(&gate),
+            batches: batch_tx,
+        }));
+        let mut send = BufferedIpSend::new(16, inner, CancellationToken::new());
+
+        send.send_many(&mut vec![packet(64, 1), packet(64, 2)])
+            .await
+            .unwrap();
+        // Let the writer take the first run and block inside the gated write. The test runtime is
+        // single-threaded, so a few yields always run the writer up to the gate.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        send.send_many(&mut vec![packet(64, 3), packet(64, 4)])
+            .await
+            .unwrap();
+        send.send(packet(64, 5)).await.unwrap();
+        send.send_many(&mut vec![packet(64, 6)]).await.unwrap();
+
+        gate.add_permits(2);
+        let mut calls = Vec::new();
+        for _ in 0..2 {
+            calls.push(
+                tokio::time::timeout(Duration::from_secs(1), batch_rx.recv())
+                    .await
+                    .expect("each write call must reach the device")
+                    .expect("the send task remains open"),
+            );
+        }
+        assert_eq!(calls, [vec![1, 2], vec![3, 4, 5, 6]]);
+    }
+
     async fn scripted_recv(script: Vec<io::Result<Vec<Packet<Ip>>>>) -> BufferedIpRecv<Script> {
         let inner = Arc::new(Mutex::new(Script(VecDeque::from(script))));
         BufferedIpRecv::new(64, PacketBufPool::new(1), inner, CancellationToken::new()).await
