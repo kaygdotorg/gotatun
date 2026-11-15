@@ -2068,3 +2068,49 @@ async fn a_drain_requested_before_peer_removal_sends_nothing() {
     assert_eq!(kept, 8, "control: a live peer's queue is drained");
     assert_eq!(removed, 0, "a removed peer's handshake queue was sent");
 }
+
+/// Measures one `request_keepalives` call at mesh design scale (infraternal D393: designed for
+/// 1,000 peers, tested up to 4,096; #483 J707 P3). Alice has one live session (Bob) and the
+/// rest idle, as after an underlay change on a large, mostly quiet mesh. Prints p50, p99 and
+/// max over 1,000 calls per size; it asserts nothing about time, so it is ignored by default.
+///
+/// Run it in release on a quiet host:
+/// `cargo test --release -p gotatun --lib --features device,ring,tun -- --ignored --nocapture
+/// requested_keepalives_cost_at_design_scale`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "measurement; run in release on a quiet host"]
+async fn requested_keepalives_cost_at_design_scale() {
+    use crate::device::Peer;
+    use ipnetwork::Ipv4Network;
+    use std::net::Ipv4Addr;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    for total in [1_000_u32, 4_096] {
+        let (alice, mut bob, _eve) = mock::device_pair().await;
+        let idle = (0..total - 1).map(|index| {
+            let [_, _, high, low] = index.to_be_bytes();
+            Peer::new(PublicKey::from(&StaticSecret::random()))
+                .with_endpoint((Ipv4Addr::new(10, 99, high, low), 51820).into())
+                .with_allowed_ip(
+                    Ipv4Network::new(Ipv4Addr::new(10, 200, high, low), 32)
+                        .unwrap()
+                        .into(),
+                )
+        });
+        assert!(alice.device.add_peers(idle).await.unwrap());
+        let packet = mock::packet(b"Hello!");
+        alice.app_tx.send(packet.clone()).await;
+        assert_eq!(bob.app_rx.recv().await.as_bytes(), packet.as_bytes());
+        let mut samples = Vec::with_capacity(1_000);
+        for _ in 0..1_000 {
+            let started = std::time::Instant::now();
+            assert_eq!(alice.device.request_keepalives().await, 1);
+            samples.push(started.elapsed());
+        }
+        samples.sort();
+        println!(
+            "request_keepalives peers={total} calls=1000 p50={:?} p99={:?} max={:?}",
+            samples[499], samples[989], samples[999]
+        );
+    }
+}
