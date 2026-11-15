@@ -59,6 +59,58 @@ enum BufferedUdpMessage {
     Batch(Vec<(Packet, SocketAddr)>, OwnedSemaphorePermit, Option<u64>),
 }
 
+/// The send task's poll point (#260, J728).
+///
+/// On a current-thread runtime the send task, the receive task and the TUN reader share one
+/// thread. A socket send that never blocks never yields, so one queued run of N datagrams keeps
+/// the thread for N socket calls (about 25 us each on the macOS VM), and a reply that arrived
+/// meanwhile waits for the whole run. After `every` datagrams this budget yields: Tokio defers a
+/// yielded task until it has polled I/O, so the woken receive task runs first. `every == 0`
+/// never yields (the default).
+struct SendTurnBudget {
+    every: usize,
+    sent: usize,
+}
+
+impl SendTurnBudget {
+    /// Count `datagrams` handed to the socket and yield once the budget is spent.
+    async fn charge(&mut self, datagrams: usize) {
+        if self.every == 0 || datagrams == 0 {
+            return;
+        }
+        self.sent += datagrams;
+        if self.sent >= self.every {
+            self.sent = 0;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The largest run to hand to the socket in one call: at most the budget when it is on.
+    fn chunk(&self, max_packet_count: usize) -> usize {
+        if self.every == 0 {
+            max_packet_count
+        } else {
+            max_packet_count.min(self.every)
+        }
+    }
+}
+
+/// Bench switch (#260, J728): `GOTATUN_BENCH_SEND_YIELD=<n>` turns on the send-turn budget
+/// ([`SendTurnBudget`]) with `n` datagrams per turn. Read once; unset or 0 leaves it off.
+fn send_yield_every() -> usize {
+    static EVERY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let every = std::env::var("GOTATUN_BENCH_SEND_YIELD")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        if every > 0 {
+            eprintln!("diag send_yield every={every}");
+        }
+        every
+    })
+}
+
 /// Send one same-family UDP run through the transport's reusable send buffer.
 async fn flush_udp_packets<U: UdpSend>(
     udp_tx: &U,
@@ -119,22 +171,30 @@ async fn flush_udp_packets<U: UdpSend>(
 }
 
 /// Send a bounded run in as few transport calls as its maximum batch size allows.
+///
+/// `budget` is charged after every socket call, so a long run yields between calls.
 async fn flush_udp_run<U: UdpSend>(
     udp_tx: &U,
     send_buf: &mut U::SendManyBuf,
     packets: Vec<(Packet, SocketAddr)>,
     max_packet_count: usize,
+    budget: &mut SendTurnBudget,
 ) {
-    if packets.len() <= max_packet_count {
+    let chunk = budget.chunk(max_packet_count);
+    if packets.len() <= chunk {
         let mut packets = packets;
+        let count = packets.len();
         flush_udp_packets(udp_tx, send_buf, &mut packets).await;
+        budget.charge(count).await;
         return;
     }
 
     let mut packets = packets.into_iter();
     while packets.len() > 0 {
-        let mut batch = packets.by_ref().take(max_packet_count).collect::<Vec<_>>();
+        let mut batch = packets.by_ref().take(chunk).collect::<Vec<_>>();
+        let count = batch.len();
         flush_udp_packets(udp_tx, send_buf, &mut batch).await;
+        budget.charge(count).await;
     }
 }
 
@@ -177,7 +237,7 @@ impl BufferedUdpSend {
         udp_tx: impl UdpSend + 'static,
         reply_lane: bool,
     ) -> Self {
-        Self::with_send_turn(capacity, udp_tx, reply_lane, 0)
+        Self::with_send_turn(capacity, udp_tx, reply_lane, send_yield_every())
     }
 
     /// Like [`Self::with_reply_lane`], plus a send-turn budget (#260, J728): after
@@ -189,7 +249,6 @@ impl BufferedUdpSend {
         reply_lane: bool,
         yield_every: usize,
     ) -> Self {
-        let _ = yield_every;
         let (send_tx, mut send_rx) = mpsc::channel::<BufferedUdpMessage>(capacity);
         let packet_slots = Arc::new(Semaphore::new(capacity));
         let (reply_tx, mut reply_rx) = if reply_lane {
@@ -206,6 +265,10 @@ impl BufferedUdpSend {
             let mut singles = Vec::with_capacity(max_packet_count);
             let mut single_permits = Vec::with_capacity(max_packet_count);
             let mut replies = Vec::with_capacity(max_packet_count);
+            let mut budget = SendTurnBudget {
+                every: yield_every,
+                sent: 0,
+            };
 
             loop {
                 let count = match &mut reply_rx {
@@ -247,9 +310,11 @@ impl BufferedUdpSend {
                             }
                             singles.push((packet, addr));
                             single_permits.push(permit);
-                            if singles.len() == max_packet_count {
+                            if singles.len() == budget.chunk(max_packet_count) {
+                                let count = singles.len();
                                 flush_udp_packets(&udp_tx, &mut send_many_buf, &mut singles).await;
                                 single_permits.clear();
+                                budget.charge(count).await;
                             }
                         }
                         BufferedUdpMessage::Batch(packets, permit, sequence) => {
@@ -261,8 +326,14 @@ impl BufferedUdpSend {
                             }
                             flush_udp_packets(&udp_tx, &mut send_many_buf, &mut singles).await;
                             single_permits.clear();
-                            flush_udp_run(&udp_tx, &mut send_many_buf, packets, max_packet_count)
-                                .await;
+                            flush_udp_run(
+                                &udp_tx,
+                                &mut send_many_buf,
+                                packets,
+                                max_packet_count,
+                                &mut budget,
+                            )
+                            .await;
                             if let Some(sequence) = sequence {
                                 eprintln!(
                                     "send_many complete direction=udp sequence={sequence} packets={packet_count}"
