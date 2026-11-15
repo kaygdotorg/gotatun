@@ -198,9 +198,36 @@ impl ConnectedSends {
         wildcard: &tokio::net::UdpSocket,
         destination: SocketAddr,
     ) -> Option<Arc<Entry>> {
-        // Red (J744): no connected sockets yet; every send uses the wildcard socket.
-        let _ = (wildcard, destination, connect);
-        None
+        if !self.enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter().find(|entry| entry.destination == destination) {
+            return Some(Arc::clone(entry));
+        }
+        let socket = match connect(wildcard, destination) {
+            Ok(socket) => socket,
+            Err(error) => {
+                if self.enabled.swap(false, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "macOS UDP: cannot connect a send socket to {destination} ({error}); using sendto"
+                    );
+                }
+                return None;
+            }
+        };
+        if entries.len() == MAX_CONNECTED {
+            entries.remove(0);
+        }
+        let entry = Arc::new(Entry {
+            destination,
+            socket,
+        });
+        entries.push(Arc::clone(&entry));
+        drop(entries);
+        self.generation.fetch_add(1, Ordering::Release);
+        self.receiver.wake();
+        Some(entry)
     }
 
     /// Drop `entry` after a send error that says its path is gone; the next send reconnects.
