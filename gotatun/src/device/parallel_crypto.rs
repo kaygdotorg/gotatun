@@ -98,6 +98,11 @@ pub(crate) const fn receive_run_goes_to_worker(
     lane_says_worker && packet_count > inline_max
 }
 
+/// Red stub (J763): J744's parse, off by default everywhere.
+pub(crate) fn inline_max_from(value: Option<&str>) -> usize {
+    value.and_then(|value| value.trim().parse().ok()).filter(|&value| value > 0).unwrap_or(0)
+}
+
 /// Receive runs up to this many packets stay inline: `GOTATUN_BENCH_RX_INLINE_MAX=<n>`, read once
 /// (#260, J744). Off (`0`) by default; a bench switch until the sweep decides a default.
 pub(crate) fn receive_inline_max() -> usize {
@@ -2060,6 +2065,17 @@ mod tests {
         assert!(super::receive_run_goes_to_worker(true, 17, 16));
         assert!(super::receive_run_goes_to_worker(true, 16, 0));
         assert!(!super::receive_run_goes_to_worker(false, 64, 16));
+    }
+
+    /// The inline limit defaults to 16 on macOS and 0 elsewhere; the variable overrides it, and
+    /// `0` turns it off (#260, J763).
+    #[test]
+    fn the_receive_inline_limit_defaults_per_platform_and_can_be_turned_off() {
+        let default = if cfg!(target_os = "macos") { 16 } else { 0 };
+        assert_eq!(super::inline_max_from(None), default);
+        assert_eq!(super::inline_max_from(Some("0")), 0);
+        assert_eq!(super::inline_max_from(Some("8")), 8);
+        assert_eq!(super::inline_max_from(Some("x")), default);
     }
 
     /// Keep a lone ready run inline and dispatch substantial work only when another run exists.

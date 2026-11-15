@@ -230,6 +230,12 @@ impl UdpSocket {
         self.inner.socket.local_addr()
     }
 
+    /// Tell the socket that the host's network changed (red stub, #260 J763).
+    pub fn underlay_changed(&self) {
+        #[cfg(target_os = "macos")]
+        self.inner.connected.underlay_changed();
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn udp_gso_supported(&self) -> bool {
         self.inner.udp_gso_supported

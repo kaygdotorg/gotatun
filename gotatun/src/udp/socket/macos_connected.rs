@@ -55,6 +55,14 @@ use tokio::io::ReadBuf;
 /// and one reactor registration, and every receive poll visits each entry.
 pub(crate) const MAX_CONNECTED: usize = 16;
 
+/// Whether the switch's value turns connected sends on (red stub: J744's off-unless-`1`).
+pub(crate) fn switch_on(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.trim() == "1")
+}
+
+/// Red stub (J763): the table bound J763 changes.
+pub(crate) const ACTIVE_SENDS: u64 = 1024;
+
 /// Whether the bench switch asks for connected sends, read once per process.
 pub(crate) fn wanted() -> bool {
     static WANTED: OnceLock<bool> = OnceLock::new();
@@ -109,6 +117,21 @@ impl ConnectedSends {
             receiver: AtomicWaker::new(),
         }
     }
+
+    /// Red stub (J763): connected sockets created so far are not counted yet.
+    #[cfg(test)]
+    pub(crate) fn connects(&self) -> u64 {
+        0
+    }
+
+    /// Whether connected sends are still on for this socket.
+    #[cfg(test)]
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Red stub (J763): a network change does nothing yet.
+    pub(crate) fn underlay_changed(&self) {}
 
     /// How many endpoints have a connected socket right now.
     #[cfg(test)]
@@ -315,6 +338,20 @@ mod tests {
         },
     };
 
+    /// A data-message-shaped payload of `len` bytes (type 4), large enough to get a socket.
+    fn data(len: usize) -> Vec<u8> {
+        let mut payload = vec![0u8; len];
+        payload[0] = 4;
+        payload
+    }
+
+    /// A handshake-initiation-shaped payload (type 1, 148 bytes).
+    fn initiation() -> Vec<u8> {
+        let mut payload = vec![0u8; 148];
+        payload[0] = 1;
+        payload
+    }
+
     /// A dual-stack WireGuard socket on a free port, the way the product binds it.
     fn wireguard_socket(connected: bool) -> UdpSocket {
         let opts = SockOpt {
@@ -344,6 +381,16 @@ mod tests {
         (packet.to_vec(), source)
     }
 
+    /// Wait for one datagram on a plain peer socket (a hang check, not a speed check).
+    async fn peer_recv(socket: &tokio::net::UdpSocket) -> (Vec<u8>, SocketAddr) {
+        let mut buf = [0u8; 256];
+        let (n, source) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
+            .await
+            .expect("a datagram within 5 s")
+            .expect("receive");
+        (buf[..n].to_vec(), source)
+    }
+
     /// Send `payload` from the WireGuard socket.
     async fn send(socket: &UdpSocket, payload: &[u8], to: SocketAddr) {
         socket
@@ -352,7 +399,33 @@ mod tests {
             .expect("send");
     }
 
-    /// The first send to an endpoint gives it a connected socket on the WireGuard port. The
+    /// The switch: on when unset, off only for `0` (J763 makes it the macOS default).
+    #[test]
+    fn connected_sends_are_on_unless_switched_off() {
+        assert!(super::switch_on(None));
+        assert!(super::switch_on(Some("1")));
+        assert!(!super::switch_on(Some("0")));
+        assert!(!super::switch_on(Some(" 0\n")));
+    }
+
+    /// Binding the WireGuard socket the default way (no explicit choice) turns them on.
+    #[tokio::test]
+    async fn a_default_socket_sends_through_connected_sockets() {
+        if std::env::var_os("GOTATUN_BENCH_MAC_CONNECTED").is_some() {
+            return; // The switch decides; the default is what this test checks.
+        }
+        let opts = SockOpt {
+            only_v6: Some(false),
+            ..SockOpt::default()
+        };
+        let wireguard = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0).into(), opts).expect("bind");
+        let (a, a_address) = peer().await;
+        send(&wireguard, &data(64), a_address).await;
+        peer_recv(&a).await;
+        assert_eq!(wireguard.inner.connected.len(), 1);
+    }
+
+    /// The first data send to an endpoint gives it a connected socket on the WireGuard port. The
     /// endpoint sees the WireGuard port as the source, its replies (which the kernel now delivers
     /// to the connected socket) still arrive, and so do datagrams from other endpoints.
     #[tokio::test]
@@ -362,10 +435,9 @@ mod tests {
         let (a, a_address) = peer().await;
         let (b, _) = peer().await;
 
-        send(&wireguard, b"to-a", a_address).await;
-        let mut buf = [0u8; 64];
-        let (n, source) = a.recv_from(&mut buf).await.expect("a receives");
-        assert_eq!(&buf[..n], b"to-a");
+        send(&wireguard, &data(64), a_address).await;
+        let (payload, source) = peer_recv(&a).await;
+        assert_eq!(payload, data(64));
         assert_eq!(source.port(), port, "the endpoint sees the WireGuard port");
         assert_eq!(wireguard.inner.connected.len(), 1, "a connected socket for the endpoint");
 
@@ -377,10 +449,131 @@ mod tests {
         assert_eq!(payload, b"from-b");
         assert_eq!(source, b.local_addr().expect("b address"));
 
-        send(&wireguard, b"to-a-again", a_address).await;
-        let (n, _) = a.recv_from(&mut buf).await.expect("a receives again");
-        assert_eq!(&buf[..n], b"to-a-again");
+        send(&wireguard, &data(65), a_address).await;
+        assert_eq!(peer_recv(&a).await.0, data(65));
         assert_eq!(wireguard.inner.connected.len(), 1, "the entry is reused");
+    }
+
+    /// While connected sends are on, no other wildcard socket can join the WireGuard port: the
+    /// shared-port option is cleared after each of our binds (J763 measured that macOS lets any
+    /// user co-bind a port that carries it, even a specific address that then steals its
+    /// datagrams). A specific-address bind by the *same* user is allowed with or without this
+    /// feature, so it is not checked here; the cross-user probe is on #260.
+    #[tokio::test]
+    async fn the_port_stays_closed_to_other_sockets() {
+        let wireguard = wireguard_socket(true);
+        let port = wireguard.local_addr().expect("local").port();
+        let (a, a_address) = peer().await;
+        send(&wireguard, &data(64), a_address).await;
+        peer_recv(&a).await;
+        assert_eq!(wireguard.inner.connected.len(), 1);
+
+        for address in [
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)),
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
+        ] {
+            let other = socket2::Socket::new(
+                socket2::Domain::for_address(address),
+                socket2::Type::DGRAM,
+                None,
+            )
+            .expect("socket");
+            other.set_reuse_port(true).expect("SO_REUSEPORT");
+            assert!(
+                other.bind(&address.into()).is_err(),
+                "another socket must not bind {address} beside ours"
+            );
+        }
+
+        // Our own next connected socket still binds.
+        let (b, b_address) = peer().await;
+        send(&wireguard, &data(64), b_address).await;
+        peer_recv(&b).await;
+        assert_eq!(wireguard.inner.connected.len(), 2);
+    }
+
+    /// A network change closes every connected socket; the next data reconnects and arrives.
+    #[tokio::test]
+    async fn a_network_change_reconnects_every_endpoint() {
+        let wireguard = wireguard_socket(true);
+        let (a, a_address) = peer().await;
+        let (b, b_address) = peer().await;
+        send(&wireguard, &data(64), a_address).await;
+        send(&wireguard, &data(64), b_address).await;
+        peer_recv(&a).await;
+        peer_recv(&b).await;
+        assert_eq!(wireguard.inner.connected.len(), 2);
+
+        wireguard.underlay_changed();
+        assert_eq!(wireguard.inner.connected.len(), 0, "every connected socket closed");
+
+        let before = wireguard.inner.connected.connects();
+        send(&wireguard, &data(66), a_address).await;
+        assert_eq!(peer_recv(&a).await.0, data(66));
+        assert_eq!(wireguard.inner.connected.connects(), before + 1, "a fresh connect");
+    }
+
+    /// A handshake initiation leaves through the wildcard socket and closes its endpoint's
+    /// connected socket, so a stale source ends at WireGuard's own retry even with no signal.
+    #[tokio::test]
+    async fn a_handshake_initiation_reconnects_its_endpoint() {
+        let wireguard = wireguard_socket(true);
+        let (a, a_address) = peer().await;
+        send(&wireguard, &data(64), a_address).await;
+        peer_recv(&a).await;
+        assert_eq!(wireguard.inner.connected.len(), 1);
+
+        send(&wireguard, &initiation(), a_address).await;
+        assert_eq!(peer_recv(&a).await.0, initiation());
+        assert_eq!(wireguard.inner.connected.len(), 0, "the initiation closed the entry");
+
+        let before = wireguard.inner.connected.connects();
+        send(&wireguard, &data(64), a_address).await;
+        peer_recv(&a).await;
+        assert_eq!(wireguard.inner.connected.connects(), before + 1);
+    }
+
+    /// Keepalives and handshake messages never create a connected socket.
+    #[tokio::test]
+    async fn keepalives_and_handshakes_do_not_create_sockets() {
+        let wireguard = wireguard_socket(true);
+        let (a, a_address) = peer().await;
+        send(&wireguard, &data(32), a_address).await;
+        send(&wireguard, &initiation(), a_address).await;
+        let mut response = vec![0u8; 92];
+        response[0] = 2;
+        send(&wireguard, &response, a_address).await;
+        for _ in 0..3 {
+            peer_recv(&a).await;
+        }
+        assert_eq!(wireguard.inner.connected.len(), 0);
+    }
+
+    /// An endpoint the kernel cannot reach right now gets `sendto` for that datagram, and
+    /// connected sends stay on for everyone else: neither a failed `connect` nor a failed `send`
+    /// is a refused port. On macOS 26 `connect` succeeds for unroutable addresses and the
+    /// `send` fails (`0.0.0.1`: `EHOSTUNREACH`); `connect` itself fails with `EADDRNOTAVAIL`
+    /// when no source can reach the endpoint, as when the Mac has no network at all, and port 0
+    /// reproduces that error on loopback (J763 probe on #260).
+    #[tokio::test]
+    async fn an_unreachable_endpoint_does_not_turn_the_feature_off() {
+        let wireguard = wireguard_socket(true);
+        for nowhere in [
+            SocketAddr::from((Ipv4Addr::new(0, 0, 0, 1), 9)),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        ] {
+            let result = wireguard
+                .send_to(Packet::from_bytes(bytes::BytesMut::from(&data(64)[..])), nowhere)
+                .await;
+            assert!(result.is_err(), "{nowhere} must be unreachable for this test");
+            assert!(wireguard.inner.connected.is_enabled(), "still on after {nowhere}");
+            assert_eq!(wireguard.inner.connected.len(), 0, "no entry left for {nowhere}");
+        }
+
+        let (a, a_address) = peer().await;
+        send(&wireguard, &data(64), a_address).await;
+        peer_recv(&a).await;
+        assert_eq!(wireguard.inner.connected.len(), 1);
     }
 
     /// An ICMP "port unreachable" for a connected endpoint is reported on that socket's next
@@ -393,7 +586,8 @@ mod tests {
         drop(closed);
 
         for _ in 0..3 {
-            send(&wireguard, b"to-nobody", closed_address).await;
+            send(&wireguard, &data(64), closed_address).await;
+            // sleep: give the kernel time to queue the ICMP error on the connected socket.
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let (b, b_address) = peer().await;
@@ -401,37 +595,49 @@ mod tests {
         assert_eq!(recv(&mut wireguard).await, (b"from-b".to_vec(), b_address));
     }
 
-    /// The table holds at most `MAX_CONNECTED` endpoints; the oldest makes room and every
-    /// endpoint keeps working.
+    /// The table holds at most `MAX_CONNECTED` endpoints. Past it, a new endpoint evicts only an
+    /// idle entry; when every entry is busy it keeps `sendto`, and every endpoint keeps working.
     #[tokio::test]
-    async fn a_full_table_closes_its_oldest_entry() {
+    async fn a_full_table_evicts_only_idle_entries() {
         let wireguard = wireguard_socket(true);
         let mut peers = Vec::new();
-        for _ in 0..super::MAX_CONNECTED + 2 {
+        for _ in 0..super::MAX_CONNECTED {
             let (socket, address) = peer().await;
-            send(&wireguard, b"hello", address).await;
-            peers.push(socket);
+            send(&wireguard, &data(64), address).await;
+            peers.push((socket, address));
         }
         assert_eq!(wireguard.inner.connected.len(), super::MAX_CONNECTED);
-        let mut buf = [0u8; 16];
-        for socket in &peers {
-            let (n, _) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
-                .await
-                .expect("each endpoint got its datagram")
-                .expect("receive");
-            assert_eq!(&buf[..n], b"hello");
+        let connects = wireguard.inner.connected.connects();
+
+        // All sixteen are busy: a seventeenth endpoint uses `sendto` and evicts nobody.
+        let (extra, extra_address) = peer().await;
+        send(&wireguard, &data(64), extra_address).await;
+        assert_eq!(peer_recv(&extra).await.0, data(64));
+        assert_eq!(wireguard.inner.connected.connects(), connects, "no eviction");
+
+        // Keep only the first endpoint busy until the others count as idle.
+        let (first, first_address) = &peers[0];
+        for _ in 0..super::ACTIVE_SENDS {
+            send(&wireguard, &data(40), *first_address).await;
+            peer_recv(first).await;
+        }
+        send(&wireguard, &data(64), extra_address).await;
+        assert_eq!(peer_recv(&extra).await.0, data(64));
+        assert_eq!(wireguard.inner.connected.len(), super::MAX_CONNECTED);
+        assert_eq!(wireguard.inner.connected.connects(), connects + 1, "an idle entry made room");
+
+        for (socket, _) in &peers[1..] {
+            assert_eq!(peer_recv(socket).await.0, data(64), "each endpoint got its datagram");
         }
     }
 
-    /// Off (the default), sends leave from the wildcard socket and no extra socket is made.
+    /// Off, sends leave from the wildcard socket and no extra socket is made.
     #[tokio::test]
-    async fn off_by_default_sends_from_the_wildcard_socket() {
+    async fn switched_off_sends_from_the_wildcard_socket() {
         let wireguard = wireguard_socket(false);
         let (a, a_address) = peer().await;
-        send(&wireguard, b"to-a", a_address).await;
-        let mut buf = [0u8; 16];
-        let (n, _) = a.recv_from(&mut buf).await.expect("a receives");
-        assert_eq!(&buf[..n], b"to-a");
+        send(&wireguard, &data(64), a_address).await;
+        assert_eq!(peer_recv(&a).await.0, data(64));
         assert_eq!(wireguard.inner.connected.len(), 0);
     }
 }
