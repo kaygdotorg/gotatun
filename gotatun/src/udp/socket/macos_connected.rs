@@ -701,6 +701,37 @@ mod tests {
         assert_eq!(wireguard.inner.connected.connects(), before + 1, "a fresh connect");
     }
 
+    /// A network change while the receive task is running closes the old sockets at once, so
+    /// an endpoint whose route did not move reconnects on the same 4-tuple instead of colliding
+    /// with a socket the receiver still holds (the kernel refuses a second connected socket with
+    /// the same addresses and ports while the first is open).
+    #[tokio::test]
+    async fn a_network_change_reconnects_while_the_receiver_runs() {
+        let wireguard = wireguard_socket(true);
+        let mut receiver = wireguard.clone();
+        let task = tokio::spawn(async move {
+            let mut pool = PacketBufPool::new(4);
+            while receiver.recv_from(&mut pool).await.is_ok() {}
+        });
+        let (a, a_address) = peer().await;
+        send(&wireguard, &data(64), a_address).await;
+        peer_recv(&a).await;
+        // sleep: let the receive task take the new entry into its view (the insert wakes it).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        wireguard.underlay_changed();
+        let before = wireguard.inner.connected.connects();
+        send(&wireguard, &data(66), a_address).await;
+        assert_eq!(peer_recv(&a).await.0, data(66));
+        assert_eq!(
+            wireguard.inner.connected.connects(),
+            before + 1,
+            "the endpoint reconnected on its unchanged 4-tuple"
+        );
+        assert_eq!(wireguard.inner.connected.len(), 1);
+        task.abort();
+    }
+
     /// A handshake initiation leaves through the wildcard socket and closes its endpoint's
     /// connected socket, so a stale source ends at WireGuard's own retry even with no signal.
     #[tokio::test]
