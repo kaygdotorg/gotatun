@@ -48,6 +48,8 @@ pub struct BufferedUdpSend {
     send_tx: mpsc::Sender<BufferedUdpMessage>,
     packet_slots: Arc<Semaphore>,
     packet_capacity: usize,
+    /// Small datagrams, sent before the next queued run (#260, J720); `None` without the lane.
+    reply_tx: Option<mpsc::Sender<(Packet, SocketAddr)>>,
 }
 
 /// One queued datagram or one ordered run of datagrams.
@@ -136,11 +138,66 @@ async fn flush_udp_run<U: UdpSend>(
     }
 }
 
+/// Send `replies` and every reply already queued on `reply_rx`, one address family per call.
+async fn flush_replies<U: UdpSend>(
+    reply_rx: &mut mpsc::Receiver<(Packet, SocketAddr)>,
+    udp_tx: &U,
+    send_buf: &mut U::SendManyBuf,
+    replies: &mut Vec<(Packet, SocketAddr)>,
+    max_packet_count: usize,
+) {
+    while let Ok(reply) = reply_rx.try_recv() {
+        let other_family = replies.first().is_some_and(|(_, first)| {
+            matches!(first, SocketAddr::V4(..)) != matches!(reply.1, SocketAddr::V4(..))
+        });
+        if other_family || replies.len() == max_packet_count {
+            flush_udp_packets(udp_tx, send_buf, replies).await;
+        }
+        replies.push(reply);
+    }
+    flush_udp_packets(udp_tx, send_buf, replies).await;
+}
+
 impl BufferedUdpSend {
     /// Wrap a [`UdpSend`] into a [`BufferedUdpSend`] with `capacity`.
+    ///
+    /// Small datagrams get their own lane when `GOTATUN_BENCH_REPLIES_FIRST` names `tx`
+    /// (#260, J720; see [`crate::priority`]).
     pub fn new(capacity: usize, udp_tx: impl UdpSend + 'static) -> Self {
+        Self::with_reply_lane(capacity, udp_tx, crate::priority::mode().tx)
+    }
+
+    /// Like [`Self::new`], with the reply lane chosen by the caller (`reply_lane`).
+    ///
+    /// With the lane, a datagram of at most [`crate::priority::REPLY_MAX`] bytes skips the
+    /// queued runs: the send task sends every queued reply before its next queued run, so a
+    /// probe or ACK no longer waits behind a full send queue of bulk datagrams.
+    pub(crate) fn with_reply_lane(
+        capacity: usize,
+        udp_tx: impl UdpSend + 'static,
+        reply_lane: bool,
+    ) -> Self {
+        Self::with_send_turn(capacity, udp_tx, reply_lane, 0)
+    }
+
+    /// Like [`Self::with_reply_lane`], plus a send-turn budget (#260, J728): after
+    /// `yield_every` datagrams reach the socket, the send task yields so the runtime polls I/O
+    /// before it sends more. `0` turns the budget off.
+    pub(crate) fn with_send_turn(
+        capacity: usize,
+        udp_tx: impl UdpSend + 'static,
+        reply_lane: bool,
+        yield_every: usize,
+    ) -> Self {
+        let _ = yield_every;
         let (send_tx, mut send_rx) = mpsc::channel::<BufferedUdpMessage>(capacity);
         let packet_slots = Arc::new(Semaphore::new(capacity));
+        let (reply_tx, mut reply_rx) = if reply_lane {
+            let (tx, rx) = mpsc::channel(capacity);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
 
         let send_task = Task::spawn("buffered UDP send", async move {
             let mut buf = vec![];
@@ -148,14 +205,37 @@ impl BufferedUdpSend {
             let mut send_many_buf = Default::default();
             let mut singles = Vec::with_capacity(max_packet_count);
             let mut single_permits = Vec::with_capacity(max_packet_count);
+            let mut replies = Vec::with_capacity(max_packet_count);
 
             loop {
-                let count = send_rx.recv_many(&mut buf, max_packet_count).await;
+                let count = match &mut reply_rx {
+                    Some(reply_rx) => tokio::select! {
+                        biased;
+                        Some(reply) = reply_rx.recv() => {
+                            replies.push(reply);
+                            flush_replies(reply_rx, &udp_tx, &mut send_many_buf, &mut replies, max_packet_count).await;
+                            continue;
+                        }
+                        count = send_rx.recv_many(&mut buf, max_packet_count) => count,
+                    },
+                    None => send_rx.recv_many(&mut buf, max_packet_count).await,
+                };
                 if count == 0 {
                     break;
                 }
 
                 for message in buf.drain(..) {
+                    // Replies queued since the last run leave before the next one.
+                    if let Some(reply_rx) = &mut reply_rx {
+                        flush_replies(
+                            reply_rx,
+                            &udp_tx,
+                            &mut send_many_buf,
+                            &mut replies,
+                            max_packet_count,
+                        )
+                        .await;
+                    }
                     match message {
                         BufferedUdpMessage::Single(packet, addr, permit) => {
                             if singles.first().is_some_and(|(_, first_addr)| {
@@ -203,6 +283,7 @@ impl BufferedUdpSend {
             send_tx,
             packet_slots,
             packet_capacity: capacity,
+            reply_tx,
         }
     }
 }
@@ -224,6 +305,14 @@ impl UdpSend for BufferedUdpSend {
     type SendManyBuf = ();
 
     async fn send_to(&self, packet: Packet, destination: SocketAddr) -> io::Result<()> {
+        if let Some(reply_tx) = &self.reply_tx
+            && crate::priority::datagram_is_reply(packet.len())
+        {
+            return reply_tx
+                .send((packet, destination))
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e));
+        }
         let permit = Arc::clone(&self.packet_slots)
             .acquire_owned()
             .await
@@ -252,6 +341,24 @@ impl UdpSend for BufferedUdpSend {
                 io::ErrorKind::InvalidInput,
                 "a UDP run cannot mix address families",
             ));
+        }
+        if let Some(reply_tx) = &self.reply_tx
+            && packets
+                .iter()
+                .any(|(packet, _)| crate::priority::datagram_is_reply(packet.len()))
+        {
+            let mut bulk = Vec::with_capacity(packets.len());
+            for (packet, address) in packets.drain(..) {
+                if crate::priority::datagram_is_reply(packet.len()) {
+                    reply_tx
+                        .send((packet, address))
+                        .await
+                        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+                } else {
+                    bulk.push((packet, address));
+                }
+            }
+            *packets = bulk;
         }
         while !packets.is_empty() {
             let count = packets.len().min(self.packet_capacity);
@@ -328,17 +435,38 @@ pub struct BufferedUdpReceive {
     /// Bench diagnostic handle on the receive queue (#260, J687); never keeps it open.
     depth_tx: mpsc::WeakSender<io::Result<(Packet, SocketAddr)>>,
     recv_rx: mpsc::Receiver<io::Result<(Packet, SocketAddr)>>,
+    /// Small datagrams, taken before `recv_rx` (#260, J720); `None` without the reply lane.
+    reply_rx: Option<mpsc::Receiver<(Packet, SocketAddr)>>,
 }
 
 #[cfg(any(not(target_os = "linux"), test))]
 impl BufferedUdpReceive {
     /// Wrap a [`UdpRecv`] into a [`BufferedUdpReceive`] with `capacity`.
-    pub fn new(
+    ///
+    /// Small datagrams get their own lane when `GOTATUN_BENCH_REPLIES_FIRST` names `udp`
+    /// (#260, J720; see [`crate::priority`]).
+    pub fn new(capacity: usize, udp_rx: impl UdpRecv + 'static, recv_pool: PacketBufPool) -> Self {
+        Self::with_reply_lane(capacity, udp_rx, recv_pool, crate::priority::mode().udp)
+    }
+
+    /// Like [`Self::new`], with the reply lane chosen by the caller (`reply_lane`).
+    ///
+    /// With the lane, a datagram of at most [`crate::priority::REPLY_MAX`] bytes waits in its
+    /// own queue of `capacity`, and every receive call takes that queue first. A probe reply or
+    /// ACK then no longer waits behind a full queue of bulk datagrams.
+    pub(crate) fn with_reply_lane(
         capacity: usize,
         mut udp_rx: impl UdpRecv + 'static,
         mut recv_pool: PacketBufPool,
+        reply_lane: bool,
     ) -> Self {
         let (recv_tx, recv_rx) = mpsc::channel(capacity);
+        let (reply_tx, reply_rx) = if reply_lane {
+            let (tx, rx) = mpsc::channel(capacity);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let depth_tx = recv_tx.downgrade();
 
         let recv_task = Task::spawn("buffered UDP receive", async move {
@@ -367,6 +495,14 @@ impl BufferedUdpReceive {
                 }
 
                 for (packet_buf, src) in packet_bufs.drain(..) {
+                    if let Some(reply_tx) = &reply_tx
+                        && crate::priority::datagram_is_reply(packet_buf.len())
+                    {
+                        if reply_tx.send((packet_buf, src)).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
                     match recv_tx.try_send(Ok((packet_buf, src))) {
                         Ok(()) => (),
                         Err(mpsc::error::TrySendError::Full(packet)) => {
@@ -385,6 +521,7 @@ impl BufferedUdpReceive {
             _recv_task: Arc::new(recv_task),
             depth_tx,
             recv_rx,
+            reply_rx,
         }
     }
 
@@ -413,6 +550,19 @@ impl UdpRecv for BufferedUdpReceive {
     type RecvManyBuf = ();
 
     async fn recv_from(&mut self, _pool: &mut PacketBufPool) -> io::Result<(Packet, SocketAddr)> {
+        if let Some(reply_rx) = &mut self.reply_rx {
+            // Replies first; a closed lane only means the receive task is gone, and the bulk
+            // queue then reports how it ended.
+            tokio::select! {
+                biased;
+                Some(reply) = reply_rx.recv() => return Ok(reply),
+                packet = self.recv_rx.recv() => {
+                    return packet.unwrap_or_else(|| {
+                        Err(io::Error::new(io::ErrorKind::BrokenPipe, "UDP receive task stopped"))
+                    });
+                }
+            }
+        }
         let Some(packet) = self.recv_rx.recv().await else {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -435,9 +585,13 @@ impl UdpRecv for BufferedUdpReceive {
         packets.push(self.recv_from(pool).await?);
         // Bench override (#260, J687): GOTATUN_BENCH_UDP_RX_BATCH=1 restores one datagram per call.
         static BATCH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let batch = *BATCH
-            .get_or_init(|| crate::diag::capacity("GOTATUN_BENCH_UDP_RX_BATCH", RECV_BATCH));
+        let batch =
+            *BATCH.get_or_init(|| crate::diag::capacity("GOTATUN_BENCH_UDP_RX_BATCH", RECV_BATCH));
         for _ in 1..batch {
+            if let Some(reply) = self.reply_rx.as_mut().and_then(|rx| rx.try_recv().ok()) {
+                packets.push(reply);
+                continue;
+            }
             let Ok(item) = self.recv_rx.try_recv() else {
                 break;
             };
@@ -704,5 +858,189 @@ mod test {
         .await
         .expect("the receive task must stop promptly")
         .expect("the panicked receive task must not close its channel");
+    }
+}
+
+/// Reply lane tests (#260, J720). These run on every target, the Mac included.
+#[cfg(test)]
+mod reply_lane_test {
+    use super::*;
+
+    /// Hands out scripted datagrams, then waits forever.
+    struct Script(std::collections::VecDeque<(Packet, SocketAddr)>);
+
+    impl UdpRecv for Script {
+        type RecvManyBuf = ();
+
+        async fn recv_from(
+            &mut self,
+            _pool: &mut PacketBufPool,
+        ) -> io::Result<(Packet, SocketAddr)> {
+            match self.0.pop_front() {
+                Some(item) => Ok(item),
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    /// A datagram of `len` bytes whose first byte is `id`.
+    fn datagram(len: usize, id: u8) -> (Packet, SocketAddr) {
+        let mut bytes = bytes::BytesMut::zeroed(len);
+        bytes[0] = id;
+        (
+            Packet::from_bytes(bytes),
+            "192.0.2.1:51820".parse().unwrap(),
+        )
+    }
+
+    async fn drained(lane: bool) -> Vec<u8> {
+        let script = [
+            datagram(1452, 1),
+            datagram(1452, 2),
+            datagram(96, 3),
+            datagram(1452, 4),
+            datagram(156, 5),
+        ];
+        let mut receiver = BufferedUdpReceive::with_reply_lane(
+            16,
+            Script(script.into()),
+            PacketBufPool::new(8),
+            lane,
+        );
+        // The receive task queues all five before the first call takes them.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut pool = PacketBufPool::new(1);
+        let mut packets = Vec::new();
+        let mut ids = Vec::new();
+        while ids.len() < 5 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                receiver.recv_many_from(&mut (), &mut pool, &mut packets),
+            )
+            .await
+            .expect("queued datagrams")
+            .expect("the script never fails");
+            ids.extend(packets.drain(..).map(|(p, _)| p[0]));
+        }
+        ids
+    }
+
+    /// Records the first byte of every datagram that reaches the socket. Each send call first
+    /// takes a permit from `gate`, so the test can hold the first run in flight while more queue.
+    #[derive(Clone)]
+    struct GatedSend {
+        gate: Arc<Semaphore>,
+        sent: mpsc::UnboundedSender<u8>,
+    }
+
+    impl UdpSend for GatedSend {
+        type SendManyBuf = ();
+
+        async fn send_to(&self, packet: Packet, _destination: SocketAddr) -> io::Result<()> {
+            self.gate.acquire().await.expect("open gate").forget();
+            self.sent.send(packet[0]).expect("the test listens");
+            Ok(())
+        }
+    }
+
+    async fn sent_order(lane: bool) -> Vec<u8> {
+        let gate = Arc::new(Semaphore::new(0));
+        let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+        let send = BufferedUdpSend::with_reply_lane(
+            64,
+            GatedSend {
+                gate: Arc::clone(&gate),
+                sent: sent_tx,
+            },
+            lane,
+        );
+        let mut buf = ();
+        // A bulk run the send task takes and holds at the gate.
+        send.send_many_to(&mut buf, &mut vec![datagram(1452, 1), datagram(1452, 2)])
+            .await
+            .expect("queued");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Queued while it waits: another bulk run, then a run with a probe reply.
+        send.send_many_to(&mut buf, &mut vec![datagram(1452, 3), datagram(1452, 4)])
+            .await
+            .expect("queued");
+        send.send_many_to(&mut buf, &mut vec![datagram(1452, 5), datagram(124, 6)])
+            .await
+            .expect("queued");
+        gate.add_permits(16);
+        let mut order = Vec::new();
+        while order.len() < 6 {
+            order.push(
+                tokio::time::timeout(std::time::Duration::from_secs(2), sent_rx.recv())
+                    .await
+                    .expect("all six are sent")
+                    .expect("the send task holds the sender"),
+            );
+        }
+        order
+    }
+
+    /// With the lane, a small datagram queued behind bulk runs is sent before them (the run in
+    /// flight finishes first). Without it, the send queue is a FIFO.
+    #[tokio::test]
+    async fn small_datagrams_overtake_queued_send_runs() {
+        assert_eq!(sent_order(false).await, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(sent_order(true).await, [1, 2, 6, 3, 4, 5]);
+    }
+
+    /// Logs `s` for every datagram that reaches the socket.
+    #[derive(Clone)]
+    struct LoggingSend(Arc<std::sync::Mutex<String>>);
+
+    impl UdpSend for LoggingSend {
+        type SendManyBuf = ();
+
+        async fn send_to(&self, _packet: Packet, _destination: SocketAddr) -> io::Result<()> {
+            self.0.lock().expect("log").push('s');
+            Ok(())
+        }
+    }
+
+    /// The longest unbroken run of sends while a competing task (`o`, standing in for the
+    /// receive task a reply wakes) wants the same current-thread runtime.
+    async fn longest_send_run(yield_every: usize) -> (usize, String) {
+        let log = Arc::new(std::sync::Mutex::new(String::new()));
+        let send =
+            BufferedUdpSend::with_send_turn(64, LoggingSend(Arc::clone(&log)), false, yield_every);
+        let mut run = (1..=8).map(|id| datagram(1452, id)).collect::<Vec<_>>();
+        send.send_many_to(&mut (), &mut run).await.expect("queued");
+        let competitor_log = Arc::clone(&log);
+        let competitor = tokio::spawn(async move {
+            while competitor_log.lock().expect("log").matches('s').count() < 8 {
+                competitor_log.lock().expect("log").push('o');
+                tokio::task::yield_now().await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), competitor)
+            .await
+            .expect("all eight are sent")
+            .expect("the competitor never panics");
+        let log = log.lock().expect("log").clone();
+        (log.split('o').map(str::len).max().unwrap_or(0), log)
+    }
+
+    /// With a send-turn budget, the send task gives the runtime back after that many datagrams,
+    /// so a ready receive runs between them. Without it, one queued run leaves in one turn.
+    /// Tokio wakes the tasks deferred by a yield as one batch, so two budgets may still run back
+    /// to back (the Mac VM logged `ssoossssooss`); the bound is therefore twice the budget.
+    #[tokio::test]
+    async fn send_turn_budget_lets_other_tasks_run_between_datagrams() {
+        let (off, log) = longest_send_run(0).await;
+        assert_eq!(off, 8, "{log}");
+        let (on, log) = longest_send_run(2).await;
+        assert!(on <= 4, "{log}");
+    }
+
+    /// With the lane, small datagrams queued behind bulk ones are handed over first, each class
+    /// in arrival order. Without it, the queue is a FIFO.
+    #[tokio::test]
+    async fn small_datagrams_overtake_queued_bulk() {
+        assert_eq!(drained(false).await, [1, 2, 3, 4, 5]);
+        assert_eq!(drained(true).await, [3, 5, 1, 2, 4]);
     }
 }

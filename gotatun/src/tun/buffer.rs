@@ -296,6 +296,8 @@ pub struct BufferedIpRecv<I> {
     _task: Arc<Task>,
     _phantom: std::marker::PhantomData<I>,
     mtu: MtuWatcher,
+    /// Move replies ahead of bulk data in each batch (#260, J720; see [`crate::priority`]).
+    replies_first: bool,
 }
 
 impl<I: IpRecv> BufferedIpRecv<I> {
@@ -363,6 +365,7 @@ impl<I: IpRecv> BufferedIpRecv<I> {
             _task: Arc::new(task),
             _phantom: std::marker::PhantomData,
             mtu,
+            replies_first: crate::priority::mode().tun,
         }
     }
 }
@@ -392,6 +395,11 @@ impl<I: IpRecv> IpRecv for BufferedIpRecv<I> {
                 io::ErrorKind::UnexpectedEof,
                 "channel closed",
             ));
+        }
+        if self.replies_first {
+            crate::priority::replies_first(&mut self.rx_packet_buf, |packet| {
+                crate::priority::ip_is_reply(zerocopy::IntoBytes::as_bytes(&**packet))
+            });
         }
         Ok(self.rx_packet_buf.drain(..n))
     }
@@ -527,6 +535,56 @@ mod tests {
     async fn scripted_recv(script: Vec<io::Result<Vec<Packet<Ip>>>>) -> BufferedIpRecv<Script> {
         let inner = Arc::new(Mutex::new(Script(VecDeque::from(script))));
         BufferedIpRecv::new(64, PacketBufPool::new(1), inner, CancellationToken::new()).await
+    }
+
+    /// An IPv4 pure ACK (no payload), identified like [`packet`].
+    fn ack(id: u16) -> Packet<Ip> {
+        let mut bytes = BytesMut::zeroed(52);
+        bytes[0] = 0x45;
+        bytes[2..4].copy_from_slice(&52u16.to_be_bytes());
+        bytes[4..6].copy_from_slice(&id.to_be_bytes());
+        bytes[9] = 6;
+        bytes[20 + 12] = 8 << 4;
+        bytes[20 + 13] = 0x10;
+        Packet::from_bytes(bytes).try_into_ip().unwrap()
+    }
+
+    /// Bulk TCP data of `len` bytes, identified like [`packet`].
+    fn data(len: u16, id: u16) -> Packet<Ip> {
+        let mut bytes = BytesMut::zeroed(usize::from(len));
+        bytes[0] = 0x45;
+        bytes[2..4].copy_from_slice(&len.to_be_bytes());
+        bytes[4..6].copy_from_slice(&id.to_be_bytes());
+        bytes[9] = 6;
+        bytes[20 + 12] = 8 << 4;
+        bytes[20 + 13] = 0x10;
+        Packet::from_bytes(bytes).try_into_ip().unwrap()
+    }
+
+    /// With replies first on, a pure ACK read behind bulk data leaves the read-ahead first, and
+    /// each class keeps its order (#260, J720). Off, the batch is a FIFO.
+    #[tokio::test]
+    async fn replies_leave_the_read_ahead_before_bulk_data() {
+        let batch = || vec![data(1400, 1), data(1400, 2), ack(3), data(1400, 4), ack(5)];
+        for (on, expected) in [(false, [1, 2, 3, 4, 5]), (true, [3, 5, 1, 2, 4])] {
+            let mut recv = scripted_recv(vec![Ok(batch())]).await;
+            recv.replies_first = on;
+            let mut pool = PacketBufPool::new(1);
+            // The reader task forwards packet by packet; wait until all five are queued.
+            for _ in 0..100 {
+                if recv.rx.len() == 5 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let ids: Vec<u16> = recv
+                .recv(&mut pool)
+                .await
+                .expect("the scripted batch")
+                .map(|p| packet_id(&p))
+                .collect();
+            assert_eq!(ids, expected, "replies_first={on}");
+        }
     }
 
     /// One frame the TUN reader refuses (malformed headers) is dropped; the next frame still
