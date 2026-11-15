@@ -306,7 +306,10 @@ impl ConnectedSends {
     ) -> Option<Arc<Entry>> {
         let now = self.sends.fetch_add(1, Ordering::Relaxed);
         let mut entries = self.entries.lock();
-        if let Some(entry) = entries.iter().find(|entry| entry.destination == destination) {
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.destination == destination)
+        {
             entry.last_used.store(now, Ordering::Relaxed);
             return Some(Arc::clone(entry));
         }
@@ -317,7 +320,10 @@ impl ConnectedSends {
                 .iter()
                 .enumerate()
                 .map(|(index, entry)| {
-                    (index, now.saturating_sub(entry.last_used.load(Ordering::Relaxed)))
+                    (
+                        index,
+                        now.saturating_sub(entry.last_used.load(Ordering::Relaxed)),
+                    )
                 })
                 .max_by_key(|&(_, idle)| idle)?;
             if idle < ACTIVE_SENDS {
@@ -486,7 +492,11 @@ fn connect(
     {
         let mut ours = Vec::with_capacity(entries.len() + 2);
         ours.push(socket2::SockRef::from(wildcard));
-        ours.extend(entries.iter().map(|entry| socket2::SockRef::from(&entry.socket)));
+        ours.extend(
+            entries
+                .iter()
+                .map(|entry| socket2::SockRef::from(&entry.socket)),
+        );
         ours.push(socket2::SockRef::from(&socket));
         let _window = ReusePortWindow::open(ours).map_err(shared)?;
         socket.bind(&local.into()).map_err(shared)?;
@@ -570,10 +580,11 @@ mod tests {
     /// Wait for one datagram on `socket` (a hang check, not a speed check).
     async fn recv(socket: &mut UdpSocket) -> (Vec<u8>, SocketAddr) {
         let mut pool = PacketBufPool::new(4);
-        let (packet, source) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut pool))
-            .await
-            .expect("a datagram within 5 s")
-            .expect("receive");
+        let (packet, source) =
+            tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut pool))
+                .await
+                .expect("a datagram within 5 s")
+                .expect("receive");
         (packet.to_vec(), source)
     }
 
@@ -635,7 +646,11 @@ mod tests {
         let (payload, source) = peer_recv(&a).await;
         assert_eq!(payload, data(64));
         assert_eq!(source.port(), port, "the endpoint sees the WireGuard port");
-        assert_eq!(wireguard.inner.connected.len(), 1, "a connected socket for the endpoint");
+        assert_eq!(
+            wireguard.inner.connected.len(),
+            1,
+            "a connected socket for the endpoint"
+        );
 
         let ours: SocketAddr = (Ipv4Addr::LOCALHOST, port).into();
         a.send_to(b"from-a", ours).await.expect("a replies");
@@ -701,12 +716,20 @@ mod tests {
         assert_eq!(wireguard.inner.connected.len(), 2);
 
         wireguard.underlay_changed();
-        assert_eq!(wireguard.inner.connected.len(), 0, "every connected socket closed");
+        assert_eq!(
+            wireguard.inner.connected.len(),
+            0,
+            "every connected socket closed"
+        );
 
         let before = wireguard.inner.connected.connects();
         send(&wireguard, &data(66), a_address).await;
         assert_eq!(peer_recv(&a).await.0, data(66));
-        assert_eq!(wireguard.inner.connected.connects(), before + 1, "a fresh connect");
+        assert_eq!(
+            wireguard.inner.connected.connects(),
+            before + 1,
+            "a fresh connect"
+        );
     }
 
     /// A network change while the receive task is running closes the old sockets at once, so
@@ -752,7 +775,11 @@ mod tests {
 
         send(&wireguard, &initiation(), a_address).await;
         assert_eq!(peer_recv(&a).await.0, initiation());
-        assert_eq!(wireguard.inner.connected.len(), 0, "the initiation closed the entry");
+        assert_eq!(
+            wireguard.inner.connected.len(),
+            0,
+            "the initiation closed the entry"
+        );
 
         let before = wireguard.inner.connected.connects();
         send(&wireguard, &data(64), a_address).await;
@@ -774,11 +801,19 @@ mod tests {
         for (name, message) in [("keepalive", data(32)), ("handshake response", response)] {
             send(&wireguard, &data(64), a_address).await;
             peer_recv(&a).await;
-            assert_eq!(wireguard.inner.connected.len(), 1, "data made an entry before the {name}");
+            assert_eq!(
+                wireguard.inner.connected.len(),
+                1,
+                "data made an entry before the {name}"
+            );
 
             send(&wireguard, &message, a_address).await;
             assert_eq!(peer_recv(&a).await.0, message);
-            assert_eq!(wireguard.inner.connected.len(), 0, "the {name} closed the entry");
+            assert_eq!(
+                wireguard.inner.connected.len(),
+                0,
+                "the {name} closed the entry"
+            );
         }
     }
 
@@ -794,7 +829,12 @@ mod tests {
         for message in [data(32), initiation(), response] {
             send(&wireguard, &message, a_address).await;
             assert_eq!(peer_recv(&a).await.0, message);
-            assert_eq!(wireguard.inner.connected.len(), 0, "{} bytes made no entry", message.len());
+            assert_eq!(
+                wireguard.inner.connected.len(),
+                0,
+                "{} bytes made no entry",
+                message.len()
+            );
         }
     }
 
@@ -812,11 +852,24 @@ mod tests {
             SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         ] {
             let result = wireguard
-                .send_to(Packet::from_bytes(bytes::BytesMut::from(&data(64)[..])), nowhere)
+                .send_to(
+                    Packet::from_bytes(bytes::BytesMut::from(&data(64)[..])),
+                    nowhere,
+                )
                 .await;
-            assert!(result.is_err(), "{nowhere} must be unreachable for this test");
-            assert!(wireguard.inner.connected.is_enabled(), "still on after {nowhere}");
-            assert_eq!(wireguard.inner.connected.len(), 0, "no entry left for {nowhere}");
+            assert!(
+                result.is_err(),
+                "{nowhere} must be unreachable for this test"
+            );
+            assert!(
+                wireguard.inner.connected.is_enabled(),
+                "still on after {nowhere}"
+            );
+            assert_eq!(
+                wireguard.inner.connected.len(),
+                0,
+                "no entry left for {nowhere}"
+            );
         }
 
         let (a, a_address) = peer().await;
@@ -840,7 +893,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let (b, b_address) = peer().await;
-        b.send_to(b"from-b", (Ipv4Addr::LOCALHOST, port)).await.expect("b sends");
+        b.send_to(b"from-b", (Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("b sends");
         assert_eq!(recv(&mut wireguard).await, (b"from-b".to_vec(), b_address));
     }
 
@@ -894,7 +949,9 @@ mod tests {
         send(&wireguard, &data(64), a_address).await;
         peer_recv(&a).await;
         assert_eq!(wireguard.inner.connected.len(), 1);
-        a.send_to(b"reply", (Ipv4Addr::LOCALHOST, port)).await.expect("a replies");
+        a.send_to(b"reply", (Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("a replies");
         let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("the parked receiver reads the new connected socket")
@@ -920,7 +977,9 @@ mod tests {
             send(&wireguard, &data(64), closed_address).await;
             // sleep: give the kernel time to queue the ICMP error on the connected socket.
             tokio::time::sleep(Duration::from_millis(20)).await;
-            b.send_to(b"from-b", (Ipv4Addr::LOCALHOST, port)).await.expect("b sends");
+            b.send_to(b"from-b", (Ipv4Addr::LOCALHOST, port))
+                .await
+                .expect("b sends");
             assert_eq!(
                 recv(&mut wireguard).await,
                 (b"from-b".to_vec(), b_address),
@@ -934,13 +993,24 @@ mod tests {
     #[test]
     fn send_errors_are_classified() {
         let error = |code| std::io::Error::from_raw_os_error(code);
-        for code in [libc::EADDRNOTAVAIL, libc::ENETUNREACH, libc::ENETDOWN, libc::EDESTADDRREQ] {
+        for code in [
+            libc::EADDRNOTAVAIL,
+            libc::ENETUNREACH,
+            libc::ENETDOWN,
+            libc::EDESTADDRREQ,
+        ] {
             assert!(super::is_path_error(&error(code)), "path error {code}");
-            assert!(!super::is_icmp_error(&error(code)), "not an ICMP report {code}");
+            assert!(
+                !super::is_icmp_error(&error(code)),
+                "not an ICMP report {code}"
+            );
         }
         for code in [libc::ECONNREFUSED, libc::EHOSTDOWN, libc::EHOSTUNREACH] {
             assert!(super::is_icmp_error(&error(code)), "ICMP report {code}");
-            assert!(!super::is_path_error(&error(code)), "not a path error {code}");
+            assert!(
+                !super::is_path_error(&error(code)),
+                "not a path error {code}"
+            );
         }
         for code in [libc::ENOBUFS, libc::EAGAIN, libc::EPERM] {
             assert!(!super::is_path_error(&error(code)) && !super::is_icmp_error(&error(code)));
@@ -965,7 +1035,11 @@ mod tests {
         let (extra, extra_address) = peer().await;
         send(&wireguard, &data(64), extra_address).await;
         assert_eq!(peer_recv(&extra).await.0, data(64));
-        assert_eq!(wireguard.inner.connected.connects(), connects, "no eviction");
+        assert_eq!(
+            wireguard.inner.connected.connects(),
+            connects,
+            "no eviction"
+        );
 
         // Keep only the first endpoint busy until the others count as idle.
         let (first, first_address) = &peers[0];
@@ -976,10 +1050,18 @@ mod tests {
         send(&wireguard, &data(64), extra_address).await;
         assert_eq!(peer_recv(&extra).await.0, data(64));
         assert_eq!(wireguard.inner.connected.len(), super::MAX_CONNECTED);
-        assert_eq!(wireguard.inner.connected.connects(), connects + 1, "an idle entry made room");
+        assert_eq!(
+            wireguard.inner.connected.connects(),
+            connects + 1,
+            "an idle entry made room"
+        );
 
         for (socket, _) in &peers[1..] {
-            assert_eq!(peer_recv(socket).await.0, data(64), "each endpoint got its datagram");
+            assert_eq!(
+                peer_recv(socket).await.0,
+                data(64),
+                "each endpoint got its datagram"
+            );
         }
     }
 

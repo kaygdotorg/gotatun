@@ -27,7 +27,11 @@ impl UdpSend for super::UdpSocket {
         // macOS: an endpoint's connected socket skips xnu's per-datagram route and policy
         // decision (#260, J744, J763; see `macos_connected`). Off, this is the plain `sendto`.
         #[cfg(target_os = "macos")]
-        return self.inner.connected.send(self.socket(), &packet, dest).await;
+        return self
+            .inner
+            .connected
+            .send(self.socket(), &packet, dest)
+            .await;
         #[cfg(not(target_os = "macos"))]
         {
             self.socket().send_to(&packet, dest).await?;
@@ -50,9 +54,12 @@ impl UdpRecv for super::UdpSocket {
         let (n, src) = {
             let this = &mut *self;
             std::future::poll_fn(|cx| {
-                this.inner
-                    .connected
-                    .poll_recv(&this.inner.socket, &mut this.recv_view, cx, &mut buf)
+                this.inner.connected.poll_recv(
+                    &this.inner.socket,
+                    &mut this.recv_view,
+                    cx,
+                    &mut buf,
+                )
             })
             .await?
         };

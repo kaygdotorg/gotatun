@@ -232,7 +232,9 @@ impl UdpSocket {
         };
         #[cfg(target_os = "macos")]
         {
-            let mut live = LIVE_SOCKETS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut live = LIVE_SOCKETS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             live.retain(|state| state.strong_count() > 0);
             live.push(Arc::downgrade(&socket.inner));
         }
