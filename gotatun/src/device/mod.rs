@@ -465,6 +465,15 @@ struct PreparedIncomingRun {
     peer_key: usize,
     peer_arc: Arc<Mutex<PeerState>>,
     packets: Vec<(PreparedDecryption, std::net::SocketAddr)>,
+    /// Kernel receive time (ns) of each packet's datagram, aligned with `packets`; empty when the
+    /// receive-side queue bound is off.
+    rx_stamps: Vec<u64>,
+}
+
+/// The kernel receive timestamp of `packets[index]` from `udp_rx`'s last batch (see
+/// [`UdpRecv::rx_timestamp_ns`]). A helper only so `handle_incoming` can name its receiver type.
+fn rx_stamp_of<R: UdpRecv>(_udp_rx: &R, recv_buf: &R::RecvManyBuf, index: usize) -> u64 {
+    R::rx_timestamp_ns(recv_buf, index)
 }
 
 #[cfg(test)]
@@ -1651,10 +1660,13 @@ impl<T: DeviceTransports> DeviceState<T> {
         lookup: Arc<PacketLookup>,
         peer_arc: Arc<Mutex<PeerState>>,
         completions: Vec<Option<IncomingCompletion>>,
+        rx_stamps: Vec<u64>,
         mut tun_tx: impl IpSend,
     ) -> Result<(), Error> {
         let diagnostic = crate::diag::PIPELINE.on() || crate::diag::SEND_QUEUE.on();
         let completion_count = completions.len();
+        let aqm_on = crate::aqm::enabled();
+        let mut aqm_now = None;
         if diagnostic {
             eprintln!(
                 "pipeline stage=incoming_delivery_callback_start completions={completion_count}"
@@ -1679,13 +1691,19 @@ impl<T: DeviceTransports> DeviceState<T> {
         let mut rejected_source_count = 0;
         let mut tun_packets = Vec::with_capacity(completions.len());
 
-        for completion in completions.into_iter().flatten() {
+        for (index, completion) in completions.into_iter().enumerate() {
+            let Some(completion) = completion else {
+                continue;
+            };
             let result = peer.complete_incoming_data(completion.result, completion.addr);
             #[cfg_attr(not(feature = "daita"), expect(unused_mut))]
             let TunnResult::WriteToTunnel(mut packet) = result else {
                 continue;
             };
             tunnel_result_count += 1;
+            // Bill the authenticated plaintext before padding removal or IP length trimming.
+            // Otherwise a large encrypted frame could claim a small packet's exemption.
+            let authenticated_len = packet.len();
 
             #[cfg(feature = "daita")]
             if let Some(daita) = peer.daita.as_mut() {
@@ -1721,6 +1739,23 @@ impl<T: DeviceTransports> DeviceState<T> {
                 }
                 rejected_source_count += 1;
                 continue;
+            }
+            let mut packet: crate::packet::Packet<crate::packet::Ip> = packet;
+            if aqm_on {
+                // The queue bound: CoDel at the point the in-order packet leaves the engine's queue. The
+                // replay window has already accepted it, so a drop here is plain loss to TCP.
+                let rx_ns = rx_stamps.get(index).copied().unwrap_or(0);
+                match crate::aqm::judge(
+                    &mut peer.aqm,
+                    zerocopy::IntoBytes::as_mut_bytes(&mut *packet),
+                    authenticated_len,
+                    rx_ns,
+                    // After the peer lock and IP authorization, so age includes lock wait.
+                    *aqm_now.get_or_insert_with(crate::aqm::DequeueTime::now),
+                ) {
+                    crate::aqm::Verdict::Drop => continue,
+                    crate::aqm::Verdict::Pass | crate::aqm::Verdict::Marked => {}
+                }
             }
             tun_packets.push(packet);
         }
@@ -1777,6 +1812,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         context: IncomingRunContext<TunTx>,
         first_slot: u64,
         packets: Vec<(PreparedDecryption, std::net::SocketAddr)>,
+        mut rx_stamps: Vec<u64>,
     ) {
         let IncomingRunContext {
             crypto,
@@ -1796,6 +1832,12 @@ impl<T: DeviceTransports> DeviceState<T> {
         while remaining > 0 {
             let batch = packets.by_ref().take(CRYPTO_BATCH_SIZE).collect::<Vec<_>>();
             let batch_len = batch.len();
+            let mut batch_stamps = if rx_stamps.is_empty() {
+                Vec::new()
+            } else {
+                let take = batch_len.min(rx_stamps.len());
+                rx_stamps.drain(..take).collect::<Vec<_>>()
+            };
             let batch_first_slot = first_slot + offset;
             // The lane's choice is made first so its backlog latch still sees every run.
             let force_worker = parallel_crypto::receive_run_goes_to_worker(
@@ -1853,6 +1895,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                             let lookup = Arc::clone(&lookup);
                             let peer_arc = Arc::clone(&peer_arc);
                             let tun_tx = tun_tx.clone();
+                            let rx_stamps = std::mem::take(&mut batch_stamps);
                             async move {
                                 Self::deliver_incoming_run(
                                     batch_first_slot,
@@ -1860,6 +1903,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                                     lookup,
                                     peer_arc,
                                     completions,
+                                    rx_stamps,
                                     tun_tx,
                                 )
                                 .await
@@ -1960,6 +2004,7 @@ impl<T: DeviceTransports> DeviceState<T> {
             },
             first_slot,
             run.packets,
+            run.rx_stamps,
         );
         if diagnostic {
             eprintln!(
@@ -2446,7 +2491,13 @@ impl<T: DeviceTransports> DeviceState<T> {
             }
 
             let mut incoming_runs = HashMap::<usize, PreparedIncomingRun>::new();
-            for (src_buf, addr) in received_packets.drain(..) {
+            let aqm_on = crate::aqm::enabled();
+            for (packet_index, (src_buf, addr)) in received_packets.drain(..).enumerate() {
+                let rx_ns = if aqm_on {
+                    rx_stamp_of(&udp_rx, &udp_recv_buf, packet_index)
+                } else {
+                    0
+                };
                 let parsed_packet = match rate_limiter.verify_packet(addr, src_buf) {
                     Ok(packet) => packet,
                     Err(TunnResult::WriteToNetwork(WgKind::CookieReply(cookie))) => {
@@ -2558,9 +2609,13 @@ impl<T: DeviceTransports> DeviceState<T> {
                                             peer_key,
                                             peer_arc: Arc::clone(&peer_arc),
                                             packets: Vec::with_capacity(CRYPTO_CHUNK_SIZE),
+                                            rx_stamps: Vec::new(),
                                         }
                                     });
                                     run.packets.push((packet, addr));
+                                    if aqm_on {
+                                        run.rx_stamps.push(rx_ns);
+                                    }
                                     run.packets.len() == CRYPTO_CHUNK_SIZE
                                 };
                                 if reached_limit {

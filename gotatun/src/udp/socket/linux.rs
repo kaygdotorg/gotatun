@@ -913,6 +913,9 @@ mod gro {
 
     pub struct RecvManyBuf {
         pub(crate) gro_bufs: Box<[BytesMut; MAX_PACKET_COUNT]>,
+        /// Kernel receive timestamps (`SO_TIMESTAMPNS`, ns), one per output packet index of the
+        /// last call; empty when the receive-side queue bound is off.
+        pub(crate) rx_stamps: Vec<u64>,
     }
 
     impl Default for RecvManyBuf {
@@ -922,7 +925,10 @@ mod gro {
             let gro_bufs = gro_bufs.map(|()| gro_buf.split_to(MAX_GRO_SIZE));
             let gro_bufs = Box::new(gro_bufs);
 
-            Self { gro_bufs }
+            Self {
+                gro_bufs,
+                rx_stamps: Vec::new(),
+            }
         }
     }
 
@@ -983,6 +989,11 @@ mod gro {
             let socket = self.socket();
             let fd = socket.as_raw_fd();
             let map_ipv4_to_ipv6 = self.map_ipv4_to_ipv6;
+            let stamp = crate::aqm::enabled();
+            if stamp {
+                // Keep one entry per already-buffered packet so indices stay aligned.
+                recv_many_bufs.rx_stamps.resize(packets.len(), 0);
+            }
 
             socket
                 .async_io(Interest::READABLE, move || {
@@ -994,7 +1005,7 @@ mod gro {
                     // can poison the peer runtime endpoint with an unspecified IPv4 address.
                     let headers = &mut MultiHeaders::<SockaddrStorage>::preallocate(
                         MAX_PACKET_COUNT,
-                        Some(cmsg_space!(i32)),
+                        Some(cmsg_space!(i32, libc::timespec)),
                     );
 
                     let mut io_slices: [[IoSliceMut; 1]; MAX_PACKET_COUNT] =
@@ -1045,13 +1056,23 @@ mod gro {
                         let source_addr = map_src_addr(map_ipv4_to_ipv6, source_addr);
 
                         // TODO: is this true? Under what circumstance can the cmsg buffer overflow?
-                        let mut cmsgs = result.cmsgs().expect("we have allocated enough memory");
+                        let cmsgs = result.cmsgs().expect("we have allocated enough memory");
 
-                        let gro_size = cmsgs
-                            .find_map(|cmsg| match cmsg {
-                                ControlMessageOwned::UdpGroSegments(gro_size) => Some(gro_size),
-                                _ => None,
-                            })
+                        let mut gro_size = None;
+                        let mut rx_ns = 0_u64;
+                        for cmsg in cmsgs {
+                            match cmsg {
+                                ControlMessageOwned::UdpGroSegments(size) => gro_size = Some(size),
+                                ControlMessageOwned::ScmTimestampns(time) => {
+                                    rx_ns = u64::try_from(time.tv_sec())
+                                        .unwrap_or(0)
+                                        .saturating_mul(1_000_000_000)
+                                        .saturating_add(u64::try_from(time.tv_nsec()).unwrap_or(0));
+                                }
+                                _ => {}
+                            }
+                        }
+                        let gro_size = gro_size
                             .and_then(|gro_size| usize::try_from(gro_size).ok())
                             .filter(|&gro_size| gro_size > 0);
 
@@ -1063,6 +1084,10 @@ mod gro {
                             pool,
                             packets,
                         )?;
+                        if stamp {
+                            // Every segment of a GRO batch shares its head skb's timestamp.
+                            recv_many_bufs.rx_stamps.resize(packets.len(), rx_ns);
+                        }
                     }
 
                     Ok(())
@@ -1076,6 +1101,10 @@ mod gro {
             recv_buf.release_pages();
         }
 
+        fn rx_timestamp_ns(recv_buf: &Self::RecvManyBuf, index: usize) -> u64 {
+            recv_buf.rx_stamps.get(index).copied().unwrap_or(0)
+        }
+
         fn enable_udp_gro(&self) -> io::Result<()> {
             // TODO: missing constants on Android
             use std::os::fd::AsFd;
@@ -1084,6 +1113,14 @@ mod gro {
                 nix::sys::socket::sockopt::UdpGroSegment,
                 &true,
             )?;
+            if crate::aqm::enabled() {
+                // The receive-side queue bound measures sojourn from the kernel's receive time.
+                nix::sys::socket::setsockopt(
+                    &self.as_fd(),
+                    nix::sys::socket::sockopt::ReceiveTimestampns,
+                    &true,
+                )?;
+            }
             Ok(())
         }
     }
