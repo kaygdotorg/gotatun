@@ -503,7 +503,9 @@ impl UdpSend for BufferedUdpSend {
 #[cfg(any(not(target_os = "linux"), test))]
 pub struct BufferedUdpReceive {
     _recv_task: Arc<Task>,
-    /// Bench diagnostic handle on the receive queue (#260, J687); never keeps it open.
+    /// Bench diagnostic handle on the receive queue (#260, J687); never keeps it open. Linux
+    /// builds this type only for tests, which never sample it.
+    #[cfg(not(target_os = "linux"))]
     depth_tx: mpsc::WeakSender<io::Result<(Packet, SocketAddr)>>,
     recv_rx: mpsc::Receiver<io::Result<(Packet, SocketAddr)>>,
     /// Small datagrams, taken before `recv_rx` (#260, J720); `None` without the reply lane.
@@ -538,6 +540,7 @@ impl BufferedUdpReceive {
         } else {
             (None, None)
         };
+        #[cfg(not(target_os = "linux"))]
         let depth_tx = recv_tx.downgrade();
 
         let recv_task = Task::spawn("buffered UDP receive", async move {
@@ -590,6 +593,7 @@ impl BufferedUdpReceive {
 
         Self {
             _recv_task: Arc::new(recv_task),
+            #[cfg(not(target_os = "linux"))]
             depth_tx,
             recv_rx,
             reply_rx,
@@ -597,6 +601,7 @@ impl BufferedUdpReceive {
     }
 
     /// Bench diagnostic (#260, J687): received datagrams waiting for the packet task.
+    #[cfg(not(target_os = "linux"))]
     pub(crate) fn depth_probe(&self) -> crate::diag::DepthProbe {
         let tx = self.depth_tx.clone();
         Box::new(move || {
