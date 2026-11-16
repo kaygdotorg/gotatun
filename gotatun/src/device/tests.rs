@@ -337,6 +337,7 @@ async fn j369_control_drain_progresses_with_a_queued_device_writer() {
                         completion_lookup.clone(),
                         completion_peer.clone(),
                         completions,
+                        Vec::new(),
                         tun.clone(),
                     )
                 })
@@ -1537,6 +1538,7 @@ async fn j380_packet_lookup_progresses_with_a_pending_delivery_reader() {
                     completion_lookup.clone(),
                     completion_peer.clone(),
                     completions,
+                    Vec::new(),
                     tun.clone(),
                 )
             })
