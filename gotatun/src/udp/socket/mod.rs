@@ -796,6 +796,10 @@ mod shared_port_tests {
         }
     }
 
+    /// Held by each test here for its whole run: the squatter test's squatters must never land
+    /// on the port `a_free_port_binds` frees for a moment (J826).
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Bind the WireGuard socket the way the product does, with connected sends off.
     fn wireguard_bind(address: SocketAddr) -> std::io::Result<UdpSocket> {
         let opts = SockOpt {
@@ -810,6 +814,9 @@ mod shared_port_tests {
     /// the WireGuard bind fails with `EADDRINUSE` in every case.
     #[tokio::test]
     async fn a_port_another_process_bound_first_is_refused() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let squats: [IpAddr; 4] = [
             Ipv4Addr::UNSPECIFIED.into(),
             Ipv4Addr::LOCALHOST.into(),
@@ -841,12 +848,39 @@ mod shared_port_tests {
 
     /// Without a squatter the bind succeeds, on a fixed port too: the audit refuses only ports
     /// that someone else holds.
+    ///
+    /// The fixed-port step frees a kernel-chosen port and binds it again. A test running in
+    /// parallel (the squatter test above binds many kernel-chosen ports) can be handed that port
+    /// in between, and the kernel then refuses the re-bind outright (J826: 3 of 8 parallel runs
+    /// on the Mac VM). The squatter test is kept out by [`SERIAL`]; any other test can still take
+    /// the port, so a refusal by the kernel moves on to a fresh port. A refusal by our own audit,
+    /// or by the kernel on every try, fails the test.
     #[tokio::test]
     async fn a_free_port_binds() {
-        let first = wireguard_bind((Ipv6Addr::UNSPECIFIED, 0).into()).expect("bind a free port");
-        let port = first.local_addr().expect("local").port();
-        drop(first);
-        wireguard_bind((Ipv6Addr::UNSPECIFIED, port).into()).expect("bind the same port again");
-        wireguard_bind((Ipv4Addr::UNSPECIFIED, 0).into()).expect("bind IPv4 only");
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut refused = Vec::new();
+        for _ in 0..8 {
+            let first =
+                wireguard_bind((Ipv6Addr::UNSPECIFIED, 0).into()).expect("bind a free port");
+            let port = first.local_addr().expect("local").port();
+            drop(first);
+            match wireguard_bind((Ipv6Addr::UNSPECIFIED, port).into()) {
+                Ok(_) => {
+                    wireguard_bind((Ipv4Addr::UNSPECIFIED, 0).into()).expect("bind IPv4 only");
+                    return;
+                }
+                // The kernel's own refusal (no message of ours): someone took the freed port.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AddrInUse
+                        && error.raw_os_error() == Some(libc::EADDRINUSE) =>
+                {
+                    refused.push(format!("{port}: {error}"));
+                }
+                Err(error) => panic!("bind the same port {port} again: {error}"),
+            }
+        }
+        panic!("the same port never bound again: {refused:?}");
     }
 }

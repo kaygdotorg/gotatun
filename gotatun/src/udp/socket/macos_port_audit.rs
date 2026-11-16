@@ -32,8 +32,16 @@ use std::{ffi::CStr, io};
 /// One read of the kernel's socket list per bind (median 20 µs on the Mac VM, J827). It
 /// fails closed: `EADDRINUSE` when someone else is on the port, `InvalidData` when our own socket
 /// is not in the list (the private record layout is not recognised), and the read's own error
-/// when the list cannot be read. No later bind can join, because no socket of ours on the port
-/// carries `SO_REUSEPORT` (J789, J815), so this one check covers the socket's whole life.
+/// when the list cannot be read.
+///
+/// It checks the port once, at bind time, and nothing later. That covers the sockets that
+/// were there before us. It does **not** cover the whole socket life: xnu lets another user
+/// bind an AF_INET6 socket to `::ffff:0.0.0.0:<port>` beside our dual-stack `[::]:<port>` at
+/// any time (both are PF_INET6 wildcards, which `in_pcbbind` exempts from its conflict
+/// check), and after that a `SO_REUSEADDR` bind of `::ffff:<host address>:<port>` by the same
+/// user passes the different-user check against its own socket and takes every IPv4 datagram
+/// sent to that address (J826, #260). Closing that needs no PF_INET6 socket of ours serving
+/// IPv4 (an AF_INET socket plus an `IPV6_V6ONLY` one), not a later audit.
 pub(crate) fn ensure_alone(socket: &socket2::Socket) -> io::Result<()> {
     let port = socket
         .local_addr()?
