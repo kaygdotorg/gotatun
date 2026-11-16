@@ -31,6 +31,10 @@ mod generic;
 #[cfg(target_os = "macos")]
 mod macos_connected;
 
+/// Who holds a UDP port, from the kernel's socket list (macOS, #260, J815, J827).
+#[cfg(target_os = "macos")]
+mod macos_port_audit;
+
 /// Implementations of [`super::UdpSend`]/[`super::UdpRecv`] for linux
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
@@ -210,6 +214,12 @@ impl UdpSocket {
         #[cfg(target_os = "macos")]
         if connected {
             udp_sock.set_reuse_port(false)?;
+        } else {
+            // The exclusive bind can succeed beside a socket another user bound to the port
+            // earlier with SO_REUSEPORT (`0.0.0.0:<port>` beside our `[::]:<port>`), which would
+            // then receive the port's IPv4 datagrams. Refuse the port as if it were held, which
+            // it is (#260, J815, J827).
+            macos_port_audit::ensure_alone(&udp_sock)?;
         }
 
         #[cfg(target_os = "linux")]
