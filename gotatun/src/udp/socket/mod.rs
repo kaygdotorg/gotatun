@@ -103,7 +103,16 @@ pub struct UdpSocket {
     /// This clone's copy of the connected sockets it receives from (#260, J744).
     #[cfg(target_os = "macos")]
     recv_view: macos_connected::RecvView,
+    /// On a split pair, whether this clone's next receive polls the IPv4 socket first. It flips
+    /// on every poll, so a busy family cannot starve the other.
+    #[cfg(target_os = "macos")]
+    v4_first: bool,
 }
+
+/// How many kernel-picked ports [`UdpSocket::bind_split`] tries before it gives up: a port free
+/// on IPv6 is almost always free on IPv4 too.
+#[cfg(target_os = "macos")]
+const SPLIT_PICKS: usize = 16;
 
 /// Every WireGuard socket this process bound, for [`UdpSocket::underlay_changed_everywhere`]
 /// (macOS, #260 J763). Dead entries are pruned on each bind.
@@ -112,7 +121,12 @@ static LIVE_SOCKETS: std::sync::Mutex<Vec<std::sync::Weak<UdpSocketState>>> =
     std::sync::Mutex::new(Vec::new());
 
 struct UdpSocketState {
+    /// The socket, or on a macOS split pair its `IPV6_V6ONLY` `[::]:<port>` side.
     socket: tokio::net::UdpSocket,
+    /// macOS: the AF_INET `0.0.0.0:<port>` side of a split pair, which carries all IPv4 traffic
+    /// (#260, J826 finding 1, J834). `None` for a single socket.
+    #[cfg(target_os = "macos")]
+    v4: Option<tokio::net::UdpSocket>,
     /// Connected per-endpoint send sockets, shared by every clone (#260, J744).
     #[cfg(target_os = "macos")]
     connected: macos_connected::ConnectedSends,
@@ -151,59 +165,29 @@ impl UdpSocket {
     /// - `only_v6`, to bind dual-stack sockets.
     /// - `mark`, only on linux.
     /// - `{recv,send}_buffer_size`, for better performance. See [`SockOpt`].
+    ///
+    /// On macOS a dual-stack request (`[::]` with `only_v6: Some(false)`) and connected sends off
+    /// binds **two** sockets on one port instead: AF_INET `0.0.0.0:<port>` for IPv4 and
+    /// `[::]:<port>` with `IPV6_V6ONLY` for IPv6 (#260, J826 finding 1, J834). The handle sends
+    /// and receives through both and looks like one socket to its users. See
+    /// [`UdpSocket::bind_split`] for why.
     pub fn bind(addr: SocketAddr, opts: SockOpt) -> io::Result<Self> {
-        let domain = match addr {
-            SocketAddr::V4(..) => socket2::Domain::IPV4,
-            SocketAddr::V6(..) => socket2::Domain::IPV6,
-        };
-
-        // Construct the socket using `socket2` because we need to set the only_v6 flag.
-        let udp_sock =
-            socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-        udp_sock.set_nonblocking(true)?;
-        if let Some(only_v6) = opts.only_v6
-            && addr.is_ipv6()
-        {
-            udp_sock.set_only_v6(only_v6)?;
-        }
-        #[cfg(target_os = "linux")]
-        if let Some(mark) = opts.fwmark {
-            udp_sock.set_mark(mark)?;
-        }
-        // Failing to set buffer sizes is not a fatal error - the tunnel will most likely work just
-        // fine, even if not as performant as possible. In that case it is still a good idea to
-        // tweak the buffer sizes.
-        if let Some(recv_buffer_size) = opts.recv_buffer_size
-            && let Err(err) = apply_buffer_size(
-                || force_recv_buffer_size(&udp_sock, recv_buffer_size),
-                || udp_sock.set_recv_buffer_size(recv_buffer_size),
-            )
-        {
-            if cfg!(debug_assertions) {
-                return Err(err);
-            } else {
-                tracing::error!("Failed to change UDP socket receive buffer size: {err}");
-            }
-        }
-        if let Some(send_buffer_size) = opts.send_buffer_size
-            && let Err(err) = apply_buffer_size(
-                || force_send_buffer_size(&udp_sock, send_buffer_size),
-                || udp_sock.set_send_buffer_size(send_buffer_size),
-            )
-        {
-            if cfg!(debug_assertions) {
-                return Err(err);
-            } else {
-                tracing::error!("Failed to change UDP socket send buffer size: {err}");
-            }
-        }
-
         // Connected per-endpoint sockets share this port, which needs SO_REUSEPORT on every
         // socket that binds it (#260, J744). It is set only while one of ours binds and cleared
         // again at once, because macOS lets a process of any user join a port that carries it
         // (J763; see `macos_connected`).
         #[cfg(target_os = "macos")]
         let connected = opts.mac_connected.unwrap_or_else(macos_connected::wanted);
+        #[cfg(target_os = "macos")]
+        if !connected
+            && addr.ip() == IpAddr::from(Ipv6Addr::UNSPECIFIED)
+            && opts.only_v6 == Some(false)
+        {
+            return Self::bind_split(addr.port(), opts);
+        }
+
+        let udp_sock = configured_socket(addr, opts)?;
+
         #[cfg(target_os = "macos")]
         if connected {
             udp_sock.set_reuse_port(true)?;
@@ -215,21 +199,106 @@ impl UdpSocket {
         if connected {
             udp_sock.set_reuse_port(false)?;
         } else {
-            // The exclusive bind can succeed beside a socket another user bound to the port
-            // earlier with SO_REUSEPORT (`0.0.0.0:<port>` beside our `[::]:<port>`), which would
-            // then receive the port's IPv4 datagrams. Refuse the port as if it were held, which
-            // it is (#260, J815, J827).
+            // An exclusive single-socket bind (an explicit address, or the IPv4-only fallback)
+            // can succeed beside a socket another user bound to the port earlier with
+            // SO_REUSEPORT. Refuse the port as if it were held, which it is (#260, J815, J827).
+            // A split pair needs no such check (see `bind_split`).
             macos_port_audit::ensure_alone(&udp_sock)?;
         }
 
-        #[cfg(target_os = "linux")]
-        let udp_gso_supported = getsockopt(&udp_sock, sockopt::UdpGsoSegment).is_ok();
+        Self::from_bound(
+            udp_sock,
+            #[cfg(target_os = "macos")]
+            None,
+            addr.is_ipv6() && opts.only_v6 == Some(false),
+            #[cfg(target_os = "macos")]
+            connected,
+        )
+    }
 
-        let inner = tokio::net::UdpSocket::from_std(udp_sock.into())?;
+    /// Bind a dual-stack port on macOS as one socket per family: an `IPV6_V6ONLY` `[::]:<port>`
+    /// socket, then an AF_INET `0.0.0.0:<port>` socket, both exclusive (no `SO_REUSEPORT`).
+    ///
+    /// **Why (J826 finding 1, #260).** xnu's `in_pcbbind` lets a bind of a wildcard address skip
+    /// the conflict check when both the new socket and the one already on the port are PF_INET6
+    /// wildcards. A dual-stack `[::]:<port>` socket of ours serves IPv4 too, so another user could
+    /// bind `::ffff:0.0.0.0:<port>` beside it at any time. From that foothold a specific address
+    /// bound with `SO_REUSEADDR` passes the different-user check (the check compares against the
+    /// best match, which is now the attacker's own socket) and receives every IPv4 datagram to
+    /// that address. With an AF_INET socket on the IPv4 side the exemption never applies
+    /// (`SOCK_DOM(t) != PF_INET6`), and a specific address fails the different-user check
+    /// against our socket. That is the kernel's rule, not an audit or the list order, so it holds
+    /// for the socket's whole life.
+    ///
+    /// With `port` 0 the IPv6 socket picks the port; if that port is already held on IPv4 the
+    /// pair is dropped and another port is tried (at most [`SPLIT_PICKS`] times). With a fixed
+    /// port, a refusal of either bind is returned as is, so a caller's `EADDRINUSE` fallback
+    /// still works.
+    ///
+    /// **No audit of the socket list (J834).** Each of our two binds is an exclusive wildcard
+    /// bind (no `SO_REUSEPORT`). For such a bind the kernel looks up every socket of that family
+    /// on the port and refuses ours if there is one. The PF_INET6 exemption cannot help a
+    /// squatter, because our IPv4 side is PF_INET. On the Mac VM (macOS 26.5.2) the kernel by
+    /// itself refused all of J827's pre-start squatters against the pair, with the audit
+    /// removed, as root and as the same user. So the pair does not read `pcblist_n` and does not
+    /// depend on its private record layout: a macOS update that moves the layout cannot stop the
+    /// mesh. The same holds for the moment between the two binds, when the port is held on IPv6
+    /// only: whatever another user binds on the IPv4 side then is on the port before our AF_INET
+    /// bind, which the kernel refuses.
+    #[cfg(target_os = "macos")]
+    fn bind_split(port: u16, opts: SockOpt) -> io::Result<Self> {
+        let v6_opts = SockOpt {
+            only_v6: Some(true),
+            ..opts
+        };
+        for _ in 0..SPLIT_PICKS {
+            let v6_addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
+            let v6 = configured_socket(v6_addr, v6_opts)?;
+            v6.bind(&v6_addr.into())?;
+            let picked = v6
+                .local_addr()?
+                .as_socket()
+                .ok_or_else(|| io::Error::other("UDP socket has no IP address"))?
+                .port();
+            let v4_addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, picked));
+            let v4 = configured_socket(v4_addr, opts)?;
+            match v4.bind(&v4_addr.into()) {
+                Ok(()) => {}
+                // The port the kernel picked for IPv6 is held on IPv4: try another one.
+                Err(error) if port == 0 && error.kind() == io::ErrorKind::AddrInUse => continue,
+                Err(error) => return Err(error),
+            }
+            return Self::from_bound(v6, Some(v4), false, false);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("no UDP port free on both IPv4 and IPv6 after {SPLIT_PICKS} tries"),
+        ))
+    }
+
+    /// Wrap bound sockets in a handle: `socket` is the main one (the only one, or the IPv6 side
+    /// of a split pair), `v4` the IPv4 side of a split pair. `map_ipv4_to_ipv6` says whether
+    /// `socket` is dual-stack and takes IPv4 destinations in their v4-mapped form.
+    fn from_bound(
+        socket: socket2::Socket,
+        #[cfg(target_os = "macos")] v4: Option<socket2::Socket>,
+        map_ipv4_to_ipv6: bool,
+        #[cfg(target_os = "macos")] connected: bool,
+    ) -> io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        let udp_gso_supported = getsockopt(&socket, sockopt::UdpGsoSegment).is_ok();
+
+        let inner = tokio::net::UdpSocket::from_std(socket.into())?;
+        #[cfg(target_os = "macos")]
+        let v4 = v4
+            .map(|v4| tokio::net::UdpSocket::from_std(v4.into()))
+            .transpose()?;
 
         let socket = Self {
             inner: Arc::new(UdpSocketState {
                 socket: inner,
+                #[cfg(target_os = "macos")]
+                v4,
                 #[cfg(target_os = "linux")]
                 udp_gso_supported,
                 #[cfg(target_os = "linux")]
@@ -237,9 +306,11 @@ impl UdpSocket {
                 #[cfg(target_os = "macos")]
                 connected: macos_connected::ConnectedSends::new(connected),
             }),
-            map_ipv4_to_ipv6: addr.is_ipv6() && opts.only_v6 == Some(false),
+            map_ipv4_to_ipv6,
             #[cfg(target_os = "macos")]
             recv_view: macos_connected::RecvView::default(),
+            #[cfg(target_os = "macos")]
+            v4_first: false,
         };
         #[cfg(target_os = "macos")]
         {
@@ -309,16 +380,63 @@ impl UdpSocket {
         self.inner.udp_gso_disabled.store(true, Ordering::Relaxed);
     }
 
-    /// Map an IPv4 address to IPv6 if necessary.
+    /// The socket a datagram to `destination` leaves through, and the address to give it.
+    ///
+    /// A dual-stack socket takes IPv4 destinations in their v4-mapped IPv6 form. On a macOS
+    /// split pair, IPv4 destinations, also when given v4-mapped, leave through the AF_INET socket
+    /// as plain IPv4, and IPv6 ones through the IPv6-only socket.
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     #[inline(always)]
-    fn map_dst(&self, mut addr: SocketAddr) -> SocketAddr {
-        if self.map_ipv4_to_ipv6
-            && let std::net::IpAddr::V4(ip) = addr.ip()
-        {
-            addr.set_ip(ip.to_ipv6_mapped().into());
+    fn route(&self, mut destination: SocketAddr) -> (&tokio::net::UdpSocket, SocketAddr) {
+        #[cfg(target_os = "macos")]
+        if let Some(v4) = &self.inner.v4 {
+            if let SocketAddr::V6(v6) = destination
+                && let Some(ip) = v6.ip().to_ipv4_mapped()
+            {
+                destination = SocketAddr::from((ip, v6.port()));
+            }
+            return match destination {
+                SocketAddr::V4(_) => (v4, destination),
+                SocketAddr::V6(_) => (&self.inner.socket, destination),
+            };
         }
-        addr
+        if self.map_ipv4_to_ipv6
+            && let std::net::IpAddr::V4(ip) = destination.ip()
+        {
+            destination.set_ip(ip.to_ipv6_mapped().into());
+        }
+        (&self.inner.socket, destination)
+    }
+
+    /// Every socket this handle binds, for tests that read their options back.
+    #[cfg(all(test, target_os = "macos"))]
+    fn bound_sockets(&self) -> Vec<&tokio::net::UdpSocket> {
+        std::iter::once(&self.inner.socket)
+            .chain(self.inner.v4.as_ref())
+            .collect()
+    }
+
+    /// Receive one datagram on a macOS split pair, from either family, or `None` when this is
+    /// not a split pair. Which socket is polled first alternates, so neither family starves.
+    #[cfg(target_os = "macos")]
+    fn poll_recv_split(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> Option<std::task::Poll<io::Result<(usize, SocketAddr)>>> {
+        let v4 = self.inner.v4.as_ref()?;
+        let v6 = &self.inner.socket;
+        let order = if self.v4_first { [v4, v6] } else { [v6, v4] };
+        self.v4_first = !self.v4_first;
+        for socket in order {
+            let mut read = tokio::io::ReadBuf::new(&mut *buf);
+            if let std::task::Poll::Ready(result) = socket.poll_recv_from(cx, &mut read) {
+                return Some(std::task::Poll::Ready(
+                    result.map(|source| (read.filled().len(), source)),
+                ));
+            }
+        }
+        Some(std::task::Poll::Pending)
     }
     /// Map an IPv6 address back to IPv4 if necessary.
     #[inline(always)]
@@ -350,6 +468,60 @@ fn map_src_addr(ipv4_over_ipv6: bool, mut addr: SocketAddr) -> SocketAddr {
         addr.set_ip(ipv4.into());
     }
     addr
+}
+
+/// A UDP socket for `addr`'s family with `opts` applied, not yet bound.
+///
+/// It is non-blocking (for [`tokio`]) and carries `IPV6_V6ONLY` when asked (IPv6 only), the
+/// Linux `fwmark`, and the buffer sizes. A buffer size the system refuses is an error in debug
+/// builds and a logged warning in release builds.
+fn configured_socket(addr: SocketAddr, opts: SockOpt) -> io::Result<socket2::Socket> {
+    let domain = match addr {
+        SocketAddr::V4(..) => socket2::Domain::IPV4,
+        SocketAddr::V6(..) => socket2::Domain::IPV6,
+    };
+
+    // Construct the socket using `socket2` because we need to set the only_v6 flag.
+    let udp_sock =
+        socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+    udp_sock.set_nonblocking(true)?;
+    if let Some(only_v6) = opts.only_v6
+        && addr.is_ipv6()
+    {
+        udp_sock.set_only_v6(only_v6)?;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(mark) = opts.fwmark {
+        udp_sock.set_mark(mark)?;
+    }
+    // Failing to set buffer sizes is not a fatal error - the tunnel will most likely work just
+    // fine, even if not as performant as possible. In that case it is still a good idea to
+    // tweak the buffer sizes.
+    if let Some(recv_buffer_size) = opts.recv_buffer_size
+        && let Err(err) = apply_buffer_size(
+            || force_recv_buffer_size(&udp_sock, recv_buffer_size),
+            || udp_sock.set_recv_buffer_size(recv_buffer_size),
+        )
+    {
+        if cfg!(debug_assertions) {
+            return Err(err);
+        } else {
+            tracing::error!("Failed to change UDP socket receive buffer size: {err}");
+        }
+    }
+    if let Some(send_buffer_size) = opts.send_buffer_size
+        && let Err(err) = apply_buffer_size(
+            || force_send_buffer_size(&udp_sock, send_buffer_size),
+            || udp_sock.set_send_buffer_size(send_buffer_size),
+        )
+    {
+        if cfg!(debug_assertions) {
+            return Err(err);
+        } else {
+            tracing::error!("Failed to change UDP socket send buffer size: {err}");
+        }
+    }
+    Ok(udp_sock)
 }
 
 fn is_ipv6_unavailable(err: &io::Error) -> bool {
@@ -479,8 +651,9 @@ mod tests {
         let addr = dual_sock.local_addr().expect("local_addr");
         assert_eq!(addr.ip(), Ipv6Addr::UNSPECIFIED);
 
-        // Assert that IPV6_V6ONLY is false.
-        #[cfg(not(windows))]
+        // Assert that IPV6_V6ONLY is false. On macOS a dual-stack bind is a split pair whose
+        // main socket is IPv6-only (#260, J834; see `split_family_tests`).
+        #[cfg(not(any(windows, target_os = "macos")))]
         {
             use std::os::fd::{AsRawFd, FromRawFd};
             let raw_fd = dual_sock.socket().as_raw_fd();
@@ -882,5 +1055,118 @@ mod shared_port_tests {
             }
         }
         panic!("the same port never bound again: {refused:?}");
+    }
+}
+
+/// A dual-stack WireGuard bind on macOS is one socket per family (#260, J826 finding 1, J834).
+///
+/// xnu exempts two PF_INET6 wildcard binds of one port from its conflict check, so while our
+/// IPv4 traffic arrives on a dual-stack PF_INET6 socket, another user can bind beside it. With an
+/// AF_INET socket for IPv4 and an `IPV6_V6ONLY` socket for IPv6, that exemption never applies to
+/// our port. These tests read the options back from the kernel and check that each destination
+/// leaves through the socket of its family. J826's kit on #260 covers the behaviour itself.
+#[cfg(all(test, target_os = "macos"))]
+mod split_family_tests {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    use super::{UdpSocket, UdpSocketFactory};
+    use crate::{
+        packet::{Packet, PacketBufPool},
+        udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams},
+    };
+
+    /// Bind the way the product does: no address (dual-stack), a kernel-picked port, connected
+    /// sends at their default (off).
+    async fn product_bind() -> (UdpSocket, UdpSocket) {
+        let params = UdpTransportFactoryParams {
+            addr: None,
+            port: 0,
+        };
+        UdpSocketFactory::default()
+            .bind(&params)
+            .await
+            .expect("dual-stack bind")
+    }
+
+    /// One AF_INET `0.0.0.0:P` and one `[::]:P` with `IPV6_V6ONLY`, neither with
+    /// `SO_REUSEPORT`, on the same port.
+    #[tokio::test]
+    async fn a_dual_stack_bind_is_one_socket_per_family() {
+        let (wireguard, _) = product_bind().await;
+        let port = wireguard.local_addr().expect("local").port();
+        let mut seen = Vec::new();
+        for socket in wireguard.bound_sockets() {
+            let local = socket.local_addr().expect("local");
+            let options = socket2::SockRef::from(socket);
+            assert!(
+                !options.reuse_port().expect("SO_REUSEPORT"),
+                "{local} carries SO_REUSEPORT"
+            );
+            let only_v6 = local.is_ipv6() && options.only_v6().expect("IPV6_V6ONLY");
+            seen.push((local, only_v6));
+        }
+        let want = vec![
+            (SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)), true),
+            (SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)), false),
+        ];
+        assert_eq!(seen, want, "(address, IPV6_V6ONLY) of each socket");
+    }
+
+    /// IPv4 and v4-mapped destinations leave through the AF_INET socket as plain IPv4; IPv6
+    /// destinations through the IPv6-only socket.
+    #[tokio::test]
+    async fn each_destination_leaves_through_its_family_socket() {
+        let (wireguard, _) = product_bind().await;
+        let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        let mapped = SocketAddr::from((Ipv4Addr::LOCALHOST.to_ipv6_mapped(), 9));
+        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 9));
+        for destination in [v4, mapped] {
+            let (socket, to) = wireguard.route(destination);
+            assert!(
+                socket.local_addr().expect("local").is_ipv4(),
+                "{destination} would leave through {:?}",
+                socket.local_addr()
+            );
+            assert_eq!(to, v4, "{destination} is sent as plain IPv4");
+        }
+        let (socket, to) = wireguard.route(v6);
+        assert!(socket.local_addr().expect("local").is_ipv6());
+        assert_eq!(to, v6);
+    }
+
+    /// Datagrams cross both ways on both families, and IPv4 sources come back as plain IPv4.
+    #[tokio::test]
+    async fn both_families_send_and_receive() {
+        let (wireguard, mut receiver) = product_bind().await;
+        let port = wireguard.local_addr().expect("local").port();
+        let mut pool = PacketBufPool::new(4);
+        let peers: [IpAddr; 2] = [Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()];
+        for ip in peers {
+            let peer = tokio::net::UdpSocket::bind((ip, 0)).await.expect("peer");
+            let peer_addr = peer.local_addr().expect("peer address");
+            peer.send_to(b"in", (ip, port)).await.expect("peer sends");
+            let (packet, source) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                receiver.recv_from(&mut pool),
+            )
+            .await
+            .expect("a datagram in time")
+            .expect("receive");
+            assert_eq!((&packet[..], source), (&b"in"[..], peer_addr));
+            wireguard
+                .send_to(
+                    Packet::from_bytes(bytes::BytesMut::from(&b"out"[..])),
+                    peer_addr,
+                )
+                .await
+                .expect("send");
+            let mut buf = [0u8; 16];
+            let (n, from) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), peer.recv_from(&mut buf))
+                    .await
+                    .expect("a reply in time")
+                    .expect("peer receives");
+            assert_eq!((&buf[..n], from.port()), (&b"out"[..], port));
+        }
     }
 }

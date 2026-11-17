@@ -40,8 +40,9 @@
 //! (handshake replies, new and roaming peers). Without the feature the same loop never binds.
 //! Binding each connected socket to its specific source address with `SO_REUSEADDR` on that
 //! socket alone, and nothing on the wildcard socket, also lost the race. Until a scheme with no
-//! such window exists, a default socket keeps `sendto`. It still checks once, right after its own
-//! bind, that no socket bound before it shares the port (`macos_port_audit::ensure_alone`, J827).
+//! such window exists, a default socket keeps `sendto`, and a default dual-stack bind is one
+//! exclusive socket per family, which the kernel keeps closed to other users by itself
+//! (`UdpSocket::bind_split`, J834). This feature still uses one dual-stack socket.
 //!
 //! **A stale source.** `connect` fixes the source address the route chose at that moment, and
 //! xnu keeps it. If the network changes, the socket would keep sending from the old address:

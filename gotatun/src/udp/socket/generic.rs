@@ -23,18 +23,14 @@ impl UdpSend for super::UdpSocket {
     type SendManyBuf = ();
 
     async fn send_to(&self, packet: Packet, dest: SocketAddr) -> io::Result<()> {
-        let dest = self.map_dst(dest);
+        let (socket, dest) = self.route(dest);
         // macOS: an endpoint's connected socket skips xnu's per-datagram route and policy
         // decision (#260, J744, J763; see `macos_connected`). Off, this is the plain `sendto`.
         #[cfg(target_os = "macos")]
-        return self
-            .inner
-            .connected
-            .send(self.socket(), &packet, dest)
-            .await;
+        return self.inner.connected.send(socket, &packet, dest).await;
         #[cfg(not(target_os = "macos"))]
         {
-            self.socket().send_to(&packet, dest).await?;
+            socket.send_to(&packet, dest).await?;
             Ok(())
         }
     }
@@ -54,6 +50,10 @@ impl UdpRecv for super::UdpSocket {
         let (n, src) = {
             let this = &mut *self;
             std::future::poll_fn(|cx| {
+                // A split pair (connected sends off) reads its IPv4 and IPv6 sockets (#260, J834).
+                if let Some(ready) = this.poll_recv_split(cx, &mut buf) {
+                    return ready;
+                }
                 this.inner.connected.poll_recv(
                     &this.inner.socket,
                     &mut this.recv_view,

@@ -11,10 +11,12 @@
 //! `bind` takes, so a bind that has returned is in the list (J815, xnu `get_pcblist_n`). Closed
 //! sockets are left out.
 //!
-//! [`ensure_alone`] uses it right after the WireGuard socket binds with connected sends off: xnu
-//! lets that exclusive bind succeed beside a socket another user bound to the port earlier with
-//! `SO_REUSEPORT` (`0.0.0.0:<port>` beside our `[::]:<port>`), and that socket would then
-//! receive the port's IPv4 datagrams (#260, J815, J827). The reader and parser are J815's, shared
+//! [`ensure_alone`] uses it right after a single WireGuard socket binds with connected sends off:
+//! xnu can let that exclusive bind succeed beside a socket another user bound to the port earlier
+//! with `SO_REUSEPORT` (J827 measured `0.0.0.0:<port>` beside a dual-stack `[::]:<port>`, and `::1`
+//! beside an IPv4-only `0.0.0.0:<port>`) (#260, J815, J827). The product's dual-stack bind is a
+//! per-family pair instead (`UdpSocket::bind_split`, J834), which the kernel alone keeps closed,
+//! so it does not use this check. The reader and parser are J815's, shared
 //! with the connected-send pool's audit (`j815-mac-socket-pool`), so one review covers both.
 //!
 //! **Private layout.** The record offsets below are xnu's `xinpcb_n`/`xsocket_n` layout, which is
@@ -40,8 +42,9 @@ use std::{ffi::CStr, io};
 /// any time (both are PF_INET6 wildcards, which `in_pcbbind` exempts from its conflict
 /// check), and after that a `SO_REUSEADDR` bind of `::ffff:<host address>:<port>` by the same
 /// user passes the different-user check against its own socket and takes every IPv4 datagram
-/// sent to that address (J826, #260). Closing that needs no PF_INET6 socket of ours serving
-/// IPv4 (an AF_INET socket plus an `IPV6_V6ONLY` one), not a later audit.
+/// sent to that address (J826, #260). A dual-stack bind on macOS is therefore an AF_INET socket
+/// plus an `IPV6_V6ONLY` one (`UdpSocket::bind_split`, J834), which closes that by the kernel's
+/// own rule and needs no audit at all.
 pub(crate) fn ensure_alone(socket: &socket2::Socket) -> io::Result<()> {
     let port = socket
         .local_addr()?
