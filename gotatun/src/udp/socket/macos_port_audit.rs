@@ -11,10 +11,12 @@
 //! `bind` takes, so a bind that has returned is in the list (J815, xnu `get_pcblist_n`). Closed
 //! sockets are left out.
 //!
-//! [`ensure_alone`] uses it right after the WireGuard socket binds with connected sends off: xnu
-//! lets that exclusive bind succeed beside a socket another user bound to the port earlier with
-//! `SO_REUSEPORT` (`0.0.0.0:<port>` beside our `[::]:<port>`), and that socket would then
-//! receive the port's IPv4 datagrams (#260, J815, J827). The reader and parser are J815's, shared
+//! [`ensure_alone`] uses it right after a single WireGuard socket binds with connected sends off:
+//! xnu can let that exclusive bind succeed beside a socket another user bound to the port earlier
+//! with `SO_REUSEPORT` (J827 measured `0.0.0.0:<port>` beside a dual-stack `[::]:<port>`, and `::1`
+//! beside an IPv4-only `0.0.0.0:<port>`) (#260, J815, J827). The product's dual-stack bind is a
+//! per-family pair instead (`UdpSocket::bind_split`, J834), which the kernel alone keeps closed,
+//! so it does not use this check. The reader and parser are J815's, shared
 //! with the connected-send pool's audit (`j815-mac-socket-pool`), so one review covers both.
 //!
 //! **Private layout.** The record offsets below are xnu's `xinpcb_n`/`xsocket_n` layout, which is
@@ -40,13 +42,10 @@ use std::{ffi::CStr, io};
 /// any time (both are PF_INET6 wildcards, which `in_pcbbind` exempts from its conflict
 /// check), and after that a `SO_REUSEADDR` bind of `::ffff:<host address>:<port>` by the same
 /// user passes the different-user check against its own socket and takes every IPv4 datagram
-/// sent to that address (J826, #260). A dual-stack bind is therefore split into an AF_INET
-/// socket plus an `IPV6_V6ONLY` one (`UdpSocket::bind_split`, J834), which the kernel's own
-/// rule keeps closed for the socket's whole life. This check stays on top of that.
-///
-/// `ours` is how many sockets this bind put on the port: 1 for a single socket, 2 for a macOS
-/// split pair (AF_INET plus `IPV6_V6ONLY`, J834), whose sockets must both be in the list.
-pub(crate) fn ensure_alone(socket: &socket2::Socket, ours: usize) -> io::Result<()> {
+/// sent to that address (J826, #260). A dual-stack bind on macOS is therefore an AF_INET socket
+/// plus an `IPV6_V6ONLY` one (`UdpSocket::bind_split`, J834), which closes that by the kernel's
+/// own rule and needs no audit at all.
+pub(crate) fn ensure_alone(socket: &socket2::Socket) -> io::Result<()> {
     let port = socket
         .local_addr()?
         .as_socket()
@@ -58,22 +57,21 @@ pub(crate) fn ensure_alone(socket: &socket2::Socket, ours: usize) -> io::Result<
             format!("cannot check who else holds UDP port {port}: {error}"),
         )
     })?;
-    alone(&users, port, ours)
+    alone(&users, port)
 }
 
-/// The verdict of [`ensure_alone`] on a parsed list: exactly `ours` sockets on the port, all of
-/// them this process's. Fewer than `ours`, with nobody else there, means some of ours are missing
-/// from the list, so the layout is not recognised either.
-fn alone(users: &PortUsers, port: u16, ours: usize) -> io::Result<()> {
+/// The verdict of [`ensure_alone`] on a parsed list: exactly one socket on the port, and it is
+/// this process's.
+fn alone(users: &PortUsers, port: u16) -> io::Result<()> {
     match users.total {
-        total if total < ours && users.others.is_empty() => Err(io::Error::new(
+        0 => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "our socket on UDP port {port} is not in net.inet.udp.pcblist_n: its record \
                  layout is not recognised, so nobody can be ruled out"
             ),
         )),
-        total if total == ours && users.others.is_empty() => Ok(()),
+        1 if users.others.is_empty() => Ok(()),
         total => Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             format!(
@@ -254,24 +252,8 @@ mod tests {
     #[test]
     fn the_verdict_fails_closed() {
         let alone = |total, others: Vec<(u32, i32)>| {
-            super::alone(&super::PortUsers { total, others }, 9, 1).map_err(|error| error.kind())
+            super::alone(&super::PortUsers { total, others }, 9).map_err(|error| error.kind())
         };
-        let pair = |total, others: Vec<(u32, i32)>| {
-            super::alone(&super::PortUsers { total, others }, 9, 2).map_err(|error| error.kind())
-        };
-        assert_eq!(pair(2, vec![]), Ok(()), "a split pair");
-        assert_eq!(
-            pair(1, vec![]),
-            Err(std::io::ErrorKind::InvalidData),
-            "one of ours missing"
-        );
-        assert_eq!(pair(0, vec![]), Err(std::io::ErrorKind::InvalidData));
-        assert_eq!(pair(3, vec![]), Err(std::io::ErrorKind::AddrInUse));
-        assert_eq!(
-            pair(2, vec![(501, 77)]),
-            Err(std::io::ErrorKind::AddrInUse),
-            "one of ours plus someone else"
-        );
         assert_eq!(alone(1, vec![]), Ok(()));
         assert_eq!(
             alone(2, vec![(501, 77)]),
@@ -299,12 +281,12 @@ mod tests {
         socket
             .bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())
             .expect("bind [::]:0");
-        super::ensure_alone(&socket, 1).expect("alone on its port");
+        super::ensure_alone(&socket).expect("alone on its port");
 
         let mut took: Vec<_> = (0..200)
             .map(|_| {
                 let start = std::time::Instant::now();
-                super::ensure_alone(&socket, 1).expect("alone on its port");
+                super::ensure_alone(&socket).expect("alone on its port");
                 start.elapsed()
             })
             .collect();
