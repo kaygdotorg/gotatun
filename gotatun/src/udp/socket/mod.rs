@@ -199,10 +199,11 @@ impl UdpSocket {
         if connected {
             udp_sock.set_reuse_port(false)?;
         } else {
-            // The exclusive bind can succeed beside a socket another user bound to the port
-            // earlier with SO_REUSEPORT, which would then receive some of the port's datagrams.
-            // Refuse the port as if it were held, which it is (#260, J815, J827).
-            macos_port_audit::ensure_alone(&udp_sock, 1)?;
+            // An exclusive single-socket bind (an explicit address, or the IPv4-only fallback)
+            // can succeed beside a socket another user bound to the port earlier with
+            // SO_REUSEPORT. Refuse the port as if it were held, which it is (#260, J815, J827).
+            // A split pair needs no such check (see `bind_split`).
+            macos_port_audit::ensure_alone(&udp_sock)?;
         }
 
         Self::from_bound(
@@ -234,9 +235,16 @@ impl UdpSocket {
     /// port, a refusal of either bind is returned as is, so a caller's `EADDRINUSE` fallback
     /// still works.
     ///
-    /// Between the two binds the port is held on IPv6 only, for two system calls. A socket that
-    /// another user binds on the IPv4 side in that gap is there before our AF_INET bind, which
-    /// the kernel refuses, or the audit below catches.
+    /// **No audit of the socket list (J834).** Each of our two binds is an exclusive wildcard
+    /// bind (no `SO_REUSEPORT`). For such a bind the kernel looks up every socket of that family
+    /// on the port and refuses ours if there is one. The PF_INET6 exemption cannot help a
+    /// squatter, because our IPv4 side is PF_INET. On the Mac VM (macOS 26.5.2) the kernel by
+    /// itself refused all of J827's pre-start squatters against the pair, with the audit
+    /// removed, as root and as the same user. So the pair does not read `pcblist_n` and does not
+    /// depend on its private record layout: a macOS update that moves the layout cannot stop the
+    /// mesh. The same holds for the moment between the two binds, when the port is held on IPv6
+    /// only: whatever another user binds on the IPv4 side then is on the port before our AF_INET
+    /// bind, which the kernel refuses.
     #[cfg(target_os = "macos")]
     fn bind_split(port: u16, opts: SockOpt) -> io::Result<Self> {
         let v6_opts = SockOpt {
@@ -260,9 +268,6 @@ impl UdpSocket {
                 Err(error) if port == 0 && error.kind() == io::ErrorKind::AddrInUse => continue,
                 Err(error) => return Err(error),
             }
-            // Anyone who bound the port before us, on an address the kernel let us bind beside
-            // (J827's pre-start squatter), makes it held (#260, J815, J827, J834).
-            macos_port_audit::ensure_alone(&v6, 2)?;
             return Self::from_bound(v6, Some(v4), false, false);
         }
         Err(io::Error::new(
