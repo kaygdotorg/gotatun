@@ -262,6 +262,13 @@ const TRACKED_FLOWS: usize = 16;
 /// ~6 MiB per 10 ms interval).
 const HEAVY_FLOOR_BYTES: u32 = 16 * 1024;
 
+/// Receive ages over one second are not trustworthy enough to signal. Linux SO_TIMESTAMPNS
+/// supplies realtime stamps, without a monotonic selection for this socket option. Rejecting
+/// implausible ages avoids inventing congestion after large forward clock steps or a foreign
+/// epoch. Real queues over this ceiling also pass; sub-second steps cannot be distinguished
+/// from genuine queue age with these stamps. No clock-source dependency is added.
+const MAX_SOJOURN_NS: u64 = 1_000_000_000;
+
 /// Per-peer byte counts of the flows that crossed the queue recently, the sparse-flow
 /// exemption's memory (orchestrator decision on #260, J747).
 ///
@@ -514,8 +521,15 @@ fn judge_with(
         }
         return Verdict::Pass;
     }
-    // A wall-clock step backwards reads as zero sojourn; that only delays a signal.
-    let sojourn_ns = now_ns.saturating_sub(rx_ns);
+    let Some(sojourn_ns) = now_ns
+        .checked_sub(rx_ns)
+        .filter(|&age| age <= MAX_SOJOURN_NS)
+    else {
+        // An invalid sample breaks continuity. Forget deadlines and debt so the next valid
+        // packet must establish a fresh above-target interval instead of catching up signals.
+        *codel = Codel::default();
+        return Verdict::Pass;
+    };
     if stats {
         let sojourn_us = sojourn_ns / 1_000;
         SOJOURN_SUM_US.fetch_add(sojourn_us, Ordering::Relaxed);
@@ -987,5 +1001,102 @@ mod tests {
             Verdict::Pass
         );
         assert_eq!(codel.owed, 0);
+    }
+
+    /// Unknown and future stamps must pass even while signals are pending.
+    #[test]
+    fn j853_unknown_and_future_stamps_fail_safe() {
+        let config = ecn_1_10();
+        let mut codel = Codel::default();
+        let (_, now) = drive_bulk(&mut codel, &config, 1, 2, 10 * MS, 200);
+        let due = codel.signal_next_ns.max(now);
+        for stamp in [0, due + MS, u64::MAX] {
+            let mut packet = tcp_v4(40_000, 2, 1_400);
+            assert_eq!(
+                judge_with(&mut codel, &mut packet, stamp, due, &config),
+                Verdict::Pass
+            );
+        }
+    }
+
+    /// A stale stamp across a forward wall-clock step must not invent congestion.
+    #[test]
+    fn j853_forward_clock_step_does_not_mark() {
+        let config = ecn_1_10();
+        let mut codel = Codel::default();
+        let (_, now) = drive_bulk(&mut codel, &config, 1, 2, 10 * MS, 200);
+        let jumped = now + 3_600_000 * MS;
+        let mut signals = 0;
+        // One batch can contain many datagrams stamped just before the clock step.
+        for _ in 0..64 {
+            let mut packet = tcp_v4(40_000, 2, 1_400);
+            signals += usize::from(
+                judge_with(&mut codel, &mut packet, now, jumped, &config) != Verdict::Pass,
+            );
+        }
+        eprintln!("J853 forward clock step: signals={signals} in 64 stale-stamped packets");
+        assert_eq!(signals, 0, "a clock discontinuity invented congestion");
+    }
+
+    /// A timestamp from a monotonic epoch must not be treated as real queue age.
+    #[test]
+    fn j853_wrong_clock_domain_fails_safe() {
+        let config = ecn_1_10();
+        let mut codel = Codel::default();
+        let epoch = 1_800_000_000_000_000_000;
+        let (_, now) = drive_bulk(&mut codel, &config, 1, 2, epoch, 200);
+        let due = codel.signal_next_ns.max(now);
+        let mut packet = tcp_v4(40_000, 2, 1_400);
+        let verdict = judge_with(&mut codel, &mut packet, 10 * MS, due, &config);
+        eprintln!("J853 wrong clock domain: {verdict:?}");
+        assert_eq!(verdict, Verdict::Pass);
+    }
+
+    /// The age ceiling passes invalid samples, clears debt, and requires a new interval.
+    #[test]
+    fn j855_invalid_age_resets_before_valid_samples_resume() {
+        let config = ecn_1_10();
+        for case in 0..3 {
+            let mut codel = Codel::default();
+            let (_, now) = drive_bulk(&mut codel, &config, 1, 2, 10 * MS, 200);
+            let jumped = now + MAX_SOJOURN_NS + 1;
+            let stamp = match case {
+                0 => jumped + 1,
+                1 => 1,
+                _ => jumped - MAX_SOJOURN_NS - 1,
+            };
+            let mut packet = tcp_v4(40_000, 2, 1400);
+            assert_eq!(
+                judge_with(&mut codel, &mut packet, stamp, jumped, &config),
+                Verdict::Pass
+            );
+            assert!(!codel.signalling);
+            assert_eq!(codel.owed, 0);
+            assert_eq!(
+                judge_with(&mut codel, &mut packet, jumped - 3 * MS, jumped, &config),
+                Verdict::Pass
+            );
+            assert_eq!(codel.first_above_ns, jumped + config.interval_ns);
+            let (verdicts, _) = drive_bulk(&mut codel, &config, 1, 2, jumped, 200);
+            assert!(verdicts[0].contains(&Verdict::Marked));
+        }
+    }
+
+    /// The conservative age ceiling still judges genuine queues on its accepted side.
+    #[test]
+    fn j855_age_ceiling_keeps_plausible_congestion_visible() {
+        let config = ecn_1_10();
+        let mut codel = Codel::default();
+        let (_, now) = drive_bulk(&mut codel, &config, 1, 2, 10 * MS, 200);
+        let due = codel.signal_next_ns.max(now) + MAX_SOJOURN_NS;
+        let mut packet = tcp_v4(40_000, 2, 1400);
+        // Refill a heavy entry after the long gap, then use an age exactly at the ceiling.
+        codel
+            .flows
+            .account(flow_key(&packet), 1024 * 1024, due, config.interval_ns);
+        assert_eq!(
+            judge_with(&mut codel, &mut packet, due - MAX_SOJOURN_NS, due, &config),
+            Verdict::Marked
+        );
     }
 }
