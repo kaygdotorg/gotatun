@@ -262,9 +262,10 @@ const TRACKED_FLOWS: usize = 16;
 /// ~6 MiB per 10 ms interval).
 const HEAVY_FLOOR_BYTES: u32 = 16 * 1024;
 
-/// Sparse packets together may exempt this many decayed bytes per peer. Each tracked slot gets
-/// one heavy-flow floor of allowance, but changing keys never replenishes it. This leaves room
-/// for interactive traffic and reverse ACKs while bounding sustained port churn.
+/// New keys replacing occupied slots may exempt this many bytes before a peer-wide fallback.
+/// The allowance lasts until a signal is delivered or the queue drains; it never decays with
+/// time, so slower sustained churn cannot stay exempt forever. Stable sparse flows do not
+/// spend it. Each tracked slot contributes one heavy-flow floor of replacement allowance.
 const EXEMPT_BUDGET_BYTES: u32 = TRACKED_FLOWS as u32 * HEAVY_FLOOR_BYTES;
 
 /// Receive ages over one second are not trustworthy enough to signal. Linux SO_TIMESTAMPNS
@@ -290,9 +291,9 @@ const MAX_SOJOURN_NS: u64 = 1_000_000_000;
 /// and they are halved once per CoDel interval, so the counts follow the last few intervals.
 /// A flow is heavy when its count is at least [`HEAVY_FLOOR_BYTES`] and at least half the
 /// average of the tracked flows. Eight equal bulk flows are all heavy; a probe next to them
-/// never is. Sparse packets also share a decaying byte budget independent of the keys. Once
-/// exhausted, due signals may land on any packet until the budget decays. This prevents an
-/// unbounded stream of new keys from exempting a persistently backlogged peer.
+/// never is. Replacing an occupied slot also spends a peer-wide byte allowance. Once exhausted,
+/// a due signal may land on any packet. Delivering a signal or draining the queue renews the
+/// allowance; time alone does not, so sustained churn cannot evade signalling at lower rates.
 #[derive(Debug, Default)]
 pub(crate) struct FlowShares {
     /// Flow hash of each entry; 0 marks a free entry (a real hash of 0 is folded to 1).
@@ -304,7 +305,7 @@ pub(crate) struct FlowShares {
     /// The entry the previous packet used. Packets of one flow arrive in runs (one GRO batch,
     /// one TSO segment), so this usually skips the scan.
     last: u32,
-    /// Decayed bytes that used the sparse exemption while a signal was owed, across all keys.
+    /// Bytes of new keys that replaced occupied slots since the last signal or queue drain.
     /// Packing this beside the cached index keeps the table at 208 bytes on 64-bit platforms.
     exempt_bytes: u32,
 }
@@ -323,7 +324,6 @@ impl FlowShares {
                 *key = 0;
             }
         }
-        self.exempt_bytes = self.exempt_bytes.checked_shr(shift).unwrap_or(0);
         self.next_decay_ns = now_ns.saturating_add(interval_ns);
     }
 
@@ -345,6 +345,9 @@ impl FlowShares {
                     .enumerate()
                     .min_by_key(|&(_, &bytes)| bytes)
                     .map_or(0, |(index, _)| index);
+                if self.keys[index] != 0 {
+                    self.exempt_bytes = self.exempt_bytes.saturating_add(len);
+                }
                 self.keys[index] = key;
                 self.bytes[index] = 0;
                 index
@@ -552,6 +555,7 @@ fn judge_with(
     if !codel.above_target() {
         // The queue drained: nothing is owed to anyone any more.
         codel.owed = 0;
+        codel.flows.exempt_bytes = 0;
         return Verdict::Pass;
     }
     // Sparse-flow exemption (see `FlowShares`): count this packet's flow, and hand a due signal
@@ -566,16 +570,11 @@ fn judge_with(
     if codel.owed == 0 {
         return Verdict::Pass;
     }
-    if !codel.flows.is_heavy(entry) {
-        codel.flows.exempt_bytes = codel
-            .flows
-            .exempt_bytes
-            .saturating_add(u32::try_from(packet.len()).unwrap_or(u32::MAX));
-        if codel.flows.exempt_bytes < EXEMPT_BUDGET_BYTES {
-            return Verdict::Pass;
-        }
+    if !codel.flows.is_heavy(entry) && codel.flows.exempt_bytes < EXEMPT_BUDGET_BYTES {
+        return Verdict::Pass;
     }
     codel.owed -= 1;
+    codel.flows.exempt_bytes = 0;
     if config.mode == AqmMode::Ecn && set_ce(packet) {
         MARKS.fetch_add(1, Ordering::Relaxed);
         return Verdict::Marked;
@@ -1171,5 +1170,38 @@ mod tests {
             judge_with(&mut codel, &mut packet, due - MAX_SOJOURN_NS, due, &config),
             Verdict::Marked
         );
+    }
+
+    /// A churn fallback must also work below a decaying peer-byte budget's steady-state rate.
+    #[test]
+    fn j855_slow_churn_cannot_remain_exempt_forever() {
+        let config = ecn_1_10();
+        let mut codel = Codel::default();
+        let mut signals = 0;
+        for step in 0..100_000_u64 {
+            let now = 10 * MS + step * MS;
+            let mut packet = tcp_v4(10_000 + (step % 50_000) as u16, 2, 1_400);
+            signals += usize::from(
+                judge_with(&mut codel, &mut packet, now - 3 * MS, now, &config) != Verdict::Pass,
+            );
+        }
+        eprintln!("J855 slow churn: 140000000 bytes at 1ms steps, signals={signals}");
+        assert!(signals > 0);
+    }
+
+    /// A stable sparse flow must never spend the churn allowance, however long a trace lasts.
+    #[test]
+    fn j855_stable_sparse_flow_does_not_exhaust_churn_allowance() {
+        let config = ecn_1_10();
+        let mut codel = Codel::default();
+        for step in 0..100_000_u64 {
+            let now = 10 * MS + step * MS;
+            let mut packet = tcp_v4(22, 0, 80);
+            assert_eq!(
+                judge_with(&mut codel, &mut packet, now - 3 * MS, now, &config),
+                Verdict::Pass
+            );
+        }
+        assert_eq!(codel.flows.exempt_bytes, 0);
     }
 }
