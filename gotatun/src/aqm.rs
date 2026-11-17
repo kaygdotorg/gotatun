@@ -252,8 +252,8 @@ pub(crate) struct Codel {
 const MAX_OWED_SIGNALS: u8 = 4;
 
 /// How many flows [`FlowShares`] tracks per peer. Eight bulk flows and their probes fit with
-/// room to spare; with more concurrent flows the smallest entry is replaced, so a heavy flow
-/// can at worst be exempt for a moment after it re-enters.
+/// room to spare. New keys replace the smallest entry; the peer-wide exemption budget below
+/// bounds how much traffic can escape signalling through repeated replacements.
 const TRACKED_FLOWS: usize = 16;
 
 /// A flow needs at least this many recent bytes (decayed, see [`FlowShares`]) to count as
@@ -261,6 +261,11 @@ const TRACKED_FLOWS: usize = 16;
 /// interval (a 145 probes/s ping is ~2 KiB/s), and far below one bulk flow (5 Gbit/s is
 /// ~6 MiB per 10 ms interval).
 const HEAVY_FLOOR_BYTES: u32 = 16 * 1024;
+
+/// Sparse packets together may exempt this many decayed bytes per peer. Each tracked slot gets
+/// one heavy-flow floor of allowance, but changing keys never replenishes it. This leaves room
+/// for interactive traffic and reverse ACKs while bounding sustained port churn.
+const EXEMPT_BUDGET_BYTES: u32 = TRACKED_FLOWS as u32 * HEAVY_FLOOR_BYTES;
 
 /// Per-peer byte counts of the flows that crossed the queue recently, the sparse-flow
 /// exemption's memory (orchestrator decision on #260, J747).
@@ -278,7 +283,9 @@ const HEAVY_FLOOR_BYTES: u32 = 16 * 1024;
 /// and they are halved once per CoDel interval, so the counts follow the last few intervals.
 /// A flow is heavy when its count is at least [`HEAVY_FLOOR_BYTES`] and at least half the
 /// average of the tracked flows. Eight equal bulk flows are all heavy; a probe next to them
-/// never is.
+/// never is. Sparse packets also share a decaying byte budget independent of the keys. Once
+/// exhausted, due signals may land on any packet until the budget decays. This prevents an
+/// unbounded stream of new keys from exempting a persistently backlogged peer.
 #[derive(Debug, Default)]
 pub(crate) struct FlowShares {
     /// Flow hash of each entry; 0 marks a free entry (a real hash of 0 is folded to 1).
@@ -289,7 +296,10 @@ pub(crate) struct FlowShares {
     next_decay_ns: u64,
     /// The entry the previous packet used. Packets of one flow arrive in runs (one GRO batch,
     /// one TSO segment), so this usually skips the scan.
-    last: usize,
+    last: u32,
+    /// Decayed bytes that used the sparse exemption while a signal was owed, across all keys.
+    /// Packing this beside the cached index keeps the table at 208 bytes on 64-bit platforms.
+    exempt_bytes: u32,
 }
 
 impl FlowShares {
@@ -306,6 +316,7 @@ impl FlowShares {
                 *key = 0;
             }
         }
+        self.exempt_bytes = self.exempt_bytes.checked_shr(shift).unwrap_or(0);
         self.next_decay_ns = now_ns.saturating_add(interval_ns);
     }
 
@@ -315,8 +326,8 @@ impl FlowShares {
     fn account(&mut self, key: u64, len: usize, now_ns: u64, interval_ns: u64) -> usize {
         self.decay(now_ns, interval_ns);
         let len = u32::try_from(len).unwrap_or(u32::MAX);
-        let hit = (self.keys[self.last] == key)
-            .then_some(self.last)
+        let hit = (self.keys[self.last as usize] == key)
+            .then_some(self.last as usize)
             .or_else(|| self.keys.iter().position(|&entry| entry == key));
         let index = match hit {
             Some(index) => index,
@@ -333,7 +344,7 @@ impl FlowShares {
             }
         };
         self.bytes[index] = self.bytes[index].saturating_add(len);
-        self.last = index;
+        self.last = index as u32;
         index
     }
 
@@ -538,8 +549,17 @@ fn judge_with(
     if due {
         codel.owed = codel.owed.saturating_add(1).min(MAX_OWED_SIGNALS);
     }
-    if codel.owed == 0 || !codel.flows.is_heavy(entry) {
+    if codel.owed == 0 {
         return Verdict::Pass;
+    }
+    if !codel.flows.is_heavy(entry) {
+        codel.flows.exempt_bytes = codel
+            .flows
+            .exempt_bytes
+            .saturating_add(u32::try_from(packet.len()).unwrap_or(u32::MAX));
+        if codel.flows.exempt_bytes < EXEMPT_BUDGET_BYTES {
+            return Verdict::Pass;
+        }
     }
     codel.owed -= 1;
     if config.mode == AqmMode::Ecn && set_ce(packet) {
@@ -987,5 +1007,58 @@ mod tests {
             Verdict::Pass
         );
         assert_eq!(codel.owed, 0);
+    }
+
+    /// Rotating through more keys than the fixed table must not exempt an entire busy peer.
+    #[test]
+    fn j853_flow_churn_cannot_exempt_a_busy_peer_forever() {
+        let config = ecn_1_10();
+        let mut codel = Codel::default();
+        let mut signals = 0;
+        for step in 0..100_000_u64 {
+            let now = 10 * MS + step * 10_000;
+            let mut packet = tcp_v4(10_000 + (step % 50_000) as u16, 2, 1_400);
+            signals += usize::from(
+                judge_with(&mut codel, &mut packet, now - 3 * MS, now, &config) != Verdict::Pass,
+            );
+        }
+        eprintln!(
+            "J853 churn: 100000 packets, 140000000 bytes, 50000 rotating ports, signals={signals}"
+        );
+        assert!(
+            signals > 0,
+            "a continuously backlogged peer escaped every signal"
+        );
+    }
+
+    /// The new peer budget fits in the cached-index padding instead of growing per-peer state.
+    #[test]
+    fn j855_state_stays_bounded() {
+        let peer = std::mem::size_of::<Codel>();
+        let flows = std::mem::size_of::<FlowShares>();
+        eprintln!(
+            "J855 state: Codel={peer} FlowShares={flows} at4096={}",
+            peer * 4096
+        );
+        assert_eq!(peer, 240);
+        assert_eq!(flows, 208);
+    }
+
+    /// Changing interactive keys at a sparse rate stays exempt even beside a standing queue.
+    #[test]
+    fn j855_sparse_keystrokes_keep_their_exemption() {
+        let config = ecn_1_10();
+        let mut codel = Codel::default();
+        let (_, mut now) = drive_bulk(&mut codel, &config, 1, 2, 10 * MS, 200);
+        for key in 0..2000_u16 {
+            now = codel.signal_next_ns.max(now) + MS;
+            let mut keystroke = tcp_v4(10_000 + key, 0, 80);
+            assert_eq!(
+                judge_with(&mut codel, &mut keystroke, now - 3 * MS, now, &config),
+                Verdict::Pass
+            );
+            let mut bulk = tcp_v4(40_000, 2, 1400);
+            judge_with(&mut codel, &mut bulk, now - 3 * MS, now, &config);
+        }
     }
 }
