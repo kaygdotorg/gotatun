@@ -309,16 +309,24 @@ impl UdpSocket {
         self.inner.udp_gso_disabled.store(true, Ordering::Relaxed);
     }
 
-    /// Map an IPv4 address to IPv6 if necessary.
+    /// The socket a datagram to `destination` leaves through, and the address to give it.
+    ///
+    /// A dual-stack socket takes IPv4 destinations in their v4-mapped IPv6 form.
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     #[inline(always)]
-    fn map_dst(&self, mut addr: SocketAddr) -> SocketAddr {
+    fn route(&self, mut destination: SocketAddr) -> (&tokio::net::UdpSocket, SocketAddr) {
         if self.map_ipv4_to_ipv6
-            && let std::net::IpAddr::V4(ip) = addr.ip()
+            && let std::net::IpAddr::V4(ip) = destination.ip()
         {
-            addr.set_ip(ip.to_ipv6_mapped().into());
+            destination.set_ip(ip.to_ipv6_mapped().into());
         }
-        addr
+        (&self.inner.socket, destination)
+    }
+
+    /// Every socket this handle binds, for tests that read their options back.
+    #[cfg(all(test, target_os = "macos"))]
+    fn bound_sockets(&self) -> Vec<&tokio::net::UdpSocket> {
+        vec![&self.inner.socket]
     }
     /// Map an IPv6 address back to IPv4 if necessary.
     #[inline(always)]
@@ -882,5 +890,118 @@ mod shared_port_tests {
             }
         }
         panic!("the same port never bound again: {refused:?}");
+    }
+}
+
+/// A dual-stack WireGuard bind on macOS is one socket per family (#260, J826 finding 1, J834).
+///
+/// xnu exempts two PF_INET6 wildcard binds of one port from its conflict check, so while our
+/// IPv4 traffic arrives on a dual-stack PF_INET6 socket, another user can bind beside it. With an
+/// AF_INET socket for IPv4 and an `IPV6_V6ONLY` socket for IPv6, that exemption never applies to
+/// our port. These tests read the options back from the kernel and check that each destination
+/// leaves through the socket of its family. J826's kit on #260 covers the behaviour itself.
+#[cfg(all(test, target_os = "macos"))]
+mod split_family_tests {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    use super::{UdpSocket, UdpSocketFactory};
+    use crate::{
+        packet::{Packet, PacketBufPool},
+        udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams},
+    };
+
+    /// Bind the way the product does: no address (dual-stack), a kernel-picked port, connected
+    /// sends at their default (off).
+    async fn product_bind() -> (UdpSocket, UdpSocket) {
+        let params = UdpTransportFactoryParams {
+            addr: None,
+            port: 0,
+        };
+        UdpSocketFactory::default()
+            .bind(&params)
+            .await
+            .expect("dual-stack bind")
+    }
+
+    /// One AF_INET `0.0.0.0:P` and one `[::]:P` with `IPV6_V6ONLY`, neither with
+    /// `SO_REUSEPORT`, on the same port.
+    #[tokio::test]
+    async fn a_dual_stack_bind_is_one_socket_per_family() {
+        let (wireguard, _) = product_bind().await;
+        let port = wireguard.local_addr().expect("local").port();
+        let mut seen = Vec::new();
+        for socket in wireguard.bound_sockets() {
+            let local = socket.local_addr().expect("local");
+            let options = socket2::SockRef::from(socket);
+            assert!(
+                !options.reuse_port().expect("SO_REUSEPORT"),
+                "{local} carries SO_REUSEPORT"
+            );
+            let only_v6 = local.is_ipv6() && options.only_v6().expect("IPV6_V6ONLY");
+            seen.push((local, only_v6));
+        }
+        let want = vec![
+            (SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)), true),
+            (SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)), false),
+        ];
+        assert_eq!(seen, want, "(address, IPV6_V6ONLY) of each socket");
+    }
+
+    /// IPv4 and v4-mapped destinations leave through the AF_INET socket as plain IPv4; IPv6
+    /// destinations through the IPv6-only socket.
+    #[tokio::test]
+    async fn each_destination_leaves_through_its_family_socket() {
+        let (wireguard, _) = product_bind().await;
+        let v4 = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        let mapped = SocketAddr::from((Ipv4Addr::LOCALHOST.to_ipv6_mapped(), 9));
+        let v6 = SocketAddr::from((Ipv6Addr::LOCALHOST, 9));
+        for destination in [v4, mapped] {
+            let (socket, to) = wireguard.route(destination);
+            assert!(
+                socket.local_addr().expect("local").is_ipv4(),
+                "{destination} would leave through {:?}",
+                socket.local_addr()
+            );
+            assert_eq!(to, v4, "{destination} is sent as plain IPv4");
+        }
+        let (socket, to) = wireguard.route(v6);
+        assert!(socket.local_addr().expect("local").is_ipv6());
+        assert_eq!(to, v6);
+    }
+
+    /// Datagrams cross both ways on both families, and IPv4 sources come back as plain IPv4.
+    #[tokio::test]
+    async fn both_families_send_and_receive() {
+        let (wireguard, mut receiver) = product_bind().await;
+        let port = wireguard.local_addr().expect("local").port();
+        let mut pool = PacketBufPool::new(4);
+        let peers: [IpAddr; 2] = [Ipv4Addr::LOCALHOST.into(), Ipv6Addr::LOCALHOST.into()];
+        for ip in peers {
+            let peer = tokio::net::UdpSocket::bind((ip, 0)).await.expect("peer");
+            let peer_addr = peer.local_addr().expect("peer address");
+            peer.send_to(b"in", (ip, port)).await.expect("peer sends");
+            let (packet, source) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                receiver.recv_from(&mut pool),
+            )
+            .await
+            .expect("a datagram in time")
+            .expect("receive");
+            assert_eq!((&packet[..], source), (&b"in"[..], peer_addr));
+            wireguard
+                .send_to(
+                    Packet::from_bytes(bytes::BytesMut::from(&b"out"[..])),
+                    peer_addr,
+                )
+                .await
+                .expect("send");
+            let mut buf = [0u8; 16];
+            let (n, from) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), peer.recv_from(&mut buf))
+                    .await
+                    .expect("a reply in time")
+                    .expect("peer receives");
+            assert_eq!((&buf[..n], from.port()), (&b"out"[..], port));
+        }
     }
 }
