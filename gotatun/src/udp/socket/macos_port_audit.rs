@@ -40,9 +40,13 @@ use std::{ffi::CStr, io};
 /// any time (both are PF_INET6 wildcards, which `in_pcbbind` exempts from its conflict
 /// check), and after that a `SO_REUSEADDR` bind of `::ffff:<host address>:<port>` by the same
 /// user passes the different-user check against its own socket and takes every IPv4 datagram
-/// sent to that address (J826, #260). Closing that needs no PF_INET6 socket of ours serving
-/// IPv4 (an AF_INET socket plus an `IPV6_V6ONLY` one), not a later audit.
-pub(crate) fn ensure_alone(socket: &socket2::Socket) -> io::Result<()> {
+/// sent to that address (J826, #260). A dual-stack bind is therefore split into an AF_INET
+/// socket plus an `IPV6_V6ONLY` one (`UdpSocket::bind_split`, J834), which the kernel's own
+/// rule keeps closed for the socket's whole life. This check stays on top of that.
+///
+/// `ours` is how many sockets this bind put on the port: 1 for a single socket, 2 for a macOS
+/// split pair (AF_INET plus `IPV6_V6ONLY`, J834), whose sockets must both be in the list.
+pub(crate) fn ensure_alone(socket: &socket2::Socket, ours: usize) -> io::Result<()> {
     let port = socket
         .local_addr()?
         .as_socket()
@@ -54,21 +58,22 @@ pub(crate) fn ensure_alone(socket: &socket2::Socket) -> io::Result<()> {
             format!("cannot check who else holds UDP port {port}: {error}"),
         )
     })?;
-    alone(&users, port)
+    alone(&users, port, ours)
 }
 
-/// The verdict of [`ensure_alone`] on a parsed list: exactly one socket on the port, and it is
-/// this process's.
-fn alone(users: &PortUsers, port: u16) -> io::Result<()> {
+/// The verdict of [`ensure_alone`] on a parsed list: exactly `ours` sockets on the port, all of
+/// them this process's. Fewer than `ours`, with nobody else there, means some of ours are missing
+/// from the list, so the layout is not recognised either.
+fn alone(users: &PortUsers, port: u16, ours: usize) -> io::Result<()> {
     match users.total {
-        0 => Err(io::Error::new(
+        total if total < ours && users.others.is_empty() => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "our socket on UDP port {port} is not in net.inet.udp.pcblist_n: its record \
                  layout is not recognised, so nobody can be ruled out"
             ),
         )),
-        1 if users.others.is_empty() => Ok(()),
+        total if total == ours && users.others.is_empty() => Ok(()),
         total => Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             format!(
@@ -249,8 +254,24 @@ mod tests {
     #[test]
     fn the_verdict_fails_closed() {
         let alone = |total, others: Vec<(u32, i32)>| {
-            super::alone(&super::PortUsers { total, others }, 9).map_err(|error| error.kind())
+            super::alone(&super::PortUsers { total, others }, 9, 1).map_err(|error| error.kind())
         };
+        let pair = |total, others: Vec<(u32, i32)>| {
+            super::alone(&super::PortUsers { total, others }, 9, 2).map_err(|error| error.kind())
+        };
+        assert_eq!(pair(2, vec![]), Ok(()), "a split pair");
+        assert_eq!(
+            pair(1, vec![]),
+            Err(std::io::ErrorKind::InvalidData),
+            "one of ours missing"
+        );
+        assert_eq!(pair(0, vec![]), Err(std::io::ErrorKind::InvalidData));
+        assert_eq!(pair(3, vec![]), Err(std::io::ErrorKind::AddrInUse));
+        assert_eq!(
+            pair(2, vec![(501, 77)]),
+            Err(std::io::ErrorKind::AddrInUse),
+            "one of ours plus someone else"
+        );
         assert_eq!(alone(1, vec![]), Ok(()));
         assert_eq!(
             alone(2, vec![(501, 77)]),
@@ -278,12 +299,12 @@ mod tests {
         socket
             .bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())
             .expect("bind [::]:0");
-        super::ensure_alone(&socket).expect("alone on its port");
+        super::ensure_alone(&socket, 1).expect("alone on its port");
 
         let mut took: Vec<_> = (0..200)
             .map(|_| {
                 let start = std::time::Instant::now();
-                super::ensure_alone(&socket).expect("alone on its port");
+                super::ensure_alone(&socket, 1).expect("alone on its port");
                 start.elapsed()
             })
             .collect();
