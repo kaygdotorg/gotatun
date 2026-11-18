@@ -13,11 +13,16 @@
 //!
 //! This module lets the engine bound the queue itself. It measures each packet's *sojourn time*
 //! from the moment the kernel timestamped the datagram on the UDP socket (`SO_TIMESTAMPNS`) to
-//! the moment the in-order packet is about to be written to the TUN. That interval covers the
-//! socket backlog and the engine's own pipeline. A CoDel controller (RFC 8289) then signals
+//! the moment an in-order run is ready for the buffered TUN handoff. That interval covers the
+//! socket backlog, crypto and ordering delays, and time waiting behind previous TUN handoffs. A CoDel controller (RFC 8289) then signals
 //! congestion at that dequeue point when the sojourn stays above `target` for at least
 //! `interval`: by default (RFC 3168) by setting CE on an ECN-capable inner packet, and by
 //! dropping only packets that are not ECN-capable.
+//!
+//! Wall time measures receive age. Monotonic time drives episode deadlines and credit refill.
+//! Below-target ages or an observed gap between one peer's dequeue and its next arrival end the
+//! episode. A gap in observations alone can be a CPU, peer-lock or TUN stall. It expires old
+//! congestion evidence after one interval without treating the backlog as empty.
 //!
 //! Small packets share one per-peer byte allowance, independent of flow keys: at most 256 bytes
 //! per authenticated plaintext frame (including padding), 32 KiB per 10 ms, and a 64 KiB
@@ -82,8 +87,8 @@ pub(crate) struct AqmConfig {
 
 impl AqmConfig {
     /// Read the configuration through `lookup` (the environment in production, a map in tests).
-    /// Unset, empty or unparsable numbers fall back to the defaults; an unknown mode keeps the
-    /// default ECN mode, so a typo never turns the bound off silently (it logs a warning).
+    /// Unset, empty, unparsable or overflowing durations use their defaults. An unknown mode
+    /// warns and keeps ECN mode enabled.
     fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
         let mode = match lookup("GOTATUN_AQM").as_deref().map(str::trim) {
             None | Some("" | "ecn" | "on" | "1") => AqmMode::Ecn,
@@ -107,10 +112,15 @@ impl AqmConfig {
             (None, true) => Some(1_000),
             (None, false) => None,
         };
+        let nanos = |name, default_us| {
+            positive(name)
+                .and_then(|us| us.checked_mul(1_000))
+                .unwrap_or(default_us * 1_000)
+        };
         Self {
             mode,
-            target_ns: positive("GOTATUN_AQM_TARGET_US").unwrap_or(DEFAULT_TARGET_US) * 1_000,
-            interval_ns: positive("GOTATUN_AQM_INTERVAL_US").unwrap_or(DEFAULT_INTERVAL_US) * 1_000,
+            target_ns: nanos("GOTATUN_AQM_TARGET_US", DEFAULT_TARGET_US),
+            interval_ns: nanos("GOTATUN_AQM_INTERVAL_US", DEFAULT_INTERVAL_US),
             stats_ms,
         }
     }
@@ -222,28 +232,38 @@ pub(crate) enum Verdict {
     Drop,
 }
 
-/// CoDel state for one queue (here: one peer's receive path).
-///
-/// This follows the state machine RFC 8289 §5 describes, in our own structure: a packet is "above
-/// target" once its sojourn exceeds `target`; once packets have stayed above target for a whole
-/// `interval`, the controller enters the signalling state and signals one packet, then the next
-/// one after `interval / sqrt(count)`, and so on, until a packet's sojourn falls below target.
-/// Re-entering soon after leaving resumes near the previous signalling rate, so a persistent
-/// queue doesn't restart from one signal per interval.
+/// The two clocks sampled together at the first eligible dequeue in an in-order run.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DequeueTime {
+    /// Realtime nanoseconds since the Unix epoch, comparable with the kernel receive stamp.
+    wall_ns: u64,
+    /// Monotonic nanoseconds since an arbitrary, process-wide starting point.
+    mono_ns: u64,
+}
+
+impl DequeueTime {
+    /// Read both clocks once under the peer lock, before handing the run to the TUN.
+    pub(crate) fn now() -> Self {
+        use std::time::Instant;
+        static START: OnceLock<Instant> = OnceLock::new();
+        let start = START.get_or_init(Instant::now);
+        Self {
+            wall_ns: realtime_ns(),
+            mono_ns: u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        }
+    }
+}
+
+/// State of one peer's receive queue, with an observation phase before signalling.
 #[derive(Debug, Default)]
 pub(crate) struct Codel {
-    /// When the sojourn first went above target in this episode, plus one interval; 0 when the
-    /// sojourn is below target.
-    first_above_ns: u64,
-    /// When the next signal is due while signalling.
-    signal_next_ns: u64,
-    /// Signals in the current signalling episode.
+    /// Initial observation deadline or next signal deadline. Zero means no current evidence.
+    deadline_ns: u64,
+    /// The newest above-target observation and the reference for an arrival after dequeue.
+    last_above: DequeueTime,
+    /// Signals earned in this episode. Zero while observing.
     count: u32,
-    /// `count` when the previous episode ended, for the quick re-entry rule.
-    last_count: u32,
-    /// Whether the controller is in its signalling state.
-    signalling: bool,
-    /// Due signals deferred by the small-packet budget, capped to avoid an unbounded burst.
+    /// Signals deferred by the small-packet budget, capped to avoid an unbounded burst.
     owed: u8,
     /// Aggregate byte credit; packet addresses and flow keys never affect eligibility.
     sparse: SparseBudget,
@@ -319,83 +339,85 @@ impl SparseBudget {
 }
 
 impl Codel {
-    /// The time of the next signal after `from`, `interval / sqrt(count)` later (RFC 8289's
-    /// control law). Called rarely (once per signal), so the float square root costs nothing.
-    fn control_law(from_ns: u64, interval_ns: u64, count: u32) -> u64 {
-        let spacing = interval_ns as f64 / f64::from(count.max(1)).sqrt();
-        from_ns.saturating_add(spacing as u64)
+    /// Discard evidence and deferred signals without replenishing the byte allowance.
+    fn end_episode(&mut self) {
+        self.deadline_ns = 0;
+        self.count = 0;
+        self.owed = 0;
     }
 
-    /// Whether the last judged packet found the queue standing above target (the window in
-    /// which the sparse-flow exemption counts bytes).
-    fn above_target(&self) -> bool {
-        self.first_above_ns != 0
+    /// Realtime of the latest above-target dequeue, for the socket-to-TUN regression.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn above_target_wall_ns(&self) -> Option<u64> {
+        (self.deadline_ns != 0).then_some(self.last_above.wall_ns)
     }
 
-    /// Whether the packet dequeued at `now_ns` with `sojourn_ns` of queueing should be signalled.
-    pub(crate) fn should_signal(
+    /// Update congestion evidence and return whether this observation earns a signal.
+    fn should_signal(
         &mut self,
-        now_ns: u64,
+        now: DequeueTime,
+        rx_ns: u64,
         sojourn_ns: u64,
         config: &AqmConfig,
     ) -> bool {
-        // Step 1: has the queue stood above target for at least one interval?
-        let persistent = if sojourn_ns < config.target_ns {
-            self.first_above_ns = 0;
-            false
-        } else if self.first_above_ns == 0 {
-            self.first_above_ns = now_ns.saturating_add(config.interval_ns);
-            false
-        } else {
-            now_ns >= self.first_above_ns
-        };
-
-        // Step 2: run the signalling state machine.
-        if self.signalling {
-            if !persistent {
-                self.signalling = false;
-                return false;
-            }
-            if now_ns >= self.signal_next_ns {
-                self.count = self.count.saturating_add(1);
-                self.signal_next_ns =
-                    Self::control_law(self.signal_next_ns, config.interval_ns, self.count);
-                return true;
-            }
+        if sojourn_ns < config.target_ns {
+            *self = Self::default();
             return false;
         }
-        if persistent {
-            self.signalling = true;
-            // Re-entering within 16 intervals of the last signal keeps most of the old rate.
-            let delta = self.count.saturating_sub(self.last_count);
-            let recent =
-                now_ns.saturating_sub(self.signal_next_ns) < config.interval_ns.saturating_mul(16);
-            self.count = if delta > 1 && recent { delta } else { 1 };
-            self.last_count = self.count;
-            self.signal_next_ns = Self::control_law(now_ns, config.interval_ns, self.count);
-            return true;
+        let gap = now.mono_ns.saturating_sub(self.last_above.mono_ns);
+        if self.deadline_ns != 0 {
+            if gap > sojourn_ns && rx_ns > self.last_above.wall_ns {
+                // In this ordered peer stream the next arrival is after the previous dequeue.
+                // Require agreement from both clock comparisons before renewing byte credit.
+                *self = Self::default();
+            } else if gap > config.interval_ns {
+                // No recent observation: the queue could have stood throughout a local stall.
+                self.end_episode();
+            }
         }
-        false
+        self.last_above = now;
+        if self.deadline_ns == 0 {
+            self.deadline_ns = now.mono_ns.saturating_add(config.interval_ns);
+            return false;
+        }
+
+        let deadline = self.deadline_ns;
+        if now.mono_ns < deadline {
+            return false;
+        }
+
+        let first = self.count == 0;
+        self.count = self.count.saturating_add(1);
+        let spacing = (config.interval_ns as f64 / f64::from(self.count).sqrt()) as u64;
+        let spacing = spacing.max(1);
+        let next = deadline.saturating_add(spacing);
+        // Keep the control law's phase through small scheduling delays. Once another deadline
+        // is already past, rebase the schedule so a stalled run can earn only one new signal.
+        self.deadline_ns = if first || next <= now.mono_ns {
+            now.mono_ns.saturating_add(spacing)
+        } else {
+            next
+        };
+        true
     }
 }
 
 /// Judge one in-order packet about to be written to the TUN, and apply the verdict's header
 /// change. `authenticated_len` includes padding before IP validation trims the plaintext.
 /// The size ceiling and credit use that length; only `packet` is ever changed.
-/// `rx_ns` is the kernel receive timestamp of its datagram (0 if none); `now_ns` comes
-/// from [`realtime_ns`] once per delivered run.
+/// `rx_ns` is the kernel receive timestamp of its datagram (0 if none). Reuse `now` for the run.
 pub(crate) fn judge(
     codel: &mut Codel,
     packet: &mut [u8],
     authenticated_len: usize,
     rx_ns: u64,
-    now_ns: u64,
+    now: DequeueTime,
 ) -> Verdict {
     let config = config();
     if !config.active() {
         return Verdict::Pass;
     }
-    judge_frame_with(codel, packet, authenticated_len, rx_ns, now_ns, config)
+    judge_frame_with(codel, packet, authenticated_len, rx_ns, now, config)
 }
 
 /// Test seam for ordinary frames with their normal sixteen-byte padding alignment.
@@ -407,8 +429,29 @@ fn judge_with(
     now_ns: u64,
     config: &AqmConfig,
 ) -> Verdict {
+    judge_with_time(codel, packet, rx_ns, test_time(now_ns), config)
+}
+
+/// Judge a normally padded frame with independently controlled clocks.
+#[cfg(test)]
+fn judge_with_time(
+    codel: &mut Codel,
+    packet: &mut [u8],
+    rx_ns: u64,
+    now: DequeueTime,
+    config: &AqmConfig,
+) -> Verdict {
     let authenticated_len = packet.len().next_multiple_of(16);
-    judge_frame_with(codel, packet, authenticated_len, rx_ns, now_ns, config)
+    judge_frame_with(codel, packet, authenticated_len, rx_ns, now, config)
+}
+
+/// Both clocks advance together in the ordinary virtual dequeue trace.
+#[cfg(test)]
+fn test_time(ns: u64) -> DequeueTime {
+    DequeueTime {
+        wall_ns: ns,
+        mono_ns: ns,
+    }
 }
 
 /// Judge validated IP bytes with the pre-trim authenticated plaintext length, assumed active.
@@ -418,7 +461,7 @@ fn judge_frame_with(
     packet: &mut [u8],
     authenticated_len: usize,
     rx_ns: u64,
-    now_ns: u64,
+    now: DequeueTime,
     config: &AqmConfig,
 ) -> Verdict {
     let stats = config.stats_ms.is_some();
@@ -431,7 +474,8 @@ fn judge_frame_with(
         }
         return Verdict::Pass;
     }
-    let Some(sojourn_ns) = now_ns
+    let Some(sojourn_ns) = now
+        .wall_ns
         .checked_sub(rx_ns)
         .filter(|&age| age <= MAX_SOJOURN_NS)
     else {
@@ -447,15 +491,12 @@ fn judge_frame_with(
         SOJOURN_MAX_US.fetch_max(sojourn_us, Ordering::Relaxed);
     }
 
-    let due = codel.should_signal(now_ns, sojourn_ns, config);
-    if !codel.above_target() {
-        // Observed drain ends both the signal debt and the sparse-credit episode.
-        codel.owed = 0;
-        codel.sparse = SparseBudget::default();
+    let due = codel.should_signal(now, rx_ns, sojourn_ns, config);
+    if codel.deadline_ns == 0 {
         return Verdict::Pass;
     }
     let charged_len = authenticated_len.max(packet.len());
-    let exempt = codel.sparse.exempt(charged_len, now_ns);
+    let exempt = codel.sparse.exempt(charged_len, now.mono_ns);
     if due {
         codel.owed = codel.owed.saturating_add(1).min(MAX_OWED_SIGNALS);
     }
@@ -613,7 +654,7 @@ mod tests {
         let mut codel = Codel::default();
         let config = config(AqmMode::Drop);
         for step in 0..10_000 {
-            assert!(!codel.should_signal(step * MS, 4 * MS, &config));
+            assert!(!codel.should_signal(test_time(step * MS), 0, 4 * MS, &config));
         }
     }
 
@@ -621,20 +662,20 @@ mod tests {
     fn first_signal_waits_one_interval_above_target() {
         let mut codel = Codel::default();
         let config = config(AqmMode::Drop);
-        assert!(!codel.should_signal(0, 6 * MS, &config));
-        assert!(!codel.should_signal(99 * MS, 6 * MS, &config));
-        assert!(codel.should_signal(100 * MS, 6 * MS, &config));
+        assert!(!codel.should_signal(test_time(0), 0, 6 * MS, &config));
+        assert!(!codel.should_signal(test_time(99 * MS), 0, 6 * MS, &config));
+        assert!(codel.should_signal(test_time(100 * MS), 0, 6 * MS, &config));
     }
 
     #[test]
     fn signal_spacing_shrinks_with_the_square_root_of_count() {
         let mut codel = Codel::default();
         let config = config(AqmMode::Drop);
-        codel.should_signal(0, 6 * MS, &config);
+        codel.should_signal(test_time(0), 0, 6 * MS, &config);
         let mut signals = Vec::new();
         for step in 1..=400 {
             let now = step * MS;
-            if codel.should_signal(now, 6 * MS, &config) {
+            if codel.should_signal(test_time(now), 0, 6 * MS, &config) {
                 signals.push(now);
             }
         }
@@ -651,13 +692,13 @@ mod tests {
     fn falling_below_target_leaves_the_signalling_state() {
         let mut codel = Codel::default();
         let config = config(AqmMode::Drop);
-        codel.should_signal(0, 6 * MS, &config);
-        assert!(codel.should_signal(100 * MS, 6 * MS, &config));
-        assert!(!codel.should_signal(101 * MS, MS, &config));
+        codel.should_signal(test_time(0), 0, 6 * MS, &config);
+        assert!(codel.should_signal(test_time(100 * MS), 0, 6 * MS, &config));
+        assert!(!codel.should_signal(test_time(101 * MS), 0, MS, &config));
         // A new episode needs another full interval above target.
-        assert!(!codel.should_signal(102 * MS, 6 * MS, &config));
-        assert!(!codel.should_signal(201 * MS, 6 * MS, &config));
-        assert!(codel.should_signal(202 * MS, 6 * MS, &config));
+        assert!(!codel.should_signal(test_time(102 * MS), 0, 6 * MS, &config));
+        assert!(!codel.should_signal(test_time(201 * MS), 0, 6 * MS, &config));
+        assert!(codel.should_signal(test_time(202 * MS), 0, 6 * MS, &config));
     }
 
     #[test]
@@ -761,9 +802,9 @@ mod tests {
             verdicts[0].contains(&Verdict::Marked),
             "the bulk flow is signalled"
         );
-        assert!(codel.signalling);
+        assert!(codel.count != 0);
         // The next signal is due exactly when a Not-ECT probe reaches the TUN.
-        let due = codel.signal_next_ns.max(now);
+        let due = codel.deadline_ns.max(now);
         let mut probe = icmp_probe();
         assert_eq!(
             judge_with(&mut codel, &mut probe, due - 3 * MS, due, &config),
@@ -794,17 +835,11 @@ mod tests {
         // 2 s of bulk at one packet per 10 µs, a probe every 0.25 ms, and the probe placed
         // right on the due signal whenever one is pending (the worst case for the probe).
         for step in 0..200_000_u64 {
-            if step % 25 == 0 {
-                let at = if codel.signalling {
-                    codel.signal_next_ns.max(now)
-                } else {
-                    now
-                };
+            if step % 25 == 0 || (codel.count != 0 && now >= codel.deadline_ns) {
                 let mut probe = icmp_probe();
-                if judge_with(&mut codel, &mut probe, at - 3 * MS, at, &config) == Verdict::Drop {
+                if judge_with(&mut codel, &mut probe, now - 3 * MS, now, &config) == Verdict::Drop {
                     probe_drops += 1;
                 }
-                now = at;
             }
             let mut bulk = tcp_v4(40_000, 0b01, 1_400);
             if judge_with(&mut codel, &mut bulk, now - 3 * MS, now, &config) == Verdict::Marked {
@@ -846,18 +881,12 @@ mod tests {
         let mut now = 10 * MS;
         let mut ack_drops = 0;
         for step in 0..100_000_u64 {
-            if step % 4 == 0 {
-                let at = if codel.signalling {
-                    codel.signal_next_ns.max(now)
-                } else {
-                    now
-                };
+            if step % 4 == 0 || (codel.count != 0 && now >= codel.deadline_ns) {
                 // A 52-byte Not-ECT pure ACK of another TCP connection (RFC 3168 §6.1.4).
                 let mut ack = tcp_v4(22, 0, 52);
-                if judge_with(&mut codel, &mut ack, at - 3 * MS, at, &config) == Verdict::Drop {
+                if judge_with(&mut codel, &mut ack, now - 3 * MS, now, &config) == Verdict::Drop {
                     ack_drops += 1;
                 }
-                now = at;
             }
             let mut bulk = tcp_v4(40_000, 0b10, 1_400);
             judge_with(&mut codel, &mut bulk, now - 3 * MS, now, &config);
@@ -871,7 +900,7 @@ mod tests {
         let config = ecn_1_10();
         let mut codel = Codel::default();
         let (_, now) = drive_bulk(&mut codel, &config, 1, 0b10, 10 * MS, 100);
-        let due = codel.signal_next_ns.max(now);
+        let due = codel.deadline_ns.max(now);
         let mut probe = icmp_probe();
         assert_eq!(
             judge_with(&mut codel, &mut probe, due - 3 * MS, due, &config),
@@ -893,7 +922,7 @@ mod tests {
         let config = ecn_1_10();
         let mut codel = Codel::default();
         let (_, now) = drive_bulk(&mut codel, &config, 1, 2, 10 * MS, 200);
-        let due = codel.signal_next_ns.max(now);
+        let due = codel.deadline_ns.max(now);
         for stamp in [0, due + MS, u64::MAX] {
             let mut packet = tcp_v4(40_000, 2, 1_400);
             assert_eq!(
@@ -929,7 +958,7 @@ mod tests {
         let mut codel = Codel::default();
         let epoch = 1_800_000_000_000_000_000;
         let (_, now) = drive_bulk(&mut codel, &config, 1, 2, epoch, 200);
-        let due = codel.signal_next_ns.max(now);
+        let due = codel.deadline_ns.max(now);
         let mut packet = tcp_v4(40_000, 2, 1_400);
         let verdict = judge_with(&mut codel, &mut packet, 10 * MS, due, &config);
         eprintln!("J853 wrong clock domain: {verdict:?}");
@@ -954,13 +983,13 @@ mod tests {
                 judge_with(&mut codel, &mut packet, stamp, jumped, &config),
                 Verdict::Pass
             );
-            assert!(!codel.signalling);
+            assert!(codel.count == 0);
             assert_eq!(codel.owed, 0);
             assert_eq!(
                 judge_with(&mut codel, &mut packet, jumped - 3 * MS, jumped, &config),
                 Verdict::Pass
             );
-            assert_eq!(codel.first_above_ns, jumped + config.interval_ns);
+            assert_eq!(codel.deadline_ns, jumped + config.interval_ns);
             let (verdicts, _) = drive_bulk(&mut codel, &config, 1, 2, jumped, 200);
             assert!(verdicts[0].contains(&Verdict::Marked));
         }
@@ -972,16 +1001,26 @@ mod tests {
         let config = ecn_1_10();
         let mut codel = Codel::default();
         let (_, now) = drive_bulk(&mut codel, &config, 1, 2, 10 * MS, 200);
-        let due = codel.signal_next_ns.max(now) + MAX_SOJOURN_NS;
+        let due = codel.deadline_ns.max(now);
+        let wall = 2 * MAX_SOJOURN_NS;
         let mut packet = tcp_v4(40_000, 2, 1400);
         assert_eq!(
-            judge_with(&mut codel, &mut packet, due - MAX_SOJOURN_NS, due, &config),
+            judge_with_time(
+                &mut codel,
+                &mut packet,
+                wall - MAX_SOJOURN_NS,
+                DequeueTime {
+                    wall_ns: wall,
+                    mono_ns: due
+                },
+                &config,
+            ),
             Verdict::Marked
         );
     }
 
     /// Changing only keys cannot alter aggregate eligibility at any tested packet rate.
-    /// Small churn within the envelope passes; above it signals. Large churn always signals.
+    /// Continuous bulk signals. At slower single-packet cadences each new arrival follows drain.
     #[test]
     fn aggregate_churn_has_no_key_dependency() {
         let config = ecn_1_10();
@@ -999,7 +1038,8 @@ mod tests {
                     assert_eq!(va, vb, "len={len} spacing={spacing} step={step}");
                     signals += usize::from(vb != Verdict::Pass);
                 }
-                let overload = len > SPARSE_MAX_PACKET_BYTES || spacing == 10_000;
+                let overload =
+                    spacing <= MS && (len > SPARSE_MAX_PACKET_BYTES || spacing == 10_000);
                 eprintln!(
                     "J870 churn len={len} spacing_ns={spacing} signals={signals} overload={overload}"
                 );
@@ -1054,12 +1094,12 @@ mod tests {
         let config = ecn_1_10();
         let mut codel = Codel::default();
         let start = 10 * MS;
-        codel.should_signal(start, 3 * MS, &config);
+        codel.should_signal(test_time(start), start - 3 * MS, 3 * MS, &config);
         let due = start + config.interval_ns;
         for _ in 0..SPARSE_BURST_BYTES / 256 {
             let mut packet = tcp_v4(22, 2, 256);
             assert_eq!(
-                judge_with(&mut codel, &mut packet, due - 3 * MS, due, &config),
+                judge_with(&mut codel, &mut packet, start - 3 * MS, due, &config),
                 Verdict::Pass
             );
         }
@@ -1074,7 +1114,7 @@ mod tests {
         let recovered = due + 20 * MS;
         for step in 0..100_000_u64 {
             let now = recovered + step * MS;
-            codel.signal_next_ns = now;
+            codel.deadline_ns = now;
             let mut ssh = tcp_v4(22, 0, 96);
             assert_eq!(
                 judge_with(&mut codel, &mut ssh, now - 3 * MS, now, &config),
@@ -1103,7 +1143,7 @@ mod tests {
             judge_with(&mut codel, &mut packet, now, now + 3 * MS, &config),
             Verdict::Pass
         );
-        assert_eq!(codel.first_above_ns, now + 3 * MS + config.interval_ns);
+        assert_eq!(codel.deadline_ns, now + 3 * MS + config.interval_ns);
     }
 
     /// State is constant per peer with no per-flow entries or heap allocations.
@@ -1149,8 +1189,8 @@ mod tests {
                 }
                 let at = now.max(at);
                 // Place a pending signal on each captured packet to exercise the exemption.
-                if codel.signalling {
-                    codel.signal_next_ns = at;
+                if codel.count != 0 {
+                    codel.deadline_ns = at;
                 }
                 let mut sparse = tcp_v4(22, 0, len);
                 assert_eq!(
@@ -1174,16 +1214,21 @@ mod tests {
     #[test]
     fn public_off_switch_preserves_everything() {
         if std::env::var_os("J870_OFF_CHILD").is_some() {
-            let mut codel = Codel::default();
-            codel.owed = MAX_OWED_SIGNALS;
-            codel.sparse.credit = 0;
+            let mut codel = Codel {
+                owed: MAX_OWED_SIGNALS,
+                sparse: SparseBudget {
+                    credit: 0,
+                    last_ns: 0,
+                },
+                ..Codel::default()
+            };
             let before = format!("{codel:?}");
             for step in 0..100 {
                 let now = 10 * MS + step * MS;
                 let mut packet = tcp_v4(22, 2, 1400);
                 let original = packet.clone();
                 assert_eq!(
-                    judge(&mut codel, &mut packet, 1400, now - 3 * MS, now),
+                    judge(&mut codel, &mut packet, 1400, now - 3 * MS, test_time(now)),
                     Verdict::Pass
                 );
                 assert_eq!(packet, original);
@@ -1229,8 +1274,8 @@ mod tests {
                     .chain([96, 96, 216, 216])
                     .chain(std::iter::repeat_n(84, 40))
                 {
-                    if codel.signalling {
-                        codel.signal_next_ns = now;
+                    if codel.count != 0 {
+                        codel.deadline_ns = now;
                     }
                     let mut packet = tcp_v4(22, 0, len);
                     assert_eq!(
@@ -1257,7 +1302,7 @@ mod tests {
         let config = ecn_1_10();
         let mut codel = Codel::default();
         let start = 10 * MS;
-        codel.should_signal(start, 3 * MS, &config);
+        codel.should_signal(test_time(start), start - 3 * MS, 3 * MS, &config);
         let now = start + config.interval_ns;
         let mut bytes = icmp_probe();
         bytes[2..4].copy_from_slice(&84_u16.to_be_bytes());
@@ -1279,8 +1324,8 @@ mod tests {
                 &mut codel,
                 zerocopy::IntoBytes::as_mut_bytes(&mut *packet),
                 authenticated_len,
-                now - 3 * MS,
-                now,
+                start - 3 * MS,
+                test_time(now),
                 &config
             ),
             Verdict::Drop,
@@ -1305,14 +1350,14 @@ mod tests {
                 .unwrap()
                 .either(|ip| ip.into(), |ip| ip.into());
         assert_eq!(zerocopy::IntoBytes::as_bytes(&*packet).len(), 216);
-        codel.signal_next_ns = now;
+        codel.deadline_ns = now;
         assert_eq!(
             judge_frame_with(
                 &mut codel,
                 zerocopy::IntoBytes::as_mut_bytes(&mut *packet),
                 authenticated_len,
-                now - 3 * MS,
-                now,
+                start - 3 * MS,
+                test_time(now),
                 &config
             ),
             Verdict::Pass,
@@ -1326,5 +1371,300 @@ mod tests {
         eprintln!(
             "J870 padding: inner84/plaintext1400=Drop; inner216/plaintext224=Pass, charged224"
         );
+    }
+
+    /// Independent peers keep separate credit and owed signals under a small-packet flood.
+    #[test]
+    fn j881_peer_isolation_under_small_packet_flood() {
+        let cfg = ecn_1_10();
+        let mut flood = Codel::default();
+        let mut victim = Codel::default();
+        let mut reference = Codel::default();
+        let mut signs = 0;
+        for n in 0..100_000u64 {
+            let now = 10 * MS + n * 1_000;
+            let mut p = tcp_v4((n % 50_000) as u16 + 1, 2, 256);
+            signs += usize::from(
+                judge_with(&mut flood, &mut p, now - 3 * MS, now, &cfg) != Verdict::Pass,
+            );
+            if n % 1000 == 0 {
+                let mut a = tcp_v4(22, 0, 216);
+                let mut b = a.clone();
+                assert_eq!(
+                    judge_with(&mut victim, &mut a, now - 3 * MS, now, &cfg),
+                    judge_with(&mut reference, &mut b, now - 3 * MS, now, &cfg)
+                );
+                assert_eq!(a, b);
+                assert_eq!(format!("{victim:?}"), format!("{reference:?}"));
+            }
+        }
+        assert!(signs > 0);
+        assert_eq!(victim.owed, MAX_OWED_SIGNALS);
+        eprintln!("J881 flood signals={signs}; independent peer remains exempt");
+    }
+
+    /// Irregular mixed-size offers obey the burst-plus-refill bound even at window edges.
+    #[test]
+    fn j881_irregular_credit_conserves_bytes() {
+        let mut budget = SparseBudget::default();
+        let mut random = 0x123456789abcdefu64;
+        let mut now = 10 * MS;
+        let start = now;
+        let mut allowed = 0u64;
+        let mut refused = 0u64;
+        for n in 0..200_000 {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            now += [0, 1, 305, 306, 10_000, 9_999][n % 6];
+            let len = [1, 52, 80, 216, 224, 256, 257, 1400][random as usize % 8];
+            let before = budget.credit;
+            let exempt = budget.exempt(len, now);
+            if len > 256 {
+                assert!(!exempt);
+                assert!(budget.credit >= before);
+            } else if exempt {
+                allowed += len as u64;
+            } else {
+                refused += 1;
+            }
+            assert!(budget.credit <= SPARSE_BURST_BYTES * SPARSE_INTERVAL_NS);
+            assert!(
+                allowed as u128 * SPARSE_INTERVAL_NS as u128
+                    <= SPARSE_BURST_BYTES as u128 * SPARSE_INTERVAL_NS as u128
+                        + (now - start) as u128 * SPARSE_BYTES as u128
+            );
+        }
+        assert!(refused > 0);
+        eprintln!(
+            "J881 irregular accepted={allowed} refused={refused} elapsed_ns={}",
+            now - start
+        );
+    }
+
+    /// Mixed refill-edge bursts cannot suppress all congestion signals.
+    #[test]
+    fn j881_mixed_overload_cannot_hide_due_signals() {
+        let cfg = ecn_1_10();
+        let mut codel = Codel::default();
+        let mut small = 0;
+        let mut large = 0;
+        for n in 0..200_000u64 {
+            let now = 10 * MS + (n / 1000) * 10 * MS + (n % 1000);
+            let len = if n % 3 == 0 { 1400 } else { 256 };
+            let mut p = tcp_v4((n % 50000) as u16 + 1, 2, len);
+            if judge_with(&mut codel, &mut p, now - 10 * MS + 1, now, &cfg) != Verdict::Pass {
+                if len == 256 {
+                    small += 1;
+                } else {
+                    large += 1;
+                }
+            }
+        }
+        assert!(small + large > 0);
+        eprintln!("J881 refill-edge mixed small_signals={small} large_signals={large}");
+    }
+
+    /// Parsed diagnostic durations must not panic or wrap into a zero-nanosecond controller.
+    #[test]
+    fn j881_diagnostic_duration_conversion_is_overflow_safe() {
+        let mut invalid = Vec::new();
+        for knob in ["GOTATUN_AQM_TARGET_US", "GOTATUN_AQM_INTERVAL_US"] {
+            let result = std::panic::catch_unwind(|| from_vars(&[(knob, "2305843009213693952")]));
+            match result {
+                Err(_) => {
+                    eprintln!("J881 {knob}: panicked");
+                    invalid.push(knob);
+                }
+                Ok(cfg) => {
+                    eprintln!(
+                        "J881 {knob}: target_ns={} interval_ns={}",
+                        cfg.target_ns, cfg.interval_ns
+                    );
+                    if cfg.target_ns == 0 || cfg.interval_ns == 0 {
+                        invalid.push(knob);
+                    }
+                }
+            }
+        }
+        assert!(
+            invalid.is_empty(),
+            "overflowing diagnostic durations: {invalid:?}"
+        );
+    }
+
+    /// Fresh receive stamps follow a wall-clock step while all congestion deadlines stay put.
+    #[test]
+    fn j881_clock_steps_with_fresh_stamps_preserve_deadlines() {
+        let cfg = ecn_1_10();
+        let epoch = 1_800_000_000_000_000_000;
+        for ecn in [0, 2] {
+            let mut stable = None;
+            for shift_ms in [0_i64, -3_600_000, 3_600_000] {
+                let mut codel = Codel::default();
+                let (before, now) = drive_bulk(&mut codel, &cfg, 1, ecn, epoch, 200);
+                assert!(before[0].iter().any(|&v| v != Verdict::Pass));
+                let after = now.checked_add_signed(shift_ms * MS as i64).unwrap();
+                let mut signals = 0;
+                for step in 0..100_000_u64 {
+                    let at = DequeueTime {
+                        wall_ns: after + step * 10_000,
+                        mono_ns: now + step * 10_000,
+                    };
+                    let age = 3 * MS + step * 1_000;
+                    let mut p = tcp_v4(40_000, ecn, 1400);
+                    let verdict = judge_with_time(&mut codel, &mut p, at.wall_ns - age, at, &cfg);
+                    signals += usize::from(verdict != Verdict::Pass);
+                }
+                eprintln!(
+                    "J881 fresh stamps ecn={ecn} shift_ms={shift_ms} signals={signals}/100000"
+                );
+                assert!(signals > 0 && signals < 100_000);
+                assert_eq!(signals, *stable.get_or_insert(signals));
+            }
+        }
+    }
+
+    /// An idle gap followed by a fresh burst never inherits a warm controller's debt.
+    #[test]
+    fn j881_idle_resume_does_not_reuse_old_signal_schedule() {
+        let cfg = ecn_1_10();
+        for gap in [
+            4 * MS,
+            10 * MS - 1,
+            10 * MS,
+            10 * MS + 1,
+            20 * MS - 1,
+            20 * MS,
+            20 * MS + 1,
+            200 * MS - 1,
+            200 * MS,
+            200 * MS + 1,
+            3_600_000 * MS,
+        ] {
+            let mut warm = Codel::default();
+            let (_, previous) = drive_bulk(&mut warm, &cfg, 1, 0, 1_800_000_000_000_000_000, 200);
+            assert!(warm.count != 0);
+            warm.owed = MAX_OWED_SIGNALS;
+            let resumed = previous + gap;
+            let mut fresh = Codel::default();
+            for step in 0..10_u64 {
+                let now = resumed + step * 10_000;
+                let stamp = now - 3 * MS;
+                assert!(stamp > previous);
+                let mut a = tcp_v4(40_000, 0, 1400);
+                let mut b = a.clone();
+                assert_eq!(
+                    judge_with(&mut warm, &mut a, stamp, now, &cfg),
+                    judge_with(&mut fresh, &mut b, stamp, now, &cfg),
+                    "gap={gap}, step={step}",
+                );
+                assert_eq!(warm.owed, 0);
+            }
+            assert_eq!(warm.deadline_ns, resumed + cfg.interval_ns);
+        }
+    }
+
+    /// A stalled run can earn one overdue signal, then waits for a future deadline.
+    #[test]
+    fn overdue_schedule_earns_only_one_new_signal_at_a_dequeue() {
+        let cfg = ecn_1_10();
+        let mut codel = Codel::default();
+        let (_, previous) = drive_bulk(&mut codel, &cfg, 1, 0, 10 * MS, 200);
+        let resumed = codel.last_above.mono_ns + cfg.interval_ns;
+        assert!(resumed > previous && resumed > codel.deadline_ns);
+        let stamp = previous - 3 * MS;
+        let mut signals = 0;
+        for _ in 0..64 {
+            let mut p = tcp_v4(40_000, 0, 1400);
+            signals +=
+                usize::from(judge_with(&mut codel, &mut p, stamp, resumed, &cfg) == Verdict::Drop);
+        }
+        assert_eq!(signals, 1);
+        assert!(codel.deadline_ns > resumed);
+    }
+
+    /// Silence expires congestion evidence when an old stamp shows that the backlog did not drain.
+    #[test]
+    fn stale_evidence_during_a_stall_does_not_reset_credit() {
+        let cfg = ecn_1_10();
+        let mut codel = Codel::default();
+        let (_, previous) = drive_bulk(&mut codel, &cfg, 1, 2, 10 * MS, 200);
+        let last = codel.last_above.mono_ns;
+        codel.owed = MAX_OWED_SIGNALS;
+        codel.sparse.credit = 0;
+        codel.sparse.last_ns = last;
+        let resumed = last + cfg.interval_ns + 1;
+        let mut small = tcp_v4(40_000, 2, 256);
+        assert_eq!(
+            judge_with(&mut codel, &mut small, previous - 3 * MS, resumed, &cfg),
+            Verdict::Pass
+        );
+        assert_eq!(codel.deadline_ns, resumed + cfg.interval_ns);
+        assert_eq!(codel.owed, 0);
+        assert_eq!(
+            codel.sparse.credit,
+            (cfg.interval_ns + 1) * SPARSE_BYTES - 256 * SPARSE_INTERVAL_NS
+        );
+    }
+
+    /// A fresh realtime epoch cannot replenish or freeze a peer's credit.
+    #[test]
+    fn fresh_clock_steps_leave_monotonic_refill_unchanged() {
+        let cfg = ecn_1_10();
+        let epoch = 1_800_000_000_000_000_000;
+        for shift_ms in [-3_600_000_i64, 0, 3_600_000] {
+            let mut codel = Codel::default();
+            let mut packet = tcp_v4(40_000, 2, 256);
+            let initial = DequeueTime {
+                wall_ns: epoch,
+                mono_ns: 10 * MS,
+            };
+            judge_with_time(&mut codel, &mut packet, epoch - 6 * MS, initial, &cfg);
+            codel.sparse.credit = 0;
+            let at = DequeueTime {
+                wall_ns: (epoch + 5 * MS)
+                    .checked_add_signed(shift_ms * MS as i64)
+                    .unwrap(),
+                mono_ns: initial.mono_ns + 5 * MS,
+            };
+            assert_eq!(
+                judge_with_time(&mut codel, &mut packet, at.wall_ns - 6 * MS, at, &cfg),
+                Verdict::Pass
+            );
+            assert_eq!(
+                codel.sparse.credit,
+                5 * MS * SPARSE_BYTES - 256 * SPARSE_INTERVAL_NS
+            );
+        }
+    }
+
+    /// Invalid old stamps fail open in both wall-step directions, then a new sample rearms AQM.
+    #[test]
+    fn stale_stamps_from_both_wall_clock_steps_end_the_episode() {
+        let cfg = ecn_1_10();
+        for shift_ms in [-3_600_000_i64, 3_600_000] {
+            let mut codel = Codel::default();
+            let (_, previous) = drive_bulk(&mut codel, &cfg, 1, 2, 1_800_000_000_000_000_000, 200);
+            let at = DequeueTime {
+                wall_ns: previous.checked_add_signed(shift_ms * MS as i64).unwrap(),
+                mono_ns: previous,
+            };
+            codel.owed = MAX_OWED_SIGNALS;
+            codel.sparse.credit = 0;
+            let mut p = tcp_v4(40_000, 2, 1400);
+            assert_eq!(
+                judge_with_time(&mut codel, &mut p, previous - 3 * MS, at, &cfg),
+                Verdict::Pass
+            );
+            assert_eq!(codel.deadline_ns, 0);
+            assert_eq!(codel.owed, 0);
+            assert_eq!(codel.sparse.credit, SPARSE_BURST_BYTES * SPARSE_INTERVAL_NS);
+            assert_eq!(
+                judge_with_time(&mut codel, &mut p, at.wall_ns - 3 * MS, at, &cfg),
+                Verdict::Pass
+            );
+            assert_eq!(codel.deadline_ns, at.mono_ns + cfg.interval_ns);
+        }
     }
 }

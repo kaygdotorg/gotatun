@@ -1666,8 +1666,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         let diagnostic = crate::diag::PIPELINE.on() || crate::diag::SEND_QUEUE.on();
         let completion_count = completions.len();
         let aqm_on = crate::aqm::enabled();
-        // One clock read per delivered run: every packet in it reaches the TUN together.
-        let aqm_now = if aqm_on { crate::aqm::realtime_ns() } else { 0 };
+        let mut aqm_now = None;
         if diagnostic {
             eprintln!(
                 "pipeline stage=incoming_delivery_callback_start completions={completion_count}"
@@ -1751,7 +1750,8 @@ impl<T: DeviceTransports> DeviceState<T> {
                     zerocopy::IntoBytes::as_mut_bytes(&mut *packet),
                     authenticated_len,
                     rx_ns,
-                    aqm_now,
+                    // After the peer lock and IP authorization, so age includes lock wait.
+                    *aqm_now.get_or_insert_with(crate::aqm::DequeueTime::now),
                 ) {
                     crate::aqm::Verdict::Drop => continue,
                     crate::aqm::Verdict::Pass | crate::aqm::Verdict::Marked => {}

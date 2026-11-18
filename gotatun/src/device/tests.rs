@@ -38,6 +38,8 @@ use crate::noise::index_table::IndexTable;
 use crate::packet::{Ip, Packet, PacketBufPool};
 use crate::tun::{IpRecv, IpSend, MtuWatcher};
 
+#[cfg(target_os = "linux")]
+mod aqm;
 pub mod mock;
 
 /// A TUN test double that drains each immediately ready run in packet order.
