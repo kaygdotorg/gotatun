@@ -1687,6 +1687,9 @@ impl<T: DeviceTransports> DeviceState<T> {
                 continue;
             };
             tunnel_result_count += 1;
+            // Bill the authenticated plaintext before padding removal or IP length trimming.
+            // Otherwise a large encrypted frame could claim a small packet's exemption.
+            let authenticated_len = packet.len();
 
             #[cfg(feature = "daita")]
             if let Some(daita) = peer.daita.as_mut() {
@@ -1731,6 +1734,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                 match crate::aqm::judge(
                     &mut peer.aqm,
                     zerocopy::IntoBytes::as_mut_bytes(&mut *packet),
+                    authenticated_len,
                     rx_ns,
                     aqm_now,
                 ) {

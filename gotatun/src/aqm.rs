@@ -20,7 +20,8 @@
 //! dropping only packets that are not ECN-capable.
 //!
 //! Small packets share one per-peer byte allowance, independent of flow keys: at most 256 bytes
-//! per packet, 32 KiB per 10 ms, and a 64 KiB burst. Larger packets remain subject to CoDel.
+//! per authenticated plaintext frame (including padding), 32 KiB per 10 ms, and a 64 KiB
+//! burst. Larger frames remain subject to CoDel; header changes use only the validated IP packet.
 //! See [`SparseBudget`] for measurement rationale, overload and recovery behavior.
 //!
 //! # Defaults and how to turn it off
@@ -250,7 +251,7 @@ pub(crate) struct Codel {
 
 /// Maximum pending signals transferred to subsequent non-exempt packets.
 const MAX_OWED_SIGNALS: u8 = 4;
-/// Largest exempt inner packet, above measured 216-byte interactive SSH packets.
+/// Largest exempt authenticated frame, above measured 216-byte SSH packets plus normal padding.
 const SPARSE_MAX_PACKET_BYTES: usize = 256;
 /// Small-packet allowance per refill interval, covering measured ACK and interactive bursts.
 const SPARSE_BYTES: u64 = 32 * 1024;
@@ -265,6 +266,8 @@ const MAX_SOJOURN_NS: u64 = 1_000_000_000;
 /// One peer's aggregate small-packet token bucket, without flow classification or allocation.
 ///
 /// Measurements on #260 chose a 256-byte ceiling, 32 KiB per 10 ms, and a 64 KiB burst.
+/// Lengths include authenticated padding before IP decoding truncates the frame. A peer cannot
+/// hide a large decrypt/queue workload behind a small inner IP total-length field.
 /// All above-target eligible bytes spend credit, including packets with no signal due. Large
 /// packets never receive or consume the allowance, so line-rate bulk cannot starve keystrokes,
 /// ACKs or probes. Small-packet floods exhaust it and become subject to the same controller.
@@ -377,20 +380,43 @@ impl Codel {
 }
 
 /// Judge one in-order packet about to be written to the TUN, and apply the verdict's header
-/// change. `rx_ns` is the kernel receive timestamp of its datagram (0 if none); `now_ns` comes
+/// change. `authenticated_len` includes padding before IP validation trims the plaintext.
+/// The size ceiling and credit use that length; only `packet` is ever changed.
+/// `rx_ns` is the kernel receive timestamp of its datagram (0 if none); `now_ns` comes
 /// from [`realtime_ns`] once per delivered run.
-pub(crate) fn judge(codel: &mut Codel, packet: &mut [u8], rx_ns: u64, now_ns: u64) -> Verdict {
+pub(crate) fn judge(
+    codel: &mut Codel,
+    packet: &mut [u8],
+    authenticated_len: usize,
+    rx_ns: u64,
+    now_ns: u64,
+) -> Verdict {
     let config = config();
     if !config.active() {
         return Verdict::Pass;
     }
-    judge_with(codel, packet, rx_ns, now_ns, config)
+    judge_frame_with(codel, packet, authenticated_len, rx_ns, now_ns, config)
 }
 
-/// [`judge`] with an explicit configuration, assumed active; tests drive the controller here.
+/// Test seam for ordinary frames with their normal sixteen-byte padding alignment.
+#[cfg(test)]
 fn judge_with(
     codel: &mut Codel,
     packet: &mut [u8],
+    rx_ns: u64,
+    now_ns: u64,
+    config: &AqmConfig,
+) -> Verdict {
+    let authenticated_len = packet.len().next_multiple_of(16);
+    judge_frame_with(codel, packet, authenticated_len, rx_ns, now_ns, config)
+}
+
+/// Judge validated IP bytes with the pre-trim authenticated plaintext length, assumed active.
+/// Clamp an undersized caller value to the inner length so it cannot undercharge the packet.
+fn judge_frame_with(
+    codel: &mut Codel,
+    packet: &mut [u8],
+    authenticated_len: usize,
     rx_ns: u64,
     now_ns: u64,
     config: &AqmConfig,
@@ -428,7 +454,8 @@ fn judge_with(
         codel.sparse = SparseBudget::default();
         return Verdict::Pass;
     }
-    let exempt = codel.sparse.exempt(packet.len(), now_ns);
+    let charged_len = authenticated_len.max(packet.len());
+    let exempt = codel.sparse.exempt(charged_len, now_ns);
     if due {
         codel.owed = codel.owed.saturating_add(1).min(MAX_OWED_SIGNALS);
     }
@@ -1156,7 +1183,7 @@ mod tests {
                 let mut packet = tcp_v4(22, 2, 1400);
                 let original = packet.clone();
                 assert_eq!(
-                    judge(&mut codel, &mut packet, now - 3 * MS, now),
+                    judge(&mut codel, &mut packet, 1400, now - 3 * MS, now),
                     Verdict::Pass
                 );
                 assert_eq!(packet, original);
@@ -1222,5 +1249,82 @@ mod tests {
             "J870 mixed sparse_packets={sparse_packets} sparse_signals=0 bulk_marks={bulk_marks}"
         );
         assert!(bulk_marks > 0);
+    }
+
+    /// Real IP decoding trims padding, but both eligibility and credit bill the whole frame.
+    #[test]
+    fn authenticated_padding_cannot_hide_a_large_frame() {
+        let config = ecn_1_10();
+        let mut codel = Codel::default();
+        let start = 10 * MS;
+        codel.should_signal(start, 3 * MS, &config);
+        let now = start + config.interval_ns;
+        let mut bytes = icmp_probe();
+        bytes[2..4].copy_from_slice(&84_u16.to_be_bytes());
+        bytes.resize(1400, 0);
+        let authenticated_len = bytes.len();
+        let mut packet: crate::packet::Packet<crate::packet::Ip> =
+            crate::packet::Packet::from_bytes(bytes::BytesMut::from(bytes.as_slice()))
+                .try_into_ipvx()
+                .unwrap()
+                .either(|ip| ip.into(), |ip| ip.into());
+        assert_eq!(
+            zerocopy::IntoBytes::as_bytes(&*packet).len(),
+            84,
+            "IP decoding really removed the padding"
+        );
+        let credit = codel.sparse.credit;
+        assert_eq!(
+            judge_frame_with(
+                &mut codel,
+                zerocopy::IntoBytes::as_mut_bytes(&mut *packet),
+                authenticated_len,
+                now - 3 * MS,
+                now,
+                &config
+            ),
+            Verdict::Drop,
+            "84 inner bytes padded to 1400 bytes are a large frame, never exempt"
+        );
+        assert_eq!(
+            codel.sparse.credit, credit,
+            "large frames do not consume small-frame credit"
+        );
+        assert_eq!(
+            zerocopy::IntoBytes::as_bytes(&*packet).len(),
+            84,
+            "only validated inner bytes reach the TUN"
+        );
+
+        let mut ssh = tcp_v4(22, 0, 216);
+        ssh.resize(224, 0);
+        let authenticated_len = ssh.len();
+        let mut packet: crate::packet::Packet<crate::packet::Ip> =
+            crate::packet::Packet::from_bytes(bytes::BytesMut::from(ssh.as_slice()))
+                .try_into_ipvx()
+                .unwrap()
+                .either(|ip| ip.into(), |ip| ip.into());
+        assert_eq!(zerocopy::IntoBytes::as_bytes(&*packet).len(), 216);
+        codel.signal_next_ns = now;
+        assert_eq!(
+            judge_frame_with(
+                &mut codel,
+                zerocopy::IntoBytes::as_mut_bytes(&mut *packet),
+                authenticated_len,
+                now - 3 * MS,
+                now,
+                &config
+            ),
+            Verdict::Pass,
+            "a measured SSH packet plus its eight normal padding bytes stays exempt"
+        );
+        assert_eq!(
+            codel.sparse.credit,
+            credit - 224 * SPARSE_INTERVAL_NS,
+            "the full padded length is charged, rather than 216 inner bytes"
+        );
+        eprintln!(
+            "J870 padding: inner84/plaintext1400=Drop; inner216/plaintext224=Pass, charged224"
+        );
     }
 }
