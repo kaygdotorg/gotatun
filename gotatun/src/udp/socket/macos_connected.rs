@@ -16,7 +16,7 @@
 //! about 3% on the same socket, so no private API is used here.
 //!
 //! **How.** The WireGuard socket binds the wildcard address on its port as before. Right after
-//! that bind, [`bind_pool`] binds [`POOL_SIZE`] more sockets to the same address and port; this
+//! that pair binds, [`bind_pool_counted`] binds [`POOL_SIZE`] sockets per family to the same address and port; this
 //! is the only time any socket of ours binds the port. From then on, an endpoint that receives
 //! data gets one pool socket through `connect`, and later datagrams to it use `send` on that
 //! socket. A new endpoint, an evicted one, and a fresh source after a network change are all a
@@ -33,7 +33,7 @@
 //! another user can join it. J763 opened such a moment for every new endpoint; J789 showed
 //! another uid wins it in milliseconds and then receives every datagram no connected socket
 //! matches. This module therefore opens the option exactly once per WireGuard socket, inside
-//! [`bind_pool`], and makes that one moment fail closed:
+//! [`bind_pool_counted`], and makes that one moment fail closed:
 //! 1. The wildcard socket binds first **without** the option, so it binds only if nobody holds
 //!    the port (the behaviour without this feature).
 //! 2. The option is set on it, the pool sockets bind, and the option is cleared on every socket.
@@ -46,7 +46,7 @@
 //!    window, nothing proves the port is ours alone, and the socket is refused too.
 //!
 //! The list is also read once *before* step 2 (J826). It must show the wildcard socket alone. If
-//! it cannot be read, or does not show our own socket (the records are private kernel ABI and
+//! it cannot be read, or shows fewer than our already-bound sockets (the records are private kernel ABI and
 //! an OS update may change them), the window is never opened and the socket carries on with
 //! `sendto`: no pool, no audit needed, and no second bind of the port. If it shows someone
 //! else already, the socket is refused before the window.
@@ -149,7 +149,7 @@ pub(crate) fn wanted() -> bool {
     })
 }
 
-/// Why [`bind_pool`] produced no pool.
+/// Why [`bind_pool_counted`] produced no pool.
 #[derive(Debug)]
 pub(crate) enum PoolError {
     /// No pool, and the port holds only the wildcard socket: either the window never opened
@@ -174,10 +174,20 @@ pub(crate) fn pool_for(
     local: SocketAddr,
     existing: usize,
 ) -> io::Result<Vec<socket2::Socket>> {
-    decide(bind_pool_counted(wildcard, local, POOL_SIZE, existing, |_| {}, super::macos_port_audit::port_users), local.port())
+    decide(
+        bind_pool_counted(
+            wildcard,
+            local,
+            POOL_SIZE,
+            existing,
+            |_| {},
+            super::macos_port_audit::port_users,
+        ),
+        local.port(),
+    )
 }
 
-/// What [`pool_for`] does with each outcome of [`bind_pool`].
+/// What [`pool_for`] does with each outcome of [`bind_pool_counted`].
 fn decide(
     result: Result<Vec<socket2::Socket>, PoolError>,
     port: u16,
@@ -234,7 +244,7 @@ pub(crate) fn bind_pool(
     )
 }
 
-/// [`bind_pool`], with `in_window` called while the option is open (tests use it to join the
+/// [`bind_pool_counted`], with `in_window` called while the option is open (tests use it to join the
 /// port the way another process could) and `read_users` reading who is on a port (the kernel's
 /// list in the product; tests substitute failures and odd lists).
 #[cfg(test)]
@@ -339,7 +349,7 @@ fn pool_socket_like(wildcard: &socket2::Socket, local: SocketAddr) -> io::Result
     Ok(socket)
 }
 
-/// The address family a pool socket serves once it has connected (see the module docs).
+/// The address family fixed by a pool socket's bind (see the module docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Family {
     V4,
@@ -356,7 +366,6 @@ impl Family {
             SocketAddr::V6(_) => Family::V6,
         }
     }
-
 }
 
 /// One pool socket.
@@ -413,13 +422,22 @@ enum Sent {
 }
 
 impl ConnectedSends {
-    /// Connected sends through `pool`, sockets from [`bind_pool`]. Must run inside the tokio
+    /// Connected sends through `pool`, sockets from [`bind_pool_counted`]. Must run inside the tokio
     /// runtime (the sockets register with its reactor).
     pub(crate) fn new(pool: Vec<socket2::Socket>) -> io::Result<Self> {
-        let table = pool.iter().map(|socket| {
-            let local = socket.local_addr()?.as_socket().ok_or_else(|| io::Error::other("UDP pool socket has no IP address"))?;
-            Ok(Assignment { family: Some(Family::of(local)), ..Assignment::default() })
-        }).collect::<io::Result<Vec<_>>>()?;
+        let table = pool
+            .iter()
+            .map(|socket| {
+                let local = socket
+                    .local_addr()?
+                    .as_socket()
+                    .ok_or_else(|| io::Error::other("UDP pool socket has no IP address"))?;
+                Ok(Assignment {
+                    family: Some(Family::of(local)),
+                    ..Assignment::default()
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
         let slots = pool
             .into_iter()
             .map(|socket| {
@@ -668,9 +686,8 @@ impl ConnectedSends {
     }
 }
 
-/// The pool socket a new endpoint of `family` gets: a free one that already has the family,
-/// else a never-used one (kept for last so both families find one), else the least recently
-/// used one of the family that has been idle for [`ACTIVE_SENDS`] data sends. `None` when every
+/// The pool socket a new endpoint of `family` gets: a free one of its bound family, else
+/// the least recently used one of that family that has been idle for [`ACTIVE_SENDS`] data sends. `None` when every
 /// candidate is busy.
 fn pick(table: &[Assignment], family: Family, now: u64) -> Option<usize> {
     let free = |wanted: Option<Family>| {
@@ -909,7 +926,11 @@ mod tests {
         let slots = &wireguard.inner.connected.slots;
         assert_eq!(slots.len(), 2 * super::POOL_SIZE);
         let mut v4_count = 0;
-        for socket in wireguard.bound_sockets().into_iter().chain(slots.iter().map(|slot| &slot.socket)) {
+        for socket in wireguard
+            .bound_sockets()
+            .into_iter()
+            .chain(slots.iter().map(|slot| &slot.socket))
+        {
             let reference = socket2::SockRef::from(socket);
             assert!(!reference.reuse_port().expect("SO_REUSEPORT"));
             if socket.local_addr().expect("local").is_ipv6() {
@@ -920,11 +941,23 @@ mod tests {
         }
         assert_eq!(v4_count, super::POOL_SIZE + 1);
         let (peer, address) = peer().await;
-        let SocketAddr::V4(ipv4) = address else { panic!("IPv4 peer") };
-        send(&wireguard, &data(64), (ipv4.ip().to_ipv6_mapped(), ipv4.port()).into()).await;
+        let SocketAddr::V4(ipv4) = address else {
+            panic!("IPv4 peer")
+        };
+        send(
+            &wireguard,
+            &data(64),
+            (ipv4.ip().to_ipv6_mapped(), ipv4.port()).into(),
+        )
+        .await;
         peer_recv(&peer).await;
         let table = wireguard.inner.connected.table.lock();
-        assert!(table.iter().any(|assignment| assignment.destination == Some(address) && assignment.family == Some(super::Family::V4)));
+        assert!(
+            table
+                .iter()
+                .any(|assignment| assignment.destination == Some(address)
+                    && assignment.family == Some(super::Family::V4))
+        );
     }
 
     /// A network change marks every pool socket stale; the next data re-connects and arrives.
@@ -1324,8 +1357,7 @@ mod tests {
         }
     }
 
-    /// `destination` in the form the dual-stack WireGuard socket sends to (and the pool's table
-    /// records): an IPv4 address mapped into IPv6.
+    /// `destination` in the form the split listener records: IPv4 stays IPv4.
     fn mapped(destination: SocketAddr) -> SocketAddr {
         destination
     }
@@ -1715,11 +1747,7 @@ mod tests {
             family: Some(family),
             ..Assignment::default()
         };
-        let table = [
-            used(Family::V4, 0),
-            freed(Family::V4),
-            freed(Family::V6),
-        ];
+        let table = [used(Family::V4, 0), freed(Family::V4), freed(Family::V6)];
         assert_eq!(
             pick(&table, Family::V6, 1),
             Some(2),
@@ -1773,10 +1801,17 @@ mod tests {
             Arc,
             atomic::{AtomicBool, AtomicU64, Ordering},
         };
-        let wildcard = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).expect("IPv4 socket");
+        let wildcard = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)
+            .expect("IPv4 socket");
         wildcard.set_nonblocking(true).expect("nonblocking");
-        wildcard.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)).into()).expect("bind");
-        let local = wildcard.local_addr().expect("local").as_socket().expect("IP socket");
+        wildcard
+            .bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)).into())
+            .expect("bind");
+        let local = wildcard
+            .local_addr()
+            .expect("local")
+            .as_socket()
+            .expect("IP socket");
         let pool = super::bind_pool(&wildcard, local, 1).expect("pool");
         let sends = Arc::new(super::ConnectedSends::new(pool).expect("pool sockets"));
         let wildcard =
@@ -1942,7 +1977,11 @@ mod tests {
         let mode = std::env::var("J815_MODE").unwrap_or_else(|_| "steady".into());
         // `J815_CONNECTED=0` runs the same load with connected sends off (the control).
         let connected = std::env::var("J815_CONNECTED").map_or(true, |value| value != "0");
-        let ours = if connected { 2 * (super::POOL_SIZE + 1) } else { 2 };
+        let ours = if connected {
+            2 * (super::POOL_SIZE + 1)
+        } else {
+            2
+        };
         let opts = SockOpt {
             only_v6: Some(false),
             mac_connected: Some(connected),

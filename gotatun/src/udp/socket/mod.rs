@@ -172,16 +172,12 @@ impl UdpSocket {
     /// and receives through both and looks like one socket to its users. See
     /// [`UdpSocket::bind_split`] for why.
     pub fn bind(addr: SocketAddr, opts: SockOpt) -> io::Result<Self> {
-        // Connected per-endpoint sockets share this port, which needs SO_REUSEPORT on every
-        // socket that binds it (#260, J744). It is set only while one of ours binds and cleared
-        // again at once, because macOS lets a process of any user join a port that carries it
-        // (J763; see `macos_connected`).
+        // The default Mac listener always owns an exclusive family pair. Opt-in pools
+        // share it only during startup, with before/after audits; endpoints never bind.
         #[cfg(target_os = "macos")]
         let connected = opts.mac_connected.unwrap_or_else(macos_connected::wanted);
         #[cfg(target_os = "macos")]
-        if addr.ip() == IpAddr::from(Ipv6Addr::UNSPECIFIED)
-            && opts.only_v6 == Some(false)
-        {
+        if addr.ip() == IpAddr::from(Ipv6Addr::UNSPECIFIED) && opts.only_v6 == Some(false) {
             return Self::bind_split(addr.port(), opts);
         }
 
@@ -191,7 +187,10 @@ impl UdpSocket {
 
         #[cfg(target_os = "macos")]
         let pool = if connected && !(addr.is_ipv6() && opts.only_v6 != Some(true)) {
-            let local = udp_sock.local_addr()?.as_socket().ok_or_else(|| io::Error::other("UDP socket has no IP address"))?;
+            let local = udp_sock
+                .local_addr()?
+                .as_socket()
+                .ok_or_else(|| io::Error::other("UDP socket has no IP address"))?;
             macos_connected::pool_for(&udp_sock, local, 1)?
         } else {
             macos_port_audit::ensure_alone(&udp_sock)?;
@@ -227,7 +226,7 @@ impl UdpSocket {
     /// port, a refusal of either bind is returned as is, so a caller's `EADDRINUSE` fallback
     /// still works.
     ///
-    /// **No audit of the socket list (J834).** Each of our two binds is an exclusive wildcard
+    /// **S-off needs no audit of the socket list (J834).** Each of our two binds is an exclusive wildcard
     /// bind (no `SO_REUSEPORT`). For such a bind the kernel looks up every socket of that family
     /// on the port and refuses ours if there is one. The PF_INET6 exemption cannot help a
     /// squatter, because our IPv4 side is PF_INET. On the Mac VM (macOS 26.5.2) the kernel by
@@ -237,6 +236,12 @@ impl UdpSocket {
     /// mesh. The same holds for the moment between the two binds, when the port is held on IPv6
     /// only: whatever another user binds on the IPv4 side then is on the port before our AF_INET
     /// bind, which the kernel refuses.
+    ///
+    /// Opt-in connected sends add a fixed startup pool for each family (J877). Each startup
+    /// sharing window is audited before and after, counting both wildcards and completed pool
+    /// sockets. Nothing binds or enables sharing again while the device runs. An unreadable
+    /// pre-audit keeps the exclusive sockets with sendto; an unverified post-audit refuses the
+    /// whole listener, carrying forward J826's no-unaudited-rebind rule.
     #[cfg(target_os = "macos")]
     fn bind_split(port: u16, opts: SockOpt) -> io::Result<Self> {
         let v6_opts = SockOpt {
@@ -264,7 +269,13 @@ impl UdpSocket {
             if opts.mac_connected.unwrap_or_else(macos_connected::wanted) {
                 // Both exclusive wildcards exist before either startup window. Each audit
                 // includes the other family's sockets, and failure drops the entire pair.
-                pool = macos_connected::pool_for(&v6, v6.local_addr()?.as_socket().ok_or_else(|| io::Error::other("IPv6 socket has no IP address"))?, 2)?;
+                pool = macos_connected::pool_for(
+                    &v6,
+                    v6.local_addr()?
+                        .as_socket()
+                        .ok_or_else(|| io::Error::other("IPv6 socket has no IP address"))?,
+                    2,
+                )?;
                 let v4_pool = macos_connected::pool_for(&v4, v4_addr, 2 + pool.len())?;
                 pool.extend(v4_pool);
             }
@@ -429,15 +440,19 @@ impl UdpSocket {
         self.v4_first = !self.v4_first;
         for ipv4 in [v4_first, !v4_first] {
             if !ipv4 {
-                if let std::task::Poll::Ready(result) = self.inner.connected.poll_recv(
-                    &self.inner.socket, &mut self.recv_view, cx, buf,
-                ) {
+                if let std::task::Poll::Ready(result) =
+                    self.inner
+                        .connected
+                        .poll_recv(&self.inner.socket, &mut self.recv_view, cx, buf)
+                {
                     return Some(std::task::Poll::Ready(result));
                 }
             } else {
                 let mut read = tokio::io::ReadBuf::new(&mut *buf);
                 if let std::task::Poll::Ready(result) = v4.poll_recv_from(cx, &mut read) {
-                    return Some(std::task::Poll::Ready(result.map(|source| (read.filled().len(), source))));
+                    return Some(std::task::Poll::Ready(
+                        result.map(|source| (read.filled().len(), source)),
+                    ));
                 }
             }
         }
