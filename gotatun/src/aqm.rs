@@ -19,6 +19,10 @@
 //! `interval`: by default (RFC 3168) by setting CE on an ECN-capable inner packet, and by
 //! dropping only packets that are not ECN-capable.
 //!
+//! Small packets share one per-peer byte allowance, independent of flow keys: at most 256 bytes
+//! per packet, 32 KiB per 10 ms, and a 64 KiB burst. Larger packets remain subject to CoDel.
+//! See [`SparseBudget`] for measurement rationale, overload and recovery behavior.
+//!
 //! # Defaults and how to turn it off
 //! On by default where the kernel gives us receive stamps (Linux), in ECN mode, with a 1 ms
 //! target and a 10 ms interval. J711 measured those on backup01: RFC 8289's 5 ms / 100 ms barely
@@ -238,196 +242,76 @@ pub(crate) struct Codel {
     last_count: u32,
     /// Whether the controller is in its signalling state.
     signalling: bool,
-    /// Signals CoDel made due that landed on a sparse flow's packet and are still owed to the
-    /// next packet of a queue-heavy flow (at most [`MAX_OWED_SIGNALS`]).
+    /// Due signals deferred by the small-packet budget, capped to avoid an unbounded burst.
     owed: u8,
-    /// Recent bytes per flow while the queue stands above target, to tell queue-heavy flows from
-    /// sparse ones (see [`FlowShares`]).
-    flows: FlowShares,
+    /// Aggregate byte credit; packet addresses and flow keys never affect eligibility.
+    sparse: SparseBudget,
 }
 
-/// How many skipped signals may wait for a queue-heavy packet. A few cover the rare case of
-/// sparse packets landing on several due signals in a row; more would turn into a burst of
-/// signals on one bulk packet run, which CoDel's spacing exists to avoid.
+/// Maximum pending signals transferred to subsequent non-exempt packets.
 const MAX_OWED_SIGNALS: u8 = 4;
-
-/// How many flows [`FlowShares`] tracks per peer. Eight bulk flows and their probes fit with
-/// room to spare; with more concurrent flows the smallest entry is replaced, so a heavy flow
-/// can at worst be exempt for a moment after it re-enters.
-const TRACKED_FLOWS: usize = 16;
-
-/// A flow needs at least this many recent bytes (decayed, see [`FlowShares`]) to count as
-/// queue-heavy. It sits far above what latency probes, keystrokes and DNS put on a link in one
-/// interval (a 145 probes/s ping is ~2 KiB/s), and far below one bulk flow (5 Gbit/s is
-/// ~6 MiB per 10 ms interval).
-const HEAVY_FLOOR_BYTES: u32 = 16 * 1024;
-
-/// Receive ages over one second are not trustworthy enough to signal. Linux SO_TIMESTAMPNS
-/// supplies realtime stamps, without a monotonic selection for this socket option. Rejecting
-/// implausible ages avoids inventing congestion after large forward clock steps or a foreign
-/// epoch. Real queues over this ceiling also pass; sub-second steps cannot be distinguished
-/// from genuine queue age with these stamps. No clock-source dependency is added.
+/// Largest exempt inner packet, above measured 216-byte interactive SSH packets.
+const SPARSE_MAX_PACKET_BYTES: usize = 256;
+/// Small-packet allowance per refill interval, covering measured ACK and interactive bursts.
+const SPARSE_BYTES: u64 = 32 * 1024;
+/// Fixed 10 ms refill period, independent of a diagnostic CoDel interval override.
+const SPARSE_INTERVAL_NS: u64 = 10_000_000;
+/// Maximum accumulated allowance; two refill windows prevent interval-edge burst penalties.
+const SPARSE_BURST_BYTES: u64 = 64 * 1024;
+/// Receive ages beyond one second or in the future are invalid and never signal.
+/// Realtime receive stamps cannot distinguish smaller clock steps from genuine queue age.
 const MAX_SOJOURN_NS: u64 = 1_000_000_000;
 
-/// Per-peer byte counts of the flows that crossed the queue recently, the sparse-flow
-/// exemption's memory (orchestrator decision on #260, J747).
+/// One peer's aggregate small-packet token bucket, without flow classification or allocation.
 ///
-/// Why: a sender that never backs off (BBRv1 ignores CE and loss) keeps CoDel signalling for
-/// the whole load, and a signal lands on whichever packet reaches the TUN when it is due. With
-/// one queue per peer that is sometimes a Not-ECT latency probe, a keystroke or a DNS reply,
-/// which ECN mode then has to drop although that flow put almost nothing in the queue (J711:
-/// 10–19 of 8,000 probes). This table lets a due signal skip such packets and go to the next
-/// packet of a flow that actually fills the queue, without per-flow queues.
+/// Measurements on #260 chose a 256-byte ceiling, 32 KiB per 10 ms, and a 64 KiB burst.
+/// All above-target eligible bytes spend credit, including packets with no signal due. Large
+/// packets never receive or consume the allowance, so line-rate bulk cannot starve keystrokes,
+/// ACKs or probes. Small-packet floods exhaust it and become subject to the same controller.
+/// A signal does not replenish credit. Drain and invalid timestamps reset it. At zero credit,
+/// 20 ms without eligible traffic restores the whole burst; there is no inherited byte debt.
 ///
-/// How: flows are keyed by a 64-bit hash of the inner 5-tuple (addresses, protocol, ports when
-/// the packet carries them), so two flows practically never share an entry. Bytes are only
-/// counted while the sojourn stands above target, so an idle or uncongested peer pays nothing,
-/// and they are halved once per CoDel interval, so the counts follow the last few intervals.
-/// A flow is heavy when its count is at least [`HEAVY_FLOOR_BYTES`] and at least half the
-/// average of the tracked flows. Eight equal bulk flows are all heavy; a probe next to them
-/// never is.
-#[derive(Debug, Default)]
-pub(crate) struct FlowShares {
-    /// Flow hash of each entry; 0 marks a free entry (a real hash of 0 is folded to 1).
-    keys: [u64; TRACKED_FLOWS],
-    /// Decayed recent bytes of each entry.
-    bytes: [u32; TRACKED_FLOWS],
-    /// When the counts are next halved, in the same clock as the packet times.
-    next_decay_ns: u64,
-    /// The entry the previous packet used. Packets of one flow arrive in runs (one GRO batch,
-    /// one TSO segment), so this usually skips the scan.
-    last: usize,
+/// Below-envelope traffic passes even if every packet changes keys: with equal sizes, times
+/// and queue samples, keys cannot affect the verdict. Such sparse aggregate traffic is within
+/// the allowance, rather than a churn escape. No finite allowance can protect unlimited small
+/// traffic, so simultaneous sparse streams must share the stated envelope.
+#[derive(Debug)]
+struct SparseBudget {
+    /// Byte-nanoseconds of credit, so frequent sub-byte refills cannot lose fractional bytes.
+    credit: u64,
+    /// Most recent refill time; moving the clock backwards cannot mint duplicate credit.
+    last_ns: u64,
 }
 
-impl FlowShares {
-    /// Halve the counts once per elapsed interval since the last decay.
-    fn decay(&mut self, now_ns: u64, interval_ns: u64) {
-        if now_ns < self.next_decay_ns {
-            return;
+impl Default for SparseBudget {
+    /// Begin with one bounded burst, also used after a queue drain or invalid timestamp.
+    fn default() -> Self {
+        Self {
+            credit: SPARSE_BURST_BYTES * SPARSE_INTERVAL_NS,
+            last_ns: 0,
         }
-        let elapsed = (now_ns - self.next_decay_ns) / interval_ns.max(1) + 1;
-        let shift = u32::try_from(elapsed.min(32)).unwrap_or(32);
-        for (key, bytes) in self.keys.iter_mut().zip(self.bytes.iter_mut()) {
-            *bytes = bytes.checked_shr(shift).unwrap_or(0);
-            if *bytes == 0 {
-                *key = 0;
-            }
-        }
-        self.next_decay_ns = now_ns.saturating_add(interval_ns);
     }
+}
 
-    /// Count `len` bytes for flow `key` and return its entry. A new flow takes a free entry or
-    /// replaces the one with the fewest bytes, starting from its own bytes only (never the
-    /// evicted count), so a sparse newcomer can't inherit a heavy flow's share.
-    fn account(&mut self, key: u64, len: usize, now_ns: u64, interval_ns: u64) -> usize {
-        self.decay(now_ns, interval_ns);
-        let len = u32::try_from(len).unwrap_or(u32::MAX);
-        let hit = (self.keys[self.last] == key)
-            .then_some(self.last)
-            .or_else(|| self.keys.iter().position(|&entry| entry == key));
-        let index = match hit {
-            Some(index) => index,
-            None => {
-                let index = self
-                    .bytes
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|&(_, &bytes)| bytes)
-                    .map_or(0, |(index, _)| index);
-                self.keys[index] = key;
-                self.bytes[index] = 0;
-                index
-            }
-        };
-        self.bytes[index] = self.bytes[index].saturating_add(len);
-        self.last = index;
-        index
-    }
-
-    /// Whether the flow in entry `index` is queue-heavy (see the type docs). Only called when a
-    /// signal is due, so the scan over the table costs nothing on ordinary packets.
-    fn is_heavy(&self, index: usize) -> bool {
-        let bytes = u64::from(self.bytes[index]);
-        if bytes < u64::from(HEAVY_FLOOR_BYTES) {
+impl SparseBudget {
+    /// Spend the whole eligible packet from the shared bucket, whether or not a signal is due.
+    /// Saturating multiplication and the burst cap bound arbitrary gaps and clock values.
+    fn exempt(&mut self, len: usize, now_ns: u64) -> bool {
+        if len > SPARSE_MAX_PACKET_BYTES {
             return false;
         }
-        let (total, active) = self
-            .bytes
-            .iter()
-            .filter(|&&count| count > 0)
-            .fold((0_u64, 0_u64), |(total, active), &count| {
-                (total + u64::from(count), active + 1)
-            });
-        // bytes ≥ (total / active) / 2, without division.
-        bytes * 2 * active >= total
-    }
-}
-
-/// A 64-bit hash of the packet's inner flow: addresses, protocol and, for TCP, UDP, UDP-Lite,
-/// SCTP and DCCP packets that are not later IPv4 fragments, the two ports. Never 0 (0 marks a
-/// free [`FlowShares`] entry). Anything that is not an IP packet hashes as one "other" flow.
-///
-/// IPv6 extension headers are not walked: a packet behind one hashes by addresses and its
-/// first next-header value, which still separates it from a bulk TCP flow between the same
-/// hosts. The hash only needs to tell flows apart within one peer, not resist an attacker: a
-/// peer that forges flows can only make its own packets exempt or signalled.
-pub(crate) fn flow_key(packet: &[u8]) -> u64 {
-    /// Port-carrying protocols, whose first four transport bytes are source and destination port.
-    fn has_ports(protocol: u8) -> bool {
-        matches!(protocol, 6 | 17 | 33 | 132 | 136)
-    }
-    let mut hash = Fold::default();
-    match packet.first().map(|first| first >> 4) {
-        Some(4) if packet.len() >= 20 => {
-            let header_len = usize::from(packet[0] & 0x0f) * 4;
-            let protocol = packet[9];
-            hash.add(&packet[12..20]);
-            hash.add(&[4, protocol]);
-            let later_fragment = u16::from_be_bytes([packet[6], packet[7]]) & 0x1fff != 0;
-            if has_ports(protocol)
-                && !later_fragment
-                && let Some(ports) = packet.get(header_len..header_len + 4)
-            {
-                hash.add(ports);
-            }
+        let elapsed = now_ns.saturating_sub(self.last_ns);
+        self.credit = self
+            .credit
+            .saturating_add(elapsed.saturating_mul(SPARSE_BYTES))
+            .min(SPARSE_BURST_BYTES * SPARSE_INTERVAL_NS);
+        self.last_ns = self.last_ns.max(now_ns);
+        let cost = len as u64 * SPARSE_INTERVAL_NS;
+        if self.credit < cost {
+            return false;
         }
-        Some(6) if packet.len() >= 40 => {
-            let next_header = packet[6];
-            hash.add(&packet[8..40]);
-            hash.add(&[6, next_header]);
-            if has_ports(next_header)
-                && let Some(ports) = packet.get(40..44)
-            {
-                hash.add(ports);
-            }
-        }
-        _ => hash.add(&[0]),
-    }
-    hash.finish().max(1)
-}
-
-/// A small multiply-rotate hash over byte slices, enough to tell a peer's flows apart. Not a
-/// keyed hash on purpose: see [`flow_key`].
-#[derive(Default)]
-struct Fold(u64);
-
-impl Fold {
-    /// Mix `bytes` into the hash, eight at a time.
-    fn add(&mut self, bytes: &[u8]) {
-        for chunk in bytes.chunks(8) {
-            let mut word = [0_u8; 8];
-            word[..chunk.len()].copy_from_slice(chunk);
-            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(word))
-                .wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
-        }
-    }
-
-    /// The final mixed value.
-    fn finish(&self) -> u64 {
-        let mut value = self.0;
-        value ^= value >> 33;
-        value = value.wrapping_mul(0xff51_afd7_ed55_8ccd);
-        value ^ (value >> 33)
+        self.credit -= cost;
+        true
     }
 }
 
@@ -539,20 +423,16 @@ fn judge_with(
 
     let due = codel.should_signal(now_ns, sojourn_ns, config);
     if !codel.above_target() {
-        // The queue drained: nothing is owed to anyone any more.
+        // Observed drain ends both the signal debt and the sparse-credit episode.
         codel.owed = 0;
+        codel.sparse = SparseBudget::default();
         return Verdict::Pass;
     }
-    // Sparse-flow exemption (see `FlowShares`): count this packet's flow, and hand a due signal
-    // only to a queue-heavy flow. A signal that lands on a sparse packet waits for the next
-    // heavy one instead of being spent on a flow that didn't build the queue.
-    let entry = codel
-        .flows
-        .account(flow_key(packet), packet.len(), now_ns, config.interval_ns);
+    let exempt = codel.sparse.exempt(packet.len(), now_ns);
     if due {
         codel.owed = codel.owed.saturating_add(1).min(MAX_OWED_SIGNALS);
     }
-    if codel.owed == 0 || !codel.flows.is_heavy(entry) {
+    if codel.owed == 0 || exempt {
         return Verdict::Pass;
     }
     codel.owed -= 1;
@@ -960,29 +840,6 @@ mod tests {
     }
 
     #[test]
-    fn flow_keys_separate_ports_protocols_and_fragments() {
-        let a = flow_key(&tcp_v4(40_000, 0, 1_400));
-        assert_eq!(
-            a,
-            flow_key(&tcp_v4(40_000, 0b10, 60)),
-            "ECN and length don't matter"
-        );
-        assert_ne!(a, flow_key(&tcp_v4(40_001, 0, 1_400)));
-        assert_ne!(a, flow_key(&icmp_probe()));
-        let mut fragment = tcp_v4(40_000, 0, 1_400);
-        fragment[7] = 0x10; // fragment offset 16: no ports in this packet
-        assert_ne!(a, flow_key(&fragment));
-        let mut ipv6 = vec![0_u8; 60];
-        ipv6[0] = 0x60;
-        ipv6[6] = 6;
-        ipv6[40..42].copy_from_slice(&40_000_u16.to_be_bytes());
-        let v6 = flow_key(&ipv6);
-        ipv6[40..42].copy_from_slice(&40_001_u16.to_be_bytes());
-        assert_ne!(v6, flow_key(&ipv6));
-        assert_ne!(flow_key(&[]), 0);
-    }
-
-    #[test]
     fn owed_signals_are_forgotten_once_the_queue_drains() {
         let config = ecn_1_10();
         let mut codel = Codel::default();
@@ -1090,13 +947,280 @@ mod tests {
         let (_, now) = drive_bulk(&mut codel, &config, 1, 2, 10 * MS, 200);
         let due = codel.signal_next_ns.max(now) + MAX_SOJOURN_NS;
         let mut packet = tcp_v4(40_000, 2, 1400);
-        // Refill a heavy entry after the long gap, then use an age exactly at the ceiling.
-        codel
-            .flows
-            .account(flow_key(&packet), 1024 * 1024, due, config.interval_ns);
         assert_eq!(
             judge_with(&mut codel, &mut packet, due - MAX_SOJOURN_NS, due, &config),
             Verdict::Marked
         );
+    }
+
+    /// Changing only keys cannot alter aggregate eligibility at any tested packet rate.
+    /// Small churn within the envelope passes; above it signals. Large churn always signals.
+    #[test]
+    fn aggregate_churn_has_no_key_dependency() {
+        let config = ecn_1_10();
+        for len in [80, 256, 257, 1400] {
+            for spacing in [10_000, MS, 10 * MS, 100 * MS] {
+                let mut stable = Codel::default();
+                let mut churn = Codel::default();
+                let mut signals = 0;
+                for step in 0..100_000_u64 {
+                    let now = 10 * MS + step * spacing;
+                    let mut a = tcp_v4(40_000, 2, len);
+                    let mut b = tcp_v4(10_000 + (step % 50_000) as u16, 2, len);
+                    let va = judge_with(&mut stable, &mut a, now - 3 * MS, now, &config);
+                    let vb = judge_with(&mut churn, &mut b, now - 3 * MS, now, &config);
+                    assert_eq!(va, vb, "len={len} spacing={spacing} step={step}");
+                    signals += usize::from(vb != Verdict::Pass);
+                }
+                let overload = len > SPARSE_MAX_PACKET_BYTES || spacing == 10_000;
+                eprintln!(
+                    "J870 churn len={len} spacing_ns={spacing} signals={signals} overload={overload}"
+                );
+                assert_eq!(signals > 0, overload);
+            }
+        }
+    }
+
+    /// Sustained SSH-like traffic remains exempt for 100 seconds of observed standing queue.
+    #[test]
+    fn steady_interactive_traffic_is_exempt_for_one_hundred_seconds() {
+        let config = ecn_1_10();
+        let mut codel = Codel::default();
+        for step in 0..100_000_u64 {
+            let now = 10 * MS + step * MS;
+            let mut packet = tcp_v4(22, 0, 96);
+            assert_eq!(
+                judge_with(&mut codel, &mut packet, now - 3 * MS, now, &config),
+                Verdict::Pass
+            );
+        }
+        assert_eq!(codel.owed, MAX_OWED_SIGNALS);
+    }
+
+    /// Refill is continuous across interval edges, bounded, fractional and independent of signals.
+    #[test]
+    fn aggregate_credit_has_no_interval_edge_or_rounding_loophole() {
+        let mut budget = SparseBudget::default();
+        let start = 10 * MS - 1;
+        for _ in 0..SPARSE_BURST_BYTES / 256 {
+            assert!(budget.exempt(256, start));
+        }
+        assert!(!budget.exempt(1, start));
+        assert!(
+            !budget.exempt(1, start + 2),
+            "crossing a window boundary does not reset credit"
+        );
+        // Keep every fractional refill: 1 byte needs ceil(I/B) = 306 ns.
+        for delta in 3..306 {
+            assert!(!budget.exempt(1, start + delta));
+        }
+        assert!(budget.exempt(1, start + 306));
+        assert!(!budget.exempt(1, start - 1), "rollback cannot refill twice");
+        assert!(!budget.exempt(257, u64::MAX));
+        assert!(budget.exempt(256, u64::MAX));
+        assert!(budget.credit <= SPARSE_BURST_BYTES * SPARSE_INTERVAL_NS);
+    }
+
+    /// Empty credit recovers fully in 20 ms; marking itself never renews a sparse allowance.
+    #[test]
+    fn overload_has_bounded_recovery_and_signals_do_not_mint_credit() {
+        let config = ecn_1_10();
+        let mut codel = Codel::default();
+        let start = 10 * MS;
+        codel.should_signal(start, 3 * MS, &config);
+        let due = start + config.interval_ns;
+        for _ in 0..SPARSE_BURST_BYTES / 256 {
+            let mut packet = tcp_v4(22, 2, 256);
+            assert_eq!(
+                judge_with(&mut codel, &mut packet, due - 3 * MS, due, &config),
+                Verdict::Pass
+            );
+        }
+        assert_eq!(codel.sparse.credit, 0);
+        let mut packet = tcp_v4(22, 2, 256);
+        assert_eq!(
+            judge_with(&mut codel, &mut packet, due - 3 * MS, due, &config),
+            Verdict::Marked
+        );
+        assert_eq!(codel.sparse.credit, 0);
+        // Force due signals so success cannot depend on a quiet point in the control law.
+        let recovered = due + 20 * MS;
+        for step in 0..100_000_u64 {
+            let now = recovered + step * MS;
+            codel.signal_next_ns = now;
+            let mut ssh = tcp_v4(22, 0, 96);
+            assert_eq!(
+                judge_with(&mut codel, &mut ssh, now - 3 * MS, now, &config),
+                Verdict::Pass
+            );
+        }
+        assert!(codel.owed <= MAX_OWED_SIGNALS);
+    }
+
+    /// Observed drain clears the bucket and signal debt and requires another full interval.
+    #[test]
+    fn drain_resets_all_aggregate_state() {
+        let config = ecn_1_10();
+        let mut codel = Codel::default();
+        codel.sparse.credit = 0;
+        codel.owed = MAX_OWED_SIGNALS;
+        let now = 10 * MS;
+        let mut packet = tcp_v4(22, 2, 256);
+        assert_eq!(
+            judge_with(&mut codel, &mut packet, now, now, &config),
+            Verdict::Pass
+        );
+        assert_eq!(codel.sparse.credit, SPARSE_BURST_BYTES * SPARSE_INTERVAL_NS);
+        assert_eq!(codel.owed, 0);
+        assert_eq!(
+            judge_with(&mut codel, &mut packet, now, now + 3 * MS, &config),
+            Verdict::Pass
+        );
+        assert_eq!(codel.first_above_ns, now + 3 * MS + config.interval_ns);
+    }
+
+    /// State is constant per peer with no per-flow entries or heap allocations.
+    #[test]
+    fn aggregate_state_is_small_and_constant() {
+        let bytes = std::mem::size_of::<Codel>();
+        eprintln!(
+            "J870 Codel={bytes} budget={} bytes4096={}",
+            std::mem::size_of::<SparseBudget>(),
+            bytes * 4096
+        );
+        assert_eq!(bytes, 48);
+        assert_eq!(std::mem::size_of::<SparseBudget>(), 16);
+    }
+
+    /// Replay captured real SSH and ACK sizes/times beside a standing line-rate bulk stream.
+    #[test]
+    fn measured_ssh_ack_and_probe_envelopes_pass_beside_bulk() {
+        let config = ecn_1_10();
+        for phase in ["ssh-keystrokes", "ssh-paste", "tcp-acks", "kit-probes"] {
+            let mut codel = Codel::default();
+            let mut now = 10 * MS;
+            let mut marks = 0;
+            let mut packets = 0;
+            for line in include_str!("aqm_sparse_trace.txt")
+                .lines()
+                .filter(|line| !line.starts_with('#'))
+            {
+                let mut fields = line.split_whitespace();
+                if fields.next() != Some(phase) {
+                    continue;
+                }
+                let offset: u64 = fields.next().unwrap().parse().unwrap();
+                let len: usize = fields.next().unwrap().parse().unwrap();
+                let at = 10 * MS + offset;
+                while now < at {
+                    let mut bulk = tcp_v4(40_000, 2, 1400);
+                    marks += usize::from(
+                        judge_with(&mut codel, &mut bulk, now - 3 * MS, now, &config)
+                            == Verdict::Marked,
+                    );
+                    now += 2_000; // 5.6 Gbit/s of 1400-byte packets; virtual clock only.
+                }
+                let at = now.max(at);
+                // Place a pending signal on each captured packet to exercise the exemption.
+                if codel.signalling {
+                    codel.signal_next_ns = at;
+                }
+                let mut sparse = tcp_v4(22, 0, len);
+                assert_eq!(
+                    judge_with(&mut codel, &mut sparse, at - 3 * MS, at, &config),
+                    Verdict::Pass,
+                    "phase={phase} offset={offset} len={len}"
+                );
+                packets += 1;
+            }
+            // The 10ms ACK burst needs another interval to enter signalling.
+            let (bulk, _) = drive_bulk(&mut codel, &config, 1, 2, now, 20);
+            assert!(marks > 0 || bulk[0].contains(&Verdict::Marked));
+            assert!(packets > 0);
+            eprintln!(
+                "J870 captured phase={phase} replayed={packets} sparse_signals=0 bulk_marks={marks}"
+            );
+        }
+    }
+
+    /// The public off switch bypasses packet changes, controller state and telemetry creation.
+    #[test]
+    fn public_off_switch_preserves_everything() {
+        if std::env::var_os("J870_OFF_CHILD").is_some() {
+            let mut codel = Codel::default();
+            codel.owed = MAX_OWED_SIGNALS;
+            codel.sparse.credit = 0;
+            let before = format!("{codel:?}");
+            for step in 0..100 {
+                let now = 10 * MS + step * MS;
+                let mut packet = tcp_v4(22, 2, 1400);
+                let original = packet.clone();
+                assert_eq!(
+                    judge(&mut codel, &mut packet, now - 3 * MS, now),
+                    Verdict::Pass
+                );
+                assert_eq!(packet, original);
+            }
+            assert_eq!(format!("{codel:?}"), before);
+            assert_eq!(DROPS.load(Ordering::Relaxed), 0);
+            assert_eq!(MARKS.load(Ordering::Relaxed), 0);
+            assert_eq!(SEEN.load(Ordering::Relaxed), 0);
+            let path = std::env::var("GOTATUN_AQM_STATS_PATH").unwrap();
+            assert!(!std::path::Path::new(&format!("{path}.{}", std::process::id())).exists());
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "aqm::tests::public_off_switch_preserves_everything",
+                "--nocapture",
+            ])
+            .env("J870_OFF_CHILD", "1")
+            .env("GOTATUN_AQM", "off")
+            .env("GOTATUN_AQM_STATS_MS", "1")
+            .env(
+                "GOTATUN_AQM_STATS_PATH",
+                std::env::temp_dir().join(format!("j870-off-{}", std::process::id())),
+            )
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// One small allowance covers the measured ACK burst, SSH and probe traffic together.
+    #[test]
+    fn mixed_small_packets_keep_credit_beside_line_rate_bulk() {
+        let config = ecn_1_10();
+        let mut codel = Codel::default();
+        let mut sparse_packets = 0;
+        let mut bulk_marks = 0;
+        for step in 0..500_000_u64 {
+            let now = 10 * MS + step * 2_000;
+            if step % 5_000 == 0 {
+                // Repeat the busiest captured 10ms ACK burst, plus SSH and 4000 probes/s.
+                for len in std::iter::repeat_n(52, 176)
+                    .chain([96, 96, 216, 216])
+                    .chain(std::iter::repeat_n(84, 40))
+                {
+                    if codel.signalling {
+                        codel.signal_next_ns = now;
+                    }
+                    let mut packet = tcp_v4(22, 0, len);
+                    assert_eq!(
+                        judge_with(&mut codel, &mut packet, now - 3 * MS, now, &config),
+                        Verdict::Pass
+                    );
+                    sparse_packets += 1;
+                }
+            }
+            let mut bulk = tcp_v4(40_000, 2, 1400);
+            bulk_marks += usize::from(
+                judge_with(&mut codel, &mut bulk, now - 3 * MS, now, &config) == Verdict::Marked,
+            );
+        }
+        eprintln!(
+            "J870 mixed sparse_packets={sparse_packets} sparse_signals=0 bulk_marks={bulk_marks}"
+        );
+        assert!(bulk_marks > 0);
     }
 }
