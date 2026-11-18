@@ -150,9 +150,9 @@ pub struct SockOpt {
     pub send_buffer_size: Option<usize>,
     /// If `Some`, set `IPV6_V6ONLY` on the socket.
     pub only_v6: Option<bool>,
-    /// macOS: send through connected per-endpoint sockets (#260, J744, J763). `None` follows the
+    /// macOS: send through startup-bound, per-family connected pools (#260, J877). `None` follows the
     /// default: off, unless `GOTATUN_BENCH_MAC_CONNECTED` is set to something other than `0`
-    /// (J789: the shared-port window is a race another local user can win).
+    /// Pending independent review, S remains opt-in.
     #[cfg(target_os = "macos")]
     pub mac_connected: Option<bool>,
 }
@@ -166,7 +166,7 @@ impl UdpSocket {
     /// - `mark`, only on linux.
     /// - `{recv,send}_buffer_size`, for better performance. See [`SockOpt`].
     ///
-    /// On macOS a dual-stack request (`[::]` with `only_v6: Some(false)`) and connected sends off
+    /// On macOS a dual-stack request (`[::]` with `only_v6: Some(false)`)
     /// binds **two** sockets on one port instead: AF_INET `0.0.0.0:<port>` for IPv4 and
     /// `[::]:<port>` with `IPV6_V6ONLY` for IPv6 (#260, J826 finding 1, J834). The handle sends
     /// and receives through both and looks like one socket to its users. See
@@ -179,8 +179,7 @@ impl UdpSocket {
         #[cfg(target_os = "macos")]
         let connected = opts.mac_connected.unwrap_or_else(macos_connected::wanted);
         #[cfg(target_os = "macos")]
-        if !connected
-            && addr.ip() == IpAddr::from(Ipv6Addr::UNSPECIFIED)
+        if addr.ip() == IpAddr::from(Ipv6Addr::UNSPECIFIED)
             && opts.only_v6 == Some(false)
         {
             return Self::bind_split(addr.port(), opts);
@@ -188,23 +187,16 @@ impl UdpSocket {
 
         let udp_sock = configured_socket(addr, opts)?;
 
-        #[cfg(target_os = "macos")]
-        if connected {
-            udp_sock.set_reuse_port(true)?;
-        }
-
         udp_sock.bind(&addr.into())?;
 
         #[cfg(target_os = "macos")]
-        if connected {
-            udp_sock.set_reuse_port(false)?;
+        let pool = if connected && !(addr.is_ipv6() && opts.only_v6 != Some(true)) {
+            let local = udp_sock.local_addr()?.as_socket().ok_or_else(|| io::Error::other("UDP socket has no IP address"))?;
+            macos_connected::pool_for(&udp_sock, local, 1)?
         } else {
-            // An exclusive single-socket bind (an explicit address, or the IPv4-only fallback)
-            // can succeed beside a socket another user bound to the port earlier with
-            // SO_REUSEPORT. Refuse the port as if it were held, which it is (#260, J815, J827).
-            // A split pair needs no such check (see `bind_split`).
             macos_port_audit::ensure_alone(&udp_sock)?;
-        }
+            Vec::new()
+        };
 
         Self::from_bound(
             udp_sock,
@@ -212,7 +204,7 @@ impl UdpSocket {
             None,
             addr.is_ipv6() && opts.only_v6 == Some(false),
             #[cfg(target_os = "macos")]
-            connected,
+            pool,
         )
     }
 
@@ -268,7 +260,15 @@ impl UdpSocket {
                 Err(error) if port == 0 && error.kind() == io::ErrorKind::AddrInUse => continue,
                 Err(error) => return Err(error),
             }
-            return Self::from_bound(v6, Some(v4), false, false);
+            let mut pool = Vec::new();
+            if opts.mac_connected.unwrap_or_else(macos_connected::wanted) {
+                // Both exclusive wildcards exist before either startup window. Each audit
+                // includes the other family's sockets, and failure drops the entire pair.
+                pool = macos_connected::pool_for(&v6, v6.local_addr()?.as_socket().ok_or_else(|| io::Error::other("IPv6 socket has no IP address"))?, 2)?;
+                let v4_pool = macos_connected::pool_for(&v4, v4_addr, 2 + pool.len())?;
+                pool.extend(v4_pool);
+            }
+            return Self::from_bound(v6, Some(v4), false, pool);
         }
         Err(io::Error::new(
             io::ErrorKind::AddrInUse,
@@ -283,7 +283,7 @@ impl UdpSocket {
         socket: socket2::Socket,
         #[cfg(target_os = "macos")] v4: Option<socket2::Socket>,
         map_ipv4_to_ipv6: bool,
-        #[cfg(target_os = "macos")] connected: bool,
+        #[cfg(target_os = "macos")] pool: Vec<socket2::Socket>,
     ) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         let udp_gso_supported = getsockopt(&socket, sockopt::UdpGsoSegment).is_ok();
@@ -304,7 +304,7 @@ impl UdpSocket {
                 #[cfg(target_os = "linux")]
                 udp_gso_disabled: AtomicBool::new(false),
                 #[cfg(target_os = "macos")]
-                connected: macos_connected::ConnectedSends::new(connected),
+                connected: macos_connected::ConnectedSends::new(pool)?,
             }),
             map_ipv4_to_ipv6,
             #[cfg(target_os = "macos")]
@@ -355,7 +355,7 @@ impl UdpSocket {
 
     /// Tell the socket that the host's network changed (an address, route or link moved).
     ///
-    /// On macOS this closes the connected per-endpoint send sockets (#260, J763), which keep the
+    /// On macOS this marks the connected pool sockets stale (#260, J877), since they keep the
     /// source address chosen when they connected; the next datagram to each endpoint reconnects
     /// on the current route. Call it from the owner's network-change signal before asking live
     /// sessions to announce their endpoint, so those announcements already leave from the new
@@ -425,15 +425,20 @@ impl UdpSocket {
         buf: &mut [u8],
     ) -> Option<std::task::Poll<io::Result<(usize, SocketAddr)>>> {
         let v4 = self.inner.v4.as_ref()?;
-        let v6 = &self.inner.socket;
-        let order = if self.v4_first { [v4, v6] } else { [v6, v4] };
+        let v4_first = self.v4_first;
         self.v4_first = !self.v4_first;
-        for socket in order {
-            let mut read = tokio::io::ReadBuf::new(&mut *buf);
-            if let std::task::Poll::Ready(result) = socket.poll_recv_from(cx, &mut read) {
-                return Some(std::task::Poll::Ready(
-                    result.map(|source| (read.filled().len(), source)),
-                ));
+        for ipv4 in [v4_first, !v4_first] {
+            if !ipv4 {
+                if let std::task::Poll::Ready(result) = self.inner.connected.poll_recv(
+                    &self.inner.socket, &mut self.recv_view, cx, buf,
+                ) {
+                    return Some(std::task::Poll::Ready(result));
+                }
+            } else {
+                let mut read = tokio::io::ReadBuf::new(&mut *buf);
+                if let std::task::Poll::Ready(result) = v4.poll_recv_from(cx, &mut read) {
+                    return Some(std::task::Poll::Ready(result.map(|source| (read.filled().len(), source))));
+                }
             }
         }
         Some(std::task::Poll::Pending)
