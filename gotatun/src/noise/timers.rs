@@ -424,19 +424,6 @@ impl<R: rand::RngCore + Send> Tunn<R> {
                 }
 
                 if !handshake_initiation_required {
-                    // An owner asked for one keepalive now. The peer roams its endpoint on any
-                    // authenticated packet, so this is how a node whose address changed
-                    // announces itself without waiting for the 15 s silence handshake. The
-                    // session may have expired since the request (`update_session_timers`
-                    // above); then the request is dropped, because `handle_outgoing_packet`
-                    // would queue the keepalive and start a handshake with an idle peer.
-                    if std::mem::take(&mut self.timers.keepalive_requested)
-                        && self.has_current_session()
-                    {
-                        tracing::trace!("KEEPALIVE(REQUESTED)");
-                        keepalive_required = true;
-                    }
-
                     // If a data packet has been received from a given peer, but we have not sent
                     // anything back within the sampled keepalive timeout (KEEPALIVE ms by
                     // default), we send an empty packet.
@@ -468,8 +455,18 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         }
 
         if keepalive_required {
+            // An ordinary keepalive already announces the current endpoint.
+            self.timers.keepalive_requested = false;
             return Ok(self
                 .handle_outgoing_packet(crate::packet::Packet::from_bytes(BytesMut::new()), None));
+        }
+
+        if std::mem::take(&mut self.timers.keepalive_requested) {
+            // An in-flight rekey may have left on the old path. The live session can
+            // announce the new path now, even while that initiation remains unanswered.
+            // If the session is gone or exhausted, never queue data or start a rekey here.
+            let packet = crate::packet::Packet::from_bytes(BytesMut::new());
+            return Ok(self.encapsulate_with_session(packet).ok().map(WgKind::Data));
         }
 
         Ok(None)
@@ -481,8 +478,8 @@ impl<R: rand::RngCore + Send> Tunn<R> {
     /// Call this when the local endpoint changed (a new source address or port). The peer only
     /// learns a new endpoint from an authenticated packet, and a node that is only receiving
     /// would otherwise stay silent until the keepalive-plus-rekey timeout, about 15 s.
-    /// Requests made while a handshake is in flight wait for that handshake to finish; the
-    /// handshake itself already reaches the peer from the new endpoint.
+    /// A rekey in flight does not stop the current session from announcing. A due initiation
+    /// or retry has priority on the timer pass that sends it.
     ///
     /// A peer without a session is left alone: it has no flow to move, and a handshake per idle
     /// peer per address change would flood a large mesh (#483, J633). It learns the new endpoint
