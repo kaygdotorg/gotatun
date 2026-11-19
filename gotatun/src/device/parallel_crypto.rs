@@ -726,6 +726,10 @@ struct CryptoQueue {
 /// Queue metadata protected only while runs are added, removed, or the pool closes.
 struct CryptoQueueState {
     jobs: VecDeque<QueuedCryptoJob>,
+    /// Workers inside the condition wait, including those reacquiring the mutex.
+    sleepers: usize,
+    /// Signalled workers that have yet to reacquire the mutex and check for work.
+    waking: usize,
     closed: bool,
 }
 
@@ -741,6 +745,8 @@ impl CryptoQueue {
         Self {
             state: Mutex::new(CryptoQueueState {
                 jobs: VecDeque::with_capacity(capacity),
+                sleepers: 0,
+                waking: 0,
                 closed: false,
             }),
             ready: Condvar::new(),
@@ -749,7 +755,10 @@ impl CryptoQueue {
         }
     }
 
-    /// Enqueue one complete run under one queue lock and wake one parked worker.
+    /// Enqueue one complete producer run and wake an idle worker for uncovered work.
+    ///
+    /// Each job already contains all prepared packets in its run. Wake at most one new
+    /// worker per submitted job, accounting for workers on their way back from the wait.
     async fn push(&self, job: CryptoJob) -> Result<(), ()> {
         let permit = Arc::clone(&self.queued_slots)
             .acquire_owned()
@@ -764,7 +773,12 @@ impl CryptoQueue {
             _permit: permit,
         });
         self.queued_jobs.fetch_add(1, Ordering::Release);
-        self.ready.notify_one();
+        if state.jobs.len() > state.waking
+            && state.sleepers > state.waking
+            && self.ready.notify_one()
+        {
+            state.waking += 1;
+        }
         Ok(())
     }
 
@@ -792,7 +806,14 @@ impl CryptoQueue {
 
             state = self.state.lock();
             if state.jobs.is_empty() && !state.closed {
+                state.sleepers += 1;
                 self.ready.wait(&mut state);
+                state.sleepers -= 1;
+                // parking_lot waits return only after notification. During close the
+                // broadcast can also wake workers without a reservation.
+                if !state.closed {
+                    state.waking -= 1;
+                }
             }
         }
     }
