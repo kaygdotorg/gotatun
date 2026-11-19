@@ -1913,4 +1913,34 @@ mod tests {
             size_of::<SparseBudget>()
         );
     }
+
+    /// Equal offered load should give each bulk flow a share of the signals.
+    #[test]
+    #[ignore = "fixed run-order CE concentration is tracked separately in #260"]
+    fn j891_signal_distribution_at_real_run_granularity() {
+        let cfg = ecn_1_10();
+        let mut distributions = Vec::new();
+        for rotate in [false, true] {
+            let mut codel = Codel::default();
+            let mut marks = [0_u32; 8];
+            for run in 0..12_000_usize {
+                let now = 10 * MS + run as u64 * 80_000;
+                let start_flow = if rotate { run % marks.len() } else { 0 };
+                for slot in 0..32 {
+                    let flow = (start_flow + slot) % marks.len();
+                    let mut packet = tcp_v4(40_000 + flow as u16, 2, 1400);
+                    let verdict = judge_with(&mut codel, &mut packet, now - 3 * MS, now, &cfg);
+                    marks[flow] += u32::from(verdict == Verdict::Marked);
+                }
+            }
+            eprintln!("J891 run_phase_rotated={rotate} marks={marks:?}");
+            distributions.push(marks);
+        }
+        assert!(
+            distributions
+                .iter()
+                .all(|marks| marks.iter().all(|&mark| mark > 0)),
+            "one flow alone receives CE when its position at the head of every run is fixed"
+        );
+    }
 }
