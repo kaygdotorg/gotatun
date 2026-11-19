@@ -1421,7 +1421,7 @@ impl<T: DeviceTransports> Device<T> {
     /// Peers without a session get nothing: they have no flow to move, and a handshake with
     /// every idle or offline peer on each address change would flood a large mesh (#483, J633).
     /// The timer task is woken only when at least one peer took the request. Returns the number
-    /// of peers that will send a keepalive.
+    /// of peers that accepted a request.
     pub async fn request_keepalives(&self) -> usize {
         let (peers, wake) = {
             let device = self.inner.read().await;
