@@ -359,15 +359,26 @@ impl Session {
     /// Reserve the header and plaintext bytes without touching the AEAD key.
     fn prepare_packet_data_with_counter(
         &self,
-        packet: Packet,
+        mut packet: Packet,
         sending_key_counter: u64,
     ) -> Packet<WgData> {
-        let len = WgData::OVERHEAD + packet.len();
+        let plaintext_len = packet.len();
+        let len = WgData::OVERHEAD + plaintext_len;
 
-        // Prepare a buffer to hold our the WgData packet and our encapsulated payload.
-        // TODO: we can remove this allocation by pre-allocating some extra
-        // space at the beginning of `packet`s allocation, and using that.
-        let mut buf = Packet::from_bytes(BytesMut::zeroed(len));
+        let mut buf = if packet.buf_mut().capacity() >= len {
+            // TUN segmentation can reserve independent space in each backing allocation.
+            // Resize initializes the new bytes, and the payload move leaves the tag at zero.
+            packet.buf_mut().resize(len, 0);
+            packet
+                .buf_mut()
+                .copy_within(..plaintext_len, WgDataHeader::LEN);
+            packet
+        } else {
+            let mut buf = Packet::from_bytes(BytesMut::zeroed(len));
+            buf.buf_mut()[WgDataHeader::LEN..WgDataHeader::LEN + plaintext_len]
+                .copy_from_slice(&packet);
+            buf
+        };
 
         let data = WgData::mut_from_bytes(buf.buf_mut())
             .expect("buffer size is at least WgData::OVERHEAD");
@@ -376,11 +387,6 @@ impl Session {
         data.header = WgDataHeader::new()
             .with_receiver_idx(self.sending_index)
             .with_counter(sending_key_counter);
-
-        // Copy inner packet into place.
-        debug_assert_eq!(packet.len(), data.encrypted_encapsulated_packet_mut().len());
-        data.encrypted_encapsulated_packet_mut()
-            .copy_from_slice(&packet);
 
         // Keep the reserved counter in the header until a worker applies AEAD.
         let packet = buf.try_into_wg().expect("is a wireguard packet");
@@ -488,6 +494,22 @@ mod tests {
     fn test_session() -> Session {
         let table: IndexTable = IndexTable::from_os_rng();
         Session::new(table.new_index(), 0, [0u8; 32], [0u8; 32])
+    }
+
+    /// Reserve the transport envelope in the input allocation without changing the plaintext.
+    #[test]
+    fn prepare_transport_reuses_writable_tailroom() {
+        let plaintext = [0x53; 96];
+        let mut bytes = BytesMut::with_capacity(plaintext.len() + WgData::OVERHEAD);
+        bytes.extend_from_slice(&plaintext);
+        let original = bytes.as_ptr();
+
+        let mut packet =
+            test_session().prepare_packet_data_with_counter(Packet::from_bytes(bytes), 7);
+        assert_eq!(packet.as_bytes().as_ptr(), original);
+        assert_eq!(packet.encrypted_encapsulated_packet(), &plaintext);
+        assert_eq!(packet.header.counter.get(), 7);
+        assert_eq!(packet.tag(), &[0; WgData::TAG_LEN]);
     }
 
     /// Craft a (cryptographically invalid) `WgData` packet with a chosen receiver index and

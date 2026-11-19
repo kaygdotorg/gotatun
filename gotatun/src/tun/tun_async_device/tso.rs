@@ -13,7 +13,7 @@
 
 use crate::packet::{
     Ip, IpNextProtocol, Ipv4, Ipv4Header, Ipv4VersionIhl, Ipv6, Ipv6Header, Packet, PseudoHeaderV4,
-    PseudoHeaderV6, Tcp, TcpHeader, Udp, UdpHeader, checksum_ipv4_with_skip,
+    PseudoHeaderV6, Tcp, TcpHeader, Udp, UdpHeader, WgData, checksum_ipv4_with_skip,
     checksum_tcp_with_skip, checksum_udp_with_skip,
 };
 use crate::tun::tun_async_device::virtio::VirtioNetHeader;
@@ -24,6 +24,18 @@ use libc::{TUN_F_CSUM, TUN_F_TSO4, TUN_F_TSO6, TUN_F_USO4, TUN_F_USO6, TUNSETOFF
 use std::mem::offset_of;
 use std::{io, os::fd::AsRawFd};
 use zerocopy::{FromBytes, IntoBytes};
+
+/// Space beyond a TCP segment's IP length for up to 15 padding bytes and the wire envelope.
+const TCP_SEGMENT_TAILROOM: usize = 15 + WgData::OVERHEAD;
+
+/// Split off one TCP segment with spare writable bytes before the next segment starts.
+///
+/// The allocation reserves this space once per segment. The bytes stay outside the IP length
+/// until transport preparation initializes them.
+fn take_tcp_segment(buf: &mut BytesMut) -> Packet {
+    let rest = buf.split_off(buf.len() + TCP_SEGMENT_TAILROOM);
+    Packet::from_bytes(std::mem::replace(buf, rest))
+}
 
 /// Enable TCP offloading on the given tun device
 ///
@@ -108,7 +120,7 @@ pub fn new_tso_iter_ipvx(ipvx_packet: Packet<IpvX>, gso_size: usize) -> io::Resu
 
                 let segment_payload_len = gso_size;
                 let segment_count = payload_len.div_ceil(segment_payload_len);
-                let capacity = header_len
+                let capacity = (header_len + TCP_SEGMENT_TAILROOM)
                     .checked_mul(segment_count)
                     .and_then(|headers_len| headers_len.checked_add(payload_len))
                     .ok_or_else(|| {
@@ -1033,7 +1045,7 @@ impl Iterator for TsoIter {
                 buf.extend_from_slice(segment_headers.as_bytes());
                 buf.extend_from_slice(tcp_options);
                 buf.extend_from_slice(&segment_payload);
-                let packet = Packet::from_bytes(buf.split());
+                let packet = take_tcp_segment(buf);
 
                 let mut packet = packet
                     .try_into_ipvx()
@@ -1116,7 +1128,7 @@ impl Iterator for TsoIter {
                 buf.extend_from_slice(segment_headers.as_bytes());
                 buf.extend_from_slice(tcp_options);
                 buf.extend_from_slice(&segment_payload);
-                let packet = Packet::from_bytes(buf.split());
+                let packet = take_tcp_segment(buf);
 
                 let mut packet = packet
                     .try_into_ipvx()
@@ -1327,6 +1339,23 @@ mod tests {
         bytes.extend_from_slice(udp_header.as_bytes());
         bytes.extend_from_slice(payload);
         Packet::from_bytes(bytes)
+    }
+
+    /// Give each TCP segment a distinct writable suffix outside its IP packet length.
+    #[test]
+    fn tcp_segments_retain_independent_transport_tailroom() {
+        let packet = ipv4_tcp_packet(&[0x35; 32], &[]);
+        let mut segments = new_tso_iter_ipv4(packet.into(), 16).unwrap();
+        let mut first = segments.next().unwrap().into_bytes();
+        let second = segments.next().unwrap().into_bytes();
+        assert!(segments.next().is_none());
+        let second_bytes = second.as_ref().to_vec();
+        let length = first.len();
+
+        let bytes = first.buf_mut();
+        assert!(bytes.capacity() >= length + TCP_SEGMENT_TAILROOM);
+        bytes.resize(length + TCP_SEGMENT_TAILROOM, 0xef);
+        assert_eq!(second.as_ref(), second_bytes);
     }
 
     #[test]
