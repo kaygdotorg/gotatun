@@ -240,6 +240,15 @@ impl TunDevice {
 }
 
 impl IpSend for TunDevice {
+    /// Gather ready packets only when the descriptor can coalesce their writes.
+    fn ready_write_batch_capacity(&self) -> usize {
+        #[cfg(target_os = "linux")]
+        if self.state.vnet_header && (self.state.offloads.tcp_tso || self.state.offloads.udp_uso) {
+            return gso::MAX_GSO_SEGMENTS;
+        }
+        1
+    }
+
     async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         if self.state.vnet_header {

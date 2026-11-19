@@ -15,7 +15,7 @@ use std::{future::Future, io, mem::offset_of, ops::Deref};
 use zerocopy::IntoBytes;
 
 /// Maximum number of input packets represented by one Linux TUN GSO frame.
-const MAX_GSO_SEGMENTS: usize = 64;
+pub(super) const MAX_GSO_SEGMENTS: usize = 64;
 
 /// Maximum frame size accepted for a coalesced TUN write, including its virtio header.
 const MAX_GSO_FRAME_LEN: usize = 64 * 1024;

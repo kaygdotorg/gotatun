@@ -46,6 +46,13 @@ pub trait IpSend: Send + Sync + 'static {
     // TODO: consider refactoring trait with methods that take `Packet<Ipv4>` and `Packet<Ipv6>`
     fn send(&mut self, packet: Packet<Ip>) -> impl Future<Output = io::Result<()>> + Send;
 
+    /// Maximum number of ready packets the buffered writer may combine across runs.
+    ///
+    /// A writer without coalescing leaves this at one and receives each original run.
+    fn ready_write_batch_capacity(&self) -> usize {
+        1
+    }
+
     /// Send a consecutive run of complete IP packets in input order.
     ///
     /// Buffered implementations can move a run across their boundary with one handoff. The

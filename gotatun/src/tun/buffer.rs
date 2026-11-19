@@ -75,6 +75,30 @@ enum BufferedIpMessage {
     Batch(Vec<Packet<Ip>>, OwnedSemaphorePermit, Option<u64>),
 }
 
+impl BufferedIpMessage {
+    /// Count the packets covered by this message's queue permit.
+    fn packet_count(&self) -> usize {
+        match self {
+            Self::Single(..) => 1,
+            Self::Batch(packets, ..) => packets.len(),
+        }
+    }
+
+    /// Move the ready packets into one write run, retaining permits until the write completes.
+    fn append_to(self, run: &mut Vec<Packet<Ip>>, permits: &mut Vec<OwnedSemaphorePermit>) {
+        match self {
+            Self::Single(packet, permit) => {
+                run.push(packet);
+                permits.push(permit);
+            }
+            Self::Batch(mut packets, permit, _) => {
+                run.append(&mut packets);
+                permits.push(permit);
+            }
+        }
+    }
+}
+
 impl BufferedIpSend {
     /// Create a [`BufferedIpSend`] with `capacity`.
     ///
@@ -96,9 +120,41 @@ impl BufferedIpSend {
                 .expect("Deadlock on IpSend. There must be no more than one IpSend active at any given time.");
 
             let mut refused: u64 = 0;
-            while let Some(message) = rx.recv().await {
+            let mut next_message = None;
+            let batch_capacity = inner.ready_write_batch_capacity();
+            let mut run = Vec::new();
+            let mut permits = Vec::new();
+            loop {
+                let message = match next_message.take() {
+                    Some(message) => message,
+                    None => match rx.recv().await {
+                        Some(message) => message,
+                        None => break,
+                    },
+                };
                 let diagnostic = crate::diag::PIPELINE.on();
                 let (result, refused_packets) = match message {
+                    message
+                        if batch_capacity > 1 && !diagnostic && !crate::diag::SEND_QUEUE.on() =>
+                    {
+                        message.append_to(&mut run, &mut permits);
+                        while run.len() < batch_capacity {
+                            let Ok(message) = rx.try_recv() else {
+                                break;
+                            };
+                            if message.packet_count() > batch_capacity - run.len() {
+                                next_message = Some(message);
+                                break;
+                            }
+                            message.append_to(&mut run, &mut permits);
+                        }
+                        let batch_len = run.len() as u64;
+                        let result = inner.send_many(&mut run).await;
+                        run.clear();
+                        permits.clear();
+                        (result, batch_len)
+                    }
+
                     BufferedIpMessage::Single(packet, _permit) => {
                         if diagnostic {
                             eprintln!("pipeline stage=tun_buffer_dequeue mode=single packets=1");
@@ -453,9 +509,15 @@ mod tests {
     struct RecordingIpSend {
         singles: mpsc::UnboundedSender<u16>,
         batches: mpsc::UnboundedSender<Vec<u16>>,
+        ready_capacity: usize,
     }
 
     impl IpSend for RecordingIpSend {
+        /// Allow tests to opt into combining already-ready submissions.
+        fn ready_write_batch_capacity(&self) -> usize {
+            self.ready_capacity
+        }
+
         async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
             self.singles
                 .send(packet_id(&packet))
@@ -486,6 +548,7 @@ mod tests {
         let inner = Arc::new(Mutex::new(RecordingIpSend {
             singles: single_tx,
             batches: batch_tx,
+            ready_capacity: 1,
         }));
         let mut send = BufferedIpSend::new(3, inner, CancellationToken::new());
         let mut packets = vec![packet(64, 1), packet(64, 2), packet(64, 3)];
@@ -502,6 +565,41 @@ mod tests {
         assert!(single_rx.try_recv().is_err());
     }
 
+    /// Combine queued runs to the device limit and write an isolated packet immediately.
+    #[tokio::test]
+    async fn ready_tun_runs_share_a_bounded_write() {
+        let (singles, _single_rx) = mpsc::unbounded_channel();
+        let (batches, mut batch_rx) = mpsc::unbounded_channel();
+        let inner = Arc::new(Mutex::new(RecordingIpSend {
+            singles,
+            batches,
+            ready_capacity: 3,
+        }));
+        let mut send = BufferedIpSend::new(5, inner, CancellationToken::new());
+        send.send(packet(64, 1)).await.unwrap();
+        send.send_many(&mut vec![packet(64, 2), packet(64, 3)])
+            .await
+            .unwrap();
+        send.send_many(&mut vec![packet(64, 4), packet(64, 5)])
+            .await
+            .unwrap();
+
+        let first = tokio::time::timeout(Duration::from_secs(1), batch_rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(first, Some(vec![1, 2, 3]));
+        let second = tokio::time::timeout(Duration::from_secs(1), batch_rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(second, Some(vec![4, 5]));
+
+        send.send(packet(64, 6)).await.unwrap();
+        let lone = tokio::time::timeout(Duration::from_secs(1), batch_rx.recv())
+            .await
+            .unwrap();
+        assert_eq!(lone, Some(vec![6]));
+    }
+
     /// A run larger than the packet budget is split without waiting for impossible permits.
     #[tokio::test]
     async fn send_many_splits_runs_larger_than_the_packet_budget() {
@@ -510,6 +608,7 @@ mod tests {
         let inner = Arc::new(Mutex::new(RecordingIpSend {
             singles: single_tx,
             batches: batch_tx,
+            ready_capacity: 1,
         }));
         let mut send = BufferedIpSend::new(1, inner, CancellationToken::new());
         let mut packets = vec![packet(64, 1), packet(64, 2), packet(64, 3)];

@@ -186,51 +186,68 @@ async fn send_plain_range(
     Ok(())
 }
 
+/// Submit consecutive UDP GSO messages that share the same segment size.
+///
+/// Nix applies one control-message set to the entire syscall. Equal-size messages
+/// can share it while keeping their own destination and payload slice.
 #[cfg(target_os = "linux")]
-async fn send_gso_segment(
+async fn send_gso_range(
     udp_socket: &super::UdpSocket,
     batch: &SendBatch<'_, '_>,
-    start: usize,
-    datagrams: usize,
+    mut messages: &[UdpGsoBatch],
     segment_size: u16,
 ) -> io::Result<()> {
-    let end = start + datagrams;
-    let mut segment_iovs = [IoSlice::new(&[]); UDP_SEGMENT_MAX_DATAGRAMS];
-    for (dst, packet_iov) in segment_iovs.iter_mut().zip(&batch.pkts[start..end]) {
-        *dst = packet_iov[0];
+    let iovs = batch.pkts.as_flattened();
+    let mut message_iovs = [&iovs[..0]; MAX_PACKET_COUNT];
+    let mut targets = [None; MAX_PACKET_COUNT];
+    for ((iov, target), message) in message_iovs.iter_mut().zip(&mut targets).zip(messages) {
+        *iov = &iovs[message.start..message.start + message.datagrams];
+        *target = batch.targets[message.start];
     }
-    let segment_iovs = &segment_iovs[..datagrams];
+    let mut first = 0;
+    let message_count = messages.len();
     let cmsgs = udp_gso_control_messages(&segment_size);
 
-    let result = batch
-        .socket
-        .async_io(Interest::WRITABLE, || {
-            let mut multiheaders = MultiHeaders::preallocate(1, Some(nix::cmsg_space!(u16)));
-            let multiresult = nix::sys::socket::sendmmsg(
-                batch.fd,
-                &mut multiheaders,
-                [&segment_iovs],
-                &batch.targets[start..start + 1],
-                cmsgs,
-                MsgFlags::MSG_DONTWAIT,
-            )?;
-            Ok(multiresult.count())
-        })
-        .await;
+    while !messages.is_empty() {
+        let result = batch
+            .socket
+            .async_io(Interest::WRITABLE, || {
+                let mut multiheaders =
+                    MultiHeaders::preallocate(messages.len(), Some(nix::cmsg_space!(u16)));
+                let multiresult = nix::sys::socket::sendmmsg(
+                    batch.fd,
+                    &mut multiheaders,
+                    &message_iovs[first..message_count],
+                    &targets[first..message_count],
+                    cmsgs,
+                    MsgFlags::MSG_DONTWAIT,
+                )?;
+                Ok(multiresult.count())
+            })
+            .await;
 
-    match result {
-        Ok(1) => Ok(()),
-        Ok(0) => Err(io::Error::new(
-            io::ErrorKind::WriteZero,
-            "sendmmsg sent zero UDP GSO segments",
-        )),
-        Ok(_) => unreachable!("one UDP GSO message was submitted"),
-        Err(err) if should_disable_udp_gso(&err) => {
-            udp_socket.disable_udp_gso();
-            send_plain_range(batch, start, end).await
+        match result {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "sendmmsg sent zero UDP GSO messages",
+                ));
+            }
+            Ok(sent) => {
+                first += sent;
+                messages = &messages[sent..];
+            }
+            Err(error) if should_disable_udp_gso(&error) => {
+                // A positive return already advanced past the accepted prefix.
+                udp_socket.disable_udp_gso();
+                let last = messages.last().expect("there are unsent messages");
+                return send_plain_range(batch, messages[0].start, last.start + last.datagrams)
+                    .await;
+            }
+            Err(error) => return Err(error),
         }
-        Err(err) => Err(err),
     }
+    Ok(())
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -635,6 +652,43 @@ mod gso_tests {
         }
     }
 
+    /// Two same-size GSO messages retain their individual addresses and datagram boundaries.
+    #[tokio::test]
+    async fn send_many_delivers_multiple_gso_messages_in_order() {
+        use crate::packet::PacketBufPool;
+        use crate::udp::{UdpSend, socket::SockOpt};
+        use std::time::Duration;
+
+        let sender = crate::udp::socket::UdpSocket::bind(target(0), SockOpt::default()).unwrap();
+        let first = std::net::UdpSocket::bind(target(0)).unwrap();
+        let second = std::net::UdpSocket::bind(target(0)).unwrap();
+        let pool = PacketBufPool::<4096>::new(4);
+        let mut packets = Vec::new();
+        for (receiver, first_byte) in [(&first, 1), (&second, 3)] {
+            receiver
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            for byte in first_byte..first_byte + 2 {
+                let mut packet = pool.get();
+                packet.truncate(1200);
+                packet.fill(byte);
+                packets.push((packet, receiver.local_addr().unwrap()));
+            }
+        }
+
+        let mut buf = super::SendmmsgBuf::default();
+        sender.send_many_to(&mut buf, &mut packets).await.unwrap();
+        assert_eq!(buf.gso_batches().len(), 2);
+
+        let mut payload = [0; 1200];
+        for (receiver, first_byte) in [(&first, 1), (&second, 3)] {
+            for byte in first_byte..first_byte + 2 {
+                assert_eq!(receiver.recv(&mut payload).unwrap(), payload.len());
+                assert!(payload.iter().all(|&value| value == byte));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn send_many_to_preserves_datagrams_when_gso_is_disabled() {
         use crate::packet::PacketBufPool;
@@ -787,39 +841,17 @@ impl UdpSend for super::UdpSocket {
             );
 
             if self.udp_gso_supported() && !self.udp_gso_disabled() {
-                let mut plain_start = None;
-
-                for gso_batch in &buf.gso_batches {
-                    let Some(segment_size) = udp_gso_segment_size(gso_batch) else {
-                        plain_start.get_or_insert(gso_batch.start);
-                        continue;
-                    };
-
-                    if let Some(start) = plain_start.take() {
-                        send_plain_range(&batch, start, gso_batch.start).await?;
+                for messages in buf.gso_batches.chunk_by(|left, right| {
+                    udp_gso_segment_size(left) == udp_gso_segment_size(right)
+                }) {
+                    let first = &messages[0];
+                    let segment_size = udp_gso_segment_size(first);
+                    if self.udp_gso_disabled() || segment_size.is_none() {
+                        let last = &messages[messages.len() - 1];
+                        send_plain_range(&batch, first.start, last.start + last.datagrams).await?;
+                    } else if let Some(segment_size) = segment_size {
+                        send_gso_range(self, &batch, messages, segment_size).await?;
                     }
-
-                    if self.udp_gso_disabled() {
-                        send_plain_range(
-                            &batch,
-                            gso_batch.start,
-                            gso_batch.start + gso_batch.datagrams,
-                        )
-                        .await?;
-                    } else {
-                        send_gso_segment(
-                            self,
-                            &batch,
-                            gso_batch.start,
-                            gso_batch.datagrams,
-                            segment_size,
-                        )
-                        .await?;
-                    }
-                }
-
-                if let Some(start) = plain_start {
-                    send_plain_range(&batch, start, buf.targets.len()).await?;
                 }
             } else {
                 send_plain_range(&batch, 0, buf.targets.len()).await?;
