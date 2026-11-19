@@ -938,6 +938,69 @@ mod tests {
         ));
     }
 
+    /// A requested keepalive needs a current session; without one it sends nothing at all
+    /// (infraternal #483, J633 P1). A handshake per idle peer per local address change would
+    /// flood a 1,000-peer mesh.
+    #[test]
+    fn requested_keepalive_without_a_session_sends_nothing() {
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        assert!(!my_tun.request_keepalive());
+        assert!(matches!(my_tun.update_timers(), Ok(None)));
+    }
+
+    /// An initiation already sent by a rekey might have left from the old underlay address.
+    /// Announce the new address on the live session before any rekey response or retry.
+    #[test]
+    fn requested_keepalive_uses_live_session_during_rekey() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let _unanswered = create_handshake_init(&mut my_tun);
+        assert!(my_tun.request_keepalive());
+        let packet = my_tun.update_timers().expect("timers run");
+        let Some(WgKind::Data(keepalive)) = packet else {
+            panic!("expected an immediate keepalive on the live session, got {packet:?}");
+        };
+        parse_keepalive(&mut their_tun, keepalive);
+        assert!(matches!(my_tun.update_timers(), Ok(None)));
+    }
+
+    /// An exhausted key cannot announce. The request must neither queue a packet nor start a
+    /// handshake on its own, even if the expired counter still has a slot in the session ring.
+    #[test]
+    fn requested_keepalive_does_not_rekey_an_exhausted_session() {
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+        let slot = my_tun.current % N_SESSIONS;
+        my_tun.sessions.as_ref().unwrap()[slot]
+            .as_ref()
+            .unwrap()
+            .set_sending_key_counter(session::REJECT_AFTER_MESSAGES);
+        let _ = my_tun.request_keepalive();
+        let packet = my_tun.update_timers().expect("timers run");
+        assert!(packet.is_none(), "the request started a rekey: {packet:?}");
+        assert!(my_tun.packet_queue.is_empty());
+    }
+
+    /// An outstanding request dies with an expired handshake. Otherwise it fires on whichever
+    /// session comes next, long after the address change it was meant to announce.
+    #[test]
+    #[cfg(feature = "mock_instant")]
+    fn requested_keepalive_does_not_outlive_an_expired_handshake() {
+        MockClock::set_time(Duration::ZERO);
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let _rekey = create_handshake_init(&mut my_tun);
+        assert!(my_tun.request_keepalive());
+        // The next timer pass sees an already-expired rekey before servicing the request.
+        MockClock::advance(Duration::from_secs(100));
+        assert!(matches!(
+            my_tun.update_timers(),
+            Err(WireGuardError::ConnectionExpired)
+        ));
+        complete_handshake(&mut my_tun, &mut their_tun);
+        assert!(
+            matches!(my_tun.update_timers(), Ok(None)),
+            "a keepalive requested before the expiry fired on the next session"
+        );
+    }
+
     #[test]
     // Verify that a valid handshake is accepted by two linked peers when rate limiting is not
     // applied.

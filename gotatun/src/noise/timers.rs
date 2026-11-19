@@ -119,6 +119,13 @@ pub struct Timers {
     want_handshake: Option<Duration>,
     persistent_keepalive: Option<Duration>,
     persistent_keepalive_due: bool,
+    /// An immediate keepalive was requested, for example because our own address changed and
+    /// the peer has to learn the new endpoint from an authenticated packet (#260, J561).
+    ///
+    /// Set only while a session exists. Cleared when the next timer pass sends it, when that
+    /// pass finds the session gone, and whenever the connection expires (`clear`), so a request
+    /// never turns into a handshake and never fires on a later session (#483, J633).
+    keepalive_requested: bool,
     /// Timer deadline ranges that the sampled deadlines below are drawn from.
     pub(super) params: TimerParams,
     /// Current passive keepalive deadline.
@@ -149,6 +156,7 @@ impl Timers {
             want_handshake: Default::default(),
             persistent_keepalive,
             persistent_keepalive_due: persistent_keepalive.is_some(),
+            keepalive_requested: false,
             params: TimerParams::default(),
             keepalive_timeout: Duration::ZERO,
             new_handshake_timeout: Duration::ZERO,
@@ -183,6 +191,7 @@ impl Timers {
         }
         self.want_handshake = None;
         self.want_keepalive = None;
+        self.keepalive_requested = false;
         self.persistent_keepalive_due = self.persistent_keepalive.is_some();
         self.dangerously_set_params(self.params.clone());
     }
@@ -330,6 +339,8 @@ impl<R: rand::RngCore + Send> Tunn<R> {
 
         {
             if self.handshake.is_expired() {
+                // An expired connection has no session to announce on.
+                self.timers.keepalive_requested = false;
                 return Err(WireGuardError::ConnectionExpired);
             }
 
@@ -444,11 +455,41 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         }
 
         if keepalive_required {
+            // An ordinary keepalive already announces the current endpoint.
+            self.timers.keepalive_requested = false;
             return Ok(self
                 .handle_outgoing_packet(crate::packet::Packet::from_bytes(BytesMut::new()), None));
         }
 
+        if std::mem::take(&mut self.timers.keepalive_requested) {
+            // An in-flight rekey may have left on the old path. The live session can
+            // announce the new path now, even while that initiation remains unanswered.
+            // If the session is gone or exhausted, never queue data or start a rekey here.
+            let packet = crate::packet::Packet::from_bytes(BytesMut::new());
+            return Ok(self.encapsulate_with_session(packet).ok().map(WgKind::Data));
+        }
+
         Ok(None)
+    }
+
+    /// Ask the next [`Tunn::update_timers`] pass to send one keepalive to this peer, if it has a
+    /// current session. Returns whether the request was taken.
+    ///
+    /// Call this when the local endpoint changed (a new source address or port). The peer only
+    /// learns a new endpoint from an authenticated packet, and a node that is only receiving
+    /// would otherwise stay silent until the keepalive-plus-rekey timeout, about 15 s.
+    /// A rekey in flight does not stop the current session from announcing. A due initiation
+    /// or retry has priority on the timer pass that sends it.
+    ///
+    /// A peer without a session is left alone: it has no flow to move, and a handshake per idle
+    /// peer per address change would flood a large mesh (#483, J633). It learns the new endpoint
+    /// from its own next handshake to us, or out of band.
+    pub fn request_keepalive(&mut self) -> bool {
+        if !self.has_current_session() {
+            return false;
+        }
+        self.timers.keepalive_requested = true;
+        true
     }
 
     /// Get the time elapsed since the last successful handshake.
