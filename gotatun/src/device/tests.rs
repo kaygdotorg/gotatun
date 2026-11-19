@@ -1655,6 +1655,8 @@ async fn rehandshake_sends_over_an_active_session() {
             .is_err(),
         "force_handshake must not send over an active session"
     );
+    // `mock_instant` freezes handshake timestamps; give the new initiation a later TAI64N value.
+    advance_mock_clock();
     timeout(
         Duration::from_secs(2),
         alice.device.rehandshake(&bob_public_key),
