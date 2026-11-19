@@ -408,6 +408,7 @@ async fn j369_timer_output_survives_a_full_peer_window() {
             lookup: packet_lookup,
             flush_requests: Arc::default(),
         },
+        Arc::default(),
         index_table,
         rate_limiter,
         udp,
@@ -952,6 +953,165 @@ async fn test_endpoint_roaming() {
     ping_pong("1.2.3.4".parse().unwrap()).await;
     ping_pong("1.3.3.7".parse().unwrap()).await;
     ping_pong("1.2.3.4".parse().unwrap()).await;
+}
+
+/// A node that only receives announces a new local address at once when asked (#260, J561).
+///
+/// Bob learns Alice's endpoint only from an authenticated packet. If Alice's address changes
+/// while she is just receiving, she sends nothing until the keepalive-plus-rekey timeout (about
+/// 15 s), and Bob keeps sending to the old address. [`Device::request_keepalives`] closes that
+/// gap: Bob roams within one timer wake, without any data from Alice.
+#[tokio::test]
+#[test_log::test]
+async fn requested_keepalive_announces_a_new_source_address() {
+    let (alice, mut bob, _eve) = mock::device_pair().await;
+    let packet = mock::packet(b"Hello!");
+    let bob_endpoint_of_alice = async |bob: &mock::MockDevice| {
+        let peers = bob.device.peers().await;
+        peers[0].peer.endpoint.map(|addr| addr.ip())
+    };
+
+    alice.app_tx.send(packet.clone()).await;
+    assert_eq!(bob.app_rx.recv().await.as_bytes(), packet.as_bytes());
+    let old_ip = bob_endpoint_of_alice(&bob).await;
+
+    let moved: Ipv4Addr = "1.3.3.7".parse().unwrap();
+    *alice.source_ipv4_override.lock().await = Some(moved);
+
+    // sleep: shows the gap: with no request, a receive-only Alice stays silent and Bob keeps
+    // the old endpoint (the passive keepalive is 10 s away).
+    sleep(Duration::from_millis(600)).await;
+    assert_eq!(bob_endpoint_of_alice(&bob).await, old_ip);
+
+    assert_eq!(alice.device.request_keepalives().await, 1);
+    timeout(Duration::from_secs(2), async {
+        while bob_endpoint_of_alice(&bob).await != Some(moved.into()) {
+            // sleep: polls Bob's peer table; the bound is the outer timeout.
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Bob should roam to Alice's new address after one requested keepalive");
+
+    // The keepalive carries no payload, so nothing reaches Bob's application.
+    assert!(
+        timeout(Duration::from_millis(200), bob.app_rx.recv())
+            .await
+            .is_err()
+    );
+}
+
+/// A requested keepalive never opens a session with an idle peer (infraternal #483, J633 P1).
+///
+/// The owner asks for keepalives whenever the local underlay changes. In a 1,000-peer mesh most
+/// peers have no session (idle past `REJECT_AFTER_TIME * 3`, or offline), and they learn our new
+/// endpoint from the coordinator. A handshake per sessionless peer per change, retried every 5 s
+/// for 90 s against offline peers, is a flood with nothing to move. Only a live session has a
+/// flow whose return path needs the new endpoint now.
+#[tokio::test]
+#[test_log::test]
+async fn requested_keepalive_does_not_handshake_a_sessionless_peer() {
+    let (alice, bob, _eve) = mock::device_pair().await;
+    // No session yet, so no peer takes the request.
+    assert_eq!(alice.device.request_keepalives().await, 0);
+    // sleep: a timer wake plus one in-memory handshake round trip finishes well inside this.
+    sleep(Duration::from_millis(500)).await;
+    let peers = bob.device.peers().await;
+    assert!(
+        peers[0].stats.last_handshake.is_none(),
+        "a requested keepalive opened a session with an idle peer"
+    );
+}
+
+/// At mesh design scale, one underlay change costs one keepalive per live session and nothing
+/// for idle peers (infraternal D393: designed for 1,000 peers; #483, J633).
+///
+/// Alice has one peer with a session (Bob) and 999 configured peers that never handshook. A
+/// request flags exactly one peer, and after a timer wake Bob has heard one keepalive while no
+/// idle peer got an initiation.
+///
+/// Bob's hearing is observed as his roam to Alice's moved source address. A keepalive carries
+/// no payload, so it never moves Bob's `rx_bytes`, which counts decapsulated bytes.
+///
+/// Every idle peer has an endpoint in `10.99.0.0/16`, a sink nobody answers, and the test
+/// counts every datagram Alice sends there (infraternal #483, J707 P3). Without endpoints an
+/// idle peer could not send an initiation at all, so a request that wrongly woke every peer
+/// still passed; with them, that mutation sends 999 initiations to the sink and fails here.
+#[tokio::test]
+#[test_log::test]
+async fn requested_keepalives_at_1000_peers_reach_only_live_sessions() {
+    use crate::device::Peer;
+    use futures::StreamExt;
+    use ipnetwork::Ipv4Network;
+    use std::net::Ipv4Addr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let (alice, mut bob, eve) = mock::device_pair().await;
+    let idle = (0..999_u32).map(|index| {
+        let [_, _, high, low] = index.to_be_bytes();
+        Peer::new(PublicKey::from(&StaticSecret::random()))
+            .with_endpoint((Ipv4Addr::new(10, 99, high, low), 51820).into())
+            .with_allowed_ip(
+                Ipv4Network::new(Ipv4Addr::new(10, 200, high, low), 32)
+                    .unwrap()
+                    .into(),
+            )
+    });
+    assert!(alice.device.add_peers(idle).await.unwrap());
+    assert_eq!(alice.device.peers().await.len(), 1000);
+
+    // Count every datagram addressed to an idle peer's endpoint, from here to the end.
+    let to_sink = Arc::new(AtomicUsize::new(0));
+    let sink = Ipv4Network::new(Ipv4Addr::new(10, 99, 0, 0), 16).unwrap();
+    let counter = Arc::clone(&to_sink);
+    let mut sniffed = Box::pin(eve.ipv4());
+    tokio::spawn(async move {
+        while let Some(datagram) = sniffed.next().await {
+            if sink.contains(Ipv4Addr::from_bits(
+                datagram.header.destination_address.get(),
+            )) {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+
+    let packet = mock::packet(b"Hello!");
+    alice.app_tx.send(packet.clone()).await;
+    assert_eq!(bob.app_rx.recv().await.as_bytes(), packet.as_bytes());
+
+    let moved: Ipv4Addr = "1.3.3.7".parse().unwrap();
+    *alice.source_ipv4_override.lock().await = Some(moved);
+    assert_eq!(alice.device.request_keepalives().await, 1);
+    timeout(Duration::from_secs(2), async {
+        while bob.device.peers().await[0]
+            .peer
+            .endpoint
+            .map(|addr| addr.ip())
+            != Some(moved.into())
+        {
+            // sleep: polls Bob's peer table; the bound is the outer timeout.
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Bob should hear the requested keepalive");
+    // sleep: two more timer wakes, so an initiation queued by the same request has been sent.
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        to_sink.load(Ordering::Relaxed),
+        0,
+        "a requested keepalive sent initiations to idle peers"
+    );
+    let started = alice
+        .device
+        .peers()
+        .await
+        .into_iter()
+        .filter(|peer| peer.stats.last_handshake.is_some() || peer.stats.tx_bytes > 0)
+        .count();
+    assert_eq!(started, 1, "only the live session may send anything");
 }
 
 /// Adding peers is atomic, including when a public key is duplicated within the batch.
@@ -1968,4 +2128,50 @@ async fn a_drain_requested_before_peer_removal_sends_nothing() {
     eprintln!("drain: peer kept -> {kept} datagrams, peer removed -> {removed} datagrams");
     assert_eq!(kept, 8, "control: a live peer's queue is drained");
     assert_eq!(removed, 0, "a removed peer's handshake queue was sent");
+}
+
+/// Measures one `request_keepalives` call at mesh design scale (infraternal D393: designed for
+/// 1,000 peers, tested up to 4,096; #483 J707 P3). Alice has one live session (Bob) and the
+/// rest idle, as after an underlay change on a large, mostly quiet mesh. Prints p50, p99 and
+/// max over 1,000 calls per size; it asserts nothing about time, so it is ignored by default.
+///
+/// Run it in release on a quiet host:
+/// `cargo test --release -p gotatun --lib --features device,ring,tun -- --ignored --nocapture
+/// requested_keepalives_cost_at_design_scale`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "measurement; run in release on a quiet host"]
+async fn requested_keepalives_cost_at_design_scale() {
+    use crate::device::Peer;
+    use ipnetwork::Ipv4Network;
+    use std::net::Ipv4Addr;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    for total in [1_000_u32, 4_096] {
+        let (alice, mut bob, _eve) = mock::device_pair().await;
+        let idle = (0..total - 1).map(|index| {
+            let [_, _, high, low] = index.to_be_bytes();
+            Peer::new(PublicKey::from(&StaticSecret::random()))
+                .with_endpoint((Ipv4Addr::new(10, 99, high, low), 51820).into())
+                .with_allowed_ip(
+                    Ipv4Network::new(Ipv4Addr::new(10, 200, high, low), 32)
+                        .unwrap()
+                        .into(),
+                )
+        });
+        assert!(alice.device.add_peers(idle).await.unwrap());
+        let packet = mock::packet(b"Hello!");
+        alice.app_tx.send(packet.clone()).await;
+        assert_eq!(bob.app_rx.recv().await.as_bytes(), packet.as_bytes());
+        let mut samples = Vec::with_capacity(1_000);
+        for _ in 0..1_000 {
+            let started = std::time::Instant::now();
+            assert_eq!(alice.device.request_keepalives().await, 1);
+            samples.push(started.elapsed());
+        }
+        samples.sort();
+        println!(
+            "request_keepalives peers={total} calls=1000 p50={:?} p99={:?} max={:?}",
+            samples[499], samples[989], samples[999]
+        );
+    }
 }
