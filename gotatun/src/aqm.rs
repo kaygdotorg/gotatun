@@ -370,8 +370,13 @@ impl Codel {
                 // In this ordered peer stream the next arrival is after the previous dequeue.
                 // Require agreement from both clock comparisons before renewing byte credit.
                 *self = Self::default();
-            } else if gap > config.interval_ns {
-                // No recent observation: the queue could have stood throughout a local stall.
+            } else if gap > config.interval_ns
+                || (gap > sojourn_ns
+                    && now.wall_ns.saturating_sub(self.last_above.wall_ns) <= sojourn_ns)
+            {
+                // A long silence may be a local stall. When only the monotonic comparison
+                // indicates a drain, a clock step may have hidden it from the wall comparison.
+                // Discard old signals in either case, preserving the byte allowance.
                 self.end_episode();
             }
         }
@@ -1666,5 +1671,117 @@ mod tests {
             );
             assert_eq!(codel.deadline_ns, at.mono_ns + cfg.interval_ns);
         }
+    }
+
+    /// A real drain still starts a new episode when fresh stamps use a new wall epoch.
+    #[test]
+    fn j891_drained_peer_resumes_across_clock_step() {
+        let cfg = ecn_1_10();
+        let epoch = 1_800_000_000_000_000_000;
+        let mut results = Vec::new();
+        for shift in [
+            0_i64,
+            3_600_000 * MS as i64,
+            -3_600_000 * MS as i64,
+            -7 * MS as i64,
+        ] {
+            let mut warm = Codel::default();
+            let (_, _) = drive_bulk(&mut warm, &cfg, 1, 0, epoch, 200);
+            for _ in 0..MAX_OWED_SIGNALS {
+                let when = warm.deadline_ns;
+                let mut small = tcp_v4(22, 0, 216);
+                assert_eq!(
+                    judge_with(&mut warm, &mut small, when - 3 * MS, when, &cfg),
+                    Verdict::Pass
+                );
+            }
+            assert_eq!(warm.owed, MAX_OWED_SIGNALS);
+            let last = warm.last_above.mono_ns;
+            let resumed = last + cfg.interval_ns - 100_000;
+            assert!(resumed - 3 * MS > last, "the new packets arrive after drain");
+            warm.sparse.credit = 0;
+            warm.sparse.last_ns = last;
+            let mut fresh = Codel::default();
+            let mut warm_drops = 0;
+            let mut fresh_drops = 0;
+            for step in 0..10 {
+                let mono_ns = resumed + step * 10_000;
+                let wall_ns = mono_ns.checked_add_signed(shift).unwrap();
+                let at = DequeueTime { wall_ns, mono_ns };
+                let stamp = wall_ns - 3 * MS;
+                let mut packet = tcp_v4(40_000, 0, 1400);
+                warm_drops += usize::from(
+                    judge_with_time(&mut warm, &mut packet, stamp, at, &cfg) == Verdict::Drop,
+                );
+                fresh_drops += usize::from(
+                    judge_with_time(&mut fresh, &mut packet, stamp, at, &cfg) == Verdict::Drop,
+                );
+            }
+            eprintln!(
+                "J891 shift_ns={shift} gap_ns=9900000 warm_drops={warm_drops} fresh_drops={fresh_drops}"
+            );
+            results.push((warm_drops, fresh_drops));
+            // Bulk packets never touch the bucket. Only the two agreeing drain
+            // comparisons can renew it immediately.
+            let expected_credit = if shift >= 0 {
+                SPARSE_BURST_BYTES * SPARSE_INTERVAL_NS
+            } else {
+                0
+            };
+            assert_eq!(warm.sparse.credit, expected_credit, "shift_ns={shift}");
+        }
+        assert_eq!(results, vec![(0, 0); 4]);
+    }
+
+    /// An overdue deadline equal to the candidate next deadline only earns one signal.
+    #[test]
+    fn j891_catch_up_at_next_deadline_equality() {
+        let cfg = ecn_1_10();
+        let mut codel = Codel::default();
+        drive_bulk(&mut codel, &cfg, 1, 0, 10 * MS, 200);
+        assert!(codel.count > 0);
+        let spacing = (cfg.interval_ns as f64 / f64::from(codel.count + 1).sqrt()) as u64;
+        let now = codel.deadline_ns + spacing;
+        let stamp = codel.last_above.wall_ns - 3 * MS;
+        let mut packet = tcp_v4(40_000, 0, 1400);
+        assert_eq!(
+            judge_with(&mut codel, &mut packet, stamp, now, &cfg),
+            Verdict::Drop
+        );
+        assert_eq!(
+            judge_with(&mut codel, &mut packet, stamp, now, &cfg),
+            Verdict::Pass
+        );
+        assert!(codel.deadline_ns > now);
+    }
+
+    /// The environment cannot select zero timing or wrap a near-u64 deadline.
+    #[test]
+    fn j891_timing_bounds_and_saturation() {
+        let normal = ecn_1_10();
+        let zero = from_vars(&[
+            ("GOTATUN_AQM_INTERVAL_US", "0"),
+            ("GOTATUN_AQM_TARGET_US", "0"),
+        ]);
+        assert_eq!(zero, normal);
+        let maximum = (u64::MAX / 1_000).to_string();
+        let huge = from_vars(&[("GOTATUN_AQM_INTERVAL_US", &maximum)]);
+        assert_eq!(huge.interval_ns, u64::MAX / 1_000 * 1_000);
+        let wall_ns = 1_800_000_000_000_000_000;
+        let mut codel = Codel::default();
+        let mut packet = tcp_v4(40_000, 2, 1400);
+        for mono_ns in [u64::MAX - 2, u64::MAX - 1] {
+            let at = DequeueTime { wall_ns, mono_ns };
+            assert_eq!(
+                judge_with_time(&mut codel, &mut packet, wall_ns - 3 * MS, at, &huge),
+                Verdict::Pass
+            );
+            assert_eq!(codel.deadline_ns, u64::MAX);
+        }
+        eprintln!(
+            "J891 state_bytes={} sparse_bytes={}",
+            size_of::<Codel>(),
+            size_of::<SparseBudget>()
+        );
     }
 }
