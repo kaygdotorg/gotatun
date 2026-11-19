@@ -366,12 +366,21 @@ impl Codel {
         }
         let gap = now.mono_ns.saturating_sub(self.last_above.mono_ns);
         if self.deadline_ns != 0 {
-            if gap > sojourn_ns && rx_ns > self.last_above.wall_ns {
-                // In this ordered peer stream the next arrival is after the previous dequeue.
-                // Require agreement from both clock comparisons before renewing byte credit.
+            let drained_by_age = gap > sojourn_ns;
+            let drained_by_stamp = rx_ns > self.last_above.wall_ns;
+            if drained_by_age && drained_by_stamp {
+                // Both comparisons place the next arrival after the prior dequeue.
                 *self = Self::default();
-            } else if gap > config.interval_ns {
-                // No recent observation: the queue could have stood throughout a local stall.
+            } else if gap > config.interval_ns
+                || drained_by_age
+                || (drained_by_stamp && rx_ns - self.last_above.wall_ns <= gap)
+            {
+                // A long silence expires old observations. A drain indicated by age alone
+                // may have been hidden by a backward wall-clock step. A newer stamp within
+                // the previous wall epoch's monotonic window could have preceded a forward
+                // step that inflated its age. A stamp beyond that window can be fresh in
+                // the new epoch, so it cannot establish a drain on its own.
+                // Keep byte credit when the two comparisons disagree.
                 self.end_episode();
             }
         }
@@ -658,13 +667,15 @@ mod tests {
         }
     }
 
+    /// A continuous backlog gets its first signal at the observation deadline.
     #[test]
     fn first_signal_waits_one_interval_above_target() {
         let mut codel = Codel::default();
         let config = config(AqmMode::Drop);
-        assert!(!codel.should_signal(test_time(0), 0, 6 * MS, &config));
-        assert!(!codel.should_signal(test_time(99 * MS), 0, 6 * MS, &config));
-        assert!(codel.should_signal(test_time(100 * MS), 0, 6 * MS, &config));
+        let stamp = 4 * MS;
+        assert!(!codel.should_signal(test_time(10 * MS), stamp, 6 * MS, &config));
+        assert!(!codel.should_signal(test_time(109 * MS), stamp, 105 * MS, &config));
+        assert!(codel.should_signal(test_time(110 * MS), stamp, 106 * MS, &config));
     }
 
     #[test]
@@ -688,17 +699,20 @@ mod tests {
         assert!(signals.windows(2).all(|pair| pair[1] > pair[0]));
     }
 
+    /// A below-target packet clears the prior episode before fresh backlog can signal.
     #[test]
     fn falling_below_target_leaves_the_signalling_state() {
         let mut codel = Codel::default();
         let config = config(AqmMode::Drop);
-        codel.should_signal(test_time(0), 0, 6 * MS, &config);
-        assert!(codel.should_signal(test_time(100 * MS), 0, 6 * MS, &config));
-        assert!(!codel.should_signal(test_time(101 * MS), 0, MS, &config));
+        let stamp = 4 * MS;
+        codel.should_signal(test_time(10 * MS), stamp, 6 * MS, &config);
+        assert!(codel.should_signal(test_time(110 * MS), stamp, 106 * MS, &config));
+        assert!(!codel.should_signal(test_time(111 * MS), 110 * MS, MS, &config));
         // A new episode needs another full interval above target.
-        assert!(!codel.should_signal(test_time(102 * MS), 0, 6 * MS, &config));
-        assert!(!codel.should_signal(test_time(201 * MS), 0, 6 * MS, &config));
-        assert!(codel.should_signal(test_time(202 * MS), 0, 6 * MS, &config));
+        let stamp = 111 * MS;
+        assert!(!codel.should_signal(test_time(117 * MS), stamp, 6 * MS, &config));
+        assert!(!codel.should_signal(test_time(216 * MS), stamp, 105 * MS, &config));
+        assert!(codel.should_signal(test_time(217 * MS), stamp, 106 * MS, &config));
     }
 
     #[test]
@@ -1666,5 +1680,267 @@ mod tests {
             );
             assert_eq!(codel.deadline_ns, at.mono_ns + cfg.interval_ns);
         }
+    }
+
+    /// A real drain still starts a new episode when fresh stamps use a new wall epoch.
+    #[test]
+    fn j891_drained_peer_resumes_across_clock_step() {
+        let cfg = ecn_1_10();
+        let epoch = 1_800_000_000_000_000_000;
+        let mut results = Vec::new();
+        for shift in [
+            0_i64,
+            3_600_000 * MS as i64,
+            -3_600_000 * MS as i64,
+            -7 * MS as i64,
+        ] {
+            let mut warm = Codel::default();
+            let (_, _) = drive_bulk(&mut warm, &cfg, 1, 0, epoch, 200);
+            for _ in 0..MAX_OWED_SIGNALS {
+                let when = warm.deadline_ns;
+                let mut small = tcp_v4(22, 0, 216);
+                assert_eq!(
+                    judge_with(&mut warm, &mut small, when - 3 * MS, when, &cfg),
+                    Verdict::Pass
+                );
+            }
+            assert_eq!(warm.owed, MAX_OWED_SIGNALS);
+            let last = warm.last_above.mono_ns;
+            let resumed = last + cfg.interval_ns - 100_000;
+            assert!(
+                resumed - 3 * MS > last,
+                "the new packets arrive after drain"
+            );
+            warm.sparse.credit = 0;
+            warm.sparse.last_ns = last;
+            let mut fresh = Codel::default();
+            let mut warm_drops = 0;
+            let mut fresh_drops = 0;
+            for step in 0..10 {
+                let mono_ns = resumed + step * 10_000;
+                let wall_ns = mono_ns.checked_add_signed(shift).unwrap();
+                let at = DequeueTime { wall_ns, mono_ns };
+                let stamp = wall_ns - 3 * MS;
+                let mut packet = tcp_v4(40_000, 0, 1400);
+                warm_drops += usize::from(
+                    judge_with_time(&mut warm, &mut packet, stamp, at, &cfg) == Verdict::Drop,
+                );
+                fresh_drops += usize::from(
+                    judge_with_time(&mut fresh, &mut packet, stamp, at, &cfg) == Verdict::Drop,
+                );
+            }
+            eprintln!(
+                "J891 shift_ns={shift} gap_ns=9900000 warm_drops={warm_drops} fresh_drops={fresh_drops}"
+            );
+            results.push((warm_drops, fresh_drops));
+            // Bulk packets never touch the bucket. Only the two agreeing drain
+            // comparisons can renew it immediately.
+            let expected_credit = if shift >= 0 {
+                SPARSE_BURST_BYTES * SPARSE_INTERVAL_NS
+            } else {
+                0
+            };
+            assert_eq!(warm.sparse.credit, expected_credit, "shift_ns={shift}");
+        }
+        assert_eq!(results, vec![(0, 0); 4]);
+    }
+
+    /// A forward clock step between receive and dequeue must not carry a drained episode's debt.
+    #[test]
+    fn j908_forward_step_after_receive_clears_drained_episode() {
+        let cfg = ecn_1_10();
+        let epoch = 1_800_000_000_000_000_000;
+        let mut verdicts = Vec::new();
+        for shift in [0, 7 * MS] {
+            let mut warm = Codel::default();
+            drive_bulk(&mut warm, &cfg, 1, 0, epoch, 200);
+            for _ in 0..MAX_OWED_SIGNALS {
+                let now = warm.deadline_ns;
+                let mut small = tcp_v4(22, 0, 216);
+                assert_eq!(
+                    judge_with(&mut warm, &mut small, now - 3 * MS, now, &cfg),
+                    Verdict::Pass
+                );
+            }
+            assert_eq!(warm.owed, MAX_OWED_SIGNALS);
+            warm.sparse.credit = 0;
+            let last = warm.last_above;
+            warm.sparse.last_ns = last.mono_ns;
+            let resumed = last.mono_ns + 9 * MS + 900_000;
+            // The new datagram arrived 6.9 ms after the prior dequeue. Its stamp
+            // precedes the step, so the measured age grows from 3 ms to 10 ms.
+            let stamp = resumed - 3 * MS;
+            assert!(stamp > last.wall_ns);
+            let at = DequeueTime {
+                wall_ns: resumed + shift,
+                mono_ns: resumed,
+            };
+            let mut packet = tcp_v4(40_000, 0, 1400);
+            let mut fresh = Codel::default();
+            let warm_result = judge_with_time(&mut warm, &mut packet, stamp, at, &cfg);
+            let fresh_result = judge_with_time(&mut fresh, &mut packet, stamp, at, &cfg);
+            eprintln!(
+                "shift_ns={shift} age_ns={} warm={warm_result:?} fresh={fresh_result:?} owed={} credit={} deadline={} expected_deadline={}",
+                at.wall_ns - stamp,
+                warm.owed,
+                warm.sparse.credit,
+                warm.deadline_ns,
+                resumed + cfg.interval_ns
+            );
+            verdicts.push((
+                warm_result,
+                fresh_result,
+                warm.owed,
+                warm.sparse.credit,
+                warm.deadline_ns,
+            ));
+            assert_eq!(fresh.deadline_ns, resumed + cfg.interval_ns);
+        }
+        assert_eq!(
+            verdicts[0],
+            (
+                Verdict::Pass,
+                Verdict::Pass,
+                0,
+                SPARSE_BURST_BYTES * SPARSE_INTERVAL_NS,
+                verdicts[0].4
+            )
+        );
+        assert_eq!(
+            verdicts[1],
+            (Verdict::Pass, Verdict::Pass, 0, 0, verdicts[0].4)
+        );
+    }
+
+    /// Bulk frames leave sparse credit available independently at the 4,096-peer design scale.
+    #[test]
+    fn j908_mixed_credit_is_independent_at_mesh_scale() {
+        let cfg = ecn_1_10();
+        let mut peers: Vec<_> = (0..4096).map(|_| Codel::default()).collect();
+        let initial = 20 * MS;
+        for peer in &mut peers {
+            let mut bulk = tcp_v4(40_000, 2, 1400);
+            judge_with(peer, &mut bulk, initial - 3 * MS, initial, &cfg);
+        }
+        for peer in &mut peers[..2048] {
+            let mut small = tcp_v4(22, 0, 256);
+            for _ in 0..256 {
+                judge_with(peer, &mut small, initial - 3 * MS, initial, &cfg);
+            }
+            assert_eq!(peer.sparse.credit, 0);
+        }
+        // Present one above-target sample before the interval elapses on each peer.
+        let midpoint = initial + 5 * MS;
+        for peer in &mut peers {
+            let mut bulk = tcp_v4(40_000, 2, 1400);
+            judge_with(peer, &mut bulk, midpoint - 8 * MS, midpoint, &cfg);
+        }
+        let due = initial + 10 * MS;
+        for (index, peer) in peers.iter_mut().enumerate() {
+            let mut small = tcp_v4(22, 0, 216);
+            let mut bulk = tcp_v4(40_000, 2, 1400);
+            assert_eq!(
+                judge_with(peer, &mut small, due - 13 * MS, due, &cfg),
+                Verdict::Pass
+            );
+            assert_eq!(
+                judge_with(peer, &mut bulk, due - 13 * MS, due, &cfg),
+                Verdict::Marked
+            );
+            let credit = if index < 2048 {
+                SPARSE_BYTES
+            } else {
+                SPARSE_BURST_BYTES
+            };
+            assert_eq!(peer.sparse.credit, (credit - 224) * SPARSE_INTERVAL_NS);
+        }
+        eprintln!(
+            "peers={} controller_bytes={} total_bytes={}",
+            peers.len(),
+            size_of::<Codel>(),
+            peers.len() * size_of::<Codel>()
+        );
+    }
+
+    /// An overdue deadline equal to the candidate next deadline only earns one signal.
+    #[test]
+    fn j891_catch_up_at_next_deadline_equality() {
+        let cfg = ecn_1_10();
+        let mut codel = Codel::default();
+        drive_bulk(&mut codel, &cfg, 1, 0, 10 * MS, 200);
+        assert!(codel.count > 0);
+        let spacing = (cfg.interval_ns as f64 / f64::from(codel.count + 1).sqrt()) as u64;
+        let now = codel.deadline_ns + spacing;
+        let stamp = codel.last_above.wall_ns - 3 * MS;
+        let mut packet = tcp_v4(40_000, 0, 1400);
+        assert_eq!(
+            judge_with(&mut codel, &mut packet, stamp, now, &cfg),
+            Verdict::Drop
+        );
+        assert_eq!(
+            judge_with(&mut codel, &mut packet, stamp, now, &cfg),
+            Verdict::Pass
+        );
+        assert!(codel.deadline_ns > now);
+    }
+
+    /// The environment cannot select zero timing or wrap a near-u64 deadline.
+    #[test]
+    fn j891_timing_bounds_and_saturation() {
+        let normal = ecn_1_10();
+        let zero = from_vars(&[
+            ("GOTATUN_AQM_INTERVAL_US", "0"),
+            ("GOTATUN_AQM_TARGET_US", "0"),
+        ]);
+        assert_eq!(zero, normal);
+        let maximum = (u64::MAX / 1_000).to_string();
+        let huge = from_vars(&[("GOTATUN_AQM_INTERVAL_US", &maximum)]);
+        assert_eq!(huge.interval_ns, u64::MAX / 1_000 * 1_000);
+        let wall_ns = 1_800_000_000_000_000_000;
+        let mut codel = Codel::default();
+        let mut packet = tcp_v4(40_000, 2, 1400);
+        for mono_ns in [u64::MAX - 2, u64::MAX - 1] {
+            let at = DequeueTime { wall_ns, mono_ns };
+            assert_eq!(
+                judge_with_time(&mut codel, &mut packet, wall_ns - 3 * MS, at, &huge),
+                Verdict::Pass
+            );
+            assert_eq!(codel.deadline_ns, u64::MAX);
+        }
+        eprintln!(
+            "J891 state_bytes={} sparse_bytes={}",
+            size_of::<Codel>(),
+            size_of::<SparseBudget>()
+        );
+    }
+
+    /// Equal offered load should give each bulk flow a share of the signals.
+    #[test]
+    #[ignore = "fixed run-order CE concentration is tracked separately in #260"]
+    fn j891_signal_distribution_at_real_run_granularity() {
+        let cfg = ecn_1_10();
+        let mut distributions = Vec::new();
+        for rotate in [false, true] {
+            let mut codel = Codel::default();
+            let mut marks = [0_u32; 8];
+            for run in 0..12_000_usize {
+                let now = 10 * MS + run as u64 * 80_000;
+                let start_flow = if rotate { run % marks.len() } else { 0 };
+                for slot in 0..32 {
+                    let flow = (start_flow + slot) % marks.len();
+                    let mut packet = tcp_v4(40_000 + flow as u16, 2, 1400);
+                    let verdict = judge_with(&mut codel, &mut packet, now - 3 * MS, now, &cfg);
+                    marks[flow] += u32::from(verdict == Verdict::Marked);
+                }
+            }
+            eprintln!("J891 run_phase_rotated={rotate} marks={marks:?}");
+            distributions.push(marks);
+        }
+        assert!(
+            distributions
+                .iter()
+                .all(|marks| marks.iter().all(|&mark| mark > 0)),
+            "one flow alone receives CE when its position at the head of every run is fixed"
+        );
     }
 }
