@@ -12,19 +12,20 @@
 
 //! Bounded packet-crypto workers and per-peer ordered completion stages.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread::{self, JoinHandle};
 
-use parking_lot::{Condvar, Mutex};
+use concurrent_queue::{ConcurrentQueue, PopError};
+use parking_lot::Mutex;
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 
 use crate::noise::errors::WireGuardError;
@@ -76,9 +77,6 @@ pub(crate) const MAX_PEER_CRYPTO_IN_FLIGHT: usize = 128;
 /// Bound on worker runs waiting in the shared queue. Every run is already full when submitted;
 /// workers never wait to fill it, so a short packet cannot be held behind a packet-count target.
 pub(crate) const MAX_QUEUED_CRYPTO_JOBS: usize = 128;
-
-/// Number of lock-free checks a worker makes for newly queued chunks before it parks.
-const WORKER_SPIN_COUNT: usize = 128;
 
 /// Assigns a diagnostic identity that stays unique after a drained lane is retired.
 static NEXT_ORDERED_LANE_ID: AtomicU64 = AtomicU64::new(1);
@@ -712,21 +710,40 @@ enum CryptoJob {
     ),
 }
 
-/// Bounded work queue shared by the fixed crypto worker set.
-///
-/// Workers park on the condition variable while the queue is empty. The mutex protects only the
-/// queue metadata; a worker releases it before processing a run.
+/// A preallocated queue with a wake on the first submission after workers observe it empty.
 struct CryptoQueue {
-    state: Mutex<CryptoQueueState>,
-    ready: Condvar,
+    jobs: ConcurrentQueue<QueuedCryptoJob>,
     queued_slots: Arc<Semaphore>,
-    queued_jobs: AtomicUsize,
+    /// Coalesces submissions while a woken worker has yet to take work.
+    ///
+    /// Set by the push that wakes a worker. Cleared when a worker finds the queue empty, and
+    /// also when a worker takes the last queued run: that worker is busy from then on, so a
+    /// later push must wake an idle peer rather than wait for it (#260, J1010).
+    ready: AtomicBool,
+    /// Rotates the first idle slot considered by each wake.
+    wake_cursor: AtomicUsize,
+    sleepers: Box<[WorkerSleep]>,
 }
 
-/// Queue metadata protected only while runs are added, removed, or the pool closes.
-struct CryptoQueueState {
-    jobs: VecDeque<QueuedCryptoJob>,
-    closed: bool,
+/// An idle claim and one retained wake token for a particular native worker.
+#[derive(Default)]
+struct WorkerSleep {
+    idle: AtomicBool,
+    thread: OnceLock<thread::Thread>,
+}
+
+impl WorkerSleep {
+    /// Claim the idle flag and retain a wake even if this worker has yet to enter `park`.
+    fn wake(&self) -> bool {
+        if self.idle.load(Ordering::SeqCst) && self.idle.swap(false, Ordering::SeqCst) {
+            self.thread
+                .get()
+                .expect("worker registered before idle")
+                .unpark();
+            return true;
+        }
+        false
+    }
 }
 
 /// One bounded run and the permit that accounts for its place in the queue.
@@ -736,71 +753,108 @@ struct QueuedCryptoJob {
 }
 
 impl CryptoQueue {
-    /// Create an empty queue with a fixed number of pending worker-run slots.
-    fn new(capacity: usize) -> Self {
+    /// Create an empty queue with a fixed number of pending runs and native workers.
+    fn new(capacity: usize, workers: usize) -> Self {
         Self {
-            state: Mutex::new(CryptoQueueState {
-                jobs: VecDeque::with_capacity(capacity),
-                closed: false,
-            }),
-            ready: Condvar::new(),
+            jobs: ConcurrentQueue::bounded(capacity),
             queued_slots: Arc::new(Semaphore::new(capacity)),
-            queued_jobs: AtomicUsize::new(0),
+            ready: AtomicBool::new(false),
+            wake_cursor: AtomicUsize::new(0),
+            sleepers: (0..workers).map(|_| WorkerSleep::default()).collect(),
         }
     }
 
-    /// Enqueue one complete run under one queue lock and wake one parked worker.
+    /// Publish one whole run, waking a worker on the first submission after an empty observation.
     async fn push(&self, job: CryptoJob) -> Result<(), ()> {
         let permit = Arc::clone(&self.queued_slots)
             .acquire_owned()
             .await
             .map_err(|_| ())?;
-        let mut state = self.state.lock();
-        if state.closed {
-            return Err(());
+        self.jobs
+            .push(QueuedCryptoJob {
+                job,
+                _permit: permit,
+            })
+            .map_err(|_| ())?;
+        if !self.ready.swap(true, Ordering::SeqCst) {
+            self.wake_one();
         }
-        state.jobs.push_back(QueuedCryptoJob {
-            job,
-            _permit: permit,
-        });
-        self.queued_jobs.fetch_add(1, Ordering::Release);
-        self.ready.notify_one();
         Ok(())
     }
 
-    /// Take one worker chunk, briefly spinning before parking when the queue remains empty.
-    fn pop(&self) -> Option<CryptoJob> {
-        let mut state = self.state.lock();
+    /// Remove one job, then hand any backlog to another idle worker (see [`Self::after_take`]).
+    fn take_job(&self) -> Result<CryptoJob, PopError> {
+        let QueuedCryptoJob { job, _permit } = self.jobs.pop()?;
+        self.after_take();
+        Ok(job)
+    }
+
+    /// Call after a worker takes a run.
+    ///
+    /// A remaining backlog goes to another idle worker. An empty queue withdraws the coalesced
+    /// ready signal: the taking worker is now busy with its run, and a push that still saw the
+    /// signal would otherwise skip its wake and wait for that run to finish while other workers
+    /// sit parked. J1010 examines this wait as the source of R's BBR queue tail.
+    ///
+    /// The re-check after the store closes the race with a push that read the old signal: its
+    /// publication precedes its read, which precedes the store, which precedes the re-check.
+    fn after_take(&self) {
+        if self.jobs.is_empty() {
+            self.ready.store(false, Ordering::SeqCst);
+            if self.jobs.is_empty() {
+                return;
+            }
+        }
+        self.wake_one();
+    }
+
+    /// Park without a queue mutex. Recheck after publishing idle to close the wake race.
+    fn pop(&self, worker_index: usize) -> Option<CryptoJob> {
+        let sleeper = &self.sleepers[worker_index];
         loop {
-            if let Some(QueuedCryptoJob { job, _permit }) = state.jobs.pop_front() {
-                self.queued_jobs.fetch_sub(1, Ordering::Relaxed);
-                drop(state);
-                drop(_permit);
-                return Some(job);
-            }
-            if state.closed {
-                return None;
+            match self.take_job() {
+                Ok(job) => return Some(job),
+                Err(PopError::Closed) => return None,
+                Err(PopError::Empty) => {}
             }
 
-            drop(state);
-            for _ in 0..WORKER_SPIN_COUNT {
-                if self.queued_jobs.load(Ordering::Acquire) > 0 {
-                    break;
+            // Use a read-modify-write to also observe a producer that published work but
+            // saw an existing ready signal and skipped the wake.
+            self.ready.swap(false, Ordering::SeqCst);
+            sleeper.idle.store(true, Ordering::SeqCst);
+            let next = self.jobs.pop();
+            if matches!(next, Err(PopError::Empty)) {
+                thread::park();
+            }
+            sleeper.idle.store(false, Ordering::SeqCst);
+            match next {
+                Ok(QueuedCryptoJob { job, _permit }) => {
+                    self.after_take();
+                    return Some(job);
                 }
-                std::hint::spin_loop();
-            }
-
-            state = self.state.lock();
-            if state.jobs.is_empty() && !state.closed {
-                self.ready.wait(&mut state);
+                Err(PopError::Closed) => return None,
+                Err(PopError::Empty) => {}
             }
         }
     }
 
-    /// Stop accepting work and wake parked workers so they can drain and exit.
+    /// Claim at most one parked worker, rotating priority across idle slots.
+    ///
+    /// The cursor determines only the order of consideration. Idle claims still own the wake
+    /// handshake, so the cursor does not need to synchronize with job publication.
+    fn wake_one(&self) {
+        let start = self.wake_cursor.fetch_add(1, Ordering::Relaxed) % self.sleepers.len();
+        let (before, after) = self.sleepers.split_at(start);
+        after.iter().chain(before).any(WorkerSleep::wake);
+    }
+
+    /// Reject new jobs, release waiting submitters, and let all workers drain before exiting.
     fn close(&self) {
-        self.state.lock().closed = true;
-        self.ready.notify_all();
+        self.jobs.close();
+        self.queued_slots.close();
+        for sleeper in &self.sleepers {
+            sleeper.wake();
+        }
     }
 }
 
@@ -1053,7 +1107,11 @@ impl WorkerThreads {
         thread::Builder::new()
             .name(format!("gotatun-crypto-{worker_index}"))
             .spawn(move || {
-                while let Some(job) = worker_queue.pop() {
+                worker_queue.sleepers[worker_index]
+                    .thread
+                    .set(thread::current())
+                    .expect("one thread per worker slot");
+                while let Some(job) = worker_queue.pop(worker_index) {
                     #[cfg(test)]
                     completed_runs.fetch_add(1, Ordering::Relaxed);
                     match job {
@@ -1130,7 +1188,7 @@ impl CryptoWorkers {
             "the crypto pool needs at least one worker"
         );
 
-        let queue = Arc::new(CryptoQueue::new(MAX_QUEUED_CRYPTO_JOBS));
+        let queue = Arc::new(CryptoQueue::new(MAX_QUEUED_CRYPTO_JOBS, worker_count));
         let active_batches = Arc::new(AtomicUsize::new(0));
         #[cfg(test)]
         let worker_run_count = Arc::new(AtomicUsize::new(0));
@@ -2040,6 +2098,123 @@ mod tests {
         workers.stop().await;
     }
 
+    /// An isolated enqueue wakes an idle pool even after repeating the park transition.
+    #[tokio::test]
+    async fn isolated_submission_wakes_a_parked_crypto_worker() {
+        let workers = CryptoWorkers::with_worker_count(4).unwrap();
+        let crypto = workers.handle();
+        assert!(workers.start_threads());
+        let (mut sender, _) = established_tunnels();
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for _ in 0..128 {
+                while !workers
+                    .queue
+                    .sleepers
+                    .iter()
+                    .all(|sleeper| sleeper.idle.load(Ordering::SeqCst))
+                {
+                    tokio::task::yield_now().await;
+                }
+                let run = prepared_encryptions(&mut sender, 1)
+                    .into_iter()
+                    .map(|packet| Some(PreparedOutgoing::Encrypt(packet)))
+                    .collect();
+                assert_eq!(crypto.encrypt_run(run, true).await.unwrap().len(), 1);
+            }
+        })
+        .await
+        .expect("every empty-to-nonempty transition must wake a worker");
+        workers.stop().await;
+    }
+
+    /// A run published while the only woken worker is busy with an earlier run wakes an idle
+    /// peer instead of waiting for that run to finish (#260, J1010).
+    #[test]
+    fn push_behind_a_busy_worker_wakes_an_idle_peer() {
+        std::thread::spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let queue = super::CryptoQueue::new(4, 2);
+            for sleeper in &queue.sleepers {
+                assert!(sleeper.thread.set(std::thread::current()).is_ok());
+                sleeper.idle.store(true, Ordering::SeqCst);
+            }
+            let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let job = || {
+                let (sender, _) = tokio::sync::oneshot::channel();
+                super::CryptoJob::Encrypt(
+                    Vec::new(),
+                    sender,
+                    super::ActiveBatch::enter_queued(&active),
+                )
+            };
+            runtime.block_on(queue.push(job())).unwrap();
+            assert!(!queue.sleepers[0].idle.load(Ordering::SeqCst));
+            // Worker 0 takes the run and keeps it; worker 1 is still parked.
+            let _running = queue.take_job().ok().expect("the published run");
+            runtime.block_on(queue.push(job())).unwrap();
+            assert!(
+                !queue.sleepers[1].idle.load(Ordering::SeqCst),
+                "the second run waits for the busy worker while a peer stays parked"
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Repeated isolated wakes share first priority across equally idle native workers.
+    #[test]
+    fn isolated_wakes_rotate_idle_worker_priority() {
+        std::thread::spawn(|| {
+            let queue = super::CryptoQueue::new(4, 4);
+            for sleeper in &queue.sleepers {
+                assert!(sleeper.thread.set(std::thread::current()).is_ok());
+                sleeper.idle.store(true, Ordering::SeqCst);
+            }
+            for expected in [0, 1, 2, 3, 0] {
+                queue.wake_one();
+                let claimed: Vec<_> = queue
+                    .sleepers
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, sleeper)| {
+                        (!sleeper.idle.load(Ordering::SeqCst)).then_some(index)
+                    })
+                    .collect();
+                assert_eq!(claimed, [expected], "one idle worker per wake");
+                queue.sleepers[expected].idle.store(true, Ordering::SeqCst);
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Closing a full queue releases a blocked submitter while preserving accepted work.
+    #[tokio::test]
+    async fn closing_a_full_queue_rejects_waiters_and_drains_accepted_work() {
+        let queue = super::CryptoQueue::new(1, 1);
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let submit = || {
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            queue.push(super::CryptoJob::Encrypt(
+                vec![None],
+                tx,
+                super::ActiveBatch::enter_queued(&active),
+            ))
+        };
+
+        assert!(submit().await.is_ok());
+        let waiting = submit();
+        tokio::pin!(waiting);
+        assert!(futures::poll!(&mut waiting).is_pending());
+        queue.close();
+        assert!(waiting.await.is_err());
+        assert!(queue.take_job().is_ok());
+        assert!(matches!(queue.take_job(), Err(super::PopError::Closed)));
+    }
+
     /// Dropping the owner closes the queue and lets each parked worker thread exit.
     #[test]
     fn j369_dropping_workers_closes_the_queue() {
@@ -2049,7 +2224,7 @@ mod tests {
         let queue = Arc::clone(&workers.queue);
         let worker_exit_rx = Arc::clone(&workers.worker_exit_rx);
         drop(workers);
-        let closed = queue.state.lock().closed;
+        let closed = queue.jobs.is_closed();
         let exited_workers = (0..2)
             .take_while(|_| {
                 worker_exit_rx
