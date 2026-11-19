@@ -26,7 +26,7 @@ use std::sync::Arc;
 #[cfg(target_has_atomic = "64")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::IntoBytes;
 
 /// The maximum number of transport data messages that may be sent or received under a single
 /// session key, per section 6.2 of the [whitepaper](https://www.wireguard.com/papers/wireguard.pdf)
@@ -362,25 +362,17 @@ impl Session {
         packet: Packet,
         sending_key_counter: u64,
     ) -> Packet<WgData> {
-        let len = WgData::OVERHEAD + packet.len();
-
-        // Prepare a buffer to hold our the WgData packet and our encapsulated payload.
-        // TODO: we can remove this allocation by pre-allocating some extra
-        // space at the beginning of `packet`s allocation, and using that.
-        let mut buf = Packet::from_bytes(BytesMut::zeroed(len));
-
-        let data = WgData::mut_from_bytes(buf.buf_mut())
-            .expect("buffer size is at least WgData::OVERHEAD");
-
-        // Initialize wireguard header.
-        data.header = WgDataHeader::new()
+        let header = WgDataHeader::new()
             .with_receiver_idx(self.sending_index)
             .with_counter(sending_key_counter);
 
-        // Copy inner packet into place.
-        debug_assert_eq!(packet.len(), data.encrypted_encapsulated_packet_mut().len());
-        data.encrypted_encapsulated_packet_mut()
-            .copy_from_slice(&packet);
+        // Initialize the header and payload directly. The tag is an initialized
+        // placeholder until the worker seals the packet, so it never exposes spare bytes.
+        let mut bytes = BytesMut::with_capacity(WgData::OVERHEAD + packet.len());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&packet);
+        bytes.extend_from_slice(&[0; WgData::TAG_LEN]);
+        let buf = Packet::from_bytes(bytes);
 
         // Keep the reserved counter in the header until a worker applies AEAD.
         let packet = buf.try_into_wg().expect("is a wireguard packet");
@@ -483,6 +475,7 @@ impl Session {
 mod tests {
     use super::*;
     use crate::noise::index_table::IndexTable;
+    use zerocopy::FromBytes;
 
     /// Build a `Session` with throwaway keys and a real receiving index.
     fn test_session() -> Session {
