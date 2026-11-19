@@ -1698,7 +1698,10 @@ mod tests {
             assert_eq!(warm.owed, MAX_OWED_SIGNALS);
             let last = warm.last_above.mono_ns;
             let resumed = last + cfg.interval_ns - 100_000;
-            assert!(resumed - 3 * MS > last, "the new packets arrive after drain");
+            assert!(
+                resumed - 3 * MS > last,
+                "the new packets arrive after drain"
+            );
             warm.sparse.credit = 0;
             warm.sparse.last_ns = last;
             let mut fresh = Codel::default();
