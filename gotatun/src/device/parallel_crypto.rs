@@ -12,7 +12,7 @@
 
 //! Bounded packet-crypto workers and per-peer ordered completion stages.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
@@ -716,6 +716,8 @@ struct CryptoQueue {
     queued_slots: Arc<Semaphore>,
     /// Coalesces submissions until a worker next finds no work.
     ready: AtomicBool,
+    /// Rotates the first idle slot considered by each wake.
+    wake_cursor: AtomicUsize,
     sleepers: Box<[WorkerSleep]>,
 }
 
@@ -753,6 +755,7 @@ impl CryptoQueue {
             jobs: ConcurrentQueue::bounded(capacity),
             queued_slots: Arc::new(Semaphore::new(capacity)),
             ready: AtomicBool::new(false),
+            wake_cursor: AtomicUsize::new(0),
             sleepers: (0..workers).map(|_| WorkerSleep::default()).collect(),
         }
     }
@@ -816,9 +819,14 @@ impl CryptoQueue {
         }
     }
 
-    /// Claim at most one parked worker. An active worker relays the signal when needed.
+    /// Claim at most one parked worker, rotating priority across idle slots.
+    ///
+    /// The cursor determines only the order of consideration. Idle claims still own the wake
+    /// handshake, so the cursor does not need to synchronize with job publication.
     fn wake_one(&self) {
-        self.sleepers.iter().any(WorkerSleep::wake);
+        let start = self.wake_cursor.fetch_add(1, Ordering::Relaxed) % self.sleepers.len();
+        let (before, after) = self.sleepers.split_at(start);
+        after.iter().chain(before).any(WorkerSleep::wake);
     }
 
     /// Reject new jobs, release waiting submitters, and let all workers drain before exiting.
@@ -2099,6 +2107,33 @@ mod tests {
         .await
         .expect("every empty-to-nonempty transition must wake a worker");
         workers.stop().await;
+    }
+
+    /// Repeated isolated wakes share first priority across equally idle native workers.
+    #[test]
+    fn isolated_wakes_rotate_idle_worker_priority() {
+        std::thread::spawn(|| {
+            let queue = super::CryptoQueue::new(4, 4);
+            for sleeper in &queue.sleepers {
+                assert!(sleeper.thread.set(std::thread::current()).is_ok());
+                sleeper.idle.store(true, Ordering::SeqCst);
+            }
+            for expected in [0, 1, 2, 3, 0] {
+                queue.wake_one();
+                let claimed: Vec<_> = queue
+                    .sleepers
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, sleeper)| {
+                        (!sleeper.idle.load(Ordering::SeqCst)).then_some(index)
+                    })
+                    .collect();
+                assert_eq!(claimed, [expected], "one idle worker per wake");
+                queue.sleepers[expected].idle.store(true, Ordering::SeqCst);
+            }
+        })
+        .join()
+        .unwrap();
     }
 
     /// Closing a full queue releases a blocked submitter while preserving accepted work.
