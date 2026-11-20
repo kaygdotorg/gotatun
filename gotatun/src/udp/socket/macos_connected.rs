@@ -686,6 +686,182 @@ impl ConnectedSends {
     }
 }
 
+/// Where one run of a batched send goes (J1023 prototype, see [`super::macos_batch`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Target {
+    /// The route's unconnected socket, with a destination per datagram.
+    Wildcard,
+    /// Pool socket `.0`, connected to `.1`, no destination.
+    Slot(usize, SocketAddr),
+}
+
+impl ConnectedSends {
+    /// J1023 prototype: send a same-family run with as few `sendmsg_x` calls as possible.
+    ///
+    /// Consecutive datagrams to the same target form one call: data to an endpoint with a pool
+    /// socket goes on that connected socket without an address, everything else on `wildcard`
+    /// with its destination (`destination` is already routed for it). The pool's rules are
+    /// unchanged: non-data marks its endpoint stale and takes the wildcard, and a run on a pool
+    /// socket is only sent while the socket is still connected to that endpoint.
+    pub(crate) async fn send_batch(
+        &self,
+        wildcard: &tokio::net::UdpSocket,
+        run: &[(&[u8], SocketAddr)],
+    ) -> io::Result<()> {
+        let mut start = 0;
+        while start < run.len() {
+            let target = self.target_of(run[start].0, run[start].1);
+            let mut end = start + 1;
+            while end < run.len() {
+                let next = match target {
+                    // Same endpoint, still data: stays on the slot without another table lookup.
+                    Target::Slot(_, to) if run[end].1 == to && carries_data(run[end].0) => target,
+                    Target::Slot(..) => break,
+                    Target::Wildcard if self.slots.is_empty() => Target::Wildcard,
+                    Target::Wildcard => self.target_of(run[end].0, run[end].1),
+                };
+                if next != target {
+                    // `target_of` may have taken a slot for it; the next run starts there.
+                    break;
+                }
+                end += 1;
+            }
+            let chunk = &run[start..end];
+            match target {
+                Target::Wildcard => self.send_wildcard(wildcard, chunk).await?,
+                Target::Slot(index, to) => {
+                    let sent = self.send_slot(index, to, chunk).await;
+                    if sent < chunk.len() {
+                        self.send_wildcard(wildcard, &chunk[sent..]).await?;
+                    }
+                }
+            }
+            start = end;
+        }
+        Ok(())
+    }
+
+    /// The target of one datagram, taking a pool socket for new data endpoints as `send` does.
+    fn target_of(&self, payload: &[u8], destination: SocketAddr) -> Target {
+        if self.slots.is_empty() {
+            return Target::Wildcard;
+        }
+        if !carries_data(payload) {
+            self.mark_stale(destination);
+            return Target::Wildcard;
+        }
+        match self.slot_for(destination) {
+            Some(index) => Target::Slot(index, destination),
+            None => Target::Wildcard,
+        }
+    }
+
+    /// Send `chunk` on the wildcard socket with destinations; after a hard batch error the
+    /// rest goes one datagram at a time (see the module docs of `macos_batch`).
+    async fn send_wildcard(
+        &self,
+        wildcard: &tokio::net::UdpSocket,
+        chunk: &[(&[u8], SocketAddr)],
+    ) -> io::Result<()> {
+        let items: Vec<(&[u8], Option<SocketAddr>)> =
+            chunk.iter().map(|(p, d)| (*p, Some(*d))).collect();
+        match super::macos_batch::send_all(wildcard, &items).await {
+            Ok(_) => Ok(()),
+            Err((done, error)) => {
+                tracing::trace!("sendmsg_x failed after {done} ({error}); one at a time");
+                let mut last = Ok(());
+                for (payload, destination) in &chunk[done..] {
+                    if let Err(error) = wildcard.send_to(payload, *destination).await {
+                        last = Err(error);
+                    }
+                }
+                last
+            }
+        }
+    }
+
+    /// Send `chunk` on pool socket `index` while it is connected to `to`. Returns how many
+    /// left; the caller sends the rest through the wildcard socket.
+    async fn send_slot(&self, index: usize, to: SocketAddr, chunk: &[(&[u8], SocketAddr)]) -> usize {
+        use std::os::fd::AsRawFd;
+        let slot = &self.slots[index];
+        let items: Vec<(&[u8], Option<SocketAddr>)> =
+            chunk.iter().map(|(p, _)| (*p, None)).collect();
+        let mut done = 0;
+        let mut icmp_retried = false;
+        while done < items.len() {
+            let result = {
+                let peer = slot.peer.read();
+                if *peer != Some(to) {
+                    return done;
+                }
+                slot.socket.try_io(tokio::io::Interest::WRITABLE, || {
+                    super::macos_batch::send_x(slot.socket.as_raw_fd(), &items[done..])
+                })
+            };
+            match result {
+                Ok(sent) => done += sent,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if slot.socket.writable().await.is_err() {
+                        return done;
+                    }
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ENOBUFS) => done += 1,
+                Err(error) if is_icmp_error(&error) && !icmp_retried => icmp_retried = true,
+                Err(error) if is_icmp_error(&error) || is_path_error(&error) => {
+                    self.forget(index, to, &error);
+                    return done;
+                }
+                Err(error) => {
+                    tracing::trace!("sendmsg_x on a pool socket failed ({error})");
+                    return done;
+                }
+            }
+        }
+        done
+    }
+
+    /// J1023 prototype: the pool sockets, for the batched receive to read.
+    pub(crate) fn pool_sockets(&self) -> impl Iterator<Item = &tokio::net::UdpSocket> {
+        self.slots.iter().map(|slot| &slot.socket)
+    }
+}
+
+/// J1023 prototype: read one `recvmsg_x` batch from `socket` if it has any. `Ready(Ok(n))` with
+/// `n > 0` when datagrams arrived, `Pending` (waker registered) when it has none. On a pool
+/// socket (`pool`), ICMP reports are skipped as `poll_recv` does and other errors only logged.
+pub(crate) fn poll_recv_batch_one(
+    socket: &tokio::net::UdpSocket,
+    pool_socket: bool,
+    cx: &mut Context<'_>,
+    buf: &mut super::macos_batch::RecvBuf,
+    packet_pool: &mut crate::packet::PacketBufPool,
+    packets: &mut Vec<(crate::packet::Packet, SocketAddr)>,
+    map_src: &impl Fn(SocketAddr) -> SocketAddr,
+) -> Poll<io::Result<usize>> {
+    use std::os::fd::AsRawFd;
+    loop {
+        match socket.poll_recv_ready(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+            Poll::Ready(Ok(())) => {}
+        }
+        match socket.try_io(tokio::io::Interest::READABLE, || {
+            super::macos_batch::recv_x(socket.as_raw_fd(), buf, packet_pool, packets, map_src)
+        }) {
+            Ok(0) => continue,
+            Ok(n) => return Poll::Ready(Ok(n)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error) if pool_socket && is_icmp_error(&error) => continue,
+            Err(error) if pool_socket => {
+                tracing::debug!("macOS UDP: pool socket receive error ({error})");
+                return Poll::Pending;
+            }
+            Err(error) => return Poll::Ready(Err(error)),
+        }
+    }
+}
+
 /// The pool socket a new endpoint of `family` gets: a free one of its bound family, else
 /// the least recently used one of that family that has been idle for [`ACTIVE_SENDS`] data sends. `None` when every
 /// candidate is busy.
