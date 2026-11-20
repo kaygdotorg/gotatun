@@ -17,7 +17,9 @@
 //! socket backlog, crypto and ordering delays, and time waiting behind previous TUN handoffs. A CoDel controller (RFC 8289) then signals
 //! congestion at that dequeue point when the sojourn stays above `target` for at least
 //! `interval`: by default (RFC 3168) by setting CE on an ECN-capable inner packet, and by
-//! dropping only packets that are not ECN-capable.
+//! dropping only packets that are not ECN-capable. A shared dequeue timestamp may line up a
+//! signal with the head of every run. For a payable bulk CE mark, choose among eligible frames
+//! in the rest of that run, without moving their delivery order or tracking flows.
 //!
 //! Wall time measures receive age. Monotonic time drives episode deadlines and credit refill.
 //! Below-target ages or an observed gap between one peer's dequeue and its next arrival end the
@@ -222,6 +224,7 @@ pub(crate) fn realtime_ns() -> u64 {
 }
 
 /// What the controller decided for one packet.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Verdict {
     /// Deliver unchanged.
@@ -411,22 +414,100 @@ impl Codel {
     }
 }
 
-/// Judge one in-order packet about to be written to the TUN, and apply the verdict's header
-/// change. `authenticated_len` includes padding before IP validation trims the plaintext.
-/// The size ceiling and credit use that length; only `packet` is ever changed.
-/// `rx_ns` is the kernel receive timestamp of its datagram (0 if none). Reuse `now` for the run.
-pub(crate) fn judge(
+/// How an ordered dequeue contributes to signal placement within its run.
+#[derive(Clone, Copy)]
+pub(crate) enum RunAction {
+    /// Pass through without offering this packet as a mark recipient.
+    Pass,
+    /// A bulk packet from the active episode may take the current run's CE mark.
+    Eligible,
+    /// Evidence expired. Commit any earlier mark before judging recipients again.
+    EndEpisode,
+    /// The payable signal is a drop on this packet.
+    Drop,
+    /// The payable signal is a CE mark. Existing CE and small frames stay in place.
+    Mark {
+        /// Existing atomic counter value used to decorrelate consecutive samples.
+        sequence: u64,
+        /// Whether another bulk recipient can carry this mark.
+        move_within_run: bool,
+    },
+}
+
+/// One payable CE mark retained until the end of its ordered delivery run.
+///
+/// A run shares a dequeue timestamp, so an elapsed deadline ordinarily picks its
+/// first packet every time. Sample eligible packets from that point within the
+/// same run, committing at the next signal, episode boundary, or end of the run.
+/// No packet waits beyond the handoff and the peer's credit and deadlines are
+/// independent of which packet carries a mark.
+#[derive(Default)]
+pub(crate) struct RunMark {
+    /// Original or sampled recipient, or none after the mark was committed.
+    selected: Option<usize>,
+    /// Number of eligible recipients seen. Zero means the mark stays in place.
+    candidates: u32,
+    /// Sampling state seeded by the existing process-wide mark sequence.
+    sample: u64,
+}
+
+impl RunMark {
+    /// Observe one dequeue and return any prior mark ready to write to its slot.
+    pub(crate) fn observe(
+        &mut self,
+        action: RunAction,
+        index: usize,
+        packet: &[u8],
+    ) -> Option<usize> {
+        match action {
+            RunAction::Mark {
+                sequence,
+                move_within_run,
+            } => {
+                self.candidates = u32::from(move_within_run);
+                self.sample = sequence;
+                self.selected.replace(index)
+            }
+            RunAction::EndEpisode | RunAction::Drop => self.finish(),
+            RunAction::Eligible if self.candidates != 0 && matches!(ecn_bits(packet), 1 | 2) => {
+                self.candidates += 1;
+                // Use the high bits of a full-period generator. Multiplication maps those
+                // bits into candidate ranks without another division or a flow table.
+                self.sample = self
+                    .sample
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                if (self.sample >> 32) * u64::from(self.candidates) < (1_u64 << 32) {
+                    self.selected = Some(index);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Commit the selected recipient at the end of the current episode or run.
+    pub(crate) fn finish(&mut self) -> Option<usize> {
+        self.candidates = 0;
+        self.selected.take()
+    }
+}
+
+/// Judge one authenticated, in-order frame without rescheduling the packet itself.
+/// The length includes padding removed from the validated IP bytes. A zero stamp
+/// means the kernel supplied no timestamp. Share the dequeue time within the run.
+pub(crate) fn judge_run_frame(
     codel: &mut Codel,
-    packet: &mut [u8],
+    packet: &[u8],
     authenticated_len: usize,
     rx_ns: u64,
     now: DequeueTime,
-) -> Verdict {
+) -> RunAction {
     let config = config();
     if !config.active() {
-        return Verdict::Pass;
+        return RunAction::Pass;
     }
-    judge_frame_with(codel, packet, authenticated_len, rx_ns, now, config)
+    judge_frame(codel, packet, authenticated_len, rx_ns, now, config)
 }
 
 /// Test seam for ordinary frames with their normal sixteen-byte padding alignment.
@@ -463,8 +544,8 @@ fn test_time(ns: u64) -> DequeueTime {
     }
 }
 
-/// Judge validated IP bytes with the pre-trim authenticated plaintext length, assumed active.
-/// Clamp an undersized caller value to the inner length so it cannot undercharge the packet.
+/// Apply a single-packet test verdict using the production episode controller.
+#[cfg(test)]
 fn judge_frame_with(
     codel: &mut Codel,
     packet: &mut [u8],
@@ -473,6 +554,27 @@ fn judge_frame_with(
     now: DequeueTime,
     config: &AqmConfig,
 ) -> Verdict {
+    match judge_frame(codel, packet, authenticated_len, rx_ns, now, config) {
+        RunAction::Drop => Verdict::Drop,
+        RunAction::Mark { .. } => {
+            let marked = set_ce(packet);
+            debug_assert!(marked);
+            Verdict::Marked
+        }
+        _ => Verdict::Pass,
+    }
+}
+
+/// Judge validated IP bytes with the pre-trim authenticated plaintext length, assumed active.
+/// Clamp an undersized caller value to the inner length so it cannot undercharge the packet.
+fn judge_frame(
+    codel: &mut Codel,
+    packet: &[u8],
+    authenticated_len: usize,
+    rx_ns: u64,
+    now: DequeueTime,
+    config: &AqmConfig,
+) -> RunAction {
     let stats = config.stats_ms.is_some();
     if stats {
         SEEN.fetch_add(1, Ordering::Relaxed);
@@ -481,7 +583,7 @@ fn judge_frame_with(
         if stats {
             UNSTAMPED.fetch_add(1, Ordering::Relaxed);
         }
-        return Verdict::Pass;
+        return RunAction::Pass;
     }
     let Some(sojourn_ns) = now
         .wall_ns
@@ -491,7 +593,7 @@ fn judge_frame_with(
         // An invalid sample breaks continuity. Forget deadlines and debt so the next valid
         // packet must establish a fresh above-target interval instead of catching up signals.
         *codel = Codel::default();
-        return Verdict::Pass;
+        return RunAction::EndEpisode;
     };
     if stats {
         let sojourn_us = sojourn_ns / 1_000;
@@ -502,27 +604,48 @@ fn judge_frame_with(
 
     let due = codel.should_signal(now, rx_ns, sojourn_ns, config);
     if codel.deadline_ns == 0 {
-        return Verdict::Pass;
+        return RunAction::EndEpisode;
     }
     let charged_len = authenticated_len.max(packet.len());
     let exempt = codel.sparse.exempt(charged_len, now.mono_ns);
     if due {
         codel.owed = codel.owed.saturating_add(1).min(MAX_OWED_SIGNALS);
     }
+    let bulk = charged_len > SPARSE_MAX_PACKET_BYTES;
     if codel.owed == 0 || exempt {
-        return Verdict::Pass;
+        return if codel.count == 0 {
+            RunAction::EndEpisode
+        } else if bulk {
+            RunAction::Eligible
+        } else {
+            RunAction::Pass
+        };
     }
     codel.owed -= 1;
-    if config.mode == AqmMode::Ecn && set_ce(packet) {
-        MARKS.fetch_add(1, Ordering::Relaxed);
-        return Verdict::Marked;
+    if config.mode == AqmMode::Ecn {
+        let ecn = ecn_bits(packet);
+        if ecn != 0 {
+            return RunAction::Mark {
+                sequence: MARKS.fetch_add(1, Ordering::Relaxed),
+                move_within_run: bulk && ecn != ECN_CE,
+            };
+        }
     }
     DROPS.fetch_add(1, Ordering::Relaxed);
-    Verdict::Drop
+    RunAction::Drop
 }
 
 /// The ECN codepoint "Congestion Experienced" (RFC 3168 §5).
 const ECN_CE: u8 = 0b11;
+
+/// Read a validated IP header's ECN codepoint, or zero when it cannot carry CE.
+fn ecn_bits(packet: &[u8]) -> u8 {
+    match packet.first().map(|first| first >> 4) {
+        Some(4) if packet.len() >= 20 => packet[1] & 0b11,
+        Some(6) if packet.len() >= 40 => (packet[1] >> 4) & 0b11,
+        _ => 0,
+    }
+}
 
 /// Set CE in an IPv4 or IPv6 header if the packet is ECN-capable (ECT(0), ECT(1) or already CE).
 ///
@@ -1239,13 +1362,11 @@ mod tests {
             let before = format!("{codel:?}");
             for step in 0..100 {
                 let now = 10 * MS + step * MS;
-                let mut packet = tcp_v4(22, 2, 1400);
-                let original = packet.clone();
-                assert_eq!(
-                    judge(&mut codel, &mut packet, 1400, now - 3 * MS, test_time(now)),
-                    Verdict::Pass
-                );
-                assert_eq!(packet, original);
+                let packet = tcp_v4(22, 2, 1400);
+                assert!(matches!(
+                    judge_run_frame(&mut codel, &packet, 1400, now - 3 * MS, test_time(now)),
+                    RunAction::Pass
+                ));
             }
             assert_eq!(format!("{codel:?}"), before);
             assert_eq!(DROPS.load(Ordering::Relaxed), 0);
@@ -1914,33 +2035,69 @@ mod tests {
         );
     }
 
-    /// Equal offered load should give each bulk flow a share of the signals.
+    /// Equal bulk streams share CE even when the same flow starts every dequeue run.
     #[test]
-    #[ignore = "fixed run-order CE concentration is tracked separately in #260"]
     fn j891_signal_distribution_at_real_run_granularity() {
         let cfg = ecn_1_10();
-        let mut distributions = Vec::new();
         for rotate in [false, true] {
             let mut codel = Codel::default();
             let mut marks = [0_u32; 8];
             for run in 0..12_000_usize {
                 let now = 10 * MS + run as u64 * 80_000;
                 let start_flow = if rotate { run % marks.len() } else { 0 };
+                let mut run_mark = RunMark::default();
                 for slot in 0..32 {
                     let flow = (start_flow + slot) % marks.len();
-                    let mut packet = tcp_v4(40_000 + flow as u16, 2, 1400);
-                    let verdict = judge_with(&mut codel, &mut packet, now - 3 * MS, now, &cfg);
-                    marks[flow] += u32::from(verdict == Verdict::Marked);
+                    let packet = tcp_v4(40_000 + flow as u16, 2, 1400);
+                    let action = judge_frame(
+                        &mut codel,
+                        &packet,
+                        1408,
+                        now - 3 * MS,
+                        test_time(now),
+                        &cfg,
+                    );
+                    assert!(!matches!(action, RunAction::Drop));
+                    if let Some(marked_slot) = run_mark.observe(action, slot, &packet) {
+                        marks[(start_flow + marked_slot) % 8] += 1;
+                    }
+                }
+                if let Some(marked_slot) = run_mark.finish() {
+                    marks[(start_flow + marked_slot) % 8] += 1;
                 }
             }
-            eprintln!("J891 run_phase_rotated={rotate} marks={marks:?}");
-            distributions.push(marks);
+            let total = marks.iter().sum::<u32>();
+            let squares = marks.iter().map(|marks| marks.pow(2)).sum::<u32>();
+            let fairness = f64::from(total.pow(2)) / (8.0 * f64::from(squares));
+            eprintln!("J891 run_phase_rotated={rotate} marks={marks:?} Jain={fairness:.6}");
+            assert_eq!(
+                total, 2326,
+                "placement must preserve the controller's schedule"
+            );
+            assert!(fairness >= 0.95, "unfair mark recipients: {marks:?}");
         }
-        assert!(
-            distributions
-                .iter()
-                .all(|marks| marks.iter().all(|&mark| mark > 0)),
-            "one flow alone receives CE when its position at the head of every run is fixed"
+    }
+
+    /// Pending marks stay in their episode and cannot land on an already marked packet.
+    #[test]
+    fn run_mark_commits_on_episode_end_and_skips_existing_ce() {
+        let mut mark = RunMark::default();
+        let ect = tcp_v4(40_000, 2, 1400);
+        let ce = tcp_v4(40_001, ECN_CE, 1400);
+        assert_eq!(
+            mark.observe(
+                RunAction::Mark {
+                    sequence: 0,
+                    move_within_run: true
+                },
+                0,
+                &ect
+            ),
+            None
         );
+        assert_eq!(mark.observe(RunAction::Eligible, 1, &ce), None);
+        assert_eq!(mark.observe(RunAction::EndEpisode, 2, &ect), Some(0));
+        assert_eq!(mark.observe(RunAction::Eligible, 3, &ect), None);
+        assert_eq!(mark.finish(), None);
     }
 }
