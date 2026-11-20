@@ -35,6 +35,17 @@ mod macos_connected;
 #[cfg(target_os = "macos")]
 mod macos_port_audit;
 
+/// J1023 measurement prototype: `sendmsg_x`/`recvmsg_x` batching behind `GOTATUN_J1023_BATCH`.
+#[cfg(target_os = "macos")]
+mod macos_batch;
+
+/// J1023 prototype counters: `[send_calls, send_datagrams, recv_calls, recv_datagrams]` through
+/// the batch calls since the process started (all zero when batching is off).
+#[cfg(target_os = "macos")]
+pub fn j1023_batch_stats() -> [u64; 4] {
+    macos_batch::stats()
+}
+
 /// Implementations of [`super::UdpSend`]/[`super::UdpRecv`] for linux
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
