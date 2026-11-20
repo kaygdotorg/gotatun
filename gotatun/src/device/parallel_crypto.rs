@@ -714,7 +714,11 @@ enum CryptoJob {
 struct CryptoQueue {
     jobs: ConcurrentQueue<QueuedCryptoJob>,
     queued_slots: Arc<Semaphore>,
-    /// Coalesces submissions until a worker next finds no work.
+    /// Coalesces submissions while a woken worker has yet to take work.
+    ///
+    /// Set by the push that wakes a worker. Cleared when a worker finds the queue empty, and
+    /// also when a worker takes the last queued run: that worker is busy from then on, so a
+    /// later push must wake an idle peer rather than wait for it (#260, J1010).
     ready: AtomicBool,
     /// Rotates the first idle slot considered by each wake.
     wake_cursor: AtomicUsize,
@@ -778,13 +782,30 @@ impl CryptoQueue {
         Ok(())
     }
 
-    /// Remove one job, passing the wake to another idle worker if a backlog remains.
+    /// Remove one job, then hand any backlog to another idle worker (see [`Self::after_take`]).
     fn take_job(&self) -> Result<CryptoJob, PopError> {
         let QueuedCryptoJob { job, _permit } = self.jobs.pop()?;
-        if !self.jobs.is_empty() {
-            self.wake_one();
-        }
+        self.after_take();
         Ok(job)
+    }
+
+    /// Call after a worker takes a run.
+    ///
+    /// A remaining backlog goes to another idle worker. An empty queue withdraws the coalesced
+    /// ready signal: the taking worker is now busy with its run, and a push that still saw the
+    /// signal would otherwise skip its wake and wait for that run to finish while other workers
+    /// sit parked. J1010 examines this wait as the source of R's BBR queue tail.
+    ///
+    /// The re-check after the store closes the race with a push that read the old signal: its
+    /// publication precedes its read, which precedes the store, which precedes the re-check.
+    fn after_take(&self) {
+        if self.jobs.is_empty() {
+            self.ready.store(false, Ordering::SeqCst);
+            if self.jobs.is_empty() {
+                return;
+            }
+        }
+        self.wake_one();
     }
 
     /// Park without a queue mutex. Recheck after publishing idle to close the wake race.
@@ -808,9 +829,7 @@ impl CryptoQueue {
             sleeper.idle.store(false, Ordering::SeqCst);
             match next {
                 Ok(QueuedCryptoJob { job, _permit }) => {
-                    if !self.jobs.is_empty() {
-                        self.wake_one();
-                    }
+                    self.after_take();
                     return Some(job);
                 }
                 Err(PopError::Closed) => return None,
@@ -2107,6 +2126,42 @@ mod tests {
         .await
         .expect("every empty-to-nonempty transition must wake a worker");
         workers.stop().await;
+    }
+
+    /// A run published while the only woken worker is busy with an earlier run wakes an idle
+    /// peer instead of waiting for that run to finish (#260, J1010).
+    #[test]
+    fn push_behind_a_busy_worker_wakes_an_idle_peer() {
+        std::thread::spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let queue = super::CryptoQueue::new(4, 2);
+            for sleeper in &queue.sleepers {
+                assert!(sleeper.thread.set(std::thread::current()).is_ok());
+                sleeper.idle.store(true, Ordering::SeqCst);
+            }
+            let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let job = || {
+                let (sender, _) = tokio::sync::oneshot::channel();
+                super::CryptoJob::Encrypt(
+                    Vec::new(),
+                    sender,
+                    super::ActiveBatch::enter_queued(&active),
+                )
+            };
+            runtime.block_on(queue.push(job())).unwrap();
+            assert!(!queue.sleepers[0].idle.load(Ordering::SeqCst));
+            // Worker 0 takes the run and keeps it; worker 1 is still parked.
+            let _running = queue.take_job().ok().expect("the published run");
+            runtime.block_on(queue.push(job())).unwrap();
+            assert!(
+                !queue.sleepers[1].idle.load(Ordering::SeqCst),
+                "the second run waits for the busy worker while a peer stays parked"
+            );
+        })
+        .join()
+        .unwrap();
     }
 
     /// Repeated isolated wakes share first priority across equally idle native workers.
