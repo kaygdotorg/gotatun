@@ -1740,6 +1740,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         let completion_count = completions.len();
         let aqm_on = crate::aqm::enabled();
         let mut aqm_now = None;
+        let mut run_mark = crate::aqm::RunMark::default();
         if diagnostic {
             eprintln!(
                 "pipeline stage=incoming_delivery_callback_start completions={completion_count}"
@@ -1762,7 +1763,8 @@ impl<T: DeviceTransports> DeviceState<T> {
         let mut empty_packet_count = 0;
         let mut malformed_packet_count = 0;
         let mut rejected_source_count = 0;
-        let mut tun_packets = Vec::with_capacity(completions.len());
+        let mut tun_packets: Vec<crate::packet::Packet<crate::packet::Ip>> =
+            Vec::with_capacity(completions.len());
 
         for (index, completion) in completions.into_iter().enumerate() {
             let Some(completion) = completion else {
@@ -1813,24 +1815,36 @@ impl<T: DeviceTransports> DeviceState<T> {
                 rejected_source_count += 1;
                 continue;
             }
-            let mut packet: crate::packet::Packet<crate::packet::Ip> = packet;
+            let packet: crate::packet::Packet<crate::packet::Ip> = packet;
             if aqm_on {
                 // The queue bound: CoDel at the point the in-order packet leaves the engine's queue. The
                 // replay window has already accepted it, so a drop here is plain loss to TCP.
                 let rx_ns = rx_stamps.get(index).copied().unwrap_or(0);
-                match crate::aqm::judge(
+                let bytes = zerocopy::IntoBytes::as_bytes(&*packet);
+                let action = crate::aqm::judge_run_frame(
                     &mut peer.aqm,
-                    zerocopy::IntoBytes::as_mut_bytes(&mut *packet),
+                    bytes,
                     authenticated_len,
                     rx_ns,
                     // After the peer lock and IP authorization, so age includes lock wait.
                     *aqm_now.get_or_insert_with(crate::aqm::DequeueTime::now),
-                ) {
-                    crate::aqm::Verdict::Drop => continue,
-                    crate::aqm::Verdict::Pass | crate::aqm::Verdict::Marked => {}
+                );
+                if let Some(index) = run_mark.observe(action, tun_packets.len(), bytes) {
+                    let marked = crate::aqm::set_ce(zerocopy::IntoBytes::as_mut_bytes(
+                        &mut *tun_packets[index],
+                    ));
+                    debug_assert!(marked);
+                }
+                if matches!(action, crate::aqm::RunAction::Drop) {
+                    continue;
                 }
             }
             tun_packets.push(packet);
+        }
+        if let Some(index) = run_mark.finish() {
+            let marked =
+                crate::aqm::set_ce(zerocopy::IntoBytes::as_mut_bytes(&mut *tun_packets[index]));
+            debug_assert!(marked);
         }
 
         drop(peer);
