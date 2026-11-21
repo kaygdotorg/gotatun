@@ -1051,6 +1051,11 @@ mod shared_port_tests {
                 );
                 match result {
                     Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+                    // `[::1]` beside our IPv4-only socket is another family: it receives only
+                    // datagrams to `[::1]`, never one of ours. macOS 26 refuses it through the
+                    // audit; macOS 27 hides the squatter from the audit and the kernel lets the
+                    // bind through, which shares nothing (J1108 on #260).
+                    Ok(_) if squat == IpAddr::from(Ipv6Addr::LOCALHOST) && wildcard.is_ipv4() => {}
                     _ => shared.push(format!("{squat} vs {wildcard}: {outcome}")),
                 }
             }

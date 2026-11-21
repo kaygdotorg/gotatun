@@ -48,7 +48,9 @@
 //!
 //! The list is also read once *before* step 2 (J826). It must show the wildcard socket alone. If
 //! it cannot be read, or shows fewer than our already-bound sockets (the records are private kernel ABI and
-//! an OS update may change them), the window is never opened and the socket carries on with
+//! an OS update may change them), or shows no other process's socket at all (macOS 27 filters the
+//! list to a program's own sockets, J1108, so a joiner would be invisible), the window is never
+//! opened and the socket carries on with
 //! `sendto`: no pool, no audit needed, and no second bind of the port. If it shows someone
 //! else already, the socket is refused before the window.
 //!
@@ -315,6 +317,14 @@ fn bind_pool_counted(
     // Before the window: the list must be readable and show the wildcard socket alone. If it
     // can't be read or doesn't show our socket, no window opens and nothing binds again.
     let before = read_users(local.port()).map_err(PoolError::Unavailable)?;
+    if !before.sees_other_processes() {
+        // macOS 27 shows a program only its own sockets (J1108): the audit after the window
+        // could never see a socket that joined, so the window must not open.
+        return Err(PoolError::Unavailable(io::Error::other(
+            "the kernel's UDP socket list shows only this process's sockets, so nobody joining \
+             the port could be seen",
+        )));
+    }
     if !before.others.is_empty() {
         return Err(joined(&before, local.port(), existing));
     }
@@ -2316,6 +2326,7 @@ mod tests {
             Some(total) => Ok(crate::udp::socket::macos_port_audit::PortUsers {
                 total,
                 others: Vec::new(),
+                visible_others: 5,
             }),
             None => Err(std::io::Error::other("scripted: the list cannot be read")),
         }
@@ -2347,6 +2358,34 @@ mod tests {
             1,
             "only the wildcard socket"
         );
+    }
+
+    /// A list that shows no other process's socket (macOS 27 filters it for us, J1108) opens no
+    /// window either: the audit after it could not see a socket that joined. Connected sends stay
+    /// off and the WireGuard socket is kept.
+    #[test]
+    fn a_list_without_other_processes_opens_no_window() {
+        let (wildcard, local) = bare_wildcard(0).expect("wildcard");
+        let mut opened = false;
+        let result = super::bind_pool_with(
+            &wildcard,
+            local,
+            4,
+            |_| opened = true,
+            |_| {
+                Ok(crate::udp::socket::macos_port_audit::PortUsers {
+                    total: 1,
+                    others: Vec::new(),
+                    visible_others: 0,
+                })
+            },
+        );
+        assert!(
+            matches!(result, Err(super::PoolError::Unavailable(_))),
+            "{result:?}"
+        );
+        assert!(!opened, "the window opened on a filtered list");
+        assert!(!wildcard.reuse_port().expect("SO_REUSEPORT"));
     }
 
     /// A list that does not show our own wildcard socket means the reader no longer understands
