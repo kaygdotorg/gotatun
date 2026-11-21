@@ -58,6 +58,93 @@ pub(crate) static TUN_SINGLE_SENDS: Switch = Switch::new("GOTATUN_DIAG_TUN_SINGL
 /// Send UDP datagrams one at a time instead of in batches.
 pub(crate) static UDP_SINGLE_SENDS: Switch = Switch::new("GOTATUN_DIAG_UDP_SINGLE_SENDS");
 
+/// Which packet stages run to completion in the task that produced the packets (#260, J1122).
+///
+/// Each switch removes one cross-task handoff from the packet path:
+/// - `tun_rx`: the outgoing packet task reads the TUN device itself, so a read is grouped,
+///   encrypted (or handed to a crypto worker) and sent by one task, with no read-ahead task and
+///   no per-packet channel send in between;
+/// - `udp_tx`: an encrypted run is written to the UDP socket by the task that finished it, when
+///   the UDP send queue is empty and its send task is not mid-send; otherwise it is queued;
+/// - `tun_tx`: the same for decrypted runs and the TUN device.
+///
+/// "Empty and idle" keeps order: a run only skips the queue when nothing queued earlier can
+/// still be waiting there, and every producer of one peer's runs already releases them one at a
+/// time, in order (the ordered lanes in `parallel_crypto`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RunToCompletion {
+    /// The outgoing task reads the TUN device directly.
+    pub(crate) tun_rx: bool,
+    /// Finished outgoing runs go straight to an idle UDP socket.
+    pub(crate) udp_tx: bool,
+    /// Finished incoming runs go straight to an idle TUN device.
+    pub(crate) tun_tx: bool,
+}
+
+impl RunToCompletion {
+    /// Every stage on: the Linux default, where J1122 measured the gain.
+    const ALL: Self = Self {
+        tun_rx: true,
+        udp_tx: true,
+        tun_tx: true,
+    };
+    /// Every stage off: the queued pipeline. The default elsewhere: on macOS the device runs on
+    /// one current-thread runtime, where a handoff costs no cross-thread wake and the queues
+    /// carry the reply lane and send-turn rules J720/J728 tuned.
+    const NONE: Self = Self {
+        tun_rx: false,
+        udp_tx: false,
+        tun_tx: false,
+    };
+
+    /// This platform's default.
+    pub(crate) const fn platform_default() -> Self {
+        if cfg!(target_os = "linux") {
+            Self::ALL
+        } else {
+            Self::NONE
+        }
+    }
+
+    /// Parse `GOTATUN_BENCH_RTC`: `all`, `none`, or a comma list of `tun_rx`, `udp_tx` and
+    /// `tun_tx` (the stages to turn on; the rest are off). Unset or unknown keeps the default.
+    pub(crate) fn parse(value: Option<&str>) -> Self {
+        let Some(value) = value else {
+            return Self::platform_default();
+        };
+        let mut mode = Self::NONE;
+        for part in value.split(',').map(str::trim) {
+            match part {
+                "all" => mode = Self::ALL,
+                "none" | "" => {}
+                "tun_rx" => mode.tun_rx = true,
+                "udp_tx" => mode.udp_tx = true,
+                "tun_tx" => mode.tun_tx = true,
+                _ => return Self::platform_default(),
+            }
+        }
+        mode
+    }
+}
+
+/// The process-wide run-to-completion stages, read once from `GOTATUN_BENCH_RTC` (#260, J1122).
+///
+/// The variable exists for A/B measurements of each stage in one binary; never set it in
+/// production. A value that changes the default is printed once to stderr.
+pub(crate) fn run_to_completion() -> RunToCompletion {
+    static MODE: OnceLock<RunToCompletion> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = RunToCompletion::parse(std::env::var("GOTATUN_BENCH_RTC").ok().as_deref());
+        if mode != RunToCompletion::platform_default() {
+            eprintln!(
+                "diag run_to_completion tun_rx={} udp_tx={} tun_tx={}",
+                mode.tun_rx, mode.udp_tx, mode.tun_tx
+            );
+        }
+        mode
+    })
+}
+
 /// Session age after which an initiator rekeys, in milliseconds, for rekey-under-load tests.
 ///
 /// Read once from `GOTATUN_DIAG_REKEY_AFTER_MS`. When it is set, every new peer that has no
@@ -157,5 +244,37 @@ pub(crate) fn spawn_queue_sampler(probes: Vec<(&'static str, DepthProbe)>) {
         });
     if let Err(error) = spawned {
         eprintln!("diag queues: no sampler thread: {error}");
+    }
+}
+
+#[cfg(test)]
+mod run_to_completion_tests {
+    use super::RunToCompletion;
+
+    /// `GOTATUN_BENCH_RTC` names the stages to turn on; unset or unknown keeps the platform
+    /// default, so a typo can never switch a stage off by accident (#260, J1122).
+    #[test]
+    fn the_switch_names_stages_and_ignores_typos() {
+        let default = RunToCompletion::platform_default();
+        assert_eq!(RunToCompletion::parse(None), default);
+        assert_eq!(RunToCompletion::parse(Some("tun-rx")), default);
+        assert_eq!(RunToCompletion::parse(Some("all")), RunToCompletion::ALL);
+        assert_eq!(RunToCompletion::parse(Some("none")), RunToCompletion::NONE);
+        assert_eq!(
+            RunToCompletion::parse(Some("udp_tx, tun_tx")),
+            RunToCompletion {
+                tun_rx: false,
+                udp_tx: true,
+                tun_tx: true,
+            }
+        );
+        assert_eq!(
+            RunToCompletion::platform_default(),
+            if cfg!(target_os = "linux") {
+                RunToCompletion::ALL
+            } else {
+                RunToCompletion::NONE
+            }
+        );
     }
 }

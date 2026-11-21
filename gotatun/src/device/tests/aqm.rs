@@ -99,6 +99,10 @@ impl IpSend for GatedTun {
 }
 
 /// A packet behind backpressure keeps its real receive stamp and ages until its own dequeue.
+///
+/// This one fills the engine's queued TUN path, so the child runs with direct TUN writes off
+/// (`GOTATUN_BENCH_RTC` without `tun_tx`); the direct path keeps its backlog in the peer's lane instead,
+/// see [`blocked_direct_tun_ages_packets_waiting_in_the_lane`].
 #[tokio::test]
 async fn blocked_tun_keeps_kernel_age_until_ordered_dequeue() {
     const CHILD: &str = "GOTATUN_TEST_AQM_TUN_CHILD";
@@ -110,6 +114,7 @@ async fn blocked_tun_keeps_kernel_age_until_ordered_dequeue() {
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            .env("GOTATUN_BENCH_RTC", "tun_rx,udp_tx")
             .env("GOTATUN_AQM", "ecn")
             .env("GOTATUN_AQM_TARGET_US", "10000")
             .env("GOTATUN_AQM_INTERVAL_US", "10000000")
@@ -185,6 +190,98 @@ async fn blocked_tun_keeps_kernel_age_until_ordered_dequeue() {
         let age = dequeue.checked_sub(queued_stamp).unwrap();
         assert!(age >= 30_000_000, "queued packet age was {age} ns");
         eprintln!("J888 real UDP ordered TUN backlog: age_ns={age}");
+        a.stop().await;
+        b.stop().await;
+    })
+    .await
+    .expect("both loopback packets traverse the real engine");
+}
+
+/// With direct TUN writes (#260, J1122), a blocked TUN write is a pending delivery in its peer's
+/// ordered lane: the receive task keeps reading (other peers are not held up), and the next
+/// packet of this peer waits in the lane, not in a TUN queue, until the write completes. Its age
+/// still counts from the kernel's receive stamp to its own delivery. (Past the lane's in-flight
+/// bound the receive task waits, and the backlog stays in the UDP socket instead.)
+#[tokio::test]
+async fn blocked_direct_tun_ages_packets_waiting_in_the_lane() {
+    const CHILD: &str = "GOTATUN_TEST_AQM_DIRECT_TUN_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "device::tests::aqm::blocked_direct_tun_ages_packets_waiting_in_the_lane",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("GOTATUN_BENCH_RTC", "all")
+            .env("GOTATUN_AQM", "ecn")
+            .env("GOTATUN_AQM_TARGET_US", "10000")
+            .env("GOTATUN_AQM_INTERVAL_US", "10000000")
+            .status();
+        assert!(status.unwrap().success());
+        return;
+    }
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (a_tun, a_app, _a_rx) = mock::mock_tun();
+        let (b_tun, _b_app, _b_rx) = mock::mock_tun();
+        let (deliver, mut delivered) = mpsc::channel(2);
+        let (stamp, mut stamped) = mpsc::channel(2);
+        let permits = Arc::new(Semaphore::new(0));
+        let a_key = StaticSecret::random();
+        let b_key = StaticSecret::random();
+        let allowed = Ipv4Network::new(Ipv4Addr::UNSPECIFIED, 0).unwrap().into();
+        let b = DeviceBuilder::new()
+            .with_private_key(b_key.clone())
+            .with_ip_pair(
+                GatedTun {
+                    delivered: deliver,
+                    permits: permits.clone(),
+                },
+                b_tun,
+            )
+            .with_udp(ObservedUdp(stamp))
+            .with_peer(Peer::new(PublicKey::from(&a_key)).with_allowed_ip(allowed))
+            .build()
+            .await
+            .unwrap();
+        let port = b.read(async |state| state.listen_port()).await;
+        let a = DeviceBuilder::new()
+            .with_private_key(a_key)
+            .with_ip(a_tun)
+            .with_default_udp()
+            .with_peer(
+                Peer::new(PublicKey::from(&b_key))
+                    .with_endpoint((Ipv4Addr::LOCALHOST, port).into())
+                    .with_allowed_ip(allowed),
+            )
+            .build()
+            .await
+            .unwrap();
+
+        // The first data packet reaches the TUN and its write blocks at the gate.
+        a_app.send(mock::packet([1; 1_200])).await;
+        stamped.recv().await.unwrap();
+        assert_eq!(delivered.recv().await.unwrap().as_bytes().last(), Some(&1));
+
+        // The next one is read (the receive task is not held up) and waits in the lane.
+        a_app.send(mock::packet([2; 1_200])).await;
+        let queued_stamp = stamped.recv().await.unwrap();
+        assert_ne!(queued_stamp, 0);
+        // sleep: age the waiting packet past the target while the TUN write stays blocked.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            delivered.try_recv().is_err(),
+            "the second delivery must wait for the first"
+        );
+        permits.add_permits(2);
+        assert_eq!(delivered.recv().await.unwrap().as_bytes().last(), Some(&2));
+
+        let peer = b.inner.read().await.peers.values().next().unwrap().clone();
+        let dequeue = peer.lock().await.aqm.above_target_wall_ns().unwrap();
+        let age = dequeue.checked_sub(queued_stamp).unwrap();
+        assert!(age >= 30_000_000, "lane-queued packet age was {age} ns");
+        eprintln!("J1122 real UDP ordered lane behind a direct TUN write: age_ns={age}");
         a.stop().await;
         b.stop().await;
     })
