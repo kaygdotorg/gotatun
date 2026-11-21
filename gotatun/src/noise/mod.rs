@@ -781,6 +781,7 @@ mod tests {
     use crate::noise::timers::{MAX_JITTER, REKEY_AFTER_TIME, REKEY_TIMEOUT, TimerName};
     use crate::packet::Ipv4;
 
+    /// The test limiters' backlog limit: waiting handshakes at which they are under load.
     const HANDSHAKE_RATE_LIMIT: u64 = 100;
 
     use super::*;
@@ -1022,7 +1023,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "mock_instant")]
-    /// Verify that cookie reply is sent when rate limit is hit.
+    /// Verify that cookie reply is sent when the device is under load.
     /// And that handshakes are accepted under load with a valid mac2.
     fn verify_cookie_reply() {
         let forced_handshake_init = |tun: &mut Tunn| {
@@ -1032,7 +1033,8 @@ mod tests {
 
         let (mut my_tun, their_tun) = create_two_tuns();
 
-        for _ in 0..HANDSHAKE_RATE_LIMIT {
+        // Many handshakes from one address are no load by themselves (#260, J1112).
+        for _ in 0..10 * HANDSHAKE_RATE_LIMIT {
             let init = forced_handshake_init(&mut my_tun);
             their_tun
                 .rate_limiter
@@ -1041,6 +1043,11 @@ mod tests {
 
             MockClock::advance(Duration::from_micros(1));
         }
+
+        // A backlog at the limit is.
+        their_tun
+            .rate_limiter
+            .note_handshake_backlog(HANDSHAKE_RATE_LIMIT as usize);
 
         // Next handshake should trigger rate limiting
         let init = forced_handshake_init(&mut my_tun);
@@ -1503,49 +1510,44 @@ mod tests {
         }
     }
 
-    /// Verify that one IP hitting the rate limit does not affect a different IP.
+    /// "Under load" is the device's state, decided by its handshake backlog (#260, J1112): a
+    /// backlog one below the limit is no load, at the limit every source needs a cookie, and the
+    /// load ends one second after the backlog last reached the limit.
     #[test]
     #[cfg(feature = "mock_instant")]
-    fn per_ip_rate_limiting_isolation() {
+    fn under_load_follows_the_backlog_for_every_source() {
         let (mut my_tun, their_tun) = create_two_tuns();
-
-        // Same port on both endpoints so the IP is the only varying factor.
         const PORT: u16 = 51820;
-        let attacker = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), PORT);
-        let legit = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 2).into(), PORT);
-
-        // Exhaust the rate limit for the attacker IP
-        for _ in 0..HANDSHAKE_RATE_LIMIT {
+        let first = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), PORT);
+        let second = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 2).into(), PORT);
+        let mut verdict = |source| {
             let init = my_tun
                 .format_handshake_initiation(true)
                 .expect("expected handshake init");
-            their_tun
-                .rate_limiter
-                .verify_handshake(attacker, init)
-                .expect("should be under limit");
-            MockClock::advance(Duration::from_micros(1));
-        }
-
-        // Attacker's next handshake should be rate limited
-        let init = my_tun
-            .format_handshake_initiation(true)
-            .expect("expected handshake init");
-        assert!(
+            their_tun.rate_limiter.verify_handshake(source, init)
+        };
+        let is_cookie = |result: &Result<_, TunnResult>| {
             matches!(
-                their_tun.rate_limiter.verify_handshake(attacker, init),
+                result,
                 Err(TunnResult::WriteToNetwork(WgKind::CookieReply(_)))
-            ),
-            "attacker IP should be rate limited"
-        );
+            )
+        };
 
-        // Legitimate IP should still be accepted (not affected by attacker)
-        let init = my_tun
-            .format_handshake_initiation(true)
-            .expect("expected handshake init");
         their_tun
             .rate_limiter
-            .verify_handshake(legit, init)
-            .expect("legitimate IP should not be rate limited");
+            .note_handshake_backlog(HANDSHAKE_RATE_LIMIT as usize - 1);
+        assert!(verdict(first).is_ok(), "below the limit is no load");
+
+        their_tun
+            .rate_limiter
+            .note_handshake_backlog(HANDSHAKE_RATE_LIMIT as usize);
+        assert!(is_cookie(&verdict(first)));
+        assert!(is_cookie(&verdict(second)), "load is not per source");
+
+        MockClock::advance(Duration::from_millis(999));
+        assert!(is_cookie(&verdict(second)), "the load holds for a second");
+        MockClock::advance(Duration::from_millis(2));
+        assert!(verdict(second).is_ok(), "and then ends");
     }
 
     /// Test that timers "freeze" if clock jumps back.
