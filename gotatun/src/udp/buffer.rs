@@ -19,9 +19,10 @@ use std::{
     },
 };
 
+use futures::future::BoxFuture;
 use tokio::{
     io,
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, mpsc},
 };
 
 use crate::packet::Packet;
@@ -40,9 +41,18 @@ static NEXT_DIAGNOSTIC_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Packets sent on this [`UdpSend::send_to`] will be buffered on a channel, and asynchronously
 /// processed on another task. This means [`UdpSend::send_to`] won't block unless the channel is
 /// full.
+///
+/// With a direct path (the Linux default, #260 J1122) a datagram or run skips the channel when
+/// no datagram is queued or being sent: the caller sends it itself. The task that finished
+/// encrypting a run then also sends it, without waking the send task on another worker; J1120
+/// counted that wake among the per-Gbit wakes where we trail wireguard-go. When the socket is
+/// busy (a run in flight, or a queue), the run is queued as before, behind everything queued
+/// earlier, so no run overtakes another.
 #[derive(Clone)]
 pub struct BufferedUdpSend {
     _send_task: Arc<Task>,
+    /// The direct path; `None` sends only through the queue.
+    direct: Option<Arc<dyn DirectUdpWrite>>,
 
     /// One FIFO keeps packets ordered when a peer's endpoint changes address family.
     send_tx: mpsc::Sender<BufferedUdpMessage>,
@@ -50,6 +60,58 @@ pub struct BufferedUdpSend {
     packet_capacity: usize,
     /// Small datagrams, sent before the next queued run (#260, J720); `None` without the lane.
     reply_tx: Option<mpsc::Sender<(Packet, SocketAddr)>>,
+}
+
+/// A caller-side send that only happens when it cannot overtake queued work (#260, J1122).
+trait DirectUdpWrite: Send + Sync {
+    /// Start sending `packets` now if no other direct send holds the socket's send buffer, or
+    /// return `None` to queue them.
+    ///
+    /// The caller checks first that no datagram is queued or in service ([`BufferedUdpSend`]'s
+    /// permits all free: the send task holds a datagram's permit until the socket took it), and
+    /// this takes the send turn only if nobody holds it ([`SharedUdpSend`]). Together that means
+    /// no run handed over earlier can still be waiting. On success `packets` is empty. Like a
+    /// queued send, an error from the socket drops the datagrams concerned and is only traced.
+    fn try_write<'a>(
+        &'a self,
+        packets: &'a mut Vec<(Packet, SocketAddr)>,
+    ) -> Option<BoxFuture<'a, ()>>;
+}
+
+/// The socket's send turn, shared by the send task and the direct path.
+///
+/// Whoever holds [`Self::send_many_buf`] is the only one sending: the send task locks it for each
+/// batch of messages it takes from the queue, and the direct path only with `try_lock`. So a run
+/// never reaches the socket while an earlier one is still being sent, whichever path each took.
+struct SharedUdpSend<U: UdpSend> {
+    udp_tx: U,
+    /// The send turn, and the transport's reusable send buffer that comes with it.
+    send_many_buf: AsyncMutex<U::SendManyBuf>,
+    /// Most datagrams one transport call takes.
+    max_packet_count: usize,
+}
+
+impl<U: UdpSend + 'static> DirectUdpWrite for SharedUdpSend<U> {
+    fn try_write<'a>(
+        &'a self,
+        packets: &'a mut Vec<(Packet, SocketAddr)>,
+    ) -> Option<BoxFuture<'a, ()>> {
+        let mut send_many_buf = self.send_many_buf.try_lock().ok()?;
+        Some(Box::pin(async move {
+            let run = std::mem::take(packets);
+            // No send-turn budget here: the caller is the packet task itself, so yielding would
+            // only delay its own next read (the budget exists for the send task, J728).
+            let mut budget = SendTurnBudget { every: 0, sent: 0 };
+            flush_udp_run(
+                &self.udp_tx,
+                &mut send_many_buf,
+                run,
+                self.max_packet_count,
+                &mut budget,
+            )
+            .await;
+        }))
+    }
 }
 
 /// One queued datagram or one ordered run of datagrams.
@@ -237,18 +299,32 @@ impl BufferedUdpSend {
         udp_tx: impl UdpSend + 'static,
         reply_lane: bool,
     ) -> Self {
-        Self::with_send_turn(capacity, udp_tx, reply_lane, send_yield_every())
+        Self::with_send_turn(
+            capacity,
+            udp_tx,
+            reply_lane,
+            send_yield_every(),
+            crate::diag::run_to_completion().udp_tx,
+        )
     }
 
     /// Like [`Self::with_reply_lane`], plus a send-turn budget (#260, J728): after
     /// `yield_every` datagrams reach the socket, the send task yields so the runtime polls I/O
-    /// before it sends more. `0` turns the budget off.
-    pub(crate) fn with_send_turn(
+    /// before it sends more. `0` turns the budget off. `direct` lets callers send to an idle
+    /// socket themselves (see the type docs).
+    pub(crate) fn with_send_turn<U: UdpSend + 'static>(
         capacity: usize,
-        udp_tx: impl UdpSend + 'static,
+        udp_tx: U,
         reply_lane: bool,
         yield_every: usize,
+        direct: bool,
     ) -> Self {
+        let shared = Arc::new(SharedUdpSend {
+            max_packet_count: udp_tx.max_number_of_packets_to_send().max(1),
+            udp_tx: udp_tx.clone(),
+            send_many_buf: AsyncMutex::new(U::SendManyBuf::default()),
+        });
+        let direct = direct.then(|| Arc::clone(&shared) as Arc<dyn DirectUdpWrite>);
         let (send_tx, mut send_rx) = mpsc::channel::<BufferedUdpMessage>(capacity);
         let packet_slots = Arc::new(Semaphore::new(capacity));
         let (reply_tx, mut reply_rx) = if reply_lane {
@@ -261,7 +337,6 @@ impl BufferedUdpSend {
         let send_task = Task::spawn("buffered UDP send", async move {
             let mut buf = vec![];
             let max_packet_count = udp_tx.max_number_of_packets_to_send().max(1);
-            let mut send_many_buf = Default::default();
             let mut singles = Vec::with_capacity(max_packet_count);
             let mut single_permits = Vec::with_capacity(max_packet_count);
             let mut replies = Vec::with_capacity(max_packet_count);
@@ -276,6 +351,7 @@ impl BufferedUdpSend {
                         biased;
                         Some(reply) = reply_rx.recv() => {
                             replies.push(reply);
+                            let mut send_many_buf = shared.send_many_buf.lock().await;
                             flush_replies(reply_rx, &udp_tx, &mut send_many_buf, &mut replies, max_packet_count).await;
                             continue;
                         }
@@ -287,6 +363,8 @@ impl BufferedUdpSend {
                     break;
                 }
 
+                // Hold the send turn for this batch, so no direct send interleaves with it.
+                let mut send_many_buf = shared.send_many_buf.lock().await;
                 for message in buf.drain(..) {
                     // Replies queued since the last run leave before the next one.
                     if let Some(reply_rx) = &mut reply_rx {
@@ -351,6 +429,7 @@ impl BufferedUdpSend {
 
         Self {
             _send_task: Arc::new(send_task),
+            direct,
             send_tx,
             packet_slots,
             packet_capacity: capacity,
@@ -360,6 +439,12 @@ impl BufferedUdpSend {
 }
 
 impl BufferedUdpSend {
+    /// The direct path, when it may send now: no datagram is queued or in service.
+    fn idle_direct(&self) -> Option<&Arc<dyn DirectUdpWrite>> {
+        let direct = self.direct.as_ref()?;
+        (self.packet_slots.available_permits() == self.packet_capacity).then_some(direct)
+    }
+
     /// Bench diagnostic (#260, J687): datagrams queued for the UDP socket and not yet sent.
     pub(crate) fn depth_probe(&self) -> crate::diag::DepthProbe {
         let tx = self.send_tx.downgrade();
@@ -384,6 +469,16 @@ impl UdpSend for BufferedUdpSend {
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e));
         }
+        let mut packet = Some(packet);
+        if let Some(direct) = self.idle_direct() {
+            let mut run = vec![(packet.take().expect("set above"), destination)];
+            if let Some(send) = direct.try_write(&mut run) {
+                send.await;
+                return Ok(());
+            }
+            packet = run.pop().map(|(packet, _)| packet);
+        }
+        let packet = packet.expect("the direct path returns a datagram it did not take");
         let permit = Arc::clone(&self.packet_slots)
             .acquire_owned()
             .await
@@ -430,6 +525,13 @@ impl UdpSend for BufferedUdpSend {
                 }
             }
             *packets = bulk;
+        }
+        if !packets.is_empty()
+            && let Some(direct) = self.idle_direct()
+            && let Some(send) = direct.try_write(packets)
+        {
+            send.await;
+            return Ok(());
         }
         while !packets.is_empty() {
             let count = packets.len().min(self.packet_capacity);
@@ -1022,13 +1124,17 @@ mod reply_lane_test {
     async fn sent_order(lane: bool) -> Vec<u8> {
         let gate = Arc::new(Semaphore::new(0));
         let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
-        let send = BufferedUdpSend::with_reply_lane(
+        // Queued only: this test holds the send task at the gate (the direct path would hold
+        // the caller there instead).
+        let send = BufferedUdpSend::with_send_turn(
             64,
             GatedSend {
                 gate: Arc::clone(&gate),
                 sent: sent_tx,
             },
             lane,
+            0,
+            false,
         );
         let mut buf = ();
         // A bulk run the send task takes and holds at the gate.
@@ -1081,8 +1187,13 @@ mod reply_lane_test {
     /// receive task a reply wakes) wants the same current-thread runtime.
     async fn longest_send_run(yield_every: usize) -> (usize, String) {
         let log = Arc::new(std::sync::Mutex::new(String::new()));
-        let send =
-            BufferedUdpSend::with_send_turn(64, LoggingSend(Arc::clone(&log)), false, yield_every);
+        let send = BufferedUdpSend::with_send_turn(
+            64,
+            LoggingSend(Arc::clone(&log)),
+            false,
+            yield_every,
+            false,
+        );
         let mut run = (1..=8).map(|id| datagram(1452, id)).collect::<Vec<_>>();
         send.send_many_to(&mut (), &mut run).await.expect("queued");
         let competitor_log = Arc::clone(&log);
@@ -1118,5 +1229,87 @@ mod reply_lane_test {
     async fn small_datagrams_overtake_queued_bulk() {
         assert_eq!(drained(false).await, [1, 2, 3, 4, 5]);
         assert_eq!(drained(true).await, [3, 5, 1, 2, 4]);
+    }
+
+    /// With the direct path, a run sent while the socket is idle leaves in the caller's task:
+    /// it has reached the socket when `send_many_to` returns (#260, J1122).
+    #[tokio::test]
+    async fn idle_direct_sender_sends_in_the_callers_task() {
+        let gate = Arc::new(Semaphore::new(16));
+        let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+        let send = BufferedUdpSend::with_send_turn(
+            8,
+            GatedSend {
+                gate,
+                sent: sent_tx,
+            },
+            false,
+            0,
+            true,
+        );
+        let mut run = vec![datagram(1452, 1), datagram(1452, 2)];
+        send.send_many_to(&mut (), &mut run).await.unwrap();
+        assert!(run.is_empty());
+        let (packet, address) = datagram(1452, 3);
+        send.send_to(packet, address).await.unwrap();
+        let sent: Vec<u8> = std::iter::from_fn(|| sent_rx.try_recv().ok()).collect();
+        assert_eq!(sent, [1, 2, 3]);
+    }
+
+    /// While a direct send holds the socket, later runs queue, and the queue keeps going to
+    /// the send task until it is empty again: the socket sees 1..=6 in order (#260, J1122).
+    #[tokio::test]
+    async fn busy_direct_sender_queues_in_order() {
+        let gate = Arc::new(Semaphore::new(0));
+        let (sent_tx, mut sent_rx) = mpsc::unbounded_channel();
+        let send = BufferedUdpSend::with_send_turn(
+            64,
+            GatedSend {
+                gate: Arc::clone(&gate),
+                sent: sent_tx,
+            },
+            false,
+            0,
+            true,
+        );
+        let first = send.clone();
+        let first = tokio::spawn(async move {
+            first
+                .send_many_to(&mut (), &mut vec![datagram(1452, 1), datagram(1452, 2)])
+                .await
+        });
+        // Wait until the first run holds the direct path, mid-send.
+        for _ in 0..200 {
+            if send
+                .direct
+                .as_ref()
+                .is_some_and(|direct| direct.try_write(&mut Vec::new()).is_none())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        for run in [[3, 4], [5, 6]] {
+            let mut run = run.map(|id| datagram(1452, id)).to_vec();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                send.send_many_to(&mut (), &mut run),
+            )
+            .await
+            .expect("a busy socket queues the run instead of waiting")
+            .unwrap();
+        }
+        gate.add_permits(16);
+        first.await.unwrap().unwrap();
+        let mut order = Vec::new();
+        while order.len() < 6 {
+            order.push(
+                tokio::time::timeout(std::time::Duration::from_secs(2), sent_rx.recv())
+                    .await
+                    .expect("all six are sent")
+                    .expect("the send task holds the sender"),
+            );
+        }
+        assert_eq!(order, [1, 2, 3, 4, 5, 6]);
     }
 }
