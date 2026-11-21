@@ -81,14 +81,15 @@ pub(crate) const MAX_QUEUED_CRYPTO_JOBS: usize = 128;
 /// Assigns a diagnostic identity that stays unique after a drained lane is retired.
 static NEXT_ORDERED_LANE_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Whether a receive run of `packet_count` packets goes to a crypto worker (#260, J744).
+/// Whether a run of `packet_count` packets goes to a crypto worker (#260, J744, J1121).
 ///
 /// `lane_says_worker` is the peer lane's own choice ([`OrderedCompletions::should_force_worker`]).
-/// A run of at most `inline_max` packets is decrypted inline anyway. On the Mac the device runs on
-/// one current-thread runtime: handing a 16-datagram receive batch to the workers costs about
-/// 4k cross-thread wakes per second at 1 Gbit/s and +4–13% CPU per Gbit (J728), while the runtime
-/// itself has time to spare in that direction. `inline_max == 0` keeps the lane's choice.
-pub(crate) const fn receive_run_goes_to_worker(
+/// A run of at most `inline_max` packets ([`receive_inline_max`] or [`transmit_inline_max`]) is
+/// opened or sealed inline anyway. On the Mac the device runs on one current-thread runtime:
+/// handing a 16-datagram receive batch to the workers costs about 4k cross-thread wakes per
+/// second at 1 Gbit/s and +4–13% CPU per Gbit (J728), while the runtime itself has time to spare
+/// in that direction. `inline_max == 0` keeps the lane's choice.
+pub(crate) const fn run_goes_to_worker(
     lane_says_worker: bool,
     packet_count: usize,
     inline_max: usize,
@@ -101,12 +102,12 @@ pub(crate) const fn receive_run_goes_to_worker(
 /// and off (`0`) elsewhere, where the Linux worker hand-off is a measured throughput win.
 pub(crate) const DEFAULT_RECEIVE_INLINE_MAX: usize = if cfg!(target_os = "macos") { 16 } else { 0 };
 
-/// The inline limit `value` (the `GOTATUN_BENCH_RX_INLINE_MAX` variable) asks for: a number,
-/// `0` included, replaces the default; anything else keeps it.
-pub(crate) fn inline_max_from(value: Option<&str>) -> usize {
+/// The inline limit `value` (a `GOTATUN_BENCH_RX_INLINE_MAX` or `GOTATUN_BENCH_TX_INLINE_MAX`
+/// variable) asks for: a number, `0` included, replaces `default`; anything else keeps it.
+pub(crate) fn inline_max_from(value: Option<&str>, default: usize) -> usize {
     value
         .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(DEFAULT_RECEIVE_INLINE_MAX)
+        .unwrap_or(default)
 }
 
 /// Receive runs up to this many packets stay inline, read once (#260, J744, J763).
@@ -116,13 +117,138 @@ pub(crate) fn inline_max_from(value: Option<&str>) -> usize {
 pub(crate) fn receive_inline_max() -> usize {
     static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
-        let max = inline_max_from(std::env::var("GOTATUN_BENCH_RX_INLINE_MAX").ok().as_deref());
+        let max = inline_max_from(
+            std::env::var("GOTATUN_BENCH_RX_INLINE_MAX").ok().as_deref(),
+            DEFAULT_RECEIVE_INLINE_MAX,
+        );
         if max != DEFAULT_RECEIVE_INLINE_MAX {
             eprintln!("diag rx_inline_max={max} (default {DEFAULT_RECEIVE_INLINE_MAX})");
         }
         max
     })
 }
+
+/// The default inline limit for transmit runs: off (`0`), so the lane alone decides (#260).
+pub(crate) const DEFAULT_TRANSMIT_INLINE_MAX: usize = 0;
+
+/// Transmit runs up to this many packets are sealed on the task that read them (#260, J1121).
+///
+/// The transmit twin of [`receive_inline_max`], applied with [`run_goes_to_worker`].
+/// [`DEFAULT_TRANSMIT_INLINE_MAX`] unless `GOTATUN_BENCH_TX_INLINE_MAX=<n>` overrides it for
+/// measurement (`0` turns it off). Read once.
+pub(crate) fn transmit_inline_max() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        let max = inline_max_from(
+            std::env::var("GOTATUN_BENCH_TX_INLINE_MAX").ok().as_deref(),
+            DEFAULT_TRANSMIT_INLINE_MAX,
+        );
+        if max != DEFAULT_TRANSMIT_INLINE_MAX {
+            eprintln!("diag tx_inline_max={max} (default {DEFAULT_TRANSMIT_INLINE_MAX})");
+        }
+        max
+    })
+}
+
+/// The pool size `value` (the `GOTATUN_BENCH_CRYPTO_WORKERS` variable) asks for: a positive
+/// number replaces `available`, the CPU count this process may use; anything else keeps it.
+///
+/// `1` means no worker thread at all: [`CryptoHandle`] then runs every run serially on its
+/// caller, which is the single-CPU path.
+pub(crate) fn worker_count_from(value: Option<&str>, available: usize) -> usize {
+    value
+        .and_then(|value| value.trim().parse().ok())
+        .filter(|&count: &usize| count > 0)
+        .unwrap_or(available)
+}
+
+/// The number of crypto workers a new pool gets (#260, J1121).
+///
+/// `available_parallelism()` unless `GOTATUN_BENCH_CRYPTO_WORKERS=<n>` overrides it for
+/// measurement. Read once per process.
+fn default_worker_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let available = thread::available_parallelism()
+            .map(NonZeroUsize::get)
+            .unwrap_or(1);
+        let count = worker_count_from(
+            std::env::var("GOTATUN_BENCH_CRYPTO_WORKERS")
+                .ok()
+                .as_deref(),
+            available,
+        );
+        if count != available {
+            eprintln!("diag crypto_workers={count} (default {available})");
+        }
+        count
+    })
+}
+
+/// The CPUs `value` (the `GOTATUN_BENCH_CRYPTO_CPUS` variable) lists, such as `1-3,5`.
+///
+/// Returns `None` for an absent, empty or malformed list, which leaves workers unpinned.
+pub(crate) fn cpu_list_from(value: Option<&str>) -> Option<Vec<usize>> {
+    let mut cpus = Vec::new();
+    for part in value?.trim().split(',') {
+        let (first, last): (usize, usize) = match part.split_once('-') {
+            Some((first, last)) => (first.trim().parse().ok()?, last.trim().parse().ok()?),
+            None => {
+                let cpu = part.trim().parse().ok()?;
+                (cpu, cpu)
+            }
+        };
+        if first > last {
+            return None;
+        }
+        cpus.extend(first..=last);
+    }
+    (!cpus.is_empty()).then_some(cpus)
+}
+
+/// The CPUs crypto workers are pinned to, round-robin, if any (#260, J1121).
+///
+/// Unpinned unless `GOTATUN_BENCH_CRYPTO_CPUS=<list>` asks for placement measurements. Read once
+/// per process; ignored outside Linux.
+fn worker_cpus() -> Option<&'static [usize]> {
+    static CPUS: OnceLock<Option<Vec<usize>>> = OnceLock::new();
+    CPUS.get_or_init(|| {
+        let cpus = cpu_list_from(std::env::var("GOTATUN_BENCH_CRYPTO_CPUS").ok().as_deref());
+        if let Some(cpus) = &cpus {
+            eprintln!("diag crypto_cpus={cpus:?}");
+        }
+        cpus
+    })
+    .as_deref()
+}
+
+/// Hands out pinning positions across every pool in the process, so two devices' workers spread
+/// over the list instead of stacking on its first CPU.
+static NEXT_PINNED_WORKER: AtomicUsize = AtomicUsize::new(0);
+
+/// Pin the calling thread to `cpu`. A failure is reported once per thread and otherwise ignored:
+/// pinning is a measurement aid, never needed for correctness.
+#[cfg(target_os = "linux")]
+fn pin_current_thread(cpu: usize) {
+    // SAFETY: `cpu_set_t` is plain data that `CPU_ZERO` fully initialises, `CPU_SET` bounds-checks
+    // the index, and `sched_setaffinity(0, ..)` only reads the set for the calling thread.
+    let result = unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
+    };
+    if result != 0 {
+        eprintln!(
+            "diag crypto worker not pinned to cpu {cpu}: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
+/// Placement is Linux-only; elsewhere the list is ignored.
+#[cfg(not(target_os = "linux"))]
+fn pin_current_thread(_cpu: usize) {}
 
 /// Whether a ready run has enough queued work behind it to justify entering parallel dispatch.
 ///
@@ -1107,6 +1233,10 @@ impl WorkerThreads {
         thread::Builder::new()
             .name(format!("gotatun-crypto-{worker_index}"))
             .spawn(move || {
+                if let Some(cpus) = worker_cpus() {
+                    let position = NEXT_PINNED_WORKER.fetch_add(1, Ordering::Relaxed);
+                    pin_current_thread(cpus[position % cpus.len()]);
+                }
                 worker_queue.sleepers[worker_index]
                     .thread
                     .set(thread::current())
@@ -1170,12 +1300,10 @@ pub(crate) struct CryptoWorkers {
 }
 
 impl CryptoWorkers {
-    /// Create a pool sized to the CPUs available to this process. No thread starts yet.
+    /// Create a pool sized to the CPUs available to this process (see [`default_worker_count`]).
+    /// No thread starts yet.
     pub(crate) fn new() -> io::Result<Self> {
-        let worker_count = thread::available_parallelism()
-            .map(NonZeroUsize::get)
-            .unwrap_or(1);
-        Self::with_worker_count(worker_count)
+        Self::with_worker_count(default_worker_count())
     }
 
     /// Create a pool with an explicit size for focused measurements. No thread starts yet.
@@ -2251,11 +2379,11 @@ mod tests {
     /// worker; larger runs and the default limit (0) keep the lane's choice (#260, J744).
     #[test]
     fn small_receive_runs_stay_inline_under_the_limit() {
-        assert!(!super::receive_run_goes_to_worker(true, 16, 16));
-        assert!(!super::receive_run_goes_to_worker(true, 1, 16));
-        assert!(super::receive_run_goes_to_worker(true, 17, 16));
-        assert!(super::receive_run_goes_to_worker(true, 16, 0));
-        assert!(!super::receive_run_goes_to_worker(false, 64, 16));
+        assert!(!super::run_goes_to_worker(true, 16, 16));
+        assert!(!super::run_goes_to_worker(true, 1, 16));
+        assert!(super::run_goes_to_worker(true, 17, 16));
+        assert!(super::run_goes_to_worker(true, 16, 0));
+        assert!(!super::run_goes_to_worker(false, 64, 16));
     }
 
     /// The inline limit defaults to 16 on macOS and 0 elsewhere; the variable overrides it, and
@@ -2263,10 +2391,40 @@ mod tests {
     #[test]
     fn the_receive_inline_limit_defaults_per_platform_and_can_be_turned_off() {
         let default = if cfg!(target_os = "macos") { 16 } else { 0 };
-        assert_eq!(super::inline_max_from(None), default);
-        assert_eq!(super::inline_max_from(Some("0")), 0);
-        assert_eq!(super::inline_max_from(Some("8")), 8);
-        assert_eq!(super::inline_max_from(Some("x")), default);
+        assert_eq!(super::DEFAULT_RECEIVE_INLINE_MAX, default);
+        assert_eq!(super::inline_max_from(None, default), default);
+        assert_eq!(super::inline_max_from(Some("0"), default), 0);
+        assert_eq!(super::inline_max_from(Some("8"), default), 8);
+        assert_eq!(super::inline_max_from(Some("x"), default), default);
+    }
+
+    /// The transmit inline limit is off by default and takes the same overrides (#260, J1121).
+    #[test]
+    fn the_transmit_inline_limit_is_off_by_default() {
+        let default = super::DEFAULT_TRANSMIT_INLINE_MAX;
+        assert_eq!(default, 0);
+        assert_eq!(super::inline_max_from(Some(" 32 "), default), 32);
+        assert_eq!(super::inline_max_from(Some("-1"), default), default);
+    }
+
+    /// A positive worker count replaces the CPU count; zero or junk keeps it (#260, J1121).
+    #[test]
+    fn the_worker_count_override_needs_a_positive_number() {
+        assert_eq!(super::worker_count_from(None, 6), 6);
+        assert_eq!(super::worker_count_from(Some("2"), 6), 2);
+        assert_eq!(super::worker_count_from(Some("0"), 6), 6);
+        assert_eq!(super::worker_count_from(Some("two"), 6), 6);
+    }
+
+    /// CPU lists take single CPUs and ranges; a malformed list pins nothing (#260, J1121).
+    #[test]
+    fn crypto_cpu_lists_parse_ranges_and_reject_junk() {
+        assert_eq!(super::cpu_list_from(Some("1-3,5")), Some(vec![1, 2, 3, 5]));
+        assert_eq!(super::cpu_list_from(Some("4")), Some(vec![4]));
+        assert_eq!(super::cpu_list_from(None), None);
+        assert_eq!(super::cpu_list_from(Some("")), None);
+        assert_eq!(super::cpu_list_from(Some("3-1")), None);
+        assert_eq!(super::cpu_list_from(Some("1,x")), None);
     }
 
     /// Keep a lone ready run inline and dispatch substantial work only when another run exists.
