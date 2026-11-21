@@ -365,6 +365,9 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
 
         if let Update::Set(addr) = endpoint {
             existing_peer.endpoint.addr = addr;
+            // The timer task skips a peer without an endpoint and leaves it unscheduled, so a
+            // new endpoint must bring it back, as the old 250 ms poll did on its next pass.
+            existing_peer.tunnel.reschedule_timers(Duration::ZERO);
         }
 
         existing_peer.update_allowed_ips(clear_allowed_ips, add_allowed_ips);

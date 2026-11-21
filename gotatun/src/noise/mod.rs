@@ -36,6 +36,8 @@ use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::timers::{TimerName, Timers};
 
 pub use crate::noise::timers::TimerParams;
+#[cfg(feature = "device")]
+pub(crate) use crate::noise::timers::{TIMER_TICK, TimerHook};
 use crate::packet::{Packet, WgCookieReply, WgData, WgHandshakeInit, WgHandshakeResp, WgKind};
 use crate::tun::MtuWatcher;
 use gotatun_crypto::x25519;
@@ -189,6 +191,8 @@ impl<R: RngCore + Send> Tunn<R> {
     pub fn reset(&mut self) {
         self.clear_all();
         self.handshake.reset();
+        // A configured persistent keepalive is owed at once again (#260, J1111).
+        self.reschedule_timers(Duration::ZERO);
     }
 
     /// Update the private key and clear existing sessions.
@@ -233,6 +237,7 @@ impl<R: RngCore + Send> Tunn<R> {
         packet: Packet,
         tun_mtu: Option<&mut MtuWatcher>,
     ) -> Option<WgKind> {
+        self.refresh_timer_clock();
         self.prepare_outgoing_packet(packet, tun_mtu)
             .map(PreparedOutgoing::encrypt)
     }
@@ -425,6 +430,7 @@ impl<R: RngCore + Send> Tunn<R> {
     /// Returns `Err(original_packet)` if there is no active session, or if the active session's
     /// sending counter has reached `REJECT_AFTER_MESSAGES`.
     pub fn encapsulate_with_session(&mut self, packet: Packet) -> Result<Packet<WgData>, Packet> {
+        self.refresh_timer_clock();
         let current = self.current;
         if let Some(session) = self
             .sessions
@@ -446,6 +452,7 @@ impl<R: RngCore + Send> Tunn<R> {
     ///
     /// This dispatches to the appropriate handler based on packet type.
     pub fn handle_incoming_packet(&mut self, packet: WgKind) -> TunnResult {
+        self.refresh_timer_clock();
         match packet {
             WgKind::HandshakeInit(p) => self.handle_handshake_init(p),
             WgKind::HandshakeResp(p) => self.handle_handshake_response(p),
@@ -578,6 +585,7 @@ impl<R: RngCore + Send> Tunn<R> {
         &mut self,
         packet: Packet<WgData>,
     ) -> Result<Packet, WireGuardError> {
+        self.refresh_timer_clock();
         let r_idx = packet.header.receiver_idx.get();
 
         // Search for the matching session. Almost always self.current, but older
@@ -614,6 +622,7 @@ impl<R: RngCore + Send> Tunn<R> {
         &mut self,
         force_resend: bool,
     ) -> Option<Packet<WgHandshakeInit>> {
+        self.refresh_timer_clock();
         if self.handshake.is_in_progress() && !force_resend {
             return None;
         }
@@ -632,6 +641,8 @@ impl<R: RngCore + Send> Tunn<R> {
         }
         self.timer_tick(TimerName::TimeLastPacketSent);
         self.update_rekey_timeout();
+        // The retry and give-up deadlines start now (#260, J1111).
+        self.reschedule_timers(Duration::ZERO);
 
         self.tx_bytes += packet.as_bytes().len();
 

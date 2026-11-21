@@ -14,6 +14,10 @@ use super::errors::WireGuardError;
 use crate::noise::Tunn;
 use crate::packet::WgKind;
 
+mod deadline;
+#[cfg(feature = "device")]
+pub(crate) use deadline::{TIMER_TICK, TimerHook};
+
 use std::ops::{Index, IndexMut, RangeInclusive};
 use std::time::Duration;
 
@@ -35,7 +39,7 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const COOKIE_EXPIRATION_TIME: Duration = Duration::from_secs(120);
 pub(crate) const MAX_JITTER: Duration = Duration::from_millis(333);
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum TimerName {
     /// Current time, updated each call to `update_timers`
     TimeCurrent,
@@ -140,6 +144,8 @@ pub struct Timers {
     /// Current rekey-after-time deadline.
     /// Sampled from [`TimerParams::rekey_after_time`] when a session is established.
     rekey_after_time: Duration,
+    /// Where the next deadline is reported, if a device schedules this tunnel (#260, J1111).
+    schedule: deadline::Schedule,
 }
 
 impl Timers {
@@ -162,6 +168,7 @@ impl Timers {
             new_handshake_timeout: Duration::ZERO,
             rekey_timeout: Duration::ZERO,
             rekey_after_time: Duration::ZERO,
+            schedule: deadline::Schedule::default(),
         };
         timers.dangerously_set_params(TimerParams::default());
         timers
@@ -222,7 +229,9 @@ impl IndexMut<TimerName> for Timers {
 
 impl<R: rand::RngCore + Send> Tunn<R> {
     pub(super) fn timer_tick(&mut self, timer_name: TimerName) {
+        self.timers.debug_assert_event_clock_fresh();
         let time = self.timers[TimeCurrent];
+        let before = self.timers[timer_name];
 
         match timer_name {
             TimeLastPacketReceived => {
@@ -257,6 +266,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         }
 
         self.timers[timer_name] = time;
+        self.timer_tick_armed(timer_name, before);
     }
 
     /// Sample a deadline uniformly from one of the [`TimerParams`] ranges.
@@ -283,6 +293,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
             self.timers[TimeCurrent];
         self.timers.is_initiator = is_initiator;
         self.timers.rekey_after_time = self.sample_timer(|p| &p.rekey_after_time);
+        self.reschedule_timers(Duration::ZERO);
     }
 
     // We don't really clear the timers, but we set them to the current time to
@@ -487,6 +498,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
             return false;
         }
         self.timers.keepalive_requested = true;
+        self.arm_requested_keepalive();
         true
     }
 
@@ -542,12 +554,15 @@ impl<R: rand::RngCore + Send> Tunn<R> {
     /// See [TimerParams].
     pub fn dangerously_set_timer_params(&mut self, params: TimerParams) {
         self.timers.dangerously_set_params(params);
+        self.reschedule_timers(Duration::ZERO);
     }
 
     /// Set the persistent keepalive interval in seconds.
     ///
     /// Pass `None` or `Some(0)` to disable persistent keepalive.
     pub fn set_persistent_keepalive(&mut self, seconds: Option<u16>) {
+        // The interval counts from now, as a stamp would (#260, J1111).
+        self.timers.refresh_event_clock();
         let was_enabled = self.timers.persistent_keepalive.is_some();
         self.timers.persistent_keepalive = seconds
             .filter(|&s| s > 0)
@@ -559,5 +574,6 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         } else {
             self.timers[TimePersistentKeepalive] = self.timers[TimeCurrent];
         }
+        self.reschedule_timers(Duration::ZERO);
     }
 }
