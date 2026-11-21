@@ -19,6 +19,18 @@
 //! so it does not use this check. The reader and parser are J815's, shared
 //! with the connected-send pool's audit (`j815-mac-socket-pool`), so one review covers both.
 //!
+//! **macOS 27 hides other processes' sockets (J1108).** On macOS 27.2.1 the list a program of
+//! ours reads holds only its own sockets: before our bind it is just the header and trailer,
+//! after it one record, ours, while a socket another process holds on the same port (same user)
+//! is missing. Developer ID signing does not change that. Apple's own tools (`netstat`, Apple's
+//! `python3` and `perl`) still read every socket, and macOS 26.5.2 shows every socket to us too.
+//! A list like that proves nothing about other processes, yet it still shows our own socket, so
+//! the layout check below would let it through. [`PortUsers::sees_other_processes`] tells the
+//! two apart: every real Mac has UDP sockets of other processes (at least the DNS responder's),
+//! so a list with none of them is a filtered one. Each user decides what that means for its
+//! own claim: [`ensure_alone`] here, and the connected-send pool's audit, which then opens no
+//! window.
+//!
 //! **Private layout.** The record offsets below are xnu's `xinpcb_n`/`xsocket_n` layout, which is
 //! not public API. [`ensure_alone`] therefore fails closed: if our own bound socket is not in the
 //! list, the layout is not recognised and the bind is refused, never let through unchecked. The
@@ -46,23 +58,59 @@ use std::{ffi::CStr, io};
 /// plus an `IPV6_V6ONLY` one (`UdpSocket::bind_split`, J834), which closes that by the kernel's
 /// own rule and needs no audit at all.
 pub(crate) fn ensure_alone(socket: &socket2::Socket) -> io::Result<()> {
-    let port = socket
+    let local = socket
         .local_addr()?
         .as_socket()
-        .ok_or_else(|| io::Error::other("UDP socket has no IP address"))?
-        .port();
+        .ok_or_else(|| io::Error::other("UDP socket has no IP address"))?;
+    let port = local.port();
     let users = port_users(port).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!("cannot check who else holds UDP port {port}: {error}"),
         )
     })?;
-    alone(&users, port)
+    let only_v6 = local.is_ipv6() && socket.only_v6()?;
+    alone(&users, port, single_family_wildcard(local, only_v6))
+}
+
+/// Whether a socket bound to `local` (IPv6-only when `only_v6`) is a wildcard of one family:
+/// `0.0.0.0`, or `[::]` with `IPV6_V6ONLY`. A dual-stack `[::]` is not: an IPv4 squatter can
+/// share its port (J815).
+fn single_family_wildcard(local: std::net::SocketAddr, only_v6: bool) -> bool {
+    local.ip().is_unspecified() && (local.is_ipv4() || only_v6)
 }
 
 /// The verdict of [`ensure_alone`] on a parsed list: exactly one socket on the port, and it is
 /// this process's.
-fn alone(users: &PortUsers, port: u16) -> io::Result<()> {
+///
+/// A list that shows no other process's socket at all (macOS 27, see the module docs) cannot
+/// rule anyone out. For a single-family `wildcard` bind (`0.0.0.0`, or `[::]` with
+/// `IPV6_V6ONLY`; never a dual-stack `[::]`, which an IPv4 squatter can share, J815) that is
+/// accepted, because there the kernel's own rule already refuses every socket of the same family
+/// on the port, before us or after us, and a socket of the other family gets none of our
+/// datagrams. J1108 measured it on macOS 26.5.2 and 27.2.1 alike: every same-family squatter
+/// (`0.0.0.0`, `127.0.0.1`, a dual-stack `[::]`, and for an IPv6-only bind an IPv6-only `[::]`
+/// and `[::1]`) was refused, and the only squatters that bound beside us were of the other
+/// family, receiving only their own family's datagrams. Any other bind fails closed.
+fn alone(users: &PortUsers, port: u16, wildcard: bool) -> io::Result<()> {
+    if users.total > 0 && !users.sees_other_processes() {
+        if wildcard && users.total == 1 {
+            tracing::debug!(
+                "UDP port {port}: the socket list shows only this process's sockets; the kernel \
+                 keeps an exclusive wildcard bind's family to itself"
+            );
+            return Ok(());
+        }
+        if !wildcard {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "cannot check who else holds UDP port {port}: the kernel's socket list shows \
+                     only this process's sockets"
+                ),
+            ));
+        }
+    }
     match users.total {
         0 => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -90,6 +138,16 @@ pub(crate) struct PortUsers {
     pub(crate) total: usize,
     /// `(uid, last pid)` of each socket that is not this process's (for the log only).
     pub(crate) others: Vec<(u32, i32)>,
+    /// How many sockets in the whole list, on any port, are not this process's.
+    pub(crate) visible_others: usize,
+}
+
+impl PortUsers {
+    /// Whether the list shows any other process's socket at all. When it does not, it has been
+    /// filtered for us (macOS 27, see the module docs) and cannot show who else is on the port.
+    pub(crate) fn sees_other_processes(&self) -> bool {
+        self.visible_others > 0
+    }
 }
 
 /// The sockets on UDP `port` right now.
@@ -186,14 +244,17 @@ pub(crate) fn parse(list: &[u8], port: u16, uid: u32, pid: i32) -> io::Result<Po
                 on_port = u16::from_be_bytes([lport[0], lport[1]]) == port;
                 users.total += usize::from(on_port);
             }
-            XSO_SOCKET if on_port => {
+            XSO_SOCKET => {
                 if len < SOCKET_LAST_PID + 4 {
                     return Err(malformed());
                 }
                 let so_uid = u32_at(offset + SOCKET_UID)?;
                 let last_pid = u32_at(offset + SOCKET_LAST_PID)? as i32;
                 if (so_uid, last_pid) != (uid, pid) {
-                    users.others.push((so_uid, last_pid));
+                    users.visible_others += 1;
+                    if on_port {
+                        users.others.push((so_uid, last_pid));
+                    }
                 }
             }
             _ => {}
@@ -252,7 +313,12 @@ mod tests {
     #[test]
     fn the_verdict_fails_closed() {
         let alone = |total, others: Vec<(u32, i32)>| {
-            super::alone(&super::PortUsers { total, others }, 9).map_err(|error| error.kind())
+            let users = super::PortUsers {
+                total,
+                others,
+                visible_others: 5,
+            };
+            super::alone(&users, 9, true).map_err(|error| error.kind())
         };
         assert_eq!(alone(1, vec![]), Ok(()));
         assert_eq!(
@@ -271,6 +337,54 @@ mod tests {
         assert_eq!(alone(0, vec![]), Err(std::io::ErrorKind::InvalidData));
     }
 
+    /// A list that shows no other process's socket (macOS 27, J1108) cannot rule anyone out: a
+    /// wildcard bind, which the kernel keeps to itself per family, is accepted with only our own
+    /// socket on the port; a specific address fails closed; two of ours and an empty list are
+    /// refused as before.
+    #[test]
+    fn a_list_without_other_processes_is_trusted_only_for_wildcards() {
+        let verdict = |total, wildcard| {
+            let users = super::PortUsers {
+                total,
+                others: Vec::new(),
+                visible_others: 0,
+            };
+            super::alone(&users, 9, wildcard).map_err(|error| error.kind())
+        };
+        assert_eq!(verdict(1, true), Ok(()));
+        assert_eq!(verdict(1, false), Err(std::io::ErrorKind::InvalidData));
+        assert_eq!(verdict(2, true), Err(std::io::ErrorKind::AddrInUse));
+        assert_eq!(verdict(0, true), Err(std::io::ErrorKind::InvalidData));
+    }
+
+    /// Only `0.0.0.0` and an IPv6-only `[::]` are trusted on a filtered list; a dual-stack `[::]`
+    /// and specific addresses are not.
+    #[test]
+    fn only_single_family_wildcards_are_trusted() {
+        let at = |address: &str| address.parse::<std::net::SocketAddr>().expect("address");
+        assert!(super::single_family_wildcard(at("0.0.0.0:9"), false));
+        assert!(super::single_family_wildcard(at("[::]:9"), true));
+        assert!(
+            !super::single_family_wildcard(at("[::]:9"), false),
+            "dual-stack"
+        );
+        assert!(!super::single_family_wildcard(at("127.0.0.1:9"), false));
+        assert!(!super::single_family_wildcard(at("[::1]:9"), true));
+    }
+
+    /// This test process sees other processes' sockets on macOS 26 (the Mac VM), not on macOS 27
+    /// (J1108); either way the count is consistent with what it reports.
+    #[test]
+    fn the_list_says_whether_it_shows_other_processes() {
+        let users = super::port_users(9).expect("read the list");
+        eprintln!(
+            "pcblist_n: {} sockets of other processes visible (filtered: {})",
+            users.visible_others,
+            !users.sees_other_processes()
+        );
+        assert_eq!(users.sees_other_processes(), users.visible_others > 0);
+    }
+
     /// A socket bound without `SO_REUSEPORT` passes the check on a real list. Also prints what
     /// one check costs (the median of 200), the price every S-off bind pays once.
     #[test]
@@ -281,6 +395,13 @@ mod tests {
         socket
             .bind(&SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)).into())
             .expect("bind [::]:0");
+        if !super::port_users(9).expect("list").sees_other_processes() {
+            // macOS 27 (J1108): the filtered list cannot clear a dual-stack bind, which an IPv4
+            // squatter could share (J815); it must fail closed.
+            let refused = super::ensure_alone(&socket).expect_err("a dual-stack bind fails closed");
+            assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData, "{refused}");
+            return;
+        }
         super::ensure_alone(&socket).expect("alone on its port");
 
         let mut took: Vec<_> = (0..200)

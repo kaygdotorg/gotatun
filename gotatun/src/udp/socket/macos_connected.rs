@@ -48,7 +48,9 @@
 //!
 //! The list is also read once *before* step 2 (J826). It must show the wildcard socket alone. If
 //! it cannot be read, or shows fewer than our already-bound sockets (the records are private kernel ABI and
-//! an OS update may change them), the window is never opened and the socket carries on with
+//! an OS update may change them), or shows no other process's socket at all (macOS 27 filters the
+//! list to a program's own sockets, J1108, so a joiner would be invisible), the window is never
+//! opened and the socket carries on with
 //! `sendto`: no pool, no audit needed, and no second bind of the port. If it shows someone
 //! else already, the socket is refused before the window.
 //!
@@ -68,12 +70,46 @@
 //! - A send error that says the path is gone (`EADDRNOTAVAIL` once the source address left the
 //!   host, `ENETUNREACH`, `ENETDOWN`; `EHOSTUNREACH` after one retry, since it can also be a
 //!   stale ICMP report) marks the socket stale, and that datagram leaves through `sendto` in the
-//!   same call.
+//!   same call. Other send errors are in **Failing sends** below.
 //! - Every message that is not data (handshake messages, cookie replies and keepalives) marks
 //!   its endpoint's socket stale and leaves through `sendto`, which picks the current source. A
 //!   Mac that sends data starts a handshake after 15 s without a reply; an idle or receive-only
 //!   Mac sends a keepalive at least every persistent-keepalive interval. So even an unsignalled,
 //!   error-free stale path ends at the protocol's own recovery point (J789).
+//!
+//! **Failing sends.** `sendto` on the wildcard socket is the reference path: connected sends
+//! are only a faster way to do the same thing, so a pool socket's send error never loses a
+//! datagram and never reaches the caller. Whatever the errno, the datagram goes through
+//! `sendto`, and only `sendto`'s own error is returned. This matters because the kernel can
+//! refuse connected sends for reasons the pool cannot know about. macOS Local Network privacy
+//! refuses a process without the user's grant any flow it starts toward a LAN host; for a
+//! connected socket the kernel's policy check marks the socket defunct and every `send` answers
+//! `EPIPE`. A flow the peer started (its handshake reached the wildcard socket) stays allowed, so
+//! `sendto` to that peer keeps working while a fresh pool socket to it never does (J1108 on an
+//! M1 with macOS 27.2.1, after J1028 and J1036 on #260/#554). Before J1108 an errno the pool did
+//! not recognise failed the datagram and every one after it, so that peer got no data at all.
+//!
+//! What happens to the socket depends on the error:
+//! - **Path errors and ICMP reports** (above): the socket is stale and re-connects. One that
+//!   keeps failing backs off instead of reconnecting before every datagram: the first failure
+//!   re-connects on the next data datagram (a moved source usually works again at once); each
+//!   further failure in a row keeps the endpoint on `sendto` for [`FIRST_BACKOFF`], doubling up
+//!   to [`MAX_BACKOFF`]. One successful send clears the count, and a network change
+//!   ([`ConnectedSends::underlay_changed`]) ends a back-off early. The back-off is checked on
+//!   the send path; there is no timer (D81).
+//! - **A full buffer** (`ENOBUFS`, `ENOMEM`): that datagram goes through `sendto`; the socket is
+//!   fine.
+//! - **Anything else** (`EPIPE` from a defunct socket, and an `EOPNOTSUPP` when re-connecting
+//!   one): the socket is **retired**. A defunct socket cannot be re-connected or disconnected,
+//!   and while it stays connected the kernel still hands it every datagram from that peer and
+//!   drops them, so the peer's traffic is lost on *receive* too (J1108 on mba: the wildcard
+//!   socket got 0 of the peer's datagrams until the pool socket was closed, then all of them).
+//!   Retiring replaces the open file behind the slot's descriptor with a fresh UDP socket that
+//!   is never bound ([`ConnectedSends::retire`]). That closes the defunct socket without a new
+//!   bind on the port, so the invariant above holds, and the slot is never used again. The
+//!   endpoint uses `sendto` until the next network change, which may lift the refusal; it then
+//!   takes another pool socket, and loses it the same way if the refusal stands. So a refused
+//!   endpoint costs at most one pool socket per network change and runs at `sendto` speed.
 //!
 //! **Family.** The default listener is an exclusive AF_INET / IPv6-only pair (J834).
 //! Each family gets its own startup pool of [`POOL_SIZE`] sockets. A slot's family is fixed
@@ -105,9 +141,10 @@ use std::{
     net::SocketAddr,
     sync::{
         OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
+    time::{Duration, Instant},
 };
 
 use parking_lot::{Mutex, RwLock};
@@ -130,6 +167,13 @@ pub(crate) const ACTIVE_SENDS: u64 = 1024;
 /// The size of a WireGuard keepalive: a data header and an empty, authenticated payload.
 /// Datagrams this small or smaller never use a pool socket.
 const KEEPALIVE_LEN: usize = 32;
+
+/// How long an endpoint stays on `sendto` after its pool socket hit a path error twice in a
+/// row (see **Failing sends** in the module docs). Doubles with each further failure.
+pub(crate) const FIRST_BACKOFF: Duration = Duration::from_secs(1);
+
+/// The longest an endpoint whose connected sends keep failing waits between attempts.
+pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(64);
 
 /// Whether the switch's value turns connected sends on: a set value other than `0` does; no
 /// value keeps them off (J789).
@@ -273,6 +317,14 @@ fn bind_pool_counted(
     // Before the window: the list must be readable and show the wildcard socket alone. If it
     // can't be read or doesn't show our socket, no window opens and nothing binds again.
     let before = read_users(local.port()).map_err(PoolError::Unavailable)?;
+    if !before.sees_other_processes() {
+        // macOS 27 shows a program only its own sockets (J1108): the audit after the window
+        // could never see a socket that joined, so the window must not open.
+        return Err(PoolError::Unavailable(io::Error::other(
+            "the kernel's UDP socket list shows only this process's sockets, so nobody joining \
+             the port could be seen",
+        )));
+    }
     if !before.others.is_empty() {
         return Err(joined(&before, local.port(), existing));
     }
@@ -377,6 +429,9 @@ struct Slot {
     /// their `send` call and a re-connect holds the write lock, so a datagram never leaves on a
     /// socket that is moving to another endpoint.
     peer: RwLock<Option<SocketAddr>>,
+    /// Set when a send on this socket failed and the failure count in its [`Assignment`] is
+    /// not zero, so a successful send knows (without the table lock) that it must clear it.
+    failing: AtomicBool,
 }
 
 /// What the table knows about one pool socket (kept under the table lock).
@@ -390,6 +445,15 @@ struct Assignment {
     stale: bool,
     /// The table's send counter at this socket's last data send, for least-recently-used reuse.
     last_used: u64,
+    /// Send failures in a row on this socket for this endpoint; zero after a successful send.
+    failures: u32,
+    /// While set and in the future, the endpoint uses `sendto` and the socket is not
+    /// re-connected (the back-off of **Failing sends** in the module docs).
+    retry_at: Option<Instant>,
+    /// The socket was retired ([`ConnectedSends::retire`]) and serves nobody, ever. While
+    /// `destination` is still set it keeps that endpoint on `sendto` until the next network
+    /// change.
+    retired: bool,
 }
 
 /// The pool of one WireGuard socket, shared by all of its clones.
@@ -403,6 +467,10 @@ pub(crate) struct ConnectedSends {
     sends: AtomicU64,
     /// How many successful connects were made so far (tests and diagnostics).
     connects: AtomicU64,
+    /// Whether the one warning about an unexpected send error was logged already.
+    warned: AtomicBool,
+    /// How many pool sockets were retired so far (tests and diagnostics).
+    retirements: AtomicU64,
 }
 
 /// A receiver's position: where its next round of polls starts.
@@ -416,10 +484,9 @@ pub(crate) struct RecvView {
 enum Sent {
     /// It left on the pool socket.
     Done,
-    /// It did not leave; the caller sends it through `sendto`.
+    /// It did not leave; the caller sends it through `sendto`. A pool socket's own error is
+    /// never returned to the caller (see **Failing sends** in the module docs).
     Fallback,
-    /// A send error that the caller returns, as `sendto` would have.
-    Failed(io::Error),
 }
 
 impl ConnectedSends {
@@ -445,6 +512,7 @@ impl ConnectedSends {
                 Ok(Slot {
                     socket: tokio::net::UdpSocket::from_std(socket.into())?,
                     peer: RwLock::new(None),
+                    failing: AtomicBool::new(false),
                 })
             })
             .collect::<io::Result<Box<[Slot]>>>()?;
@@ -460,6 +528,8 @@ impl ConnectedSends {
             slots,
             sends: AtomicU64::new(0),
             connects: AtomicU64::new(0),
+            warned: AtomicBool::new(false),
+            retirements: AtomicU64::new(0),
         }
     }
 
@@ -469,8 +539,14 @@ impl ConnectedSends {
         self.table
             .lock()
             .iter()
-            .filter(|assignment| assignment.destination.is_some() && !assignment.stale)
+            .filter(|a| a.destination.is_some() && !a.stale && !a.retired)
             .count()
+    }
+
+    /// How many pool sockets were retired so far.
+    #[cfg(test)]
+    pub(crate) fn retirements(&self) -> u64 {
+        self.retirements.load(Ordering::Relaxed)
     }
 
     /// How many successful connects this pool has made so far.
@@ -489,12 +565,19 @@ impl ConnectedSends {
     ///
     /// Each one keeps the source address and route chosen when it connected, which may be gone
     /// now. Call this from the owner's network-change signal, before asking sessions to announce
-    /// themselves.
+    /// themselves. It also ends every send back-off: the new path may take connected sends. The
+    /// failure counts stay, so a path that still fails goes straight back to a long back-off.
     pub(crate) fn underlay_changed(&self) {
         let mut table = self.table.lock();
         let mut marked = 0;
         for assignment in table.iter_mut().filter(|a| a.destination.is_some()) {
+            if assignment.retired {
+                // The refused endpoint may try a live pool socket again.
+                assignment.destination = None;
+                continue;
+            }
             assignment.stale = true;
+            assignment.retry_at = None;
             marked += 1;
         }
         drop(table);
@@ -524,7 +607,6 @@ impl ConnectedSends {
                 match self.send_on(index, payload, destination).await {
                     Sent::Done => return Ok(()),
                     Sent::Fallback => {}
-                    Sent::Failed(error) => return Err(error),
                 }
             }
         }
@@ -532,6 +614,11 @@ impl ConnectedSends {
     }
 
     /// Send `payload` on pool socket `index` while it is connected to `destination`.
+    ///
+    /// Every error ends in [`Sent::Fallback`] (the caller uses `sendto`). ICMP reports are
+    /// retried once first, because they usually belong to an earlier datagram; then they and
+    /// path errors mark the socket stale with a back-off ([`Self::forget`]), a full buffer
+    /// leaves the socket alone, and any other error retires it ([`Self::retire`]).
     async fn send_on(&self, index: usize, payload: &[u8], destination: SocketAddr) -> Sent {
         let slot = &self.slots[index];
         let mut icmp_retried = false;
@@ -545,10 +632,17 @@ impl ConnectedSends {
                 slot.socket.try_send(payload)
             };
             match result {
-                Ok(_) => return Sent::Done,
+                Ok(_) => {
+                    if slot.failing.load(Ordering::Relaxed) {
+                        self.recovered(index, destination);
+                    }
+                    return Sent::Done;
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if let Err(error) = slot.socket.writable().await {
-                        return Sent::Failed(error);
+                    // Fails only when the runtime is shutting down: nothing to learn about the
+                    // socket.
+                    if slot.socket.writable().await.is_err() {
+                        return Sent::Fallback;
                     }
                 }
                 // A pending ICMP error is reported once and cleared; the datagram was not sent.
@@ -557,7 +651,11 @@ impl ConnectedSends {
                     self.forget(index, destination, &error);
                     return Sent::Fallback;
                 }
-                Err(error) => return Sent::Failed(error),
+                Err(error) if is_full_buffer(&error) => return Sent::Fallback,
+                Err(error) => {
+                    self.retire(index, destination, &error);
+                    return Sent::Fallback;
+                }
             }
         }
     }
@@ -614,6 +712,17 @@ impl ConnectedSends {
             .iter()
             .position(|assignment| assignment.destination == Some(destination))
         {
+            if table[index].retired {
+                // Refused here before: `sendto` until the next network change.
+                return None;
+            }
+            if let Some(retry_at) = table[index].retry_at
+                && Instant::now() < retry_at
+            {
+                // Backing off: `sendto`. `last_used` stays old, so a busy endpoint may take
+                // this socket over meanwhile.
+                return None;
+            }
             table[index].last_used = now;
             if !table[index].stale {
                 return Some(index);
@@ -639,15 +748,31 @@ impl ConnectedSends {
         let family = table[index].family;
         match socket2::SockRef::from(&slot.socket).connect(&destination.into()) {
             Ok(()) => {
+                // A re-connect to the same endpoint keeps its failure count and back-off; a move
+                // to a new endpoint starts clean.
+                let (failures, retry_at) = if table[index].destination == Some(destination) {
+                    (table[index].failures, table[index].retry_at)
+                } else {
+                    slot.failing.store(false, Ordering::Relaxed);
+                    (0, None)
+                };
                 *peer = Some(destination);
                 table[index] = Assignment {
                     destination: Some(destination),
                     family,
                     stale: false,
                     last_used: now,
+                    failures,
+                    retry_at,
+                    retired: false,
                 };
                 self.connects.fetch_add(1, Ordering::Relaxed);
                 Some(index)
+            }
+            Err(error) if is_defunct_error(&error) => {
+                drop(peer);
+                self.retire_locked(table, index, destination, &error);
+                None
             }
             Err(error) => {
                 // Whatever it was connected to before, it is not connected now.
@@ -665,13 +790,101 @@ impl ConnectedSends {
         }
     }
 
-    /// Mark pool socket `index` stale after a send error that says its path is gone; the next
-    /// data re-connects it.
+    /// Mark pool socket `index` stale after a path error or an ICMP report on it, and start or
+    /// extend its back-off (see **Failing sends** in the module docs): the first failure in a
+    /// row re-connects on the next data datagram, later ones wait [`backoff`].
     fn forget(&self, index: usize, destination: SocketAddr, error: &io::Error) {
         tracing::debug!("macOS UDP: the pool socket to {destination} re-connects ({error})");
         let mut table = self.table.lock();
-        if table[index].destination == Some(destination) {
-            table[index].stale = true;
+        let assignment = &mut table[index];
+        if assignment.destination == Some(destination) {
+            assignment.stale = true;
+            assignment.failures = assignment.failures.saturating_add(1);
+            assignment.retry_at = backoff(assignment.failures).map(|wait| Instant::now() + wait);
+            self.slots[index].failing.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Retire pool socket `index` after `error` showed the kernel will not let it carry
+    /// `destination`'s traffic (see **Failing sends** in the module docs).
+    fn retire(&self, index: usize, destination: SocketAddr, error: &io::Error) {
+        let mut table = self.table.lock();
+        if table[index].destination == Some(destination) && !table[index].retired {
+            self.retire_locked(&mut table, index, destination, error);
+        }
+    }
+
+    /// [`Self::retire`] with the table lock held (taken before the slot's peer lock, the order
+    /// [`Self::connect_slot`] uses).
+    ///
+    /// The open file behind the slot's descriptor is replaced (`dup2`) by a fresh UDP socket of
+    /// the same family that is never bound and never used. The kernel closes the old socket, so
+    /// it stops taking `destination`'s datagrams, and no socket binds the port. The descriptor
+    /// stays valid for everything that holds the slot, and the receive loop finds the new socket
+    /// never readable. If the replacement fails, the slot is still never used again.
+    fn retire_locked(
+        &self,
+        table: &mut [Assignment],
+        index: usize,
+        destination: SocketAddr,
+        error: &io::Error,
+    ) {
+        use std::os::fd::AsRawFd;
+        let slot = &self.slots[index];
+        let mut peer = slot.peer.write();
+        *peer = None;
+        let domain = match table[index].family {
+            Some(Family::V6) => socket2::Domain::IPV6,
+            _ => socket2::Domain::IPV4,
+        };
+        let closed = socket2::Socket::new(domain, socket2::Type::DGRAM, None).and_then(|fresh| {
+            fresh.set_nonblocking(true)?;
+            let target = slot.socket.as_raw_fd();
+            // SAFETY: both descriptors are open and owned by this process; `dup2` atomically
+            // makes `target` refer to the fresh socket and closes the file it referred to.
+            // `target` stays owned by the slot's tokio socket; `fresh` closes its own copy on
+            // drop.
+            if unsafe { libc::dup2(fresh.as_raw_fd(), target) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // `dup2` clears close-on-exec on the new descriptor.
+            // SAFETY: `target` is an open descriptor; F_SETFD only sets its flags.
+            if unsafe { libc::fcntl(target, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+        drop(peer);
+        table[index] = Assignment {
+            destination: Some(destination),
+            family: table[index].family,
+            retired: true,
+            ..Assignment::default()
+        };
+        self.slots[index].failing.store(false, Ordering::Relaxed);
+        self.retirements.fetch_add(1, Ordering::Relaxed);
+        if !self.warned.swap(true, Ordering::Relaxed) {
+            // Once per WireGuard socket; an endpoint that keeps being refused is not news.
+            tracing::warn!(
+                "macOS UDP: the kernel refused connected sends to {destination} ({error}); \
+                 that endpoint uses sendto until the network changes"
+            );
+        } else {
+            tracing::debug!("macOS UDP: pool socket to {destination} retired ({error})");
+        }
+        if let Err(close_error) = closed {
+            tracing::warn!("macOS UDP: a retired pool socket could not be closed ({close_error})");
+        }
+    }
+
+    /// A send on pool socket `index` to `destination` worked again: clear its failure count.
+    fn recovered(&self, index: usize, destination: SocketAddr) {
+        let mut table = self.table.lock();
+        let assignment = &mut table[index];
+        if assignment.destination == Some(destination) {
+            assignment.failures = 0;
+            assignment.retry_at = None;
+            self.slots[index].failing.store(false, Ordering::Relaxed);
         }
     }
 
@@ -856,7 +1069,8 @@ impl ConnectedSends {
     }
 
     /// Send `chunk` on pool socket `index` while it is connected to `to`; whatever cannot go
-    /// there (the socket moved, or its path is gone) leaves through `wildcard`.
+    /// there (the socket moved, or any send error) leaves through `wildcard`, and only the
+    /// wildcard socket's own errors are returned (see **Failing sends** in the module docs).
     ///
     /// With `sendmsg_x` allowed on connected sockets this is one batch call per socket-full;
     /// otherwise, and after an error that may have sent part of a batch, one `send` per
@@ -908,14 +1122,15 @@ impl ConnectedSends {
                 break;
             }
         }
-        for (payload, destination) in &chunk[done..] {
-            let sent = match self.send_on(index, payload, *destination).await {
-                Sent::Done => Ok(()),
-                Sent::Fallback => wildcard.send_to(payload, *destination).await.map(|_| ()),
-                Sent::Failed(error) => Err(error),
-            };
-            if let Err(error) = sent {
-                result = Err(error);
+        for (offset, (payload, destination)) in chunk[done..].iter().enumerate() {
+            if let Sent::Fallback = self.send_on(index, payload, *destination).await {
+                // The socket failed (now stale or retired) or moved: the rest of the chunk
+                // leaves through the wildcard socket too, so one failing chunk counts once
+                // toward the back-off instead of once per datagram (J1108).
+                return merge(
+                    result,
+                    send_wildcard(wildcard, &chunk[done + offset..]).await,
+                );
             }
         }
         result
@@ -1024,18 +1239,29 @@ fn pick(table: &[Assignment], family: Family, now: u64) -> Option<usize> {
     let free = |wanted: Option<Family>| {
         table
             .iter()
-            .position(|a| a.destination.is_none() && a.family == wanted)
+            .position(|a| a.destination.is_none() && !a.retired && a.family == wanted)
     };
     free(Some(family)).or_else(|| {
         let (index, idle) = table
             .iter()
             .enumerate()
-            .filter(|(_, a)| a.family == Some(family))
+            .filter(|(_, a)| a.family == Some(family) && !a.retired)
             .map(|(index, a)| (index, now.saturating_sub(a.last_used)))
             .max_by_key(|&(_, idle)| idle)?;
         // Every socket of the family is busy: this endpoint keeps `sendto`.
         (idle >= ACTIVE_SENDS).then_some(index)
     })
+}
+
+/// How long an endpoint stays on `sendto` after `failures` send failures in a row: none after
+/// the first (re-connect at once), then [`FIRST_BACKOFF`] doubling up to [`MAX_BACKOFF`].
+fn backoff(failures: u32) -> Option<Duration> {
+    let doublings = failures.checked_sub(2)?;
+    Some(
+        FIRST_BACKOFF
+            .checked_mul(1u32.checked_shl(doublings).unwrap_or(u32::MAX))
+            .map_or(MAX_BACKOFF, |wait| wait.min(MAX_BACKOFF)),
+    )
 }
 
 /// Poll one socket for a datagram.
@@ -1062,6 +1288,17 @@ fn is_icmp_error(error: &io::Error) -> bool {
         error.raw_os_error(),
         Some(libc::ECONNREFUSED | libc::EHOSTDOWN | libc::EHOSTUNREACH)
     )
+}
+
+/// A send error that means the socket's buffer is full right now; the socket itself is fine.
+fn is_full_buffer(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ENOBUFS | libc::ENOMEM))
+}
+
+/// A `connect` error from a socket the kernel has made defunct: it can never carry anything
+/// again and must be retired.
+fn is_defunct_error(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EOPNOTSUPP))
 }
 
 /// A send error that says this connected socket's address or route no longer works.
@@ -1652,6 +1889,31 @@ mod tests {
         }
     }
 
+    /// The socket factory passes its owner's choice through: `Some(true)` binds a pool,
+    /// `Some(false)` binds none, whatever the environment switch says (J1108).
+    #[tokio::test]
+    async fn the_factory_passes_the_owners_choice_through() {
+        use crate::udp::{UdpTransportFactory, UdpTransportFactoryParams};
+        for wanted in [true, false] {
+            let mut factory = crate::udp::socket::UdpSocketFactory {
+                mac_connected: Some(wanted),
+                ..Default::default()
+            };
+            let (send, _receive) = factory
+                .bind(&UdpTransportFactoryParams {
+                    addr: None,
+                    port: 0,
+                })
+                .await
+                .expect("bind");
+            assert_eq!(
+                send.inner.connected.is_enabled(),
+                wanted,
+                "mac_connected: Some({wanted})"
+            );
+        }
+    }
+
     /// Off, sends leave from the wildcard socket and no pool is bound.
     #[tokio::test]
     async fn switched_off_sends_from_the_wildcard_socket() {
@@ -1744,6 +2006,186 @@ mod tests {
         send(&wireguard, &data(66), address).await;
         assert_eq!(peer_recv(&peer_socket).await.0, data(66));
         assert_eq!(pool.connects(), connects + 1, "the next data re-connects");
+        let assignment = pool.table.lock()[index];
+        assert_eq!(
+            (assignment.failures, assignment.retry_at),
+            (0, None),
+            "a send that works again clears the failure count"
+        );
+    }
+
+    /// The pool socket serving `address`, by index.
+    fn pool_index(wireguard: &UdpSocket, address: SocketAddr) -> usize {
+        wireguard
+            .inner
+            .connected
+            .table
+            .lock()
+            .iter()
+            .position(|assignment| assignment.destination == Some(mapped(address)))
+            .expect("the endpoint has a pool socket")
+    }
+
+    /// A pool socket the kernel refuses for good (`EPIPE`, what a defunct socket answers; on
+    /// mba Local Network privacy made the pool's sockets defunct toward LAN peers, J1108 on
+    /// #260) loses no datagram and is retired at its first failure: its descriptor no longer
+    /// refers to a socket on the WireGuard port (a defunct socket left connected would swallow
+    /// the peer's datagrams), the endpoint keeps `sendto` with no further connect, and only a
+    /// network change lets it take another pool socket. `shutdown(SHUT_WR)` makes xnu's
+    /// `sosend` answer `EPIPE` for good.
+    #[tokio::test]
+    async fn a_refused_pool_socket_is_retired_and_its_endpoint_uses_sendto() {
+        use std::os::fd::AsRawFd;
+        let mut wireguard = wireguard_socket(true);
+        let port = wireguard.local_addr().expect("local").port();
+        let (peer_socket, address) = peer().await;
+        send(&wireguard, &data(64), address).await;
+        peer_recv(&peer_socket).await;
+        let pool = &wireguard.inner.connected;
+        let index = pool_index(&wireguard, address);
+        let connects = pool.connects();
+        let fd = pool.slots[index].socket.as_raw_fd();
+        // SAFETY: a valid socket descriptor this test's pool owns; shutting its sending side
+        // down changes nothing but that socket.
+        assert_eq!(unsafe { libc::shutdown(fd, libc::SHUT_WR) }, 0, "shutdown");
+
+        for length in 65..90 {
+            send(&wireguard, &data(length), address).await;
+            assert_eq!(
+                peer_recv(&peer_socket).await.0,
+                data(length),
+                "datagram {length} went through sendto"
+            );
+        }
+        let pool = &wireguard.inner.connected;
+        assert_eq!(pool.retirements(), 1, "retired at the first failure");
+        assert_eq!(pool.connects(), connects, "never re-connected");
+        assert_eq!(pool.len(), 0);
+        let local = socket2::SockRef::from(&pool.slots[index].socket)
+            .local_addr()
+            .expect("getsockname")
+            .as_socket()
+            .map_or(0, |address| address.port());
+        assert_ne!(
+            local, port,
+            "the retired descriptor is off the WireGuard port"
+        );
+        assert!(pool.is_enabled(), "the pool stays on for other endpoints");
+
+        // The peer's datagrams still arrive (now on the wildcard socket).
+        peer_socket
+            .send_to(b"from-peer", (Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("peer sends");
+        assert_eq!(recv(&mut wireguard).await.0, b"from-peer".to_vec());
+
+        // A network change lets the endpoint try a live pool socket again.
+        wireguard.underlay_changed();
+        send(&wireguard, &data(90), address).await;
+        assert_eq!(peer_recv(&peer_socket).await.0, data(90));
+        let pool = &wireguard.inner.connected;
+        assert_eq!(pool.connects(), connects + 1, "another pool socket");
+        assert_ne!(
+            pool_index(&wireguard, address),
+            index,
+            "never the retired one"
+        );
+        assert_eq!(pool.len(), 1);
+    }
+
+    /// An endpoint whose path keeps failing (`0.0.0.1`: `connect` works, every `send` answers
+    /// `EHOSTUNREACH`) re-connects once at once, then backs off, so it does not cost a `connect`
+    /// per datagram; the back-off ends at its deadline and at a network change (J1108).
+    #[tokio::test]
+    async fn a_path_that_keeps_failing_backs_off() {
+        let wireguard = wireguard_socket(true);
+        let nowhere = SocketAddr::from((Ipv4Addr::new(0, 0, 0, 1), 9));
+        let attempt = async || {
+            let _ = wireguard
+                .send_to(
+                    Packet::from_bytes(bytes::BytesMut::from(&data(64)[..])),
+                    nowhere,
+                )
+                .await;
+        };
+        let pool = &wireguard.inner.connected;
+        let connects = pool.connects();
+        attempt().await;
+        assert_eq!(pool.connects(), connects + 1, "the first data connects");
+        attempt().await;
+        assert_eq!(pool.connects(), connects + 2, "one re-connect at once");
+        let index = pool_index(&wireguard, nowhere);
+        let first = pool.table.lock()[index];
+        assert_eq!(first.failures, 2);
+        let wait = first
+            .retry_at
+            .expect("a second failure backs off")
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            wait > super::FIRST_BACKOFF / 2 && wait <= super::FIRST_BACKOFF,
+            "first back-off {wait:?}"
+        );
+        for _ in 0..20 {
+            attempt().await;
+        }
+        assert_eq!(
+            pool.connects(),
+            connects + 2,
+            "no connect during the back-off"
+        );
+        assert_eq!(pool.retirements(), 0, "a path error never retires");
+
+        // The deadline passes: one more attempt, then a longer back-off.
+        pool.table.lock()[index].retry_at = Some(std::time::Instant::now());
+        attempt().await;
+        assert_eq!(pool.connects(), connects + 3, "one retry at the deadline");
+        let second = pool.table.lock()[index];
+        assert_eq!(second.failures, 3);
+        let wait = second
+            .retry_at
+            .expect("still backing off")
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            wait > super::FIRST_BACKOFF && wait <= super::FIRST_BACKOFF * 2,
+            "second back-off {wait:?}"
+        );
+
+        // A network change ends the back-off: the next data tries again.
+        wireguard.underlay_changed();
+        attempt().await;
+        assert_eq!(
+            pool.connects(),
+            connects + 4,
+            "a network change retries at once"
+        );
+    }
+
+    /// Send errors that leave the socket alone (a full buffer) and the `connect` error of a
+    /// defunct socket.
+    #[test]
+    fn full_buffers_and_defunct_sockets_are_classified() {
+        let error = |code| std::io::Error::from_raw_os_error(code);
+        for code in [libc::ENOBUFS, libc::ENOMEM] {
+            assert!(super::is_full_buffer(&error(code)), "{code}");
+        }
+        assert!(!super::is_full_buffer(&error(libc::EPIPE)));
+        assert!(super::is_defunct_error(&error(libc::EOPNOTSUPP)));
+        assert!(!super::is_defunct_error(&error(libc::EADDRNOTAVAIL)));
+    }
+
+    /// The back-off after `n` failures in a row: none after one, then 1 s doubling to 64 s,
+    /// and no overflow however long a socket keeps failing.
+    #[test]
+    fn the_back_off_doubles_up_to_its_cap() {
+        use super::{MAX_BACKOFF, backoff};
+        assert_eq!(backoff(0), None);
+        assert_eq!(backoff(1), None, "the first failure re-connects at once");
+        assert_eq!(backoff(2), Some(Duration::from_secs(1)));
+        assert_eq!(backoff(3), Some(Duration::from_secs(2)));
+        assert_eq!(backoff(8), Some(MAX_BACKOFF));
+        assert_eq!(backoff(9), Some(MAX_BACKOFF));
+        assert_eq!(backoff(40), Some(MAX_BACKOFF));
+        assert_eq!(backoff(u32::MAX), Some(MAX_BACKOFF));
     }
 
     /// A sender that got a pool socket from the table, and finds it moved to another endpoint
@@ -1909,6 +2351,7 @@ mod tests {
             Some(total) => Ok(crate::udp::socket::macos_port_audit::PortUsers {
                 total,
                 others: Vec::new(),
+                visible_others: 5,
             }),
             None => Err(std::io::Error::other("scripted: the list cannot be read")),
         }
@@ -1940,6 +2383,34 @@ mod tests {
             1,
             "only the wildcard socket"
         );
+    }
+
+    /// A list that shows no other process's socket (macOS 27 filters it for us, J1108) opens no
+    /// window either: the audit after it could not see a socket that joined. Connected sends stay
+    /// off and the WireGuard socket is kept.
+    #[test]
+    fn a_list_without_other_processes_opens_no_window() {
+        let (wildcard, local) = bare_wildcard(0).expect("wildcard");
+        let mut opened = false;
+        let result = super::bind_pool_with(
+            &wildcard,
+            local,
+            4,
+            |_| opened = true,
+            |_| {
+                Ok(crate::udp::socket::macos_port_audit::PortUsers {
+                    total: 1,
+                    others: Vec::new(),
+                    visible_others: 0,
+                })
+            },
+        );
+        assert!(
+            matches!(result, Err(super::PoolError::Unavailable(_))),
+            "{result:?}"
+        );
+        assert!(!opened, "the window opened on a filtered list");
+        assert!(!wildcard.reuse_port().expect("SO_REUSEPORT"));
     }
 
     /// A list that does not show our own wildcard socket means the reader no longer understands
@@ -2073,6 +2544,7 @@ mod tests {
             family: Some(family),
             stale: false,
             last_used,
+            ..Assignment::default()
         };
         let freed = |family| Assignment {
             family: Some(family),
@@ -2537,6 +3009,55 @@ mod tests {
                 .is_err(),
             "the second endpoint got the first endpoint's datagrams"
         );
+    }
+
+    /// A pool socket whose sends fail with an errno the pool has no class for (`EPIPE` from
+    /// `shutdown(SHUT_WR)`, as macOS 27.2.1 returned toward the LAN, J1028/J1036) loses no
+    /// datagram of a batched run: the whole run arrives once and in order through the wildcard
+    /// socket, the socket is retired once, and later runs go straight to the wildcard socket
+    /// (J1108).
+    #[tokio::test]
+    async fn a_failing_pool_socket_loses_no_batched_run() {
+        use std::os::fd::AsRawFd;
+        let wireguard = wireguard_socket(true);
+        let (peer_socket, address) = peer().await;
+        send(&wireguard, &data(64), address).await;
+        peer_recv(&peer_socket).await;
+        let pool = &wireguard.inner.connected;
+        let index = pool
+            .table
+            .lock()
+            .iter()
+            .position(|assignment| assignment.destination == Some(mapped(address)))
+            .expect("the endpoint has a pool socket");
+        // SAFETY: a valid socket descriptor this test's pool owns; shutting its sending side
+        // down changes nothing but that socket.
+        assert_eq!(
+            unsafe { libc::shutdown(pool.slots[index].socket.as_raw_fd(), libc::SHUT_WR) },
+            0
+        );
+        let connects = pool.connects();
+        let mut next = 0u32;
+        for round in 0..2 {
+            let payloads: Vec<Vec<u8>> = (0..10u32)
+                .map(|i| {
+                    let mut p = data(200);
+                    p[4..8].copy_from_slice(&(next + i).to_be_bytes());
+                    p
+                })
+                .collect();
+            let (wildcard, routed) = wireguard.route(address);
+            let run: Vec<(&[u8], SocketAddr)> = payloads.iter().map(|p| (&p[..], routed)).collect();
+            pool.send_batch(wildcard, &run).await.expect("send_batch");
+            assert_eq!(
+                numbers_received(&peer_socket, Duration::from_millis(300)).await,
+                (next..next + 10).collect::<Vec<_>>(),
+                "run {round}"
+            );
+            next += 10;
+            assert_eq!(pool.retirements(), 1, "run {round}: retired once");
+            assert_eq!(pool.connects(), connects, "run {round}: no re-connect");
+        }
     }
 
     /// Batched data to an endpoint whose port is closed: the ICMP errors the connected socket
