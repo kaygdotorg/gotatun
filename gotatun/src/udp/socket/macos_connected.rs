@@ -1889,6 +1889,31 @@ mod tests {
         }
     }
 
+    /// The socket factory passes its owner's choice through: `Some(true)` binds a pool,
+    /// `Some(false)` binds none, whatever the environment switch says (J1108).
+    #[tokio::test]
+    async fn the_factory_passes_the_owners_choice_through() {
+        use crate::udp::{UdpTransportFactory, UdpTransportFactoryParams};
+        for wanted in [true, false] {
+            let mut factory = crate::udp::socket::UdpSocketFactory {
+                mac_connected: Some(wanted),
+                ..Default::default()
+            };
+            let (send, _receive) = factory
+                .bind(&UdpTransportFactoryParams {
+                    addr: None,
+                    port: 0,
+                })
+                .await
+                .expect("bind");
+            assert_eq!(
+                send.inner.connected.is_enabled(),
+                wanted,
+                "mac_connected: Some({wanted})"
+            );
+        }
+    }
+
     /// Off, sends leave from the wildcard socket and no pool is bound.
     #[tokio::test]
     async fn switched_off_sends_from_the_wildcard_socket() {

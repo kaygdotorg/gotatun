@@ -63,6 +63,12 @@ pub struct UdpSocketFactory {
     pub recv_buffer_size: Option<usize>,
     /// If `Some`, set `SO_SNDBUF` on the socket.
     pub send_buffer_size: Option<usize>,
+    /// macOS only (ignored elsewhere): whether the WireGuard socket uses connected
+    /// per-endpoint sends (see `macos_connected`). `Some` is the owner's choice; `None` leaves
+    /// it to the `GOTATUN_BENCH_MAC_CONNECTED` switch, which is off unless set (J789). An owner
+    /// that turns them on still gets `sendto` wherever the pool cannot be proven safe (for
+    /// example macOS 27's filtered socket list, J1108).
+    pub mac_connected: Option<bool>,
 }
 
 impl UdpTransportFactory for UdpSocketFactory {
@@ -87,7 +93,7 @@ impl UdpTransportFactory for UdpSocketFactory {
             send_buffer_size: self.send_buffer_size,
             only_v6,
             #[cfg(target_os = "macos")]
-            mac_connected: None,
+            mac_connected: self.mac_connected,
         };
 
         let addr = params.addr.unwrap_or(Ipv6Addr::UNSPECIFIED.into());
