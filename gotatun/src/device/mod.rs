@@ -1937,7 +1937,7 @@ impl<T: DeviceTransports> DeviceState<T> {
             };
             let batch_first_slot = first_slot + offset;
             // The lane's choice is made first so its backlog latch still sees every run.
-            let force_worker = parallel_crypto::receive_run_goes_to_worker(
+            let force_worker = parallel_crypto::run_goes_to_worker(
                 lane.should_force_worker(batch_len),
                 batch_len,
                 parallel_crypto::receive_inline_max(),
@@ -2362,7 +2362,12 @@ impl<T: DeviceTransports> DeviceState<T> {
                 .take(CRYPTO_BATCH_SIZE)
                 .collect::<Vec<_>>();
             let batch_len = batch.len();
-            let force_worker = lane.should_force_worker(batch_len);
+            // The lane's choice is made first so its backlog latch still sees every run.
+            let force_worker = parallel_crypto::run_goes_to_worker(
+                lane.should_force_worker(batch_len),
+                batch_len,
+                parallel_crypto::transmit_inline_max(),
+            );
             pending.push(
                 complete_outgoing_batch(
                     context.clone(),
