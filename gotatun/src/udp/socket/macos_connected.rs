@@ -1059,7 +1059,8 @@ impl ConnectedSends {
     }
 
     /// Send `chunk` on pool socket `index` while it is connected to `to`; whatever cannot go
-    /// there (the socket moved, or its path is gone) leaves through `wildcard`.
+    /// there (the socket moved, or any send error) leaves through `wildcard`, and only the
+    /// wildcard socket's own errors are returned (see **Failing sends** in the module docs).
     ///
     /// With `sendmsg_x` allowed on connected sockets this is one batch call per socket-full;
     /// otherwise, and after an error that may have sent part of a batch, one `send` per
@@ -1111,14 +1112,15 @@ impl ConnectedSends {
                 break;
             }
         }
-        for (payload, destination) in &chunk[done..] {
-            let sent = match self.send_on(index, payload, *destination).await {
-                Sent::Done => Ok(()),
-                Sent::Fallback => wildcard.send_to(payload, *destination).await.map(|_| ()),
-                Sent::Failed(error) => Err(error),
-            };
-            if let Err(error) = sent {
-                result = Err(error);
+        for (offset, (payload, destination)) in chunk[done..].iter().enumerate() {
+            if let Sent::Fallback = self.send_on(index, payload, *destination).await {
+                // The socket failed (now stale or retired) or moved: the rest of the chunk
+                // leaves through the wildcard socket too, so one failing chunk counts once
+                // toward the back-off instead of once per datagram (J1108).
+                return merge(
+                    result,
+                    send_wildcard(wildcard, &chunk[done + offset..]).await,
+                );
             }
         }
         result
@@ -2943,6 +2945,55 @@ mod tests {
                 .is_err(),
             "the second endpoint got the first endpoint's datagrams"
         );
+    }
+
+    /// A pool socket whose sends fail with an errno the pool has no class for (`EPIPE` from
+    /// `shutdown(SHUT_WR)`, as macOS 27.2.1 returned toward the LAN, J1028/J1036) loses no
+    /// datagram of a batched run: the whole run arrives once and in order through the wildcard
+    /// socket, the socket is retired once, and later runs go straight to the wildcard socket
+    /// (J1108).
+    #[tokio::test]
+    async fn a_failing_pool_socket_loses_no_batched_run() {
+        use std::os::fd::AsRawFd;
+        let wireguard = wireguard_socket(true);
+        let (peer_socket, address) = peer().await;
+        send(&wireguard, &data(64), address).await;
+        peer_recv(&peer_socket).await;
+        let pool = &wireguard.inner.connected;
+        let index = pool
+            .table
+            .lock()
+            .iter()
+            .position(|assignment| assignment.destination == Some(mapped(address)))
+            .expect("the endpoint has a pool socket");
+        // SAFETY: a valid socket descriptor this test's pool owns; shutting its sending side
+        // down changes nothing but that socket.
+        assert_eq!(
+            unsafe { libc::shutdown(pool.slots[index].socket.as_raw_fd(), libc::SHUT_WR) },
+            0
+        );
+        let connects = pool.connects();
+        let mut next = 0u32;
+        for round in 0..2 {
+            let payloads: Vec<Vec<u8>> = (0..10u32)
+                .map(|i| {
+                    let mut p = data(200);
+                    p[4..8].copy_from_slice(&(next + i).to_be_bytes());
+                    p
+                })
+                .collect();
+            let (wildcard, routed) = wireguard.route(address);
+            let run: Vec<(&[u8], SocketAddr)> = payloads.iter().map(|p| (&p[..], routed)).collect();
+            pool.send_batch(wildcard, &run).await.expect("send_batch");
+            assert_eq!(
+                numbers_received(&peer_socket, Duration::from_millis(300)).await,
+                (next..next + 10).collect::<Vec<_>>(),
+                "run {round}"
+            );
+            next += 10;
+            assert_eq!(pool.retirements(), 1, "run {round}: retired once");
+            assert_eq!(pool.connects(), connects, "run {round}: no re-connect");
+        }
     }
 
     /// Batched data to an endpoint whose port is closed: the ICMP errors the connected socket
