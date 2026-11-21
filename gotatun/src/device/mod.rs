@@ -55,6 +55,8 @@ mod peer;
 mod peer_state;
 #[cfg(test)]
 mod tests;
+mod timer_queue;
+mod timer_task;
 mod transports;
 pub mod uapi;
 
@@ -73,7 +75,6 @@ use tokio::sync::RwLock;
 use tokio::sync::{Mutex, MutexGuard, watch};
 use tracing::{Level, instrument};
 
-use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{PreparedDecryption, PreparedOutgoing, Tunn, TunnResult};
@@ -1091,9 +1092,10 @@ pub(crate) struct DeviceState<T: DeviceTransports> {
     /// Strong token used by packet tasks for a lifetime check without access to this device lock.
     task_liveness: Arc<()>,
 
-    /// Wakes the timer task before its next 250 ms tick, so a requested keepalive leaves at
-    /// once. A `Notify` keeps one permit, so a wake that arrives mid-pass is not lost.
-    timer_wake: Arc<tokio::sync::Notify>,
+    /// Every peer's next timer deadline. The timer task sleeps until the earliest one, and a
+    /// peer that reports an earlier deadline (a requested keepalive, for one) wakes it at once.
+    /// Lives here, not in the connection, so deadlines survive a suspend and restart (#260).
+    timer_queue: Arc<timer_queue::TimerQueue>,
 
     tun_tx: Arc<Mutex<T::IpSend>>,
     /// The tun device reader.
@@ -1272,7 +1274,7 @@ impl<T: DeviceTransports> Connection<T> {
                 "handle_timers",
                 DeviceState::<T>::handle_timers(
                     handles.clone(),
-                    Arc::clone(&device.timer_wake),
+                    Arc::clone(&device.timer_queue),
                     index_table,
                     buffered_udp_tx.clone(),
                     crypto.clone(),
@@ -1417,13 +1419,13 @@ impl<T: DeviceTransports> Device<T> {
     ///
     /// Peers without a session get nothing: they have no flow to move, and a handshake with
     /// every idle or offline peer on each address change would flood a large mesh (#483, J633).
-    /// The timer task is woken only when at least one peer took the request. Returns the number
-    /// of peers that accepted a request.
+    /// The timer task is woken only when at least one peer took the request: each accepting
+    /// peer reports a deadline of now to the timer queue. Returns the number of peers that
+    /// accepted a request.
     pub async fn request_keepalives(&self) -> usize {
-        let (peers, wake) = {
+        let peers: Vec<_> = {
             let device = self.inner.read().await;
-            let peers: Vec<_> = device.peers.values().cloned().collect();
-            (peers, Arc::clone(&device.timer_wake))
+            device.peers.values().cloned().collect()
         };
         let mut requested = 0;
         for peer in &peers {
@@ -1435,9 +1437,6 @@ impl<T: DeviceTransports> Device<T> {
             {
                 requested += 1;
             }
-        }
-        if requested > 0 {
-            wake.notify_one();
         }
         requested
     }
@@ -1571,6 +1570,7 @@ impl<T: DeviceTransports> DeviceState<T> {
     async fn remove_peer(&mut self, pub_key: &x25519::PublicKey) -> Option<Arc<Mutex<PeerState>>> {
         if let Some(peer) = self.peers.remove(pub_key) {
             self.packet_lookup.remove_peer(pub_key, &peer);
+            self.timer_queue.forget(peer_order_key(&peer));
 
             tracing::info!("Peer removed");
 
@@ -1583,8 +1583,15 @@ impl<T: DeviceTransports> DeviceState<T> {
     fn add_peer(&mut self, peer_builder: Peer) {
         let pub_key = peer_builder.public_key;
         let allowed_ips = peer_builder.allowed_ips.clone();
-        let peer = self.create_peer(peer_builder);
-        let peer = Arc::new(Mutex::new(peer));
+        let mut peer = self.create_peer(peer_builder);
+        // The tunnel reports its deadlines to the timer queue, keyed by this peer's address, so
+        // the hook needs the handle before the state is shared. Installing it reports the first
+        // deadline, which brings the peer to the timer task's attention at once (#260, J1111).
+        let peer = Arc::new_cyclic(|handle| {
+            peer.tunnel
+                .set_timer_hook(self.timer_queue.hook(handle.clone()));
+            Mutex::new(peer)
+        });
 
         self.peers.insert(pub_key, Arc::clone(&peer));
         self.packet_lookup.insert_peer(pub_key, peer, allowed_ips);
@@ -1722,6 +1729,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         let n = self.peers.len();
         self.peers.clear();
         self.packet_lookup.clear();
+        self.timer_queue.clear();
         // TODO: tear down connection?
         n
     }
@@ -2367,115 +2375,20 @@ impl<T: DeviceTransports> DeviceState<T> {
         }
     }
 
-    /// Run periodic tunnel maintenance and send each peer's timer output in sequence.
+    /// Run each peer's WireGuard timers when they are due and send their output in sequence.
+    ///
+    /// The task sleeps until the earliest deadline in `queue` instead of polling every peer
+    /// (#260, J1111); see `timer_task`.
     #[instrument(level = Level::TRACE, skip_all)]
     async fn handle_timers(
         handles: PacketTaskHandles,
-        wake: Arc<tokio::sync::Notify>,
+        queue: Arc<timer_queue::TimerQueue>,
         index_table: IndexTable,
         udp: impl UdpSend,
         crypto: CryptoHandle,
         outgoing_order: Arc<OrderStore<WgKind>>,
     ) {
-        let PacketTaskHandles {
-            liveness: device,
-            lookup: packet_lookup,
-            flush_requests: _,
-        } = handles;
-        loop {
-            if device.upgrade().is_none() {
-                break;
-            }
-            // Remove stale session indices. Once a session is stale it is dropped by
-            // `update_session_timers`, and its associated index is freed from the table.
-            packet_lookup.retain_live_indices(&index_table);
-
-            let peers = packet_lookup.peers();
-
-            // This snapshot owns peer handles and does not retain lookup state during timer work.
-            for peer in peers {
-                let peer_key = peer_order_key(&peer);
-                if outgoing_order.is_flushing(peer_key) {
-                    continue;
-                }
-                let mut peer_trace = PeerLockDiagnostic::waiting("timer", peer_key);
-                let mut p = lock_peer_state(&peer, "timer", peer_key, &mut peer_trace).await;
-                if !packet_lookup.contains_peer(&peer)
-                    || outgoing_order.is_flushing(peer_key)
-                    || outgoing_order.available(peer_key) == 0
-                {
-                    // Leave due timers untouched until a bounded output slot is available.
-                    continue;
-                }
-                let endpoint_addr = match p.endpoint().addr {
-                    Some(addr) => addr,
-                    None => continue,
-                };
-
-                match p.update_timers() {
-                    Ok(Some(packet)) => {
-                        // All slot producers for this peer hold its state lock, except for a
-                        // control flush that is marked above. The free-slot check therefore
-                        // remains valid until this reservation.
-                        let Some((lane, slot)) = outgoing_order.reserve(peer_key) else {
-                            tracing::warn!(
-                                "Deferring timer packet because the peer order window filled"
-                            );
-                            continue;
-                        };
-
-                        if !packet_lookup.register_handshake_idx(&packet, &peer) {
-                            drop(p);
-                            drop(peer_trace);
-                            complete_outgoing_packet(
-                                OutgoingPeerContext {
-                                    crypto: crypto.clone(),
-                                    ordered: Arc::clone(&outgoing_order),
-                                    peer_arc: Arc::clone(&peer),
-                                    peer_key,
-                                    peer_addr: endpoint_addr,
-                                    udp: udp.clone(),
-                                },
-                                lane,
-                                slot,
-                                None,
-                                false,
-                            )
-                            .await;
-                            continue;
-                        }
-
-                        drop(p);
-                        drop(peer_trace);
-
-                        // NOTE: we don't bother with triggering TunnelRecv DAITA events here.
-                        complete_outgoing_packet(
-                            OutgoingPeerContext {
-                                crypto: crypto.clone(),
-                                ordered: Arc::clone(&outgoing_order),
-                                peer_arc: Arc::clone(&peer),
-                                peer_key,
-                                peer_addr: endpoint_addr,
-                                udp: udp.clone(),
-                            },
-                            lane,
-                            slot,
-                            Some(PreparedOutgoing::Ready(packet)),
-                            false,
-                        )
-                        .await;
-                    }
-                    Ok(None) => {}
-                    Err(WireGuardError::ConnectionExpired) => {}
-                    Err(e) => tracing::error!("Timer error = {e:?}: {e:?}"),
-                }
-            }
-
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_millis(250)) => {}
-                () = wake.notified() => {}
-            }
-        }
+        timer_task::run(handles, queue, index_table, udp, crypto, outgoing_order).await;
     }
 
     /// Read from UDP socket, decapsulate, write to tunnel device

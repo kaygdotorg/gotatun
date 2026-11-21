@@ -36,6 +36,8 @@ use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::timers::{TimerName, Timers};
 
 pub use crate::noise::timers::TimerParams;
+#[cfg(feature = "device")]
+pub(crate) use crate::noise::timers::{TIMER_TICK, TimerHook};
 use crate::packet::{Packet, WgCookieReply, WgData, WgHandshakeInit, WgHandshakeResp, WgKind};
 use crate::tun::MtuWatcher;
 use gotatun_crypto::x25519;
@@ -189,6 +191,8 @@ impl<R: RngCore + Send> Tunn<R> {
     pub fn reset(&mut self) {
         self.clear_all();
         self.handshake.reset();
+        // A configured persistent keepalive is owed at once again (#260, J1111).
+        self.reschedule_timers(Duration::ZERO);
     }
 
     /// Update the private key and clear existing sessions.
@@ -632,6 +636,8 @@ impl<R: RngCore + Send> Tunn<R> {
         }
         self.timer_tick(TimerName::TimeLastPacketSent);
         self.update_rekey_timeout();
+        // The retry and give-up deadlines start now (#260, J1111).
+        self.reschedule_timers(Duration::ZERO);
 
         self.tx_bytes += packet.as_bytes().len();
 
