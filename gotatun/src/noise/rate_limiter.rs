@@ -144,10 +144,18 @@ impl RateLimiter {
 
     /// Increment the per-source-IP handshake counter and return whether it exceeds `self.limit`.
     ///
-    /// Counters are cleared every `RESET_PERIOD` by [`try_reset_count`](Self::try_reset_count),
-    /// so each IP is independently allowed `limit` handshakes per period.
+    /// Counters are cleared every `RESET_PERIOD`, so each IP is independently allowed `limit`
+    /// handshakes per period. The clear happens here, under the lock this call takes anyway,
+    /// and also in [`try_reset_count`](Self::try_reset_count). The device's timer task used to be
+    /// the only caller of that, every 250 ms; it now sleeps until a peer has a deadline, which can
+    /// be many seconds, and the window must not stretch with it (#260, J1111).
     fn is_under_load(&self, src_addr: IpAddr) -> bool {
         let mut ip_counts = self.ip_counts.lock();
+        let current_time = Instant::now();
+        if current_time.duration_since(ip_counts.last_reset) >= RESET_PERIOD {
+            ip_counts.counts.clear();
+            ip_counts.last_reset = current_time;
+        }
         let count = ip_counts.counts.entry(src_addr).or_insert(0);
         *count += 1;
         *count > self.limit
