@@ -22,7 +22,6 @@ use mock_instant::thread_local::Instant;
 #[cfg(not(target_has_atomic = "64"))]
 use portable_atomic::AtomicU64;
 use rand::TryRngCore;
-use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 #[cfg(target_has_atomic = "64")]
 use std::sync::atomic::AtomicU64;
@@ -35,22 +34,20 @@ use crate::sleepyinstant::Instant;
 use aead::generic_array::GenericArray;
 use aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305};
-use parking_lot::Mutex;
 use rand::rngs::OsRng;
 
 const COOKIE_REFRESH: u64 = 128; // Use 128 and not 120 so the compiler can optimize out the division
 const COOKIE_SIZE: usize = 16;
 const COOKIE_NONCE_SIZE: usize = 24;
 
-/// How often to reset the under-load counter
-const RESET_PERIOD: Duration = Duration::from_secs(1);
+/// How long the device stays under load after its handshake backlog last reached the limit.
+///
+/// The same one second that kernel WireGuard and wireguard-go hold "under load" for. Without a
+/// hold, a flood that the queue limit just trims would flip cookie mode on and off with every
+/// served message, and a legitimate initiator would get a cookie or not by chance.
+const UNDER_LOAD_HOLD: Duration = Duration::from_secs(1);
 
 type Cookie = [u8; COOKIE_SIZE];
-
-struct IpCounts {
-    counts: HashMap<IpAddr, u64>,
-    last_reset: Instant,
-}
 
 /// There are two places where WireGuard requires "randomness" for cookies
 /// * The 24 byte nonce in the cookie massage - here the only goal is to avoid nonce reuse
@@ -71,18 +68,31 @@ pub struct RateLimiter {
     nonce_ctr: AtomicU64,
     mac1_key: [u8; 32],
     cookie_key: Key,
+    /// How many handshake messages must be waiting (see
+    /// [`note_handshake_backlog`](Self::note_handshake_backlog)) before the device is under load.
     limit: u64,
-    /// Per-source-IP packet counts, reset every `RESET_PERIOD`
-    ip_counts: Mutex<IpCounts>,
+    /// Nanoseconds after `start_time` until which the device is under load; 0 means never yet.
+    ///
+    /// Only ever raised (`fetch_max`), so the receive tasks of both address families can report
+    /// their backlog without a lock and the latest deadline wins.
+    under_load_until: AtomicU64,
 }
 
 impl RateLimiter {
     /// Create a new rate limiter for handshake packets.
     ///
+    /// "Under load" is decided by the handshake backlog, as the WireGuard paper describes and
+    /// kernel WireGuard implements, not by how many messages one source sent (#260, J1112).
+    /// The device's receive task reports how many handshake messages are waiting with
+    /// [`note_handshake_backlog`](Self::note_handshake_backlog); while that reaches `limit`,
+    /// and for one second after, every handshake message needs a valid MAC2 and one without
+    /// it is answered with a cookie reply. A limiter nobody reports to is never under load, so
+    /// `u64::MAX` gives a limiter that only checks MAC1.
+    ///
     /// # Arguments
     ///
     /// * `public_key` - The device's public key, used for cookie generation
-    /// * `limit` - Maximum number of packets allowed per rate limiting period
+    /// * `limit` - Waiting handshake messages at which the device is under load
     pub fn new(public_key: &x25519::PublicKey, limit: u64) -> Self {
         let mut secret_key = [0u8; 16];
         OsRng.try_fill_bytes(&mut secret_key).unwrap();
@@ -94,10 +104,7 @@ impl RateLimiter {
             mac1_key: b2s_hash(LABEL_MAC1, public_key.as_bytes()),
             cookie_key: b2s_hash(LABEL_COOKIE, public_key.as_bytes()).into(),
             limit,
-            ip_counts: Mutex::new(IpCounts {
-                counts: HashMap::new(),
-                last_reset: Instant::now(),
-            }),
+            under_load_until: AtomicU64::new(0),
         }
     }
 
@@ -107,14 +114,29 @@ impl RateLimiter {
         key
     }
 
-    /// Reset packet counts (ideally should be called with a period of 1 second)
-    pub fn try_reset_count(&self) {
-        let current_time = Instant::now();
-        let mut ip_counts = self.ip_counts.lock();
-        if current_time.duration_since(ip_counts.last_reset) >= RESET_PERIOD {
-            ip_counts.counts.clear();
-            ip_counts.last_reset = current_time;
+    /// Report that `waiting` handshake messages are queued for their key agreement.
+    ///
+    /// At `limit` or more, the device is under load from now until [`UNDER_LOAD_HOLD`] later.
+    /// Below it nothing changes, so a hold that is running ends on time. Call it each time a
+    /// queued message is about to be verified, with the number waiting at that moment.
+    pub fn note_handshake_backlog(&self, waiting: usize) {
+        if u64::try_from(waiting).unwrap_or(u64::MAX) < self.limit {
+            return;
         }
+        let hold = u64::try_from(UNDER_LOAD_HOLD.as_nanos()).unwrap_or(u64::MAX);
+        let until = self.elapsed_nanos().saturating_add(hold);
+        self.under_load_until.fetch_max(until, Ordering::Relaxed);
+    }
+
+    /// Whether the device is under load now: its backlog reached `limit` within the last
+    /// [`UNDER_LOAD_HOLD`].
+    pub fn is_under_load(&self) -> bool {
+        self.elapsed_nanos() < self.under_load_until.load(Ordering::Relaxed)
+    }
+
+    /// Nanoseconds since this limiter was created, on the same clock as the cookie secret.
+    fn elapsed_nanos(&self) -> u64 {
+        u64::try_from(Instant::now().duration_since(self.start_time).as_nanos()).unwrap_or(u64::MAX)
     }
 
     /// Compute the correct cookie value based on the current secret value and the source address
@@ -140,17 +162,6 @@ impl RateLimiter {
         let ctr = self.nonce_ctr.fetch_add(1, Ordering::Relaxed);
 
         b2s_mac_24(&self.nonce_key, &ctr.to_le_bytes())
-    }
-
-    /// Increment the per-source-IP handshake counter and return whether it exceeds `self.limit`.
-    ///
-    /// Counters are cleared every `RESET_PERIOD` by [`try_reset_count`](Self::try_reset_count),
-    /// so each IP is independently allowed `limit` handshakes per period.
-    fn is_under_load(&self, src_addr: IpAddr) -> bool {
-        let mut ip_counts = self.ip_counts.lock();
-        let count = ip_counts.counts.entry(src_addr).or_insert(0);
-        *count += 1;
-        *count > self.limit
     }
 
     pub(crate) fn format_cookie_reply(
@@ -203,7 +214,23 @@ impl RateLimiter {
         }
     }
 
+    /// Whether a handshake message's MAC1 is valid for this device.
+    ///
+    /// The cheap check (one keyed BLAKE2s) that keeps forged messages out of the handshake
+    /// queue; [`verify_handshake`](Self::verify_handshake) checks it again when the message is
+    /// served, together with the cookie.
+    pub(crate) fn mac1_valid<P: WgHandshakeBase>(&self, handshake: &Packet<P>) -> bool {
+        let computed_mac1 = b2s_keyed_mac_16(&self.mac1_key, handshake.until_mac1());
+        constant_time_eq(&computed_mac1, handshake.mac1())
+    }
+
     /// Verify the MAC fields on the handshake, and apply rate limiting if needed.
+    ///
+    /// Under load (see [`is_under_load`](Self::is_under_load)) a message without a valid MAC2
+    /// is answered with a cookie reply instead, whoever sent it: initiations and responses
+    /// alike, as kernel WireGuard does. Not under load, nothing is counted, so a burst of
+    /// responses to our own initiations from one address (many peers behind one NAT or relay)
+    /// is never turned away.
     pub(crate) fn verify_handshake<P: WgHandshakeBase>(
         &self,
         src_addr: SocketAddr,
@@ -218,7 +245,7 @@ impl RateLimiter {
             return Err(TunnResult::Err(WireGuardError::InvalidMac));
         }
 
-        if self.is_under_load(src_addr.ip()) {
+        if self.is_under_load() {
             let cookie = self.current_cookie(src_addr);
             let computed_mac2 = b2s_keyed_mac_16_2(&cookie, handshake.until_mac1(), mac1);
 

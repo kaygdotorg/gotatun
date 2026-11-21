@@ -47,6 +47,7 @@ mod builder;
 pub mod configure;
 #[cfg(feature = "daita")]
 pub mod daita;
+mod handshake_backlog;
 #[cfg(test)]
 mod integration_tests;
 mod parallel_crypto;
@@ -96,9 +97,6 @@ pub use crate::device::transports::DefaultDeviceTransports;
 pub use crate::device::transports::DeviceTransports;
 pub use builder::DeviceBuilder;
 pub use peer::Peer;
-
-/// The number of handshakes per second to tolerate before using cookies
-const HANDSHAKE_RATE_LIMIT: u64 = 100;
 
 /// Maximum number of packet buffers that each channel may contain
 const MAX_PACKET_BUFS: usize = 4000;
@@ -1276,7 +1274,6 @@ impl<T: DeviceTransports> Connection<T> {
                     handles.clone(),
                     Arc::clone(&device.timer_wake),
                     index_table,
-                    rate_limiter.clone(),
                     buffered_udp_tx.clone(),
                     crypto.clone(),
                     Arc::clone(&outgoing_order),
@@ -1677,7 +1674,10 @@ impl<T: DeviceTransports> DeviceState<T> {
             return Reconfigure::No;
         }
 
-        let rate_limiter = Arc::new(RateLimiter::new(&public_key, HANDSHAKE_RATE_LIMIT));
+        let rate_limiter = Arc::new(RateLimiter::new(
+            &public_key,
+            handshake_backlog::under_load_backlog(),
+        ));
 
         for peer in self.peers.values_mut() {
             let peer_key = peer_order_key(peer);
@@ -2373,7 +2373,6 @@ impl<T: DeviceTransports> DeviceState<T> {
         handles: PacketTaskHandles,
         wake: Arc<tokio::sync::Notify>,
         index_table: IndexTable,
-        rate_limiter: Arc<RateLimiter>,
         udp: impl UdpSend,
         crypto: CryptoHandle,
         outgoing_order: Arc<OrderStore<WgKind>>,
@@ -2391,9 +2390,6 @@ impl<T: DeviceTransports> DeviceState<T> {
             // `update_session_timers`, and its associated index is freed from the table.
             packet_lookup.retain_live_indices(&index_table);
 
-            // Keep resetting counts when a device has no peers, where per-peer timer updates
-            // would otherwise never run.
-            rate_limiter.try_reset_count();
             let peers = packet_lookup.peers();
 
             // This snapshot owns peer handles and does not retain lookup state during timer work.
@@ -2511,6 +2507,9 @@ impl<T: DeviceTransports> DeviceState<T> {
 
         let mut udp_recv_buf = Default::default();
         let mut received_packets = Vec::new();
+        // Handshake messages waiting for their key agreement; their count decides "under load"
+        // (#260, J1112, see `handshake_backlog`).
+        let mut handshake_backlog = handshake_backlog::HandshakeBacklog::new();
         let mut incoming_pending = PendingIncoming::new();
         let mut outgoing_pending = PendingOutgoing::new();
 
@@ -2566,6 +2565,8 @@ impl<T: DeviceTransports> DeviceState<T> {
                         tokio::task::yield_now().await;
                     }
                 }
+                // Nothing to read, but handshakes wait: serve them (below).
+                () = std::future::ready(()), if !handshake_backlog.is_empty() => {}
                 () = &mut idle_check => {
                     idle_check
                         .as_mut()
@@ -2583,13 +2584,34 @@ impl<T: DeviceTransports> DeviceState<T> {
 
             let mut incoming_runs = HashMap::<usize, PreparedIncomingRun>::new();
             let aqm_on = crate::aqm::enabled();
-            for (packet_index, (src_buf, addr)) in received_packets.drain(..).enumerate() {
-                let rx_ns = if aqm_on {
-                    rx_stamp_of(&udp_rx, &udp_recv_buf, packet_index)
-                } else {
-                    0
-                };
-                let parsed_packet = match rate_limiter.verify_packet(addr, src_buf) {
+            // This turn's datagrams first; handshake messages among them join the backlog. Then
+            // queued handshakes, for at most one serve budget.
+            let mut received = received_packets.drain(..).enumerate();
+            handshake_backlog.start_turn();
+            loop {
+                let (rx_ns, addr, verified) =
+                    if let Some((packet_index, (src_buf, addr))) = received.next() {
+                        let Ok(message) = src_buf.try_into_wg() else {
+                            continue;
+                        };
+                        let Some(message) = handshake_backlog.offer(message, addr, &rate_limiter)
+                        else {
+                            continue;
+                        };
+                        let rx_ns = if aqm_on {
+                            rx_stamp_of(&udp_rx, &udp_recv_buf, packet_index)
+                        } else {
+                            0
+                        };
+                        (rx_ns, addr, Ok(message))
+                    } else if let Some((src_buf, addr)) =
+                        handshake_backlog.serve(&mut packet_pool, &rate_limiter)
+                    {
+                        (0, addr, rate_limiter.verify_packet(addr, src_buf))
+                    } else {
+                        break;
+                    };
+                let parsed_packet = match verified {
                     Ok(packet) => packet,
                     Err(TunnResult::WriteToNetwork(WgKind::CookieReply(cookie))) => {
                         for run in std::mem::take(&mut incoming_runs).into_values() {
@@ -2915,6 +2937,12 @@ impl<T: DeviceTransports> DeviceState<T> {
                     run,
                 )
                 .await?;
+            }
+            if !handshake_backlog.is_empty() {
+                // The serve budget ran out with handshakes left. The branch that serves them is
+                // always ready, so give the runtime's other tasks (the send task and the TUN
+                // reader share a thread on a current-thread runtime) their turn first.
+                tokio::task::yield_now().await;
             }
         }
     }

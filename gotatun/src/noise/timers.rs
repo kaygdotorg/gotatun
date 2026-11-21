@@ -321,8 +321,6 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         let mut handshake_initiation_required = false;
         let mut keepalive_required = false;
 
-        self.rate_limiter.try_reset_count();
-
         // All the times are counted from tunnel initiation, for efficiency our timers are rounded
         // to a second, as there is no real benefit to having highly accurate timers.
         let now = self.timers.now();

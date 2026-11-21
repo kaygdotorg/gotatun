@@ -377,13 +377,12 @@ async fn j369_control_drain_progresses_with_a_queued_device_writer() {
 async fn j369_timer_output_survives_a_full_peer_window() {
     use super::parallel_crypto::{CryptoWorkers, MAX_PEER_CRYPTO_IN_FLIGHT, OrderStore};
     let (alice, bob, _eve) = mock::device_pair().await;
-    let (udp, packet_lookup, index_table, rate_limiter, task_liveness) = {
+    let (udp, packet_lookup, index_table, task_liveness) = {
         let state = alice.device.inner.read().await;
         (
             state.connection.as_ref().unwrap().udp.clone(),
             Arc::clone(&state.packet_lookup),
             state.index_table.clone(),
-            Arc::clone(state.rate_limiter.as_ref().unwrap()),
             Arc::clone(&state.task_liveness),
         )
     };
@@ -413,7 +412,6 @@ async fn j369_timer_output_survives_a_full_peer_window() {
         },
         Arc::default(),
         index_table,
-        rate_limiter,
         udp,
         workers.handle(),
         order,
