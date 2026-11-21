@@ -237,6 +237,7 @@ impl<R: RngCore + Send> Tunn<R> {
         packet: Packet,
         tun_mtu: Option<&mut MtuWatcher>,
     ) -> Option<WgKind> {
+        self.refresh_timer_clock();
         self.prepare_outgoing_packet(packet, tun_mtu)
             .map(PreparedOutgoing::encrypt)
     }
@@ -429,6 +430,7 @@ impl<R: RngCore + Send> Tunn<R> {
     /// Returns `Err(original_packet)` if there is no active session, or if the active session's
     /// sending counter has reached `REJECT_AFTER_MESSAGES`.
     pub fn encapsulate_with_session(&mut self, packet: Packet) -> Result<Packet<WgData>, Packet> {
+        self.refresh_timer_clock();
         let current = self.current;
         if let Some(session) = self
             .sessions
@@ -450,6 +452,7 @@ impl<R: RngCore + Send> Tunn<R> {
     ///
     /// This dispatches to the appropriate handler based on packet type.
     pub fn handle_incoming_packet(&mut self, packet: WgKind) -> TunnResult {
+        self.refresh_timer_clock();
         match packet {
             WgKind::HandshakeInit(p) => self.handle_handshake_init(p),
             WgKind::HandshakeResp(p) => self.handle_handshake_response(p),
@@ -582,6 +585,7 @@ impl<R: RngCore + Send> Tunn<R> {
         &mut self,
         packet: Packet<WgData>,
     ) -> Result<Packet, WireGuardError> {
+        self.refresh_timer_clock();
         let r_idx = packet.header.receiver_idx.get();
 
         // Search for the matching session. Almost always self.current, but older
@@ -618,6 +622,7 @@ impl<R: RngCore + Send> Tunn<R> {
         &mut self,
         force_resend: bool,
     ) -> Option<Packet<WgHandshakeInit>> {
+        self.refresh_timer_clock();
         if self.handshake.is_in_progress() && !force_resend {
             return None;
         }

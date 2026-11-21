@@ -229,7 +229,7 @@ impl IndexMut<TimerName> for Timers {
 
 impl<R: rand::RngCore + Send> Tunn<R> {
     pub(super) fn timer_tick(&mut self, timer_name: TimerName) {
-        self.timers.refresh_event_clock();
+        self.timers.debug_assert_event_clock_fresh();
         let time = self.timers[TimeCurrent];
         let before = self.timers[timer_name];
 

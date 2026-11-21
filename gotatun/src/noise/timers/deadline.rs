@@ -31,6 +31,17 @@
 //!   rekey-on-send rule depends on: data sent in the same tick as the handshake still does not
 //!   count as sent after it.
 //!
+//!   The clock is read once per *run* of packets, not per stamp: [`Tunn::refresh_timer_clock`]
+//!   runs at the top of each public entry point (`handle_incoming_packet`,
+//!   `handle_outgoing_packet`, …), and the device calls it once before each batch it prepares
+//!   or completes under one peer lock, then uses the crate-internal per-packet functions, which
+//!   do not read the clock. A clock read per packet cost 2.5–4.6% of loaded throughput on the
+//!   perf VM (#260, J1111), in the section serialised by the peer lock. A stamp is therefore at
+//!   most one run's duration (microseconds) older than its event, on top of the one-tick
+//!   rounding. Debug builds check on every stamp that the clock was refreshed within the last
+//!   two ticks, so a call site that forgets the refresh fails the tests; in release it would
+//!   only make that peer's timers fire early, never late.
+//!
 //! A tunnel without a hook behaves exactly as before, so direct users of [`Tunn`] that call
 //! `update_timers` on their own schedule are unaffected.
 
@@ -105,6 +116,21 @@ pub(crate) struct Schedule {
 }
 
 impl Timers {
+    /// Debug builds only: panic if a hooked tunnel stamps an event while `TimeCurrent` is more
+    /// than two ticks old, which means the caller skipped [`Tunn::refresh_timer_clock`].
+    pub(super) fn debug_assert_event_clock_fresh(&self) {
+        #[cfg(debug_assertions)]
+        if self.schedule.hook.is_some() {
+            let elapsed = Instant::now()
+                .checked_duration_since(self.time_started)
+                .unwrap_or(Duration::ZERO);
+            assert!(
+                elapsed.saturating_sub(self[TimeCurrent]) <= TIMER_TICK * 2,
+                "a timer stamp without a fresh event clock: call Tunn::refresh_timer_clock first"
+            );
+        }
+    }
+
     /// Advance `TimeCurrent` to now, rounded down to the tick, before an event is stamped.
     ///
     /// Only a hooked tunnel runs this event clock (see the module docs). The result never moves
@@ -127,6 +153,15 @@ impl Timers {
 }
 
 impl<R: rand::RngCore + Send> Tunn<R> {
+    /// Bring the event clock up to date before stamping a run of packets (see the module docs).
+    ///
+    /// One clock read; nothing without a hook. Call it once after taking the peer lock and before
+    /// a batch of `prepare_outgoing_packet`, `prepare_queued_packet` or `complete_incoming_packet`
+    /// calls. The public entry points call it themselves.
+    pub(crate) fn refresh_timer_clock(&mut self) {
+        self.timers.refresh_event_clock();
+    }
+
     /// Report this tunnel's deadlines to `hook` from now on, and report the first one at once.
     ///
     /// Also starts the event clock (see the module docs). Call it once, before the tunnel sees

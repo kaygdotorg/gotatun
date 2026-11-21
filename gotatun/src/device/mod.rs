@@ -1767,6 +1767,8 @@ impl<T: DeviceTransports> DeviceState<T> {
         if diagnostic {
             eprintln!("pipeline stage=incoming_delivery_peer_lock_acquired");
         }
+        // One clock read for the whole run's timer stamps (#260, J1111).
+        peer.tunnel.refresh_timer_clock();
         let mut tunnel_result_count = 0;
         let mut empty_packet_count = 0;
         let mut malformed_packet_count = 0;
@@ -2191,6 +2193,8 @@ impl<T: DeviceTransports> DeviceState<T> {
             let run_limit = queued_count.min(CRYPTO_CHUNK_SIZE).min(available);
             let mut jobs = Vec::with_capacity(run_limit);
             let mut stop_after_chunk = false;
+            // One clock read for the whole run's timer stamps (#260, J1111).
+            peer.tunnel.refresh_timer_clock();
             for _ in 0..run_limit {
                 let packet = peer
                     .tunnel
@@ -3031,6 +3035,8 @@ impl<T: DeviceTransports> DeviceState<T> {
                             let mut prepared = Vec::with_capacity(run_len);
                             let mut handshake_offset = None;
                             let mut flush_guard = None;
+                            // One clock read for the whole run's timer stamps (#260, J1111).
+                            peer.tunnel.refresh_timer_clock();
 
                             for _ in 0..run_len {
                                 let packet = packets.next().expect("the run length fits its input");
