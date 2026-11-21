@@ -35,14 +35,16 @@ mod macos_connected;
 #[cfg(target_os = "macos")]
 mod macos_port_audit;
 
-/// J1023 measurement prototype: `sendmsg_x`/`recvmsg_x` batching behind `GOTATUN_J1023_BATCH`.
+/// Batched sends and receives through xnu's private `sendmsg_x`/`recvmsg_x`, where they help
+/// and the OS version allows them (#260, #554, J1036).
 #[cfg(target_os = "macos")]
 mod macos_batch;
 
-/// J1023 prototype counters: `[send_calls, send_datagrams, recv_calls, recv_datagrams]` through
-/// the batch calls since the process started (all zero when batching is off).
+/// Counters for benches: `[send_calls, send_datagrams, recv_calls, recv_datagrams]` through the
+/// macOS batch calls since the process started (all zero while batching is off), so a bench can
+/// report datagrams per system call.
 #[cfg(target_os = "macos")]
-pub fn j1023_batch_stats() -> [u64; 4] {
+pub fn macos_batch_stats() -> [u64; 4] {
     macos_batch::stats()
 }
 
@@ -118,6 +120,10 @@ pub struct UdpSocket {
     /// on every poll, so a busy family cannot starve the other.
     #[cfg(target_os = "macos")]
     v4_first: bool,
+    /// Which socket this clone's next batched receive (`recvmsg_x`) polls first. It advances on
+    /// every poll, so a busy socket cannot starve the others.
+    #[cfg(target_os = "macos")]
+    recv_rotation: usize,
 }
 
 /// How many kernel-picked ports [`UdpSocket::bind_split`] tries before it gives up: a port free
@@ -333,6 +339,8 @@ impl UdpSocket {
             recv_view: macos_connected::RecvView::default(),
             #[cfg(target_os = "macos")]
             v4_first: false,
+            #[cfg(target_os = "macos")]
+            recv_rotation: 0,
         };
         #[cfg(target_os = "macos")]
         {
