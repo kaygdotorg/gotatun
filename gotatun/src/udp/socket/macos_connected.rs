@@ -12,8 +12,9 @@
 //! the network policy for every datagram. A socket with a fixed 4-tuple (a *connected* socket)
 //! keeps that decision, and the same `send` costs about 2 µs (J744 microbench, #260). The Mac's
 //! single device runtime spends about half its time in `sendto` under load (J728), so this is the
-//! largest per-datagram cost on the Mac send path. The private batch call `sendmsg_x` saves only
-//! about 3% on the same socket, so no private API is used here.
+//! largest per-datagram cost on the Mac send path. Runs of datagrams to one endpoint then go out
+//! in one private `sendmsg_x` call where the OS allows it ([`super::macos_batch`]), which xnu
+//! batches only on a connected socket like these.
 //!
 //! **How.** The WireGuard socket binds the wildcard address on its port as before. Right after
 //! that pair binds, [`bind_pool_counted`] binds [`POOL_SIZE`] sockets per family to the same address and port; this
@@ -686,7 +687,7 @@ impl ConnectedSends {
     }
 }
 
-/// Where one run of a batched send goes (J1023 prototype, see [`super::macos_batch`]).
+/// Where one run of a batched send goes (see [`super::macos_batch`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Target {
     /// The route's unconnected socket, with a destination per datagram.
@@ -695,19 +696,96 @@ enum Target {
     Slot(usize, SocketAddr),
 }
 
+/// The marker error a [`SlotSink`] returns when its pool socket moved to another endpoint
+/// between two calls: nothing was sent, and the rest goes through the wildcard socket.
+#[derive(Debug)]
+struct Moved;
+
+impl std::fmt::Display for Moved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the pool socket moved to another endpoint")
+    }
+}
+
+impl std::error::Error for Moved {}
+
+/// Whether `error` is the [`Moved`] marker.
+fn is_moved(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|inner| inner.is::<Moved>())
+}
+
+/// A [`super::macos_batch::BatchSink`] over one pool socket while it serves `to`.
+///
+/// Every call takes the socket's read lock and checks that it is still connected to `to`, as
+/// [`ConnectedSends::send_on`] does, so a datagram never leaves toward another endpoint.
+struct SlotSink<'a> {
+    /// The pool socket.
+    slot: &'a Slot,
+    /// The endpoint the run is for.
+    to: SocketAddr,
+    /// The payloads, in send order.
+    payloads: &'a [(&'a [u8], SocketAddr)],
+}
+
+impl super::macos_batch::BatchSink for SlotSink<'_> {
+    fn try_batch(&self, from: usize) -> io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        let peer = self.slot.peer.read();
+        if *peer != Some(self.to) {
+            return Err(io::Error::other(Moved));
+        }
+        self.slot.socket.try_io(tokio::io::Interest::WRITABLE, || {
+            super::macos_batch::send_x(
+                self.slot.socket.as_raw_fd(),
+                self.payloads[from..]
+                    .iter()
+                    .map(|(payload, _)| (*payload, None)),
+            )
+        })
+    }
+
+    fn try_single(&self, index: usize) -> io::Result<()> {
+        let peer = self.slot.peer.read();
+        if *peer != Some(self.to) {
+            return Err(io::Error::other(Moved));
+        }
+        self.slot
+            .socket
+            .try_send(self.payloads[index].0)
+            .map(|_| ())
+    }
+
+    async fn writable(&self) -> io::Result<()> {
+        self.slot.socket.writable().await
+    }
+}
+
 impl ConnectedSends {
-    /// J1023 prototype: send a same-family run with as few `sendmsg_x` calls as possible.
+    /// Whether runs of more than one datagram can use `sendmsg_x` on this WireGuard socket:
+    /// on its pool sockets (connected sends on) or on its wildcard socket, as
+    /// [`super::macos_batch::policy`] allows.
+    pub(crate) fn batches_sends(&self) -> bool {
+        let policy = super::macos_batch::policy();
+        policy.send_wildcard || (policy.send_connected && !self.slots.is_empty())
+    }
+
+    /// Send a run that leaves through one wildcard socket, with as few system calls as the
+    /// batching policy allows. `destination`s are already mapped for `wildcard`.
     ///
     /// Consecutive datagrams to the same target form one call: data to an endpoint with a pool
     /// socket goes on that connected socket without an address, everything else on `wildcard`
-    /// with its destination (`destination` is already routed for it). The pool's rules are
-    /// unchanged: non-data marks its endpoint stale and takes the wildcard, and a run on a pool
-    /// socket is only sent while the socket is still connected to that endpoint.
+    /// with its destination. The pool's rules are those of [`ConnectedSends::send`]: non-data
+    /// marks its endpoint stale and takes the wildcard socket, and a run on a pool socket is only
+    /// sent while the socket is still connected to that endpoint.
+    ///
+    /// Every datagram is attempted; the last error, if any, is returned, as `sendto` would
+    /// have reported it for that datagram.
     pub(crate) async fn send_batch(
         &self,
         wildcard: &tokio::net::UdpSocket,
         run: &[(&[u8], SocketAddr)],
     ) -> io::Result<()> {
+        let mut result = Ok(());
         let mut start = 0;
         while start < run.len() {
             let target = self.target_of(run[start].0, run[start].1);
@@ -718,27 +796,48 @@ impl ConnectedSends {
                     Target::Slot(_, to) if run[end].1 == to && carries_data(run[end].0) => target,
                     Target::Slot(..) => break,
                     Target::Wildcard if self.slots.is_empty() => Target::Wildcard,
-                    Target::Wildcard => self.target_of(run[end].0, run[end].1),
+                    Target::Wildcard => {
+                        // Peek without side effects; `target_of` runs for the next run's head.
+                        if carries_data(run[end].0) && self.has_slot(run[end].1) {
+                            break;
+                        }
+                        if !carries_data(run[end].0) {
+                            self.mark_stale(run[end].1);
+                        }
+                        Target::Wildcard
+                    }
                 };
                 if next != target {
-                    // `target_of` may have taken a slot for it; the next run starts there.
                     break;
                 }
                 end += 1;
             }
             let chunk = &run[start..end];
-            match target {
-                Target::Wildcard => self.send_wildcard(wildcard, chunk).await?,
-                Target::Slot(index, to) => {
-                    let sent = self.send_slot(index, to, chunk).await;
-                    if sent < chunk.len() {
-                        self.send_wildcard(wildcard, &chunk[sent..]).await?;
-                    }
-                }
+            let sent = match target {
+                Target::Wildcard => send_wildcard(wildcard, chunk).await,
+                Target::Slot(index, to) => self.send_slot(wildcard, index, to, chunk).await,
+            };
+            if let Err(error) = sent {
+                result = Err(error);
             }
             start = end;
         }
-        Ok(())
+        result
+    }
+
+    /// Whether `destination` has a pool socket assigned or could get one; the next data
+    /// datagram to it then ends a wildcard run. Only a hint for splitting runs.
+    fn has_slot(&self, destination: SocketAddr) -> bool {
+        let table = self.table.lock();
+        table
+            .iter()
+            .any(|assignment| assignment.destination == Some(destination))
+            || pick(
+                &table,
+                Family::of(destination),
+                self.sends.load(Ordering::Relaxed),
+            )
+            .is_some()
     }
 
     /// The target of one datagram, taking a pool socket for new data endpoints as `send` does.
@@ -756,80 +855,134 @@ impl ConnectedSends {
         }
     }
 
-    /// Send `chunk` on the wildcard socket with destinations; after a hard batch error the
-    /// rest goes one datagram at a time (see the module docs of `macos_batch`).
-    async fn send_wildcard(
+    /// Send `chunk` on pool socket `index` while it is connected to `to`; whatever cannot go
+    /// there (the socket moved, or its path is gone) leaves through `wildcard`.
+    ///
+    /// With `sendmsg_x` allowed on connected sockets this is one batch call per socket-full;
+    /// otherwise, and after an error that may have sent part of a batch, one `send` per
+    /// datagram through [`ConnectedSends::send_on`].
+    async fn send_slot(
         &self,
         wildcard: &tokio::net::UdpSocket,
+        index: usize,
+        to: SocketAddr,
         chunk: &[(&[u8], SocketAddr)],
     ) -> io::Result<()> {
-        let items: Vec<(&[u8], Option<SocketAddr>)> =
-            chunk.iter().map(|(p, d)| (*p, Some(*d))).collect();
-        match super::macos_batch::send_all(wildcard, &items).await {
-            Ok(_) => Ok(()),
-            Err((done, error)) => {
-                tracing::trace!("sendmsg_x failed after {done} ({error}); one at a time");
-                let mut last = Ok(());
-                for (payload, destination) in &chunk[done..] {
-                    if let Err(error) = wildcard.send_to(payload, *destination).await {
-                        last = Err(error);
-                    }
-                }
-                last
-            }
-        }
-    }
-
-    /// Send `chunk` on pool socket `index` while it is connected to `to`. Returns how many
-    /// left; the caller sends the rest through the wildcard socket.
-    async fn send_slot(&self, index: usize, to: SocketAddr, chunk: &[(&[u8], SocketAddr)]) -> usize {
-        use std::os::fd::AsRawFd;
-        let slot = &self.slots[index];
-        let items: Vec<(&[u8], Option<SocketAddr>)> =
-            chunk.iter().map(|(p, _)| (*p, None)).collect();
         let mut done = 0;
-        let mut icmp_retried = false;
-        while done < items.len() {
-            let result = {
-                let peer = slot.peer.read();
-                if *peer != Some(to) {
-                    return done;
-                }
-                slot.socket.try_io(tokio::io::Interest::WRITABLE, || {
-                    super::macos_batch::send_x(slot.socket.as_raw_fd(), &items[done..])
-                })
+        let mut result = Ok(());
+        if super::macos_batch::policy().send_connected && chunk.len() > 1 {
+            let sink = SlotSink {
+                slot: &self.slots[index],
+                to,
+                payloads: chunk,
             };
-            match result {
-                Ok(sent) => done += sent,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if slot.socket.writable().await.is_err() {
-                        return done;
-                    }
+            let mut icmp_retried = false;
+            loop {
+                let sink = SlotSink {
+                    payloads: &chunk[done..],
+                    ..sink
+                };
+                let stopped = super::macos_batch::send_loop(&sink, sink.payloads.len()).await;
+                done += stopped.done;
+                if let Some(error) = stopped.dropped {
+                    result = Err(error);
                 }
-                Err(error) if error.raw_os_error() == Some(libc::ENOBUFS) => done += 1,
-                Err(error) if is_icmp_error(&error) && !icmp_retried => icmp_retried = true,
-                Err(error) if is_icmp_error(&error) || is_path_error(&error) => {
+                let Some(error) = stopped.error else {
+                    return result;
+                };
+                if is_moved(&error) {
+                    return merge(result, send_wildcard(wildcard, &chunk[done..]).await);
+                }
+                // A pending ICMP error is reported once, before anything was sent: retry once.
+                if is_icmp_error(&error) && !icmp_retried && !stopped.maybe_sent {
+                    icmp_retried = true;
+                    continue;
+                }
+                if is_icmp_error(&error) || is_path_error(&error) {
                     self.forget(index, to, &error);
-                    return done;
+                    return merge(result, send_wildcard(wildcard, &chunk[done..]).await);
                 }
-                Err(error) => {
-                    tracing::trace!("sendmsg_x on a pool socket failed ({error})");
-                    return done;
-                }
+                tracing::trace!("sendmsg_x on a pool socket failed after {done} ({error})");
+                // Exact per-datagram errors for the rest; a prefix may leave twice (module docs
+                // of `macos_batch`), which the receiver's replay window drops.
+                break;
             }
         }
-        done
+        for (payload, destination) in &chunk[done..] {
+            let sent = match self.send_on(index, payload, *destination).await {
+                Sent::Done => Ok(()),
+                Sent::Fallback => wildcard.send_to(payload, *destination).await.map(|_| ()),
+                Sent::Failed(error) => Err(error),
+            };
+            if let Err(error) = sent {
+                result = Err(error);
+            }
+        }
+        result
     }
 
-    /// J1023 prototype: the pool sockets, for the batched receive to read.
-    pub(crate) fn pool_sockets(&self) -> impl Iterator<Item = &tokio::net::UdpSocket> {
-        self.slots.iter().map(|slot| &slot.socket)
+    /// How many pool sockets the batched receive reads besides the wildcard socket.
+    pub(crate) fn pool_len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Pool socket `index` (below [`ConnectedSends::pool_len`]), for the batched receive.
+    pub(crate) fn pool_socket(&self, index: usize) -> &tokio::net::UdpSocket {
+        &self.slots[index].socket
     }
 }
 
-/// J1023 prototype: read one `recvmsg_x` batch from `socket` if it has any. `Ready(Ok(n))` with
-/// `n > 0` when datagrams arrived, `Pending` (waker registered) when it has none. On a pool
-/// socket (`pool`), ICMP reports are skipped as `poll_recv` does and other errors only logged.
+/// `first`, unless it is fine and `second` is an error.
+fn merge(first: io::Result<()>, second: io::Result<()>) -> io::Result<()> {
+    first.and(second)
+}
+
+/// Send `chunk` on the unconnected `wildcard` socket, each datagram to its destination.
+///
+/// With `sendmsg_x` allowed on the wildcard socket this is one batch call per socket-full;
+/// otherwise, and after an error that may have sent part of a batch, one `sendto` per datagram.
+async fn send_wildcard(
+    wildcard: &tokio::net::UdpSocket,
+    chunk: &[(&[u8], SocketAddr)],
+) -> io::Result<()> {
+    let mut done = 0;
+    let mut result = Ok(());
+    if super::macos_batch::policy().send_wildcard && chunk.len() > 1 {
+        let sink = super::macos_batch::SocketSink {
+            socket: wildcard,
+            items: chunk,
+            connected: false,
+        };
+        let stopped = super::macos_batch::send_loop(&sink, chunk.len()).await;
+        done = stopped.done;
+        if let Some(error) = stopped.dropped {
+            result = Err(error);
+        }
+        match stopped.error {
+            None => return result,
+            // That datagram failed alone; the rest go one at a time below.
+            Some(error) if !stopped.maybe_sent => {
+                result = Err(error);
+                done += 1;
+            }
+            Some(error) => {
+                tracing::trace!("sendmsg_x failed after {done} ({error}); one at a time");
+            }
+        }
+    }
+    for (payload, destination) in &chunk[done.min(chunk.len())..] {
+        if let Err(error) = wildcard.send_to(payload, *destination).await {
+            result = Err(error);
+        }
+    }
+    result
+}
+
+/// Read one `recvmsg_x` batch from `socket` if it has any.
+///
+/// `Ready(Ok(n))` with `n > 0` when datagrams were appended to `packets`, `Pending` (waker
+/// registered) when it has none. On a pool socket (`pool_socket`), ICMP reports are skipped as
+/// [`ConnectedSends::poll_recv`] does and other errors only logged.
 pub(crate) fn poll_recv_batch_one(
     socket: &tokio::net::UdpSocket,
     pool_socket: bool,
@@ -846,11 +999,13 @@ pub(crate) fn poll_recv_batch_one(
             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
             Poll::Ready(Ok(())) => {}
         }
+        let before = packets.len();
         match socket.try_io(tokio::io::Interest::READABLE, || {
             super::macos_batch::recv_x(socket.as_raw_fd(), buf, packet_pool, packets, map_src)
         }) {
-            Ok(0) => continue,
-            Ok(n) => return Poll::Ready(Ok(n)),
+            // Every datagram of the call was dropped (truncated): read on.
+            Ok(_) if packets.len() == before => continue,
+            Ok(_) => return Poll::Ready(Ok(packets.len() - before)),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
             Err(error) if pool_socket && is_icmp_error(&error) => continue,
             Err(error) if pool_socket => {
@@ -2275,5 +2430,210 @@ mod tests {
              audits={audits} audits_with_foreign_sockets={foreign} send_errors={errors:?}",
             wireguard.inner.connected.connects()
         );
+    }
+
+    /// The numbers of every datagram `socket` receives within `wait` of the last one.
+    async fn numbers_received(socket: &tokio::net::UdpSocket, wait: Duration) -> Vec<u32> {
+        let mut buf = [0u8; 2048];
+        let mut numbers = Vec::new();
+        while let Ok(Ok((n, _))) = tokio::time::timeout(wait, socket.recv_from(&mut buf)).await {
+            assert!(n >= 8);
+            numbers.push(u32::from_be_bytes(buf[4..8].try_into().expect("4 bytes")));
+        }
+        numbers
+    }
+
+    /// Data runs through `send_many_to`, with connected sends on and off: every datagram reaches
+    /// its own endpoint exactly once and in order, also when a run mixes two endpoints and a
+    /// handshake message, and whatever batching policy this process runs with.
+    #[tokio::test]
+    async fn batched_runs_reach_each_endpoint_once_and_in_order() {
+        for connected in [false, true] {
+            let wireguard = wireguard_socket(connected);
+            let (a, a_address) = peer().await;
+            let (b, b_address) = peer().await;
+            for socket in [&a, &b] {
+                socket2::SockRef::from(socket)
+                    .set_recv_buffer_size(4 << 20)
+                    .expect("SO_RCVBUF");
+            }
+            let max = wireguard.max_number_of_packets_to_send();
+            let mut next = [0u32; 2];
+            let mut expected = [Vec::new(), Vec::new()];
+            for round in 0..20 {
+                let mut packets = Vec::new();
+                for i in 0..max {
+                    // Mostly A, a few B, one handshake in the middle of some runs.
+                    let (who, to) = if i % 7 == 3 {
+                        (1, b_address)
+                    } else {
+                        (0, a_address)
+                    };
+                    let mut payload = if round % 3 == 0 && i == max / 2 {
+                        initiation()
+                    } else {
+                        data(200)
+                    };
+                    payload[4..8].copy_from_slice(&next[who].to_be_bytes());
+                    expected[who].push(next[who]);
+                    next[who] += 1;
+                    packets.push((Packet::from_bytes(bytes::BytesMut::from(&payload[..])), to));
+                }
+                let mut send_buf = ();
+                wireguard
+                    .send_many_to(&mut send_buf, &mut packets)
+                    .await
+                    .expect("send_many_to");
+                assert!(packets.is_empty());
+            }
+            let got_a = numbers_received(&a, Duration::from_millis(300)).await;
+            let got_b = numbers_received(&b, Duration::from_millis(300)).await;
+            assert_eq!(got_a, expected[0], "connected={connected}, batch {max}");
+            assert_eq!(got_b, expected[1], "connected={connected}, batch {max}");
+        }
+    }
+
+    /// A pool socket that moved to another endpoint between the table lookup and a batched
+    /// send never carries the run: the run leaves through the wildcard socket instead, all of
+    /// it, once, and the other endpoint sees none of it.
+    #[tokio::test]
+    async fn a_moved_pool_socket_never_carries_a_batched_run() {
+        let wireguard = wireguard_socket(true);
+        let (first, first_address) = peer().await;
+        let (second, second_address) = peer().await;
+        send(&wireguard, &data(64), first_address).await;
+        peer_recv(&first).await;
+        let pool = &wireguard.inner.connected;
+        let index = pool
+            .table
+            .lock()
+            .iter()
+            .position(|assignment| assignment.destination == Some(mapped(first_address)))
+            .expect("the first endpoint has a pool socket");
+        // Connect the socket to the second endpoint behind the table's back: the table still
+        // hands it out for the first one.
+        *pool.slots[index].peer.write() = Some(mapped(second_address));
+        socket2::SockRef::from(&pool.slots[index].socket)
+            .connect(&mapped(second_address).into())
+            .expect("connect");
+        let payloads: Vec<Vec<u8>> = (0..10u32)
+            .map(|i| {
+                let mut p = data(200);
+                p[4..8].copy_from_slice(&i.to_be_bytes());
+                p
+            })
+            .collect();
+        let (wildcard, routed) = wireguard.route(first_address);
+        let run: Vec<(&[u8], SocketAddr)> = payloads.iter().map(|p| (&p[..], routed)).collect();
+        pool.send_batch(wildcard, &run).await.expect("send_batch");
+        assert_eq!(
+            numbers_received(&first, Duration::from_millis(300)).await,
+            (0..10).collect::<Vec<_>>()
+        );
+        let mut buf = [0u8; 256];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), second.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "the second endpoint got the first endpoint's datagrams"
+        );
+    }
+
+    /// Batched data to an endpoint whose port is closed: the ICMP errors the connected socket
+    /// reports neither stop later runs nor reach the caller as a fatal error, and data to a
+    /// live endpoint in the same and later runs still arrives in full and in order.
+    #[tokio::test]
+    async fn icmp_errors_mid_batch_do_not_stop_other_endpoints() {
+        let wireguard = wireguard_socket(true);
+        let (closed, closed_address) = peer().await;
+        drop(closed);
+        let (live, live_address) = peer().await;
+        socket2::SockRef::from(&live)
+            .set_recv_buffer_size(4 << 20)
+            .expect("SO_RCVBUF");
+        let mut sent = 0u32;
+        for _ in 0..10 {
+            let mut packets = Vec::new();
+            for i in 0..wireguard.max_number_of_packets_to_send() {
+                let mut payload = data(200);
+                let to = if i % 2 == 0 {
+                    closed_address
+                } else {
+                    payload[4..8].copy_from_slice(&sent.to_be_bytes());
+                    sent += 1;
+                    live_address
+                };
+                packets.push((Packet::from_bytes(bytes::BytesMut::from(&payload[..])), to));
+            }
+            let result = wireguard.send_many_to(&mut (), &mut packets).await;
+            if let Err(error) = result {
+                assert!(
+                    !crate::udp::is_fatal_udp_error(&error),
+                    "a closed port is not fatal: {error}"
+                );
+            }
+            // sleep: let the ICMP port-unreachable replies come back between runs.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            numbers_received(&live, Duration::from_millis(300)).await,
+            (0..sent).collect::<Vec<_>>()
+        );
+    }
+
+    /// The batched receive reads the wildcard socket and the pool sockets: replies that the
+    /// kernel delivers to a connected pool socket and datagrams from an endpoint without one
+    /// both arrive, with their sources, in calls of more than one datagram where batching is on.
+    #[tokio::test]
+    async fn the_batched_receive_reads_pool_and_wildcard_sockets() {
+        for connected in [false, true] {
+            let mut wireguard = wireguard_socket(connected);
+            let port = wireguard.local_addr().expect("local").port();
+            let to = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+            let (a, a_address) = peer().await;
+            let (b, b_address) = peer().await;
+            // A gets a pool socket (with connected sends on); B never receives data from us.
+            send(&wireguard, &data(64), a_address).await;
+            peer_recv(&a).await;
+            for i in 0..100u32 {
+                let mut p = data(100);
+                p[4..8].copy_from_slice(&i.to_be_bytes());
+                a.send_to(&p, to).await.expect("a sends");
+                b.send_to(&p, to).await.expect("b sends");
+            }
+            let mut pool = PacketBufPool::new(256);
+            let mut recv_buf = Default::default();
+            let mut packets = Vec::new();
+            let mut calls = 0;
+            while packets.len() < 200 {
+                calls += 1;
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    wireguard.recv_many_from(&mut recv_buf, &mut pool, &mut packets),
+                )
+                .await
+                .expect("datagrams within 5 s")
+                .expect("receive");
+            }
+            assert_eq!(packets.len(), 200, "connected={connected}");
+            for (address, name) in [(a_address, "a"), (b_address, "b")] {
+                let numbers: Vec<u32> = packets
+                    .iter()
+                    .filter(|(_, source)| mapped(*source) == mapped(address))
+                    .map(|(p, _)| u32::from_be_bytes(p[4..8].try_into().expect("4 bytes")))
+                    .collect();
+                assert_eq!(
+                    numbers,
+                    (0..100).collect::<Vec<_>>(),
+                    "{name}, connected={connected}"
+                );
+            }
+            if super::super::macos_batch::policy().recv {
+                assert!(
+                    calls < 200,
+                    "connected={connected}: one datagram per call ({calls})"
+                );
+            }
+        }
     }
 }
