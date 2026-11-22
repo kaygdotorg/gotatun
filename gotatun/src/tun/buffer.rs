@@ -96,8 +96,22 @@ impl BufferedIpSend {
                 .expect("Deadlock on IpSend. There must be no more than one IpSend active at any given time.");
 
             let mut refused: u64 = 0;
-            while let Some(message) = rx.recv().await {
+            // A message taken off the channel while merging that could not join the run.
+            let mut held: Option<BufferedIpMessage> = None;
+            loop {
+                let message = match held.take() {
+                    Some(message) => message,
+                    None => match rx.recv().await {
+                        Some(message) => message,
+                        None => break,
+                    },
+                };
                 let diagnostic = crate::diag::PIPELINE.on();
+                let message = if diagnostic {
+                    message
+                } else {
+                    merge_queued(message, &mut rx, &mut held)
+                };
                 let (result, refused_packets) = match message {
                     BufferedIpMessage::Single(packet, _permit) => {
                         if diagnostic {
@@ -162,6 +176,64 @@ impl BufferedIpSend {
             _task: Arc::new(task),
         }
     }
+}
+
+/// Most packets one merged TUN write run may hold. Several of the adapter's largest frames
+/// (64 segments), so merging is never the limit on frame size, while the permits of a merged
+/// run are held for at most this many packets' writes.
+const MERGE_MAX_PACKETS: usize = 256;
+
+/// Join the runs and packets already waiting in the channel behind `message` into one run, in
+/// their order, without waiting for any (#260, J1129).
+///
+/// The TUN adapter merges consecutive segments of a flow into one GSO frame only within a run,
+/// so a run cut at a decryption batch boundary would end a frame early: every queued run handed
+/// over separately cost a TUN write (J1120: 8.3k writes per Gbit against 5.1k). Merging takes
+/// only what is queued already, so it adds no delay; a message with a diagnostic sequence id
+/// ends the run and waits in `held`, so the send-queue diagnostic still sees each of its runs.
+fn merge_queued(
+    message: BufferedIpMessage,
+    rx: &mut mpsc::Receiver<BufferedIpMessage>,
+    held: &mut Option<BufferedIpMessage>,
+) -> BufferedIpMessage {
+    let (mut packets, mut permit) = match message {
+        BufferedIpMessage::Batch(packets, permit, None) => (packets, permit),
+        BufferedIpMessage::Single(packet, permit) => {
+            // A lone packet with nothing behind it goes out as it came, without a run.
+            match rx.try_recv() {
+                Ok(next) => {
+                    *held = Some(next);
+                    (vec![packet], permit)
+                }
+                Err(_) => return BufferedIpMessage::Single(packet, permit),
+            }
+        }
+        message @ BufferedIpMessage::Batch(_, _, Some(_)) => return message,
+    };
+    while packets.len() < MERGE_MAX_PACKETS {
+        let next = match held.take() {
+            Some(next) => next,
+            None => match rx.try_recv() {
+                Ok(next) => next,
+                Err(_) => break,
+            },
+        };
+        match next {
+            BufferedIpMessage::Batch(more, more_permit, None) => {
+                packets.extend(more);
+                permit.merge(more_permit);
+            }
+            BufferedIpMessage::Single(packet, more_permit) => {
+                packets.push(packet);
+                permit.merge(more_permit);
+            }
+            next @ BufferedIpMessage::Batch(_, _, Some(_)) => {
+                *held = Some(next);
+                break;
+            }
+        }
+    }
+    BufferedIpMessage::Batch(packets, permit, None)
 }
 
 impl BufferedIpSend {
@@ -530,6 +602,82 @@ mod tests {
             );
         }
         assert!(single_rx.try_recv().is_err());
+    }
+
+    /// Records runs like [`RecordingIpSend`], but each write first waits for a permit of
+    /// `gate`, and says on `started` that it began, so a test can queue runs behind it.
+    struct GatedIpSend {
+        gate: Arc<tokio::sync::Semaphore>,
+        started: mpsc::UnboundedSender<()>,
+        writes: mpsc::UnboundedSender<Vec<u16>>,
+    }
+
+    impl GatedIpSend {
+        async fn record(&mut self, ids: Vec<u16>) {
+            self.started
+                .send(())
+                .expect("the test receiver remains open");
+            self.gate.acquire().await.expect("open gate").forget();
+            self.writes
+                .send(ids)
+                .expect("the test receiver remains open");
+        }
+    }
+
+    impl IpSend for GatedIpSend {
+        async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
+            self.record(vec![packet_id(&packet)]).await;
+            Ok(())
+        }
+
+        async fn send_many(&mut self, packets: &mut Vec<Packet<Ip>>) -> io::Result<()> {
+            let ids = packets.iter().map(packet_id).collect();
+            packets.clear();
+            self.record(ids).await;
+            Ok(())
+        }
+    }
+
+    /// Runs and packets that queue up while the TUN write is busy go to the next write as one
+    /// run, in their order, so the adapter can merge across them (#260, J1129). A lone packet
+    /// with nothing queued behind it is still sent alone.
+    #[tokio::test]
+    async fn runs_queued_behind_a_busy_write_merge_in_order() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (writes_tx, mut writes_rx) = mpsc::unbounded_channel();
+        let inner = Arc::new(Mutex::new(GatedIpSend {
+            gate: Arc::clone(&gate),
+            started: started_tx,
+            writes: writes_tx,
+        }));
+        let mut send = BufferedIpSend::new(16, inner, CancellationToken::new());
+        let wait = Duration::from_secs(1);
+
+        send.send_many(&mut vec![packet(64, 1)]).await.unwrap();
+        tokio::time::timeout(wait, started_rx.recv()).await.unwrap();
+        send.send_many(&mut vec![packet(64, 2), packet(64, 3)])
+            .await
+            .unwrap();
+        send.send(packet(64, 4)).await.unwrap();
+        send.send_many(&mut vec![packet(64, 5)]).await.unwrap();
+        gate.add_permits(2);
+        for expected in [vec![1], vec![2, 3, 4, 5]] {
+            let ids = tokio::time::timeout(wait, writes_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(ids, expected);
+        }
+
+        tokio::time::timeout(wait, started_rx.recv()).await.unwrap();
+        send.send(packet(64, 6)).await.unwrap();
+        gate.add_permits(1);
+        let ids = tokio::time::timeout(wait, writes_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ids, [6], "a lone packet goes alone");
     }
 
     async fn scripted_recv(script: Vec<io::Result<Vec<Packet<Ip>>>>) -> BufferedIpRecv<Script> {
