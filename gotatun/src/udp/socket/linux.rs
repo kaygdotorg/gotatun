@@ -851,11 +851,18 @@ impl UdpSend for super::UdpSocket {
 
 #[cfg(target_os = "linux")]
 mod gro {
-    /// Number of segments per message received
-    const MAX_SEGMENTS: usize = 64;
-    /// Size of a single UDP packet with multiple segments
-    // TODO: Fix constant
-    const MAX_GRO_SIZE: usize = MAX_SEGMENTS * 4096;
+    /// Most bytes one received message carries. The kernel builds UDP GRO packets only below
+    /// 64 KiB (larger GRO packets are for TCP alone), and a UDP datagram's 16-bit length caps
+    /// an unsegmented or locally sent GSO datagram the same way.
+    const MAX_MESSAGE_LEN: usize = 1 << 16;
+    /// One allocation that receive slots are cut from. A slot keeps receiving into the rest of
+    /// its chunk while at least [`MAX_MESSAGE_LEN`] bytes are left, so a chunk serves one
+    /// full-size message or several typical ones before the slot takes another.
+    const CHUNK_LEN: usize = 2 * MAX_MESSAGE_LEN;
+    /// Most chunks kept for reuse after their slot moved on. A chunk can only be reused once
+    /// every packet cut from it is gone; beyond this many, the oldest is let go and its memory
+    /// is freed when its last packet is dropped.
+    const MAX_RETIRED_CHUNKS: usize = 2 * MAX_PACKET_COUNT;
 
     use super::MAX_PACKET_COUNT;
     use crate::packet::{Packet, PacketBufPool};
@@ -864,29 +871,24 @@ mod gro {
     use bytes::BytesMut;
     use nix::cmsg_space;
     use nix::sys::socket::{ControlMessageOwned, MsgFlags, MultiHeaders, SockaddrStorage};
+    use std::collections::VecDeque;
     use std::hint::cold_path;
     use std::io::{self, IoSliceMut};
     use std::net::SocketAddr;
     use std::os::fd::AsRawFd;
     use tokio::io::Interest;
 
+    /// Cut the `received` bytes of one message into packets without copying them (#260, J1129).
+    ///
+    /// Each packet is a view of its own bytes in the receive chunk, so decryption runs in
+    /// place there and the decrypted packet is written to the TUN from there. With GRO the
+    /// message holds `gro_size`-byte datagrams back to back, the last one possibly shorter.
     fn append_received_packets(
-        buffer: &[u8],
-        received_len: usize,
+        mut received: BytesMut,
         gro_size: Option<usize>,
         source_addr: SocketAddr,
-        pool: &mut PacketBufPool,
         packets: &mut Vec<(Packet, SocketAddr)>,
     ) -> io::Result<()> {
-        // The iovec may keep its full capacity after recvmsg, while only received_len bytes are
-        // payload. Never let unused capacity become an extra packet or zero-filled tail.
-        let received = buffer.get(..received_len).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "UDP receive length exceeded its buffer",
-            )
-        })?;
-
         if let Some(gro_size) = gro_size {
             if gro_size == 0 || received.is_empty() {
                 return Err(io::Error::new(
@@ -894,75 +896,148 @@ mod gro {
                     "invalid empty UDP GRO datagram",
                 ));
             }
-
-            for segment in received.chunks(gro_size) {
-                let mut packet = pool.get();
-                packet.buf_mut().clear();
-                packet.buf_mut().extend_from_slice(segment);
-                packets.push((packet, source_addr));
+            while !received.is_empty() {
+                let segment = received.split_to(gro_size.min(received.len()));
+                packets.push((Packet::from_bytes(segment), source_addr));
             }
         } else {
-            let mut packet = pool.get();
-            packet.buf_mut().clear();
-            packet.buf_mut().extend_from_slice(received);
-            packets.push((packet, source_addr));
+            packets.push((Packet::from_bytes(received), source_addr));
         }
-
         Ok(())
     }
 
+    /// The receive slots of one `recvmmsg` call and the chunks their packets are cut from.
+    ///
+    /// INVARIANT: `gro_bufs[i]` is the unreceived rest of the chunk that `starts[i]` points to
+    /// the start of, holds at least [`MAX_MESSAGE_LEN`] bytes before every receive, and is the
+    /// only handle to those bytes; every byte of a chunk is initialised (chunks are allocated
+    /// zeroed and only ever written).
     pub struct RecvManyBuf {
         pub(crate) gro_bufs: Box<[BytesMut; MAX_PACKET_COUNT]>,
+        /// A zero-length handle at the start of each slot's chunk; once it is the chunk's only
+        /// handle, no packet of the chunk is alive and the whole chunk can be reclaimed.
+        starts: Box<[BytesMut; MAX_PACKET_COUNT]>,
+        /// Start handles of chunks whose slot moved on, oldest first.
+        retired: VecDeque<BytesMut>,
         /// Kernel receive timestamps (`SO_TIMESTAMPNS`, ns), one per output packet index of the
         /// last call; empty when the receive-side queue bound is off.
         pub(crate) rx_stamps: Vec<u64>,
     }
 
+    /// A fresh zeroed chunk: its start handle and its writable bytes.
+    fn new_chunk() -> (BytesMut, BytesMut) {
+        let mut chunk = BytesMut::zeroed(CHUNK_LEN);
+        let start = chunk.split_to(0);
+        (start, chunk)
+    }
+
     impl Default for RecvManyBuf {
         fn default() -> Self {
-            let mut gro_buf = BytesMut::zeroed(MAX_PACKET_COUNT * MAX_GRO_SIZE);
-            let gro_bufs = [(); MAX_PACKET_COUNT];
-            let gro_bufs = gro_bufs.map(|()| gro_buf.split_to(MAX_GRO_SIZE));
-            let gro_bufs = Box::new(gro_bufs);
-
+            let mut starts = Vec::with_capacity(MAX_PACKET_COUNT);
+            let mut gro_bufs = Vec::with_capacity(MAX_PACKET_COUNT);
+            for _ in 0..MAX_PACKET_COUNT {
+                let (start, chunk) = new_chunk();
+                starts.push(start);
+                gro_bufs.push(chunk);
+            }
+            let to_slots = |slots: Vec<BytesMut>| -> Box<[BytesMut; MAX_PACKET_COUNT]> {
+                slots
+                    .into_boxed_slice()
+                    .try_into()
+                    .unwrap_or_else(|_| unreachable!("one buffer per slot"))
+            };
             Self {
-                gro_bufs,
+                gro_bufs: to_slots(gro_bufs),
+                starts: to_slots(starts),
+                retired: VecDeque::new(),
                 rx_stamps: Vec::new(),
             }
         }
     }
 
     impl RecvManyBuf {
+        /// Hand the first `len` bytes received into `slot` out as their own buffer, and give
+        /// the slot a new chunk when too little of its chunk is left for another message.
+        ///
+        /// # Errors
+        /// A length beyond the slot, which only a broken kernel reply can report.
+        fn take_received(&mut self, slot: usize, len: usize) -> io::Result<BytesMut> {
+            if len > self.gro_bufs[slot].len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "UDP receive length exceeded its buffer",
+                ));
+            }
+            let received = self.gro_bufs[slot].split_to(len);
+            if self.gro_bufs[slot].len() < MAX_MESSAGE_LEN {
+                let (start, chunk) = self.reuse_chunk().unwrap_or_else(new_chunk);
+                let old = std::mem::replace(&mut self.starts[slot], start);
+                self.gro_bufs[slot] = chunk;
+                if self.retired.len() == MAX_RETIRED_CHUNKS {
+                    self.retired.pop_front();
+                }
+                self.retired.push_back(old);
+            }
+            Ok(received)
+        }
+
+        /// The oldest retired chunk none of whose packets is alive any more, taken back whole.
+        fn reuse_chunk(&mut self) -> Option<(BytesMut, BytesMut)> {
+            let index = self
+                .retired
+                .iter_mut()
+                .position(|start| start.try_reclaim(CHUNK_LEN))?;
+            let mut start = self.retired.remove(index)?;
+            let mut chunk = start.split_off(0);
+            debug_assert!(chunk.capacity() >= CHUNK_LEN);
+            // SAFETY: `try_reclaim` succeeded, so `start` was the chunk's only handle and the
+            // capacity covers the whole chunk again; the chunk was allocated zeroed and only
+            // ever written, so all `CHUNK_LEN` bytes are initialised (see the type invariant).
+            unsafe { chunk.set_len(CHUNK_LEN) };
+            Some((start, chunk))
+        }
+
         /// Discard the pages the kernel wrote into, keeping the mapping.
         ///
-        /// The buffers are reserved at 64 × 256 KiB but only touched as far as each
-        /// GRO batch reaches, so after a burst several MiB stay resident for good. Dropping
-        /// the pages in place (instead of freeing and reallocating the buffer) leaves the
-        /// allocator alone: freeing a chunk this large would raise glibc's mmap threshold and
-        /// move the next one into an arena, where `calloc` zero-fills, and so touches, all of it.
-        /// The next receive faults fresh zero pages in on demand.
+        /// Over a burst, every slot's chunk and the retired chunks get written through, so
+        /// several MiB stay resident for good. Dropping the pages in place (instead of freeing
+        /// and reallocating the chunks) leaves the allocator alone: freeing a chunk this large
+        /// would raise glibc's mmap threshold and move the next one into an arena, where
+        /// `calloc` zero-fills, and so touches, all of it. The next receive faults fresh zero
+        /// pages in on demand. A retired chunk whose packets are still alive is left as it is.
         pub(crate) fn release_pages(&mut self) {
-            // SAFETY: sysconf has no preconditions.
-            let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
-                .ok()
-                .filter(|&page| page > 0)
-                .unwrap_or(4096);
             for buf in self.gro_bufs.iter_mut() {
-                let start = buf.as_mut_ptr() as usize;
-                let first = start.next_multiple_of(page);
-                let end = (start + buf.len()) / page * page;
-                if end <= first {
-                    continue;
-                }
-                // SAFETY: [first, end) lies inside this buffer, which we own exclusively
-                // (`&mut self`), and covers whole pages only, so no allocator metadata or
-                // neighbouring allocation shares them. MADV_DONTNEED on private anonymous
-                // memory makes the range read back as zeros, which keeps every byte of the
-                // buffer initialised. Failure only means the pages stay resident.
-                unsafe {
-                    libc::madvise(first as *mut libc::c_void, end - first, libc::MADV_DONTNEED);
+                discard_pages(buf.as_mut_ptr() as usize, buf.len());
+            }
+            for start in self.retired.iter_mut() {
+                if start.try_reclaim(CHUNK_LEN) {
+                    // The only handle again, so the whole chunk is spare capacity of `start`.
+                    let spare = start.spare_capacity_mut();
+                    discard_pages(spare.as_mut_ptr() as usize, spare.len());
                 }
             }
+        }
+    }
+
+    /// Discard the whole pages inside the `len` bytes at `start`, which no other handle may
+    /// reach: the unreceived rest of a slot, or a retired chunk with no packet alive.
+    fn discard_pages(start: usize, len: usize) {
+        // SAFETY: sysconf has no preconditions.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .ok()
+            .filter(|&page| page > 0)
+            .unwrap_or(4096);
+        let first = start.next_multiple_of(page);
+        let end = (start + len) / page * page;
+        if end <= first {
+            return;
+        }
+        // SAFETY: [first, end) lies inside the caller's exclusive range and covers whole pages
+        // only, so no allocator metadata, live packet or neighbouring allocation shares them.
+        // MADV_DONTNEED on private anonymous memory makes the range read back as zeros, which
+        // keeps every byte initialised. Failure only means the pages stay resident.
+        unsafe {
+            libc::madvise(first as *mut libc::c_void, end - first, libc::MADV_DONTNEED);
         }
     }
 
@@ -1015,6 +1090,11 @@ mod gro {
                         io_slices[i] = [IoSliceMut::new(&mut buf[..])];
                     }
 
+                    let buffered = packets.len();
+                    // Each message's slot, length, source, GRO size and timestamp. The packets
+                    // are cut out of the slots only after the iovecs' borrow of them ends.
+                    let mut received: Vec<(usize, usize, SocketAddr, Option<usize>, u64)> =
+                        Vec::new();
                     let results = nix::sys::socket::recvmmsg(
                         fd,
                         headers,
@@ -1023,14 +1103,15 @@ mod gro {
                         None,
                     )?;
 
-                    for result in results {
-                        let Some(iov) = result.iovs().next() else {
+                    // `recvmmsg` fills the slots in order, so result `slot` used `gro_bufs[slot]`.
+                    for (slot, result) in results.enumerate() {
+                        if result.iovs().next().is_none() {
                             cold_path();
                             if cfg!(debug_assertions) {
                                 tracing::trace!("Received empty datagram from IoSlice");
                             }
                             continue;
-                        };
+                        }
 
                         if result
                             .flags
@@ -1075,20 +1156,20 @@ mod gro {
                         let gro_size = gro_size
                             .and_then(|gro_size| usize::try_from(gro_size).ok())
                             .filter(|&gro_size| gro_size > 0);
+                        received.push((slot, result.bytes, source_addr, gro_size, rx_ns));
+                    }
 
-                        append_received_packets(
-                            iov,
-                            result.bytes,
-                            gro_size,
-                            source_addr,
-                            pool,
-                            packets,
-                        )?;
+                    for (slot, len, source_addr, gro_size, rx_ns) in received {
+                        let bytes = recv_many_bufs.take_received(slot, len)?;
+                        append_received_packets(bytes, gro_size, source_addr, packets)?;
                         if stamp {
                             // Every segment of a GRO batch shares its head skb's timestamp.
                             recv_many_bufs.rx_stamps.resize(packets.len(), rx_ns);
                         }
                     }
+                    // The pool's use count tells the idle release that the link is busy; these
+                    // packets no longer come from the pool, so count them there (J1129).
+                    pool.count_taken(packets.len() - buffered);
 
                     Ok(())
                 })
@@ -1131,19 +1212,24 @@ mod gro {
         use crate::packet::{Packet, PacketBufPool};
         use crate::udp::socket::SockOpt;
         use crate::udp::{UdpRecv, UdpSend};
+        use bytes::BytesMut;
         use std::net::{Ipv6Addr, SocketAddr};
         use std::time::Duration;
         #[cfg(feature = "device")]
         use {super::MAX_PACKET_COUNT, crate::udp::buffer::BufferedUdpSend, std::net::Ipv4Addr};
 
+        /// A received GRO message is cut into its datagrams in place: each packet is a view of
+        /// the slot's chunk, and only the bytes `recvmmsg` reported become packets (J1129).
         #[test]
-        fn gro_receive_splits_only_the_bytes_reported_by_recvmmsg() {
-            let mut pool = PacketBufPool::<4096>::new(3);
+        fn gro_receive_cuts_only_the_reported_bytes_without_copying() {
             let source: SocketAddr = (Ipv6Addr::LOCALHOST, 51820).into();
+            let mut bufs = RecvManyBuf::default();
+            bufs.gro_bufs[0][..12].copy_from_slice(b"abcdefghXXXX");
+            let start = bufs.gro_bufs[0].as_ptr();
             let mut packets = Vec::new();
 
-            append_received_packets(b"abcdefghXXXX", 8, Some(3), source, &mut pool, &mut packets)
-                .unwrap();
+            let bytes = bufs.take_received(0, 8).unwrap();
+            append_received_packets(bytes, Some(3), source, &mut packets).unwrap();
 
             assert_eq!(
                 packets
@@ -1153,19 +1239,74 @@ mod gro {
                 [b"abc".as_slice(), b"def", b"gh"]
             );
             assert!(packets.iter().all(|(_, addr)| *addr == source));
+            assert_eq!(packets[0].0.as_ref().as_ptr(), start, "no copy");
+            assert_eq!(
+                bufs.gro_bufs[0][..4],
+                *b"XXXX",
+                "the slot keeps receiving after the packets"
+            );
         }
 
         #[test]
         fn gro_receive_rejects_a_length_larger_than_its_iovec() {
-            let mut pool = PacketBufPool::<4096>::new(1);
-            let source: SocketAddr = (Ipv6Addr::LOCALHOST, 51820).into();
-            let mut packets = Vec::new();
+            let mut bufs = RecvManyBuf::default();
+            let len = bufs.gro_bufs[0].len();
 
-            let err = append_received_packets(b"abc", 4, None, source, &mut pool, &mut packets)
-                .unwrap_err();
+            let err = bufs.take_received(0, len + 1).unwrap_err();
 
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-            assert!(packets.is_empty());
+            assert_eq!(bufs.gro_bufs[0].len(), len, "the slot is unchanged");
+        }
+
+        /// Fill slot 0 with full-size messages until it moves to another chunk, keeping the
+        /// packets; returns them and the start of the chunk they were cut from.
+        fn fill_one_chunk(bufs: &mut RecvManyBuf) -> (Vec<BytesMut>, *const u8) {
+            let first = bufs.gro_bufs[0].as_ptr();
+            let mut kept = Vec::new();
+            while bufs.gro_bufs[0].as_ptr() >= first
+                && bufs.gro_bufs[0].as_ptr() < first.wrapping_add(super::CHUNK_LEN)
+            {
+                kept.push(bufs.take_received(0, super::MAX_MESSAGE_LEN).unwrap());
+            }
+            (kept, first)
+        }
+
+        /// A slot moves on to a fresh chunk while packets of its old chunk are alive, and takes
+        /// the old chunk back whole once they are all gone, so steady receiving allocates and
+        /// faults in nothing new.
+        #[test]
+        fn a_chunk_is_reused_only_after_its_last_packet_is_dropped() {
+            let mut bufs = RecvManyBuf::default();
+            let (kept, first) = fill_one_chunk(&mut bufs);
+            assert!(!kept.is_empty());
+            let (second_kept, second) = fill_one_chunk(&mut bufs);
+            assert_ne!(second, first, "a live packet keeps its chunk out of reuse");
+            assert_ne!(bufs.gro_bufs[0].as_ptr(), first);
+            drop(kept);
+            drop(second_kept);
+            // The slot is on a third chunk now; when that one is used up, it takes back one of
+            // the two retired chunks instead of allocating.
+            let (_third, _) = fill_one_chunk(&mut bufs);
+            let next = bufs.gro_bufs[0].as_ptr();
+            assert!(
+                next == first || next == second,
+                "a chunk with no live packet is reused"
+            );
+            assert!(bufs.gro_bufs[0].len() >= super::MAX_MESSAGE_LEN);
+        }
+
+        /// Bytes of a packet that outlives its slot's move to another chunk stay intact while
+        /// the slot keeps receiving.
+        #[test]
+        fn a_live_packet_keeps_its_bytes_while_the_slot_receives_on() {
+            let mut bufs = RecvManyBuf::default();
+            bufs.gro_bufs[0][..5].copy_from_slice(b"hello");
+            let packet = bufs.take_received(0, 5).unwrap();
+            for _ in 0..8 {
+                bufs.gro_bufs[0].fill(0xEE);
+                drop(bufs.take_received(0, super::MAX_MESSAGE_LEN).unwrap());
+            }
+            assert_eq!(&packet[..], b"hello");
         }
 
         /// Releasing an idle receive buffer drops its touched pages (they read back as zeros,
