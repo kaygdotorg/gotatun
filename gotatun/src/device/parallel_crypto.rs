@@ -63,6 +63,10 @@ pub(crate) const MIN_PARALLEL_RUN_SIZE: usize = 8;
 /// 0.19 ms → 0.31 ms). Runs this large only come from batched reads (a TSO frame from the TUN is
 /// about 44 packets at MTU 1420; a GRO datagram about 27), which happen only when the link is
 /// busy. Pings, lone ACKs and other small runs stay inline, so the idle path keeps its latency.
+///
+/// This is the lane's choice only. The per-direction inline limits ([`receive_inline_max`],
+/// [`transmit_inline_max`]) apply after it, so on Linux a bulk run still stays inline unless it
+/// is longer than [`LINUX_INLINE_RUN_MAX`].
 pub(crate) const BULK_RUN_SIZE: usize = 2 * MIN_PARALLEL_RUN_SIZE;
 
 /// Start parallel dispatch after half a worker chunk of older packets is queued for this peer.
@@ -97,10 +101,29 @@ pub(crate) const fn run_goes_to_worker(
     lane_says_worker && packet_count > inline_max
 }
 
+/// Runs of at most this many packets are opened or sealed inline on Linux, both directions
+/// (#260, J1121).
+///
+/// Only runs of more than 48 packets (in practice the full 64-packet chunks of a busy TUN or UDP
+/// read) still go to a crypto worker. Those are the handoffs that pay: forcing every run inline
+/// cost 24-29% throughput (CUBIC) and 22-35% (BBR) on the 6-vCPU perf VM, because the task stops
+/// reading its socket while it seals. Keeping the smaller runs inline removed 20-40% of crypto
+/// worker wakes and 12-30% of futex calls per Gbit with throughput and loaded p99 unchanged
+/// within run-to-run noise (J1121 screen; the head-to-head matrix is on #260). 32 saved about half
+/// as many wakes; 2-4 workers instead of one per CPU saved fewer and raised loaded p99 by up to
+/// 0.3 ms, so the pool size stays one worker per CPU.
+pub(crate) const LINUX_INLINE_RUN_MAX: usize = 48;
+
 /// The default inline limit for receive runs: 16 on macOS, where J744 measured −68% CPU per Gbit
 /// in Mac-receive with it (one current-thread runtime, so worker hand-offs are pure wake cost),
-/// and off (`0`) elsewhere, where the Linux worker hand-off is a measured throughput win.
-pub(crate) const DEFAULT_RECEIVE_INLINE_MAX: usize = if cfg!(target_os = "macos") { 16 } else { 0 };
+/// [`LINUX_INLINE_RUN_MAX`] on Linux, and off (`0`) elsewhere, where nothing was measured.
+pub(crate) const DEFAULT_RECEIVE_INLINE_MAX: usize = if cfg!(target_os = "macos") {
+    16
+} else if cfg!(target_os = "linux") {
+    LINUX_INLINE_RUN_MAX
+} else {
+    0
+};
 
 /// The inline limit `value` (a `GOTATUN_BENCH_RX_INLINE_MAX` or `GOTATUN_BENCH_TX_INLINE_MAX`
 /// variable) asks for: a number, `0` included, replaces `default`; anything else keeps it.
@@ -128,8 +151,13 @@ pub(crate) fn receive_inline_max() -> usize {
     })
 }
 
-/// The default inline limit for transmit runs: off (`0`), so the lane alone decides (#260).
-pub(crate) const DEFAULT_TRANSMIT_INLINE_MAX: usize = 0;
+/// The default inline limit for transmit runs: [`LINUX_INLINE_RUN_MAX`] on Linux, and off (`0`)
+/// elsewhere, where the lane alone decides until a measurement says otherwise (#260, J1121).
+pub(crate) const DEFAULT_TRANSMIT_INLINE_MAX: usize = if cfg!(target_os = "linux") {
+    LINUX_INLINE_RUN_MAX
+} else {
+    0
+};
 
 /// Transmit runs up to this many packets are sealed on the task that read them (#260, J1121).
 ///
@@ -2281,7 +2309,7 @@ mod tests {
             runtime.block_on(queue.push(job())).unwrap();
             assert!(!queue.sleepers[0].idle.load(Ordering::SeqCst));
             // Worker 0 takes the run and keeps it; worker 1 is still parked.
-            let _running = queue.take_job().ok().expect("the published run");
+            let _running = queue.take_job().expect("the published run");
             runtime.block_on(queue.push(job())).unwrap();
             assert!(
                 !queue.sleepers[1].idle.load(Ordering::SeqCst),
@@ -2390,7 +2418,13 @@ mod tests {
     /// `0` turns it off (#260, J763).
     #[test]
     fn the_receive_inline_limit_defaults_per_platform_and_can_be_turned_off() {
-        let default = if cfg!(target_os = "macos") { 16 } else { 0 };
+        let default = if cfg!(target_os = "macos") {
+            16
+        } else if cfg!(target_os = "linux") {
+            48
+        } else {
+            0
+        };
         assert_eq!(super::DEFAULT_RECEIVE_INLINE_MAX, default);
         assert_eq!(super::inline_max_from(None, default), default);
         assert_eq!(super::inline_max_from(Some("0"), default), 0);
@@ -2398,11 +2432,12 @@ mod tests {
         assert_eq!(super::inline_max_from(Some("x"), default), default);
     }
 
-    /// The transmit inline limit is off by default and takes the same overrides (#260, J1121).
+    /// The transmit inline limit is 48 on Linux, off elsewhere, and takes the same overrides
+    /// (#260, J1121).
     #[test]
-    fn the_transmit_inline_limit_is_off_by_default() {
+    fn the_transmit_inline_limit_defaults_per_platform() {
         let default = super::DEFAULT_TRANSMIT_INLINE_MAX;
-        assert_eq!(default, 0);
+        assert_eq!(default, if cfg!(target_os = "linux") { 48 } else { 0 });
         assert_eq!(super::inline_max_from(Some(" 32 "), default), 32);
         assert_eq!(super::inline_max_from(Some("-1"), default), default);
     }
