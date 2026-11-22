@@ -81,6 +81,19 @@ impl<const N: usize> PacketBufPool<N> {
         std::mem::take(&mut self.queue.lock().unwrap().taken)
     }
 
+    /// Count `packets` that the caller received without taking a buffer from the pool, so
+    /// [`PacketBufPool::take_count`] still sees a busy link.
+    ///
+    /// A receive path that hands out views of its own receive memory (UDP GRO, #260 J1129)
+    /// calls this once per batch; otherwise a link that only receives would look idle.
+    #[cfg(feature = "pool")]
+    pub fn count_taken(&self, packets: usize) {
+        let mut queue = self.queue.lock().unwrap();
+        queue.taken = queue
+            .taken
+            .saturating_add(u32::try_from(packets).unwrap_or(u32::MAX));
+    }
+
     /// Free every retained buffer, including the queue's own storage.
     ///
     /// Buffers still in flight return to the pool as usual afterwards, so the pool keeps
