@@ -2309,7 +2309,7 @@ mod tests {
             runtime.block_on(queue.push(job())).unwrap();
             assert!(!queue.sleepers[0].idle.load(Ordering::SeqCst));
             // Worker 0 takes the run and keeps it; worker 1 is still parked.
-            let _running = queue.take_job().ok().expect("the published run");
+            let _running = queue.take_job().expect("the published run");
             runtime.block_on(queue.push(job())).unwrap();
             assert!(
                 !queue.sleepers[1].idle.load(Ordering::SeqCst),
