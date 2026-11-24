@@ -24,8 +24,16 @@
 //! promises no order. A small encrypted datagram can overtake up to one receive queue of bulk
 //! datagrams of the same session, far inside WireGuard's replay window.
 //!
-//! Bench switch: `GOTATUN_BENCH_REPLIES_FIRST` = a comma list of `tun`, `udp` and `tx` (the UDP
-//! send queue), or `both` (`tun,udp`) or `all`. Unset, nothing moves.
+//! On by default for the send path (#260, J1143): the TUN read-ahead (`tun`) and the UDP send
+//! queue (`tx`). Three paired cross-VM holds (equal rate 2.0 Gbit/s and full speed, CUBIC and
+//! BBR, 1 and 8 flows) kept throughput within 1% and lowered the loaded median of both an ICMP
+//! probe and a keystroke-sized TCP request/response. The receive lane (`udp`, non-Linux only)
+//! was not measured there, so it stays opt-in.
+//!
+//! Switch: `GOTATUN_REPLIES_FIRST` = `off` (every queue stays a FIFO), or a comma list of
+//! `tun`, `udp` and `tx`, or `both` (`tun,udp`) or `all`. Unset or empty means the default.
+//! A value it does not understand turns every lane off, so a mistyped "no" never leaves the
+//! reordering on.
 
 use std::sync::OnceLock;
 
@@ -41,8 +49,8 @@ const TCP_FIN: u8 = 0x01;
 const TCP_SYN: u8 = 0x02;
 const TCP_RST: u8 = 0x04;
 
-/// Which queues let replies jump ahead, read once from `GOTATUN_BENCH_REPLIES_FIRST`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Which queues let replies jump ahead, read once from `GOTATUN_REPLIES_FIRST`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Mode {
     /// Reorder the TUN read-ahead batch (the send path).
     pub(crate) tun: bool,
@@ -53,18 +61,37 @@ pub(crate) struct Mode {
 }
 
 impl Mode {
-    /// Parse the switch value: a comma list of `tun`, `udp` and `tx`, or `both` (`tun,udp`) or
-    /// `all`. Anything unknown leaves every queue as it is.
+    /// Every lane off: each queue is a plain FIFO.
+    pub(crate) const OFF: Self = Self {
+        tun: false,
+        udp: false,
+        tx: false,
+    };
+
+    /// The default when the switch is unset: both send-path lanes, measured in #260 (J1143).
+    pub(crate) const DEFAULT: Self = Self {
+        tun: true,
+        udp: false,
+        tx: true,
+    };
+
+    /// Parse the switch value: unset or empty gives [`Self::DEFAULT`]; `off` gives
+    /// [`Self::OFF`]; otherwise a comma list of `tun`, `udp` and `tx`, or `both` (`tun,udp`) or
+    /// `all`. Anything unknown gives [`Self::OFF`], the behaviour before the lanes existed.
     pub(crate) fn parse(value: Option<&str>) -> Self {
-        let mut mode = Self::default();
-        for part in value.unwrap_or_default().split(',') {
+        let value = value.unwrap_or_default().trim();
+        if value.is_empty() {
+            return Self::DEFAULT;
+        }
+        let mut mode = Self::OFF;
+        for part in value.split(',') {
             match part {
                 "tun" => mode.tun = true,
                 "udp" => mode.udp = true,
                 "tx" => mode.tx = true,
                 "both" => (mode.tun, mode.udp) = (true, true),
                 "all" => (mode.tun, mode.udp, mode.tx) = (true, true, true),
-                _ => return Self::default(),
+                _ => return Self::OFF,
             }
         }
         mode
@@ -72,12 +99,15 @@ impl Mode {
 }
 
 /// The process-wide mode, read from the environment on first use.
+///
+/// Prints one `diag replies_first` line when the result differs from [`Mode::DEFAULT`], so a
+/// run that turned the lanes off (or changed them) says so in its log.
 pub(crate) fn mode() -> Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
     *MODE.get_or_init(|| {
-        let value = std::env::var("GOTATUN_BENCH_REPLIES_FIRST").ok();
+        let value = std::env::var("GOTATUN_REPLIES_FIRST").ok();
         let mode = Mode::parse(value.as_deref());
-        if mode != Mode::default() {
+        if mode != Mode::DEFAULT {
             eprintln!(
                 "diag replies_first tun={} udp={} tx={}",
                 mode.tun, mode.udp, mode.tx
@@ -239,11 +269,15 @@ mod tests {
     }
 
     #[test]
-    fn the_switch_is_off_unless_named() {
+    fn the_send_lanes_are_on_unless_turned_off() {
         let on = |tun, udp, tx| Mode { tun, udp, tx };
-        assert_eq!(Mode::parse(None), Mode::default());
-        assert_eq!(Mode::parse(Some("yes")), Mode::default());
-        assert_eq!(Mode::parse(Some("tun,nope")), Mode::default());
+        assert_eq!(Mode::parse(None), on(true, false, true), "unset = default");
+        assert_eq!(Mode::parse(Some("")), Mode::DEFAULT);
+        assert_eq!(Mode::parse(Some(" ")), Mode::DEFAULT);
+        assert_eq!(Mode::parse(Some("off")), Mode::OFF);
+        assert_eq!(Mode::parse(Some("yes")), Mode::OFF, "unknown = off");
+        assert_eq!(Mode::parse(Some("0")), Mode::OFF);
+        assert_eq!(Mode::parse(Some("tun,nope")), Mode::OFF);
         assert_eq!(Mode::parse(Some("tun")), on(true, false, false));
         assert_eq!(Mode::parse(Some("udp")), on(false, true, false));
         assert_eq!(Mode::parse(Some("tx")), on(false, false, true));
