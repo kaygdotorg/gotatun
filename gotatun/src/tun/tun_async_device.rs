@@ -36,7 +36,7 @@ use crate::{
 use std::iter;
 #[cfg(target_os = "linux")]
 use std::ops::Deref;
-use std::{convert::Infallible, io, sync::Arc, time::Duration};
+use std::{io, sync::Arc, time::Duration};
 
 #[cfg(target_os = "linux")]
 const MAX_TUN_PACKET_LEN: usize = 40 + u16::MAX as usize;
@@ -193,23 +193,31 @@ impl TunDevice {
         let tun = Arc::new(tun);
         let tun_weak = Arc::downgrade(&tun);
 
-        // Poll for changes to the MTU of the TUN device.
-        // TODO: use the OS-specific event-driven patterns that exist instead of polling
-        let watch_task = async move || -> Option<Infallible> {
+        // Watch for changes to the MTU of the TUN device.
+        // On Linux, subscribe to `NETLINK_ROUTE` `RTMGRP_LINK` events so an idle device wakes
+        // zero times (#260, J1150) and learns MTU changes immediately; fall back to a 3 s poll
+        // on other platforms or if opening the netlink socket fails.
+        let mtu_monitor = Task::spawn("tun_mtu_monitor", async move {
+            #[cfg(target_os = "linux")]
+            if watch_mtu_netlink(&tun_weak, mtu, &tx).await {
+                return;
+            }
             let mut mtu = mtu;
             loop {
                 sleep(Duration::from_secs(3)).await;
-                let tun = tun_weak.upgrade()?;
-                let new = tun.mtu().ok()?;
+                let Some(tun) = tun_weak.upgrade() else {
+                    break;
+                };
+                let Ok(new) = tun.mtu() else {
+                    break;
+                };
                 if new != mtu {
                     mtu = new;
-                    tx.send(mtu).ok()?;
+                    if tx.send(mtu).is_err() {
+                        break;
+                    }
                 }
             }
-        };
-
-        let mtu_monitor = Task::spawn("tun_mtu_monitor", async move {
-            watch_task().await;
         });
 
         Ok(Self {
@@ -236,6 +244,107 @@ impl TunDevice {
     /// Get the name of the TUN device.
     pub fn name(&self) -> Result<String, Error> {
         self.tun.tun_name().map_err(Error::GetTunName)
+    }
+}
+
+/// Watch for Linux link-layer changes over a `NETLINK_ROUTE` (`RTMGRP_LINK`) socket and re-read
+/// the TUN device MTU whenever a link event arrives (#260, J1150).
+///
+/// Returns `true` when the watcher ran until the TUN device or watch channel closed, or `false`
+/// if opening/binding the netlink socket failed so the caller should fall back to polling.
+#[cfg(target_os = "linux")]
+async fn watch_mtu_netlink(
+    tun_weak: &std::sync::Weak<tun::AsyncDevice>,
+    mut mtu: u16,
+    tx: &watch::Sender<u16>,
+) -> bool {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // SAFETY: socket() takes only integer constants and returns a new owned fd or -1.
+    let raw_fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        )
+    };
+    if raw_fd < 0 {
+        return false;
+    }
+    // SAFETY: `raw_fd` is a valid, freshly created descriptor owned exclusively here.
+    let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
+    // SAFETY: zero-initializing a C POD sockaddr_nl struct is valid.
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    addr.nl_groups = libc::RTMGRP_LINK as u32;
+
+    // SAFETY: binding our owned netlink socket to a valid sockaddr_nl.
+    let bound = unsafe {
+        libc::bind(
+            owned_fd.as_raw_fd(),
+            (&raw const addr).cast::<libc::sockaddr>(),
+            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if bound < 0 {
+        return false;
+    }
+
+    let Ok(async_fd) = tokio::io::unix::AsyncFd::new(owned_fd) else {
+        return false;
+    };
+
+    let mut scratch = [0_u8; 4096];
+    loop {
+        let Ok(mut guard) = async_fd.readable().await else {
+            return true;
+        };
+        // Drain every queued netlink message before checking MTU so a burst of link events
+        // collapses into one ioctl.
+        loop {
+            // SAFETY: receiving into our stack scratch buffer from our own non-blocking socket.
+            let n = unsafe {
+                libc::recv(
+                    async_fd.as_raw_fd(),
+                    scratch.as_mut_ptr().cast::<libc::c_void>(),
+                    scratch.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if n > 0 {
+                continue;
+            }
+            if n == 0 {
+                return true;
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                guard.clear_ready();
+                break;
+            }
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            // ENOBUFS means the kernel dropped some netlink messages; still re-check MTU below.
+            if err.raw_os_error() == Some(libc::ENOBUFS) {
+                continue;
+            }
+            return false;
+        }
+
+        let Some(tun) = tun_weak.upgrade() else {
+            return true;
+        };
+        let Ok(new) = tun.mtu() else {
+            return true;
+        };
+        if new != mtu {
+            mtu = new;
+            if tx.send(mtu).is_err() {
+                return true;
+            }
+        }
     }
 }
 

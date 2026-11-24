@@ -169,19 +169,6 @@ fn return_freed_heap_to_os() {
     }
 }
 
-/// Whether this idle-check period ends a busy stretch, given the buffers taken in it.
-///
-/// `busy` remembers whether a busy period came since the last release, so a long quiet
-/// stretch releases once rather than every period.
-fn idle_release_due(busy: &mut bool, taken: u32) -> bool {
-    if taken >= IDLE_MAX_BUFFERS_PER_PERIOD {
-        *busy = true;
-        false
-    } else {
-        std::mem::take(busy)
-    }
-}
-
 /// Error of [`Device`]-related operations.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -603,6 +590,14 @@ struct CryptoOrderContext {
     incoming: Arc<OrderStore<IncomingCompletion>>,
     /// Per-peer send lanes for ordered UDP output.
     outgoing: Arc<OrderStore<WgKind>>,
+}
+
+/// Packet buffer pool and its one-shot activity wake, handed to [`DeviceState::handle_incoming`].
+struct IncomingPool {
+    /// Shared packet buffer pool for both receive and send paths.
+    pool: PacketBufPool,
+    /// Notified once whenever the pool transitions from idle to active (#260, J1150).
+    idle_wake: Arc<tokio::sync::Notify>,
 }
 
 /// Shared state needed to enqueue and release one bounded receive run.
@@ -1165,7 +1160,11 @@ impl<T: DeviceTransports> Connection<T> {
             return Ok(());
         }
 
-        let pool = PacketBufPool::new_lazy(MAX_PACKET_BUFS);
+        let idle_wake = Arc::new(tokio::sync::Notify::new());
+        let pool = PacketBufPool::new_lazy_with_wake(MAX_PACKET_BUFS, {
+            let wake = Arc::clone(&idle_wake);
+            move || wake.notify_one()
+        });
 
         // clean up existing connection
         if let Some(conn) = device.connection.take() {
@@ -1296,7 +1295,10 @@ impl<T: DeviceTransports> Connection<T> {
                 buffered_ip_tx.clone(),
                 buffered_udp_tx,
                 incoming_udp_rx,
-                pool.clone(),
+                IncomingPool {
+                    pool: pool.clone(),
+                    idle_wake,
+                },
                 CryptoOrderContext {
                     crypto,
                     incoming: incoming_order,
@@ -2408,9 +2410,13 @@ impl<T: DeviceTransports> DeviceState<T> {
         mut tun_tx: impl IpSend + Clone,
         udp_tx: impl UdpSend + 'static,
         mut udp_rx: impl UdpRecv,
-        mut packet_pool: PacketBufPool,
+        incoming_pool: IncomingPool,
         crypto_order: CryptoOrderContext,
     ) -> Result<(), Error> {
+        let IncomingPool {
+            pool: mut packet_pool,
+            idle_wake,
+        } = incoming_pool;
         let PacketTaskHandles {
             liveness: device,
             lookup: packet_lookup,
@@ -2435,14 +2441,14 @@ impl<T: DeviceTransports> DeviceState<T> {
         let mut incoming_pending = PendingIncoming::new();
         let mut outgoing_pending = PendingOutgoing::new();
 
-        // Idle memory release. One timer for the task's lifetime, re-armed once per period,
-        // and polled only when the socket has nothing to read (`biased` polls the receive
-        // first), so a busy link pays nothing per packet. Every receive is cancel-safe while
-        // pending: nothing is consumed before its single await completes. Completion futures are
-        // polled ahead of the socket when ready so a quiet peer does not wait for another datagram.
-        let idle_check = tokio::time::sleep(IDLE_RELEASE_PERIOD);
-        tokio::pin!(idle_check);
-        let mut busy = false;
+        // Idle memory release (#260, J1150). No timer is armed while the device is already idle:
+        // `idle_wake` fires once when the first packet after idle is taken from the pool or
+        // received, arming a single 5 s timer. Once a quiet period finishes, retained buffers and
+        // receive chunks are released and the timer is dropped (unregistered from Tokio's timer
+        // wheel), leaving zero idle wakeups. Every receive is cancel-safe while pending: nothing
+        // is consumed before its single await completes. Completion futures are polled ahead of
+        // the socket when ready so a quiet peer does not wait for another datagram.
+        let mut idle_check: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
         let mut dropped_datagrams: u64 = 0;
 
         loop {
@@ -2489,16 +2495,37 @@ impl<T: DeviceTransports> DeviceState<T> {
                 }
                 // Nothing to read, but handshakes wait: serve them (below).
                 () = std::future::ready(()), if !handshake_backlog.is_empty() => {}
-                () = &mut idle_check => {
-                    idle_check
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + IDLE_RELEASE_PERIOD);
+                () = idle_wake.notified(), if idle_check.is_none() => {
+                    idle_check = Some(Box::pin(tokio::time::sleep(IDLE_RELEASE_PERIOD)));
+                    continue;
+                }
+                () = async {
+                    if let Some(sleep) = idle_check.as_mut() {
+                        sleep.as_mut().await;
+                    }
+                }, if idle_check.is_some() => {
                     // The pool sees packets in both directions, so it decides idleness.
-                    if idle_release_due(&mut busy, packet_pool.take_count()) {
+                    if packet_pool.take_count() >= IDLE_MAX_BUFFERS_PER_PERIOD {
+                        if let Some(sleep) = idle_check.as_mut() {
+                            sleep
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + IDLE_RELEASE_PERIOD);
+                        }
+                    } else {
                         packet_pool.release();
                         udp_rx.release_recv_buf(&mut udp_recv_buf);
+                        received_packets.clear();
+                        received_packets.shrink_to_fit();
                         return_freed_heap_to_os();
-                        tracing::debug!("Link idle: released packet buffers to the OS");
+                        if packet_pool.try_mark_idle() {
+                            idle_check = None;
+                            tracing::debug!("Link idle: released packet buffers to the OS");
+                        } else if let Some(sleep) = idle_check.as_mut() {
+                            // Traffic arrived while releasing; keep monitoring for another period.
+                            sleep
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + IDLE_RELEASE_PERIOD);
+                        }
                     }
                     continue;
                 }
@@ -3213,27 +3240,42 @@ mod peer_run_tests {
 
 #[cfg(test)]
 mod idle_release_tests {
-    use super::{IDLE_MAX_BUFFERS_PER_PERIOD, idle_release_due};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
-    /// Memory is released once, at the first quiet period after a busy one. Trickles such as
-    /// keepalives count as quiet, and a long quiet stretch does not release again.
+    use crate::packet::PacketBufPool;
+
+    /// The activity wake fires once on the idle-to-active transition, refuses to mark idle
+    /// while uncounted packets remain, and fires again only after a successful idle release.
     #[test]
-    fn idle_release_fires_once_per_busy_to_quiet_transition() {
-        let busy_period = IDLE_MAX_BUFFERS_PER_PERIOD;
-        let keepalive_trickle = 10;
-        let mut busy = false;
+    fn activity_wake_arms_once_per_active_stretch_and_rearms_after_idle() {
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let pool = PacketBufPool::<1024>::new_lazy_with_wake(4, {
+            let wakes = Arc::clone(&wakes);
+            move || {
+                wakes.fetch_add(1, Ordering::Relaxed);
+            }
+        });
 
-        assert!(
-            !idle_release_due(&mut busy, 0),
-            "nothing to release at start"
-        );
-        assert!(!idle_release_due(&mut busy, busy_period));
-        assert!(!idle_release_due(&mut busy, busy_period * 100));
-        assert!(idle_release_due(&mut busy, keepalive_trickle));
-        assert!(!idle_release_due(&mut busy, keepalive_trickle));
-        assert!(!idle_release_due(&mut busy, 0));
-        assert!(!idle_release_due(&mut busy, busy_period));
-        assert!(idle_release_due(&mut busy, 0));
+        assert_eq!(wakes.load(Ordering::Relaxed), 0);
+        assert!(pool.try_mark_idle(), "unused pool starts idle");
+
+        // Taking multiple packets in one active stretch wakes only once.
+        drop((pool.get(), pool.get()));
+        pool.count_taken(5);
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+
+        // Unread `taken` prevents marking idle until `take_count()` drains it.
+        assert!(!pool.try_mark_idle());
+        assert_eq!(pool.take_count(), 7);
+        pool.release();
+        assert!(pool.try_mark_idle());
+
+        // Next packet after idle wakes again.
+        pool.count_taken(1);
+        assert_eq!(wakes.load(Ordering::Relaxed), 2);
     }
 }
 

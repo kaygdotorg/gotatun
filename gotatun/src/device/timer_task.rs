@@ -20,11 +20,11 @@
 //! least one tick away. See `timer_queue` for the timing rules and `noise::timers::deadline` for
 //! how a tunnel computes its deadline.
 //!
-//! Every [`SAFETY_SWEEP`] the task also visits every peer, whatever its deadline. A visit is
-//! always correct (it only does what is due), so a deadline report that went missing can delay a
-//! timer by at most one sweep. Before each sweep visit the task checks that the peer's reported
-//! deadline is no later than its real one, and counts the peers for which it is not
-//! ([`TimerQueue::sweep_misses`], which must stay at zero).
+//! When no peer has a pending deadline, the task sleeps indefinitely on [`TimerQueue::notified`]
+//! (zero idle wakeups; #260, J1150). On Linux, timed waits use a `CLOCK_BOOTTIME` `timerfd` so
+//! the sleep tracks the same clock as `sleepyinstant` across system suspend without periodic
+//! polling. The first pass after start or resume visits every peer once so no initial deadline
+//! can be missed.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +33,7 @@ use tokio::sync::Mutex;
 
 use super::parallel_crypto::{CryptoHandle, OrderStore};
 use super::peer_state::PeerState;
-use super::timer_queue::{MAX_SLEEP, SAFETY_SWEEP, TimerQueue};
+use super::timer_queue::TimerQueue;
 use super::{
     OutgoingPeerContext, PacketLookup, PacketTaskHandles, PeerLockDiagnostic,
     complete_outgoing_packet, lock_peer_state, peer_order_key,
@@ -48,8 +48,122 @@ use crate::udp::UdpSend;
 ///
 /// The old poll did it every 250 ms. It costs a pass over every live index, and a stale index
 /// only maps a dead session to its peer (its packets are dropped there), so once a second while
-/// timers are firing, and on every sweep, is enough.
+/// timers are firing is enough.
 const RETAIN_INDICES_EVERY: Duration = Duration::from_secs(1);
+
+/// Sleeps until the next timer deadline on the same clock as [`TimerQueue`].
+///
+/// On Linux (outside `mock_instant` tests) this wraps a `CLOCK_BOOTTIME` `timerfd` in
+/// [`tokio::io::unix::AsyncFd`], so the kernel wakes the task at the exact deadline even across
+/// system suspend with zero intermediate wakeups (#260, J1150). On other platforms (where
+/// `sleepyinstant` already shares Tokio's monotonic clock) or if `timerfd_create` fails, it falls
+/// back to [`tokio::time::sleep`].
+struct DeadlineSleeper {
+    #[cfg(all(target_os = "linux", not(feature = "mock_instant")))]
+    timerfd: Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
+}
+
+impl DeadlineSleeper {
+    /// Create a sleeper, opening a `CLOCK_BOOTTIME` `timerfd` on Linux when available.
+    fn new() -> Self {
+        #[cfg(all(target_os = "linux", not(feature = "mock_instant")))]
+        {
+            use std::os::fd::{FromRawFd, OwnedFd};
+            // SAFETY: timerfd_create takes only integer flags and returns a new owned fd or -1.
+            let fd = unsafe {
+                libc::timerfd_create(libc::CLOCK_BOOTTIME, libc::TFD_NONBLOCK | libc::TFD_CLOEXEC)
+            };
+            let timerfd = if fd >= 0 {
+                // SAFETY: `fd` is a valid, freshly created descriptor owned exclusively here.
+                let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+                tokio::io::unix::AsyncFd::new(owned).ok()
+            } else {
+                None
+            };
+            Self { timerfd }
+        }
+        #[cfg(not(all(target_os = "linux", not(feature = "mock_instant"))))]
+        {
+            Self {}
+        }
+    }
+
+    /// Disarm any pending `timerfd` so an old deadline cannot fire while sleeping indefinitely.
+    fn disarm(&self) {
+        #[cfg(all(target_os = "linux", not(feature = "mock_instant")))]
+        if let Some(timerfd) = &self.timerfd {
+            use std::os::fd::AsRawFd;
+            let zero = libc::itimerspec {
+                it_interval: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+                it_value: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+            };
+            // SAFETY: valid owned timerfd and properly initialized `itimerspec`.
+            unsafe {
+                libc::timerfd_settime(timerfd.as_raw_fd(), 0, &zero, std::ptr::null_mut());
+            }
+        }
+    }
+
+    /// Sleep for `duration` (must be non-zero).
+    async fn sleep(&self, duration: Duration) {
+        #[cfg(all(target_os = "linux", not(feature = "mock_instant")))]
+        if let Some(timerfd) = &self.timerfd {
+            use std::os::fd::AsRawFd;
+            // Clamp to a safe positive `time_t` so extreme durations never overflow `tv_sec`.
+            let secs = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX / 2);
+            let nsecs = i64::from(duration.subsec_nanos());
+            // A zero `it_value` disarms a timerfd; ensure at least 1 ns for any non-zero sleep.
+            let (tv_sec, tv_nsec) = if secs == 0 && nsecs == 0 {
+                (0, 1)
+            } else {
+                (secs, nsecs)
+            };
+            let spec = libc::itimerspec {
+                it_interval: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+                it_value: libc::timespec { tv_sec, tv_nsec },
+            };
+            // SAFETY: valid owned timerfd and properly initialized `itimerspec`.
+            let armed = unsafe {
+                libc::timerfd_settime(timerfd.as_raw_fd(), 0, &spec, std::ptr::null_mut())
+            };
+            if armed == 0 {
+                loop {
+                    let Ok(mut guard) = timerfd.readable().await else {
+                        break;
+                    };
+                    let mut expirations = 0_u64;
+                    // SAFETY: reading an 8-byte expiration counter from our own timerfd.
+                    let n = unsafe {
+                        libc::read(
+                            timerfd.as_raw_fd(),
+                            (&raw mut expirations).cast::<libc::c_void>(),
+                            std::mem::size_of::<u64>(),
+                        )
+                    };
+                    if n == std::mem::size_of::<u64>() as isize {
+                        return;
+                    }
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                        guard.clear_ready();
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(duration).await;
+    }
+}
 
 /// What a peer visit needs besides the peer: the shared packet and output state.
 struct TimerContext<'a, U: UdpSend> {
@@ -89,26 +203,28 @@ pub(super) async fn run(
         udp: &udp,
         queue: &queue,
     };
-    let mut last_sweep: Option<Duration> = None;
+    let sleeper = DeadlineSleeper::new();
+    let mut initial_pass = true;
     let mut last_retain: Option<Duration> = None;
     loop {
         if device.upgrade().is_none() {
             break;
         }
         let now = queue.now();
-        let sweep = last_sweep.is_none_or(|at| now >= at + SAFETY_SWEEP);
-        let due = if sweep {
-            // The sweep visits everyone, so pending deadlines are served by it.
+        let due = if initial_pass {
+            // First pass after start or resume visits every peer once so no initial deadline
+            // can be missed.
+            initial_pass = false;
             queue.take_due(now);
             packet_lookup.peers()
         } else {
             queue.take_due(now)
         };
 
-        if !due.is_empty() || sweep {
+        if !due.is_empty() {
             // Remove stale session indices. Once a session is stale it is dropped by
             // `update_session_timers`, and its associated index is freed from the table.
-            if sweep || last_retain.is_none_or(|at| now >= at + RETAIN_INDICES_EVERY) {
+            if last_retain.is_none_or(|at| now >= at + RETAIN_INDICES_EVERY) {
                 packet_lookup.retain_live_indices(&index_table);
                 last_retain = Some(now);
             }
@@ -116,36 +232,31 @@ pub(super) async fn run(
 
         // This snapshot owns peer handles and does not retain lookup state during timer work.
         for peer in due {
-            visit_peer(peer, &context, sweep).await;
-        }
-        if sweep {
-            last_sweep = Some(now);
+            visit_peer(peer, &context).await;
         }
 
         let now = queue.now();
-        let until_sweep =
-            last_sweep.map_or(Duration::ZERO, |at| (at + SAFETY_SWEEP).saturating_sub(now));
-        let sleep = queue.sleep_for(now, MAX_SLEEP.min(until_sweep));
-        if sleep.is_zero() {
-            // Something is due already; yield so other tasks run between passes.
-            tokio::task::yield_now().await;
-            continue;
-        }
-        tokio::select! {
-            () = tokio::time::sleep(sleep) => {}
-            () = queue.notified() => {}
+        match queue.sleep_for(now) {
+            Some(sleep) if sleep.is_zero() => {
+                // Something is due already; yield so other tasks run between passes.
+                tokio::task::yield_now().await;
+            }
+            Some(sleep) => {
+                tokio::select! {
+                    () = sleeper.sleep(sleep) => {}
+                    () = queue.notified() => {}
+                }
+            }
+            None => {
+                sleeper.disarm();
+                queue.notified().await;
+            }
         }
     }
 }
 
 /// Run one peer's due timers and send what they produce, then report its next deadline.
-///
-/// `check` asks for the sweep's consistency check first (see the module docs).
-async fn visit_peer<U: UdpSend>(
-    peer: Arc<Mutex<PeerState>>,
-    context: &TimerContext<'_, U>,
-    check: bool,
-) {
+async fn visit_peer<U: UdpSend>(peer: Arc<Mutex<PeerState>>, context: &TimerContext<'_, U>) {
     let TimerContext {
         lookup: packet_lookup,
         outgoing_order,
@@ -169,18 +280,11 @@ async fn visit_peer<U: UdpSend>(
         Some(addr) => addr,
         None => {
             // Nothing can be sent without an endpoint. The peer is scheduled again by any timer
-            // its traffic arms, by a configured endpoint, or by the next sweep.
+            // its traffic arms or by a configured endpoint.
             p.tunnel.unschedule_timers();
             return;
         }
     };
-    if check && !p.tunnel.timer_schedule_is_consistent() {
-        queue.record_miss();
-        tracing::warn!(
-            misses = queue.sweep_misses(),
-            "A peer's timer deadline was reported late; the sweep ran it"
-        );
-    }
     if outgoing_order.is_flushing(peer_key) || outgoing_order.available(peer_key) == 0 {
         // Leave due timers untouched until a bounded output slot is available, and look again
         // on the next tick.
