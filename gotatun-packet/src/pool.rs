@@ -11,15 +11,31 @@
 
 use bytes::BytesMut;
 use std::collections::VecDeque;
+#[cfg(feature = "pool")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::Packet;
+
+/// Tracks whether a [`PacketBufPool`] has seen packet activity since its last idle release,
+/// waking the device's idle-release task once on the idle-to-active transition so an idle
+/// device keeps no timer armed (#260, J1150).
+#[cfg(feature = "pool")]
+struct ActivityGate {
+    /// `true` once the idle-release task has been notified for the current active stretch;
+    /// reset to `false` by [`PacketBufPool::try_mark_idle`] when no new packets arrived.
+    active: AtomicBool,
+    /// Callback invoked on the `false` -> `true` transition of `active`.
+    wake: Box<dyn Fn() + Send + Sync>,
+}
 
 /// A pool of packet buffers.
 #[derive(Clone)]
 pub struct PacketBufPool<const N: usize = 4096> {
     queue: Arc<Mutex<PoolQueue>>,
     capacity: usize,
+    #[cfg(feature = "pool")]
+    activity: Option<Arc<ActivityGate>>,
 }
 
 /// Buffers waiting for re-use, plus the use count the idle release reads.
@@ -47,16 +63,42 @@ impl<const N: usize> PacketBufPool<N> {
             buffers.push_back(BytesMut::zeroed(N).split_to(0));
         }
 
-        Self::from_buffers(buffers, capacity)
+        #[cfg(feature = "pool")]
+        {
+            Self::from_buffers(buffers, capacity, None)
+        }
+        #[cfg(not(feature = "pool"))]
+        {
+            Self::from_buffers(buffers, capacity)
+        }
     }
 
     /// Create an empty [`PacketBufPool`] with space for at least `capacity` returned buffers.
     #[cfg(feature = "pool")]
     pub fn new_lazy(capacity: usize) -> Self {
-        Self::from_buffers(VecDeque::new(), capacity)
+        Self::from_buffers(VecDeque::new(), capacity, None)
     }
 
-    fn from_buffers(buffers: VecDeque<BytesMut>, capacity: usize) -> Self {
+    /// Create an empty [`PacketBufPool`] that invokes `on_active` once whenever the pool
+    /// transitions from idle to active, so the caller only arms its idle-release timer while
+    /// traffic has actually occurred (#260, J1150).
+    #[cfg(feature = "pool")]
+    pub fn new_lazy_with_wake(
+        capacity: usize,
+        on_active: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        let gate = Arc::new(ActivityGate {
+            active: AtomicBool::new(false),
+            wake: Box::new(on_active),
+        });
+        Self::from_buffers(VecDeque::new(), capacity, Some(gate))
+    }
+
+    fn from_buffers(
+        buffers: VecDeque<BytesMut>,
+        capacity: usize,
+        #[cfg(feature = "pool")] activity: Option<Arc<ActivityGate>>,
+    ) -> Self {
         PacketBufPool {
             queue: Arc::new(Mutex::new(PoolQueue {
                 buffers,
@@ -64,7 +106,42 @@ impl<const N: usize> PacketBufPool<N> {
                 taken: 0,
             })),
             capacity,
+            #[cfg(feature = "pool")]
+            activity,
         }
+    }
+
+    /// Notify the activity callback once when transitioning from idle to active.
+    ///
+    /// Hot path while active is a single relaxed load (no atomic RMW, no lock). Must be called
+    /// after incrementing `queue.taken` under `self.queue` so it orders cleanly against
+    /// [`Self::try_mark_idle`].
+    #[inline]
+    fn mark_active(&self) {
+        #[cfg(feature = "pool")]
+        if let Some(gate) = &self.activity
+            && !gate.active.load(Ordering::Relaxed)
+            && !gate.active.swap(true, Ordering::AcqRel)
+        {
+            (gate.wake)();
+        }
+    }
+
+    /// Mark the pool idle if no packet was taken since the last [`Self::take_count`].
+    ///
+    /// Returns `true` when the pool transitioned to idle and the caller may disarm its
+    /// idle-check timer; returns `false` if a packet arrived concurrently, in which case the
+    /// caller should keep the timer armed for another period.
+    #[cfg(feature = "pool")]
+    pub fn try_mark_idle(&self) -> bool {
+        let queue = self.queue.lock().unwrap();
+        if queue.taken > 0 {
+            return false;
+        }
+        if let Some(gate) = &self.activity {
+            gate.active.store(false, Ordering::Release);
+        }
+        true
     }
 
     /// Get the configured capacity of this pool.
@@ -88,10 +165,16 @@ impl<const N: usize> PacketBufPool<N> {
     /// calls this once per batch; otherwise a link that only receives would look idle.
     #[cfg(feature = "pool")]
     pub fn count_taken(&self, packets: usize) {
-        let mut queue = self.queue.lock().unwrap();
-        queue.taken = queue
-            .taken
-            .saturating_add(u32::try_from(packets).unwrap_or(u32::MAX));
+        if packets == 0 {
+            return;
+        }
+        {
+            let mut queue = self.queue.lock().unwrap();
+            queue.taken = queue
+                .taken
+                .saturating_add(u32::try_from(packets).unwrap_or(u32::MAX));
+        }
+        self.mark_active();
     }
 
     /// Free every retained buffer, including the queue's own storage.
@@ -151,8 +234,10 @@ impl<const N: usize> PacketBufPool<N> {
     /// This will try to re-use an already allocated packet if possible, or allocate one otherwise.
     pub fn get(&self) -> Packet<[u8]> {
         if let Some(packet) = self.re_use() {
+            self.mark_active();
             return packet;
         }
+        self.mark_active();
 
         let mut buf = BytesMut::zeroed(N);
         let pointer_to_start_of_allocation = buf.split_to(0);

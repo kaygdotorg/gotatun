@@ -277,9 +277,9 @@ impl<R: rand::RngCore + Send> Tunn<R> {
     /// Whether the pending deadline is no later than the real one, allowing the one-tick floor
     /// that [`Tunn::reschedule_timers`] applies after a visit.
     ///
-    /// A device's safety sweep calls this before it visits a peer; `false` means a transition
-    /// armed an earlier timer without reporting it. Always `true` without a hook.
-    #[cfg_attr(not(feature = "device"), allow(dead_code))]
+    /// Tests call this on every tick to verify that no transition armed an earlier timer without
+    /// reporting it. Always `true` without a hook.
+    #[cfg(all(test, feature = "mock_instant"))]
     pub(crate) fn timer_schedule_is_consistent(&self) -> bool {
         if self.timers.schedule.hook.is_none() {
             return true;
