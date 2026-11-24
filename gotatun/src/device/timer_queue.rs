@@ -19,9 +19,10 @@
 //!   after it is due, as with the old poll, and deadlines that fall in one tick share a wake.
 //! - A deadline that is already due is served at once, so a requested keepalive still leaves
 //!   immediately.
-//! - The task never sleeps longer than [`MAX_SLEEP`]. Deadlines are measured on the WireGuard
-//!   clock, which keeps running while the system sleeps; the runtime's sleep timer may not. The
-//!   cap bounds how late a timer can be after the system wakes up.
+//! - When no peer has a pending deadline, [`TimerQueue::sleep_for`] returns `None` and the timer
+//!   task sleeps until [`TimerQueue::notified`] fires (zero idle wakeups; #260, J1150). On Linux
+//!   the timer task sleeps on a `CLOCK_BOOTTIME` `timerfd`, which uses the same clock as
+//!   `sleepyinstant` and wakes immediately after system suspend without periodic polling.
 //!
 //! # Consistency
 //!
@@ -34,7 +35,6 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::Weak;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Mutex;
@@ -47,20 +47,6 @@ use mock_instant::thread_local::Instant;
 
 #[cfg(not(feature = "mock_instant"))]
 use crate::sleepyinstant::Instant;
-
-/// The longest the timer task sleeps, even with nothing due.
-///
-/// One cheap wake per second, independent of the peer count. It bounds how late a timer fires
-/// after the system resumes from sleep (see the module docs).
-pub(crate) const MAX_SLEEP: Duration = Duration::from_secs(1);
-
-/// How often the timer task visits every peer regardless of its deadline.
-///
-/// A safety net while the deadline queue is new: a visit is always correct, so a missed report
-/// can delay a timer by at most this long. Each sweep also counts peers whose reported deadline
-/// was later than their real one ([`TimerQueue::sweep_misses`], which must stay at zero). It costs
-/// one old-style pass every ten seconds, a fortieth of the old poll.
-pub(crate) const SAFETY_SWEEP: Duration = Duration::from_secs(10);
 
 /// A peer the timer task should visit, as stored in the queue.
 type PeerHandle = Weak<Mutex<PeerState>>;
@@ -75,8 +61,6 @@ pub(crate) struct TimerQueue {
     wake: tokio::sync::Notify,
     /// The time origin of every deadline in this queue.
     epoch: Epoch,
-    /// Peers whose reported deadline was later than their real one when a sweep checked.
-    misses: AtomicU64,
 }
 
 /// The queue's clock origin, on the same clock as the tunnels' timers.
@@ -195,36 +179,23 @@ impl TimerQueue {
         self.state.lock().peek_live()
     }
 
-    /// How long the timer task should sleep at `now`: until the earliest deadline rounded up to
-    /// the tick grid, zero if one is already due, and never more than `cap`.
-    pub(crate) fn sleep_for(&self, now: Duration, cap: Duration) -> Duration {
-        let Some(due) = self.next_due() else {
-            return cap;
-        };
+    /// How long the timer task should sleep at `now`: `Some(duration)` until the earliest
+    /// deadline rounded up to the tick grid (or zero if one is already due), or `None` when
+    /// no peer has any pending deadline and the task should sleep until notified (#260, J1150).
+    pub(crate) fn sleep_for(&self, now: Duration) -> Option<Duration> {
+        let due = self.next_due()?;
         if due <= now {
-            return Duration::ZERO;
+            return Some(Duration::ZERO);
         }
         let tick = TIMER_TICK.as_nanos();
         let wake = due.as_nanos().div_ceil(tick) * tick;
         let wake = Duration::from_nanos(u64::try_from(wake).unwrap_or(u64::MAX));
-        wake.saturating_sub(now).min(cap)
+        Some(wake.saturating_sub(now))
     }
 
     /// Wait until a deadline earlier than the current earliest one is reported.
     pub(crate) async fn notified(&self) {
         self.wake.notified().await;
-    }
-
-    /// Record a peer whose deadline was found later than its real one by a sweep.
-    pub(crate) fn record_miss(&self) {
-        self.misses.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Peers that sweeps found scheduled too late, since the device started. Must stay at zero;
-    /// anything else is a missing report in the tunnel and a timer that fired up to one sweep
-    /// late.
-    pub(crate) fn sweep_misses(&self) -> u64 {
-        self.misses.load(Ordering::Relaxed)
     }
 }
 
@@ -285,23 +256,23 @@ mod tests {
         assert!(queue.next_due().is_none());
     }
 
-    /// Wake-ups land on the tick grid, never wait for a due deadline, and respect the cap.
+    /// Wake-ups land on the tick grid, never wait for a due deadline, and return `None` when empty.
     #[test]
-    fn sleep_rounds_up_to_the_tick_and_is_capped() {
+    fn sleep_rounds_up_to_the_tick_and_is_none_when_empty() {
         let queue = TimerQueue::default();
         let a = peer();
-        assert_eq!(queue.sleep_for(Duration::ZERO, MAX_SLEEP), MAX_SLEEP);
+        assert_eq!(queue.sleep_for(Duration::ZERO), None);
 
         queue.set(&Arc::downgrade(&a), Some(Duration::ZERO));
         assert_eq!(
-            queue.sleep_for(queue.now() + Duration::from_millis(1), MAX_SLEEP),
-            Duration::ZERO
+            queue.sleep_for(queue.now() + Duration::from_millis(1)),
+            Some(Duration::ZERO)
         );
 
         // Put the deadline at a known point by forging the clock reading passed in.
         let due = queue.next_due().unwrap();
         let now = due.saturating_sub(Duration::from_millis(1));
-        let sleep = queue.sleep_for(now, Duration::from_secs(60));
+        let sleep = queue.sleep_for(now).expect("peer deadline is pending");
         let wake = now + sleep;
         assert!(wake >= due, "woke before the deadline");
         assert!(wake < due + TIMER_TICK, "woke more than one tick late");

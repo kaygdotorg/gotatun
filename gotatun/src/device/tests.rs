@@ -1863,7 +1863,10 @@ async fn j433_incoming_handshake_during_an_outgoing_flush_keeps_receiving() {
             tun,
             udp_tx,
             udp_rx,
-            PacketBufPool::new_lazy(64),
+            super::IncomingPool {
+                pool: PacketBufPool::new_lazy(64),
+                idle_wake: Arc::new(tokio::sync::Notify::new()),
+            },
             super::CryptoOrderContext {
                 crypto: workers.handle(),
                 incoming: Arc::new(OrderStore::default()),
