@@ -997,25 +997,47 @@ mod gro {
             Some((start, chunk))
         }
 
-        /// Discard the pages the kernel wrote into, keeping the mapping.
+        /// Discard the pages the kernel wrote into, keeping the active slot mappings, and
+        /// drop retired chunks so idle RSS returns to the pre-load floor (#260, J1150).
         ///
-        /// Over a burst, every slot's chunk and the retired chunks get written through, so
-        /// several MiB stay resident for good. Dropping the pages in place (instead of freeing
-        /// and reallocating the chunks) leaves the allocator alone: freeing a chunk this large
-        /// would raise glibc's mmap threshold and move the next one into an arena, where
-        /// `calloc` zero-fills, and so touches, all of it. The next receive faults fresh zero
-        /// pages in on demand. A retired chunk whose packets are still alive is left as it is.
+        /// Over a burst, every slot's chunk (both its consumed prefix and its unreceived tail)
+        /// and the retired chunks get written through, so several MiB stay resident. For each
+        /// active slot, we drop the tail handle and try to reclaim the whole 128 KiB chunk via
+        /// `starts[i]` so `MADV_DONTNEED` discards the consumed prefix too (not only the
+        /// unreceived tail). If a packet cut from that slot is still in flight, the slot gets a
+        /// fresh demand-zeroed chunk and the old chunk frees when that packet drops. Retired
+        /// chunks are cleared outright instead of retaining up to 128 chunks and their
+        /// page-alignment edges across idle periods.
         pub(crate) fn release_pages(&mut self) {
-            for buf in self.gro_bufs.iter_mut() {
-                discard_pages(buf.as_mut_ptr() as usize, buf.len());
-            }
-            for start in self.retired.iter_mut() {
+            for (start, buf) in self.starts.iter_mut().zip(self.gro_bufs.iter_mut()) {
+                if buf.len() == CHUNK_LEN {
+                    discard_pages(buf.as_mut_ptr() as usize, buf.len());
+                    continue;
+                }
+                drop(std::mem::take(buf));
                 if start.try_reclaim(CHUNK_LEN) {
-                    // The only handle again, so the whole chunk is spare capacity of `start`.
                     let spare = start.spare_capacity_mut();
                     discard_pages(spare.as_mut_ptr() as usize, spare.len());
+                    let mut chunk = start.split_off(0);
+                    debug_assert!(chunk.capacity() >= CHUNK_LEN);
+                    // SAFETY: `try_reclaim` succeeded, so `start` was the chunk's only handle
+                    // and the capacity covers the whole chunk again; `MADV_DONTNEED` on
+                    // private anonymous memory yields zero bytes, so all `CHUNK_LEN` bytes
+                    // remain initialised (see the type invariant).
+                    unsafe { chunk.set_len(CHUNK_LEN) };
+                    *buf = chunk;
+                } else {
+                    // A packet cut from this chunk is still alive; give the slot a fresh
+                    // demand-zeroed chunk and let the old one drop with its last packet.
+                    let (new_start, new_buf) = new_chunk();
+                    *start = new_start;
+                    *buf = new_buf;
                 }
             }
+            self.retired.clear();
+            self.retired.shrink_to_fit();
+            self.rx_stamps.clear();
+            self.rx_stamps.shrink_to_fit();
         }
     }
 
@@ -1336,6 +1358,36 @@ mod gro {
                 buf[..64 * 1024].fill(0x55);
                 assert!(buf[..64 * 1024].iter().all(|&b| b == 0x55));
             }
+        }
+
+        /// After a burst, `release_pages` reclaims active slots' consumed prefixes back to full
+        /// `CHUNK_LEN`, clears retired chunks, and leaves any slot with a live packet intact.
+        #[test]
+        fn release_pages_reclaims_consumed_prefixes_and_clears_retired() {
+            let mut bufs = RecvManyBuf::default();
+            // Slot 0: consume 32 KiB and drop the packet so the whole chunk is reclaimable.
+            bufs.gro_bufs[0][..32 * 1024].fill(0xAA);
+            drop(bufs.take_received(0, 32 * 1024).unwrap());
+            assert_eq!(bufs.gro_bufs[0].len(), super::CHUNK_LEN - 32 * 1024);
+
+            // Slot 1: keep a live packet in flight so slot 1 must swap to a fresh chunk.
+            bufs.gro_bufs[1][..5].copy_from_slice(b"alive");
+            let live = bufs.take_received(1, 5).unwrap();
+
+            // Slot 2: fill enough to push a chunk onto `retired`.
+            bufs.gro_bufs[2][..super::MAX_MESSAGE_LEN].fill(0xBB);
+            drop(bufs.take_received(2, super::MAX_MESSAGE_LEN).unwrap());
+            bufs.gro_bufs[2][..1024].fill(0xCC);
+            drop(bufs.take_received(2, 1024).unwrap());
+            assert!(!bufs.retired.is_empty());
+
+            bufs.release_pages();
+
+            assert_eq!(bufs.gro_bufs[0].len(), super::CHUNK_LEN);
+            assert_eq!(bufs.gro_bufs[1].len(), super::CHUNK_LEN);
+            assert_eq!(bufs.gro_bufs[2].len(), super::CHUNK_LEN);
+            assert!(bufs.retired.is_empty());
+            assert_eq!(&live[..], b"alive");
         }
 
         #[tokio::test]
