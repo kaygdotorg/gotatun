@@ -221,8 +221,8 @@ async fn flush_replies<U: UdpSend>(
 impl BufferedUdpSend {
     /// Wrap a [`UdpSend`] into a [`BufferedUdpSend`] with `capacity`.
     ///
-    /// Small datagrams get their own lane when `GOTATUN_BENCH_REPLIES_FIRST` names `tx`
-    /// (#260, J720; see [`crate::priority`]).
+    /// Small datagrams get their own lane unless `GOTATUN_REPLIES_FIRST` turns `tx` off
+    /// (on by default since #260 J1143; see [`crate::priority`]).
     pub fn new(capacity: usize, udp_tx: impl UdpSend + 'static) -> Self {
         Self::with_reply_lane(capacity, udp_tx, crate::priority::mode().tx)
     }
@@ -516,8 +516,8 @@ pub struct BufferedUdpReceive {
 impl BufferedUdpReceive {
     /// Wrap a [`UdpRecv`] into a [`BufferedUdpReceive`] with `capacity`.
     ///
-    /// Small datagrams get their own lane when `GOTATUN_BENCH_REPLIES_FIRST` names `udp`
-    /// (#260, J720; see [`crate::priority`]).
+    /// Small datagrams get their own lane when `GOTATUN_REPLIES_FIRST` names `udp` (#260, J720;
+    /// off by default, see [`crate::priority`]).
     pub fn new(capacity: usize, udp_rx: impl UdpRecv + 'static, recv_pool: PacketBufPool) -> Self {
         Self::with_reply_lane(capacity, udp_rx, recv_pool, crate::priority::mode().udp)
     }
