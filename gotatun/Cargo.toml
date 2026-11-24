@@ -18,7 +18,13 @@ targets = ["aarch64-apple-darwin", "x86_64-pc-windows-msvc", "aarch64-linux-andr
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
-crate-type = ["cdylib", "rlib", "staticlib"]
+# No `cdylib` (#580, J1173). Cargo cannot switch a crate type on with a
+# feature, and it builds and links EVERY listed type even when this crate is
+# only a dependency, so an iOS build that wants a static library still needed a
+# working iOS linker just for a dynamic library nobody loads. Nothing in this
+# fork uses one. Whoever wants a shared library builds it on demand, without
+# touching the manifest: `cargo rustc -p gotatun --lib --crate-type cdylib`.
+crate-type = ["rlib", "staticlib"]
 
 [[bench]]
 harness = false
