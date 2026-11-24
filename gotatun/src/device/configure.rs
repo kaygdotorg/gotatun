@@ -100,6 +100,7 @@ pub struct PeerMut {
     endpoint: Update<SocketAddr>,
     keepalive: Update<u16>,
     timer_params: Update<TimerParams>,
+    side_port: Option<bool>,
 
     clear_allowed_ips: bool,
     add_allowed_ips: Vec<IpNetwork>,
@@ -127,6 +128,17 @@ impl PeerMut {
     /// kept. See [`TimerParams`].
     pub fn dangerously_set_timer_params(&mut self, timer_params: Option<TimerParams>) {
         self.timer_params = timer_params.into();
+    }
+
+    /// Let small data datagrams to this peer leave from the device's side socket (#260, J1159).
+    ///
+    /// Only for a peer known to run a GotaTun with the side-port receive rule: stock WireGuard
+    /// drops the marked datagrams, and an older GotaTun would roam to the side port. See
+    /// `side_port` in the crate source for the mark and the roaming rule. Without this call a
+    /// peer follows the bench switch `GOTATUN_SIDE_SOCKET` (off unless set to `1`). It has no
+    /// effect while the device has no side socket.
+    pub fn set_side_port(&mut self, on: bool) {
+        self.side_port = Some(on);
     }
 
     /// Clear all allowed IPs for this peer.
@@ -347,7 +359,12 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
             endpoint,
             keepalive,
             timer_params,
+            side_port,
         } = peer_mut;
+
+        if let Some(on) = side_port {
+            existing_peer.tunnel.set_side_port(on);
+        }
 
         if let Update::Set(preshared_key) = preshared_key {
             existing_peer.tunnel.set_preshared_key(preshared_key);

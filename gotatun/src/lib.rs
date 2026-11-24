@@ -39,6 +39,8 @@ pub(crate) mod sleepyinstant;
 
 #[cfg(feature = "device")]
 pub(crate) mod serialization;
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
+pub(crate) mod side_port;
 
 /// Re-export `gotatun-packet` types
 pub use gotatun_packet as packet;

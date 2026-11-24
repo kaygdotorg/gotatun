@@ -93,6 +93,10 @@ impl PeerState {
         let mut allowed_ips = allowed_ips.to_vec();
         normalize_allowed_ips(&mut allowed_ips);
 
+        // Side-port opt-in starts from the bench switch (#260, J1159); `PeerMut::set_side_port`
+        // overrides it per peer.
+        let mut tunnel = tunnel;
+        tunnel.set_side_port(crate::side_port::wanted());
         Self {
             tunnel,
             endpoint: Endpoint {
@@ -115,10 +119,16 @@ impl PeerState {
     /// response to our own initiation also update the confirmed endpoint; an accepted initiation
     /// does not, because it proves nothing until its sender's first data packet. Waiters are
     /// notified if the packet completes a handshake that we initiated.
+    ///
+    /// A data packet with the side mark (#260, J1159, [`crate::side_port`]) is delivered but
+    /// moves neither endpoint, as in [`Self::complete_incoming_data`].
     pub fn handle_incoming_packet(&mut self, packet: WgKind, addr: SocketAddr) -> TunnResult {
         let is_handshake_resp = matches!(packet, WgKind::HandshakeResp(_));
+        let side_port = matches!(&packet, WgKind::Data(data)
+            if crate::side_port::is_marked(zerocopy::IntoBytes::as_bytes(&**data)));
         let result = self.tunnel.handle_incoming_packet(packet);
         match result {
+            TunnResult::WriteToTunnel(_) if side_port => {}
             TunnResult::WriteToNetwork(_) => {
                 self.endpoint.addr = Some(addr);
                 if is_handshake_resp {
@@ -138,13 +148,20 @@ impl PeerState {
     }
 
     /// Apply the tunnel bookkeeping after a worker decrypts an incoming data packet.
+    ///
+    /// A packet that proves key possession moves the endpoint to `addr`, unless it carried the
+    /// side mark (#260, J1159, [`crate::side_port`]): it left the peer's second socket, whose
+    /// port the peer never wants traffic on, so the endpoint stays on the peer's main port.
     pub(crate) fn complete_incoming_data(
         &mut self,
         result: Result<VerifiedDecryption, WireGuardError>,
         addr: SocketAddr,
     ) -> TunnResult {
+        let side_port = result
+            .as_ref()
+            .is_ok_and(VerifiedDecryption::came_from_side_port);
         let result = self.tunnel.complete_incoming_packet(result);
-        if matches!(result, TunnResult::WriteToTunnel(_)) {
+        if !side_port && matches!(result, TunnResult::WriteToTunnel(_)) {
             self.endpoint.addr = Some(addr);
             self.confirm_endpoint(addr);
         }
@@ -401,6 +418,80 @@ mod confirmed_endpoint_tests {
             .unwrap();
         assert!(matches!(
             responder.handle_incoming_packet(data, roamed),
+            TunnResult::WriteToTunnel(_)
+        ));
+        assert_eq!(responder.endpoint().addr, Some(roamed));
+        assert_eq!(responder.endpoint().confirmed, Some(roamed));
+    }
+
+    /// Data from the peer's side socket (side mark, #260 J1159) is delivered but moves neither
+    /// endpoint, on the parallel and the serial receive path. Keepalives are never marked, and the
+    /// same peer's unmarked data still roams.
+    #[test]
+    fn side_port_data_is_delivered_without_roaming() {
+        use zerocopy::IntoBytes;
+
+        let initiator_key = StaticSecret::random_from_rng(rand_core::OsRng);
+        let responder_key = StaticSecret::random_from_rng(rand_core::OsRng);
+        let new_state = |local: &StaticSecret, remote: &StaticSecret| {
+            PeerState::new(
+                tunnel(local, remote),
+                None,
+                &[],
+                #[cfg(feature = "daita")]
+                None,
+            )
+        };
+        let mut initiator = new_state(&initiator_key, &responder_key);
+        let mut responder = new_state(&responder_key, &initiator_key);
+        let main: SocketAddr = "192.0.2.10:51820".parse().unwrap();
+        let side: SocketAddr = "192.0.2.10:40001".parse().unwrap();
+        let responder_addr: SocketAddr = "198.51.100.1:51820".parse().unwrap();
+
+        let init = initiator.tunnel.format_handshake_initiation(false).unwrap();
+        let response = network(responder.handle_incoming_packet(WgKind::from(init), main));
+        let keepalive = network(initiator.handle_incoming_packet(response, responder_addr));
+        let _ = responder.handle_incoming_packet(keepalive, main);
+        assert_eq!(responder.endpoint().confirmed, Some(main));
+
+        initiator.tunnel.set_side_port(true);
+        let small = |initiator: &mut PeerState, len: usize| {
+            let packet = Packet::from_bytes(bytes::BytesMut::zeroed(len));
+            match initiator.tunnel.handle_outgoing_packet(packet, None) {
+                Some(WgKind::Data(data)) => data,
+                other => panic!("expected a data packet, got {other:?}"),
+            }
+        };
+
+        // Parallel path: prepare, decrypt on a worker, complete under the peer lock.
+        let data = small(&mut initiator, 64);
+        assert!(crate::side_port::is_marked(data.as_bytes()));
+        let crate::noise::PreparedIncoming::Decrypt { packet } =
+            responder.prepare_incoming_data(data)
+        else {
+            panic!("a data packet with a session is decrypted on a worker");
+        };
+        assert!(matches!(
+            responder.complete_incoming_data(packet.decrypt(), side),
+            TunnResult::WriteToTunnel(_)
+        ));
+        assert_eq!(responder.endpoint().addr, Some(main));
+        assert_eq!(responder.endpoint().confirmed, Some(main));
+
+        // Serial path.
+        let data = small(&mut initiator, 64);
+        assert!(matches!(
+            responder.handle_incoming_packet(WgKind::Data(data), side),
+            TunnResult::WriteToTunnel(_)
+        ));
+        assert_eq!(responder.endpoint().addr, Some(main));
+
+        // A keepalive is never marked, so it roams, like any unmarked data.
+        let keepalive = small(&mut initiator, 0);
+        assert!(!crate::side_port::is_marked(keepalive.as_bytes()));
+        let roamed: SocketAddr = "192.0.2.20:51820".parse().unwrap();
+        assert!(matches!(
+            responder.handle_incoming_packet(WgKind::Data(keepalive), roamed),
             TunnResult::WriteToTunnel(_)
         ));
         assert_eq!(responder.endpoint().addr, Some(roamed));

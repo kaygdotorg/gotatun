@@ -68,6 +68,14 @@ impl PreparedEncryption {
         self.packet.is_keepalive()
     }
 
+    /// Set the side mark if this is a small data packet with a payload (#260, J1159).
+    ///
+    /// The mark sits in a reserved header byte that the AEAD does not cover, so setting it here,
+    /// before encryption, and clearing it later in the UDP send queue are both safe.
+    pub(crate) fn mark_side_port(&mut self) {
+        crate::side_port::mark(self.packet.as_mut_bytes());
+    }
+
     /// Apply AEAD and return the encrypted packet.
     pub(crate) fn encrypt(self) -> WgKind {
         let packet = self.session.encrypt_packet_data(self.packet);
@@ -85,12 +93,15 @@ pub(crate) struct PreparedDecryption {
 impl PreparedDecryption {
     /// Authenticate and decrypt a packet without advancing the replay window.
     pub(crate) fn decrypt(self) -> Result<VerifiedDecryption, WireGuardError> {
+        // Read the side mark before decryption consumes the header (#260, J1159).
+        let side_port = crate::side_port::is_marked(self.packet.as_bytes());
         let (counter, packet) = self.session.decrypt_packet_data(self.packet)?;
         Ok(VerifiedDecryption {
             session: self.session,
             session_slot: self.session_slot,
             counter,
             packet,
+            side_port,
         })
     }
 }
@@ -101,9 +112,17 @@ pub(crate) struct VerifiedDecryption {
     session_slot: usize,
     counter: u64,
     packet: Packet,
+    /// Whether the datagram carried the side mark (see [`crate::side_port`]): it left the peer's
+    /// side socket, so its source address must not become the peer's endpoint.
+    side_port: bool,
 }
 
 impl VerifiedDecryption {
+    /// Whether the datagram came from the peer's side socket (it carried the side mark).
+    pub(crate) fn came_from_side_port(&self) -> bool {
+        self.side_port
+    }
+
     /// Commit the replay counter and retain session identity for tunnel bookkeeping.
     pub(crate) fn complete(self) -> Result<CompletedDecryption, WireGuardError> {
         self.session.receiving_counter_mark(self.counter)?;

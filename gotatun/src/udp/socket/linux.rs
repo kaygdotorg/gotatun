@@ -842,6 +842,28 @@ impl UdpSend for super::UdpSocket {
         UdpSocket::local_addr(self).map(Some)
     }
 
+    /// Bind the side socket (#260, J1159): port 0 on this socket's address, dual-stack when this
+    /// one is, with this socket's fwmark so policy routing treats both alike. Buffer sizes stay
+    /// at the system default: it only carries datagrams of at most 256 bytes.
+    fn bind_side(&self) -> io::Result<Option<Self>> {
+        let local = UdpSocket::local_addr(self)?;
+        let only_v6 = match local {
+            SocketAddr::V6(_) => Some(!self.map_ipv4_to_ipv6),
+            SocketAddr::V4(_) => None,
+        };
+        #[cfg(target_os = "linux")]
+        let fwmark = nix::sys::socket::getsockopt(self.socket(), sockopt::Mark)
+            .ok()
+            .filter(|mark| *mark != 0);
+        let opts = super::SockOpt {
+            #[cfg(target_os = "linux")]
+            fwmark,
+            only_v6,
+            ..super::SockOpt::default()
+        };
+        UdpSocket::bind(SocketAddr::new(local.ip(), 0), opts).map(Some)
+    }
+
     #[cfg(target_os = "linux")]
     fn set_fwmark(&self, mark: u32) -> io::Result<()> {
         setsockopt(self.socket(), sockopt::Mark, &mark)?;

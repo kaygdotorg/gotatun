@@ -118,6 +118,9 @@ pub struct Tunn<R: RngCore + Send = StdRng> {
     rate_limiter: Arc<RateLimiter>,
     /// RNG used for handshake retry jitter.
     jitter_rng: R,
+    /// Whether small data packets get the side mark, so they may leave from the device's side
+    /// socket (#260, J1159, [`crate::side_port`]). Off unless the peer opted in.
+    side_port: bool,
 }
 
 impl Tunn<StdRng> {
@@ -175,7 +178,15 @@ impl<R: RngCore + Send> Tunn<R> {
 
             rate_limiter,
             jitter_rng,
+            side_port: false,
         }
+    }
+
+    /// Let small data packets to this peer carry the side mark (#260, J1159): they may then
+    /// leave from the device's side socket. Only for a peer that understands the mark (see
+    /// [`crate::side_port`]); stock WireGuard drops marked packets.
+    pub(crate) fn set_side_port(&mut self, on: bool) {
+        self.side_port = on;
     }
 
     /// Check if the tunnel handshake has expired.
@@ -270,7 +281,10 @@ impl<R: RngCore + Send> Tunn<R> {
             .cloned();
         match session {
             Some(session) => match session.prepare_packet_data(packet) {
-                Ok(prepared) => {
+                Ok(mut prepared) => {
+                    if self.side_port {
+                        prepared.mark_side_port();
+                    }
                     let packet_len = prepared.packet_len();
                     let keepalive = prepared.is_keepalive();
                     self.record_outgoing_packet(packet_len, keepalive);
@@ -303,7 +317,10 @@ impl<R: RngCore + Send> Tunn<R> {
             .cloned();
         match session {
             Some(session) => match session.prepare_packet_data(packet) {
-                Ok(prepared) => {
+                Ok(mut prepared) => {
+                    if self.side_port {
+                        prepared.mark_side_port();
+                    }
                     let packet_len = prepared.packet_len();
                     let keepalive = prepared.is_keepalive();
                     self.timer_tick(TimerName::TimeLastPacketSent);

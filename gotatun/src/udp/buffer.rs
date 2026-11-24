@@ -17,6 +17,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Instant,
 };
 
 use tokio::{
@@ -198,40 +199,152 @@ async fn flush_udp_run<U: UdpSend>(
     }
 }
 
-/// Send `replies` and every reply already queued on `reply_rx`, one address family per call.
+/// Add `datagram` to the same-family run `run`, first sending `run` when the datagram is of the
+/// other address family or the run is full.
+async fn push_to_run<U: UdpSend>(
+    udp_tx: &U,
+    send_buf: &mut U::SendManyBuf,
+    run: &mut Vec<(Packet, SocketAddr)>,
+    datagram: (Packet, SocketAddr),
+    max_packet_count: usize,
+) {
+    let other_family = run.first().is_some_and(|(_, first)| {
+        matches!(first, SocketAddr::V4(..)) != matches!(datagram.1, SocketAddr::V4(..))
+    });
+    if other_family || run.len() == max_packet_count {
+        flush_udp_packets(udp_tx, send_buf, run).await;
+    }
+    run.push(datagram);
+}
+
+/// The side socket inside the send task (#260, J1159; see [`crate::side_port`]).
+///
+/// Owned by the send task alone. It decides, per marked reply, whether the datagram leaves from
+/// the side socket (bulk to its destination left the main socket within the last second) or
+/// loses its mark and leaves from the main socket like any other reply.
+struct SideLane<U: UdpSend> {
+    udp_tx: U,
+    send_buf: U::SendManyBuf,
+    /// Side datagrams waiting for the end of the current reply flush.
+    run: Vec<(Packet, SocketAddr)>,
+    recency: crate::side_port::BulkRecency,
+}
+
+impl<U: UdpSend> SideLane<U> {
+    /// Record that the main socket is about to send the bulk datagrams of `run`, at `now`.
+    ///
+    /// One timestamp per destination change, so a run to one peer costs one map update.
+    fn bulk_run(&mut self, run: &[(Packet, SocketAddr)], now: Instant) {
+        let mut last = None;
+        for (_, destination) in run {
+            if last != Some(destination) {
+                self.recency.bulk_sent(*destination, now);
+                last = Some(destination);
+            }
+        }
+    }
+}
+
+/// Take a reply's side mark off unless it may leave from the side socket.
+///
+/// Returns the reply when it goes to the main socket (mark cleared), or `None` after queueing it
+/// on `side`'s run. `now` is read once per flush by the caller.
+async fn route_reply<U: UdpSend>(
+    mut reply: (Packet, SocketAddr),
+    side: Option<&mut SideLane<U>>,
+    now: Option<Instant>,
+    max_packet_count: usize,
+) -> Option<(Packet, SocketAddr)> {
+    if !crate::side_port::is_marked(&reply.0) {
+        return Some(reply);
+    }
+    if let (Some(side), Some(now)) = (side, now)
+        && side.recency.recent(&reply.1, now)
+    {
+        push_to_run(
+            &side.udp_tx,
+            &mut side.send_buf,
+            &mut side.run,
+            reply,
+            max_packet_count,
+        )
+        .await;
+        return None;
+    }
+    crate::side_port::clear(&mut reply.0);
+    Some(reply)
+}
+
+/// Send `first` (if any) and every reply already queued on `reply_rx`, one address family per
+/// call. With a side lane, marked replies to a destination with recent bulk leave from the side
+/// socket, after the main socket's replies.
 async fn flush_replies<U: UdpSend>(
+    first: Option<(Packet, SocketAddr)>,
     reply_rx: &mut mpsc::Receiver<(Packet, SocketAddr)>,
     udp_tx: &U,
     send_buf: &mut U::SendManyBuf,
     replies: &mut Vec<(Packet, SocketAddr)>,
     max_packet_count: usize,
+    mut side: Option<&mut SideLane<U>>,
 ) {
-    while let Ok(reply) = reply_rx.try_recv() {
-        let other_family = replies.first().is_some_and(|(_, first)| {
-            matches!(first, SocketAddr::V4(..)) != matches!(reply.1, SocketAddr::V4(..))
-        });
-        if other_family || replies.len() == max_packet_count {
-            flush_udp_packets(udp_tx, send_buf, replies).await;
-        }
-        replies.push(reply);
+    let now = side.is_some().then(Instant::now);
+    let mut next = first;
+    loop {
+        let reply = match next.take() {
+            Some(reply) => reply,
+            None => match reply_rx.try_recv() {
+                Ok(reply) => reply,
+                Err(_) => break,
+            },
+        };
+        let Some(reply) = route_reply(reply, side.as_deref_mut(), now, max_packet_count).await
+        else {
+            continue;
+        };
+        push_to_run(udp_tx, send_buf, replies, reply, max_packet_count).await;
     }
     flush_udp_packets(udp_tx, send_buf, replies).await;
+    if let Some(side) = side {
+        flush_udp_packets(&side.udp_tx, &mut side.send_buf, &mut side.run).await;
+    }
 }
 
 impl BufferedUdpSend {
-    /// Wrap a [`UdpSend`] into a [`BufferedUdpSend`] with `capacity`.
+    /// Wrap a [`UdpSend`] into a [`BufferedUdpSend`] with `capacity`, plus the side socket `side_tx` for marked small datagrams (#260,
+    /// J1159; see [`crate::side_port`]).
     ///
     /// Small datagrams get their own lane unless `GOTATUN_REPLIES_FIRST` turns `tx` off
-    /// (on by default since #260 J1143; see [`crate::priority`]).
-    pub fn new(capacity: usize, udp_tx: impl UdpSend + 'static) -> Self {
+    /// (on by default since #260 J1143; see [`crate::priority`]). The side socket needs the
+    /// reply lane: with replies-first's
+    /// `tx` lane off, or with `side_tx` `None`, every datagram leaves from `udp_tx` and loses its
+    /// side mark.
+    pub(crate) fn with_side_socket<U: UdpSend + 'static>(
+        capacity: usize,
+        udp_tx: U,
+        side_tx: Option<U>,
+    ) -> Self {
+        let reply_lane = crate::priority::mode().tx;
+        Self::with_send_turn_and_side(
+            capacity,
+            udp_tx,
+            side_tx.filter(|_| reply_lane),
+            reply_lane,
+            send_yield_every(),
+        )
+    }
+
+    /// A queue without a side socket, with replies-first's `tx` lane as configured (tests).
+    #[cfg(test)]
+    pub(crate) fn new(capacity: usize, udp_tx: impl UdpSend + 'static) -> Self {
         Self::with_reply_lane(capacity, udp_tx, crate::priority::mode().tx)
     }
 
-    /// Like [`Self::new`], with the reply lane chosen by the caller (`reply_lane`).
+    /// A queue without a side socket, with the reply lane chosen by the caller (`reply_lane`).
     ///
     /// With the lane, a datagram of at most [`crate::priority::REPLY_MAX`] bytes skips the
     /// queued runs: the send task sends every queued reply before its next queued run, so a
     /// probe or ACK no longer waits behind a full send queue of bulk datagrams.
+    #[cfg(test)]
     pub(crate) fn with_reply_lane(
         capacity: usize,
         udp_tx: impl UdpSend + 'static,
@@ -243,9 +356,22 @@ impl BufferedUdpSend {
     /// Like [`Self::with_reply_lane`], plus a send-turn budget (#260, J728): after
     /// `yield_every` datagrams reach the socket, the send task yields so the runtime polls I/O
     /// before it sends more. `0` turns the budget off.
-    pub(crate) fn with_send_turn(
+    #[cfg(test)]
+    pub(crate) fn with_send_turn<U: UdpSend + 'static>(
         capacity: usize,
-        udp_tx: impl UdpSend + 'static,
+        udp_tx: U,
+        reply_lane: bool,
+        yield_every: usize,
+    ) -> Self {
+        Self::with_send_turn_and_side(capacity, udp_tx, None, reply_lane, yield_every)
+    }
+
+    /// The full constructor: a reply lane, a send-turn budget (see `with_send_turn`) and an
+    /// optional side socket (used only with the reply lane; see [`Self::with_side_socket`]).
+    pub(crate) fn with_send_turn_and_side<U: UdpSend + 'static>(
+        capacity: usize,
+        udp_tx: U,
+        side_tx: Option<U>,
         reply_lane: bool,
         yield_every: usize,
     ) -> Self {
@@ -269,14 +395,19 @@ impl BufferedUdpSend {
                 every: yield_every,
                 sent: 0,
             };
+            let mut side = side_tx.map(|udp_tx| SideLane {
+                udp_tx,
+                send_buf: Default::default(),
+                run: Vec::with_capacity(max_packet_count),
+                recency: Default::default(),
+            });
 
             loop {
                 let count = match &mut reply_rx {
                     Some(reply_rx) => tokio::select! {
                         biased;
                         Some(reply) = reply_rx.recv() => {
-                            replies.push(reply);
-                            flush_replies(reply_rx, &udp_tx, &mut send_many_buf, &mut replies, max_packet_count).await;
+                            flush_replies(Some(reply), reply_rx, &udp_tx, &mut send_many_buf, &mut replies, max_packet_count, side.as_mut()).await;
                             continue;
                         }
                         count = send_rx.recv_many(&mut buf, max_packet_count) => count,
@@ -286,18 +417,30 @@ impl BufferedUdpSend {
                 if count == 0 {
                     break;
                 }
+                // One clock read per dequeued batch dates its bulk for the side lane.
+                let now = side.is_some().then(Instant::now);
 
                 for message in buf.drain(..) {
                     // Replies queued since the last run leave before the next one.
                     if let Some(reply_rx) = &mut reply_rx {
                         flush_replies(
+                            None,
                             reply_rx,
                             &udp_tx,
                             &mut send_many_buf,
                             &mut replies,
                             max_packet_count,
+                            side.as_mut(),
                         )
                         .await;
+                    }
+                    if let (Some(side), Some(now)) = (side.as_mut(), now) {
+                        match &message {
+                            BufferedUdpMessage::Single(_, addr, _) => {
+                                side.recency.bulk_sent(*addr, now);
+                            }
+                            BufferedUdpMessage::Batch(packets, _, _) => side.bulk_run(packets, now),
+                        }
                     }
                     match message {
                         BufferedUdpMessage::Single(packet, addr, permit) => {
@@ -375,14 +518,18 @@ impl BufferedUdpSend {
 impl UdpSend for BufferedUdpSend {
     type SendManyBuf = ();
 
-    async fn send_to(&self, packet: Packet, destination: SocketAddr) -> io::Result<()> {
-        if let Some(reply_tx) = &self.reply_tx
-            && crate::priority::datagram_is_reply(packet.len())
-        {
-            return reply_tx
-                .send((packet, destination))
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e));
+    async fn send_to(&self, mut packet: Packet, destination: SocketAddr) -> io::Result<()> {
+        if crate::priority::datagram_is_reply(packet.len()) {
+            if let Some(reply_tx) = &self.reply_tx {
+                return reply_tx
+                    .send((packet, destination))
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e));
+            }
+            // No reply lane, so no side socket: the datagram roams as usual (#260, J1159).
+            if crate::side_port::is_marked(&packet) {
+                crate::side_port::clear(&mut packet);
+            }
         }
         let permit = Arc::clone(&self.packet_slots)
             .acquire_owned()
@@ -430,6 +577,16 @@ impl UdpSend for BufferedUdpSend {
                 }
             }
             *packets = bulk;
+        } else if self.reply_tx.is_none() {
+            // No reply lane, so no side socket: small datagrams lose their side mark (#260,
+            // J1159). The length test keeps this to one compare per bulk datagram.
+            for (packet, _) in packets.iter_mut() {
+                if crate::priority::datagram_is_reply(packet.len())
+                    && crate::side_port::is_marked(packet)
+                {
+                    crate::side_port::clear(packet);
+                }
+            }
         }
         while !packets.is_empty() {
             let count = packets.len().min(self.packet_capacity);
@@ -1118,5 +1275,154 @@ mod reply_lane_test {
     async fn small_datagrams_overtake_queued_bulk() {
         assert_eq!(drained(false).await, [1, 2, 3, 4, 5]);
         assert_eq!(drained(true).await, [3, 5, 1, 2, 4]);
+    }
+}
+
+#[cfg(test)]
+mod side_lane_test {
+    //! Which socket each datagram leaves from once a side socket exists (#260, J1159).
+
+    use super::*;
+
+    /// What reached a socket: which one, the type byte, the mark byte and the destination.
+    type Sent = (&'static str, u8, u8, SocketAddr);
+
+    /// Records every datagram it sends under its `name` ("main" or "side").
+    #[derive(Clone)]
+    struct Recording {
+        name: &'static str,
+        sent: mpsc::UnboundedSender<Sent>,
+    }
+
+    impl UdpSend for Recording {
+        type SendManyBuf = ();
+
+        async fn send_to(&self, packet: Packet, destination: SocketAddr) -> io::Result<()> {
+            let mark = packet[crate::side_port::MARK_OFFSET];
+            self.sent
+                .send((self.name, packet[0], mark, destination))
+                .expect("the test listens");
+            Ok(())
+        }
+    }
+
+    const PEER: &str = "192.0.2.1:51820";
+    const IDLE_PEER: &str = "192.0.2.2:51820";
+
+    /// A data datagram of `len` bytes to `to`, marked when `marked`.
+    fn data(len: usize, marked: bool, to: &str) -> (Packet, SocketAddr) {
+        let mut bytes = bytes::BytesMut::zeroed(len);
+        bytes[0] = 4;
+        if marked {
+            bytes[crate::side_port::MARK_OFFSET] = crate::side_port::MARK;
+        }
+        (Packet::from_bytes(bytes), to.parse().unwrap())
+    }
+
+    async fn next(rx: &mut mpsc::UnboundedReceiver<Sent>) -> Sent {
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a datagram is sent")
+            .expect("the send task holds the sender")
+    }
+
+    /// A send queue with a side socket; both sockets record into one channel.
+    fn queue(side: bool, reply_lane: bool) -> (BufferedUdpSend, mpsc::UnboundedReceiver<Sent>) {
+        let (sent, rx) = mpsc::unbounded_channel();
+        let main = Recording {
+            name: "main",
+            sent: sent.clone(),
+        };
+        let side = side.then_some(Recording { name: "side", sent });
+        let send = BufferedUdpSend::with_send_turn_and_side(64, main, side, reply_lane, 0);
+        (send, rx)
+    }
+
+    /// A marked reply leaves from the side socket, mark kept, while bulk to its destination is
+    /// recent. To a destination without recent bulk it leaves from the main socket without its
+    /// mark. Unmarked replies (handshakes, keepalives) always use the main socket.
+    #[tokio::test]
+    async fn marked_replies_use_the_side_socket_only_beside_recent_bulk() {
+        let (send, mut rx) = queue(true, true);
+        let peer: SocketAddr = PEER.parse().unwrap();
+        let idle: SocketAddr = IDLE_PEER.parse().unwrap();
+
+        // Before any bulk, a marked reply goes out the main socket, unmarked.
+        let (packet, to) = data(96, true, PEER);
+        send.send_to(packet, to).await.unwrap();
+        assert_eq!(next(&mut rx).await, ("main", 4, 0, peer));
+
+        send.send_many_to(&mut (), &mut vec![data(1452, false, PEER)])
+            .await
+            .unwrap();
+        assert_eq!(next(&mut rx).await, ("main", 4, 0, peer));
+
+        let (packet, to) = data(96, true, PEER);
+        send.send_to(packet, to).await.unwrap();
+        assert_eq!(next(&mut rx).await, ("side", 4, 1, peer), "beside bulk");
+
+        let (packet, to) = data(96, true, IDLE_PEER);
+        send.send_to(packet, to).await.unwrap();
+        assert_eq!(next(&mut rx).await, ("main", 4, 0, idle), "no bulk to it");
+
+        let mut initiation = data(148, false, PEER);
+        initiation.0[0] = 1;
+        send.send_to(initiation.0, initiation.1).await.unwrap();
+        assert_eq!(next(&mut rx).await, ("main", 1, 0, peer), "handshakes stay");
+
+        // A run mixing bulk and a marked reply: the reply jumps ahead on the side socket.
+        send.send_many_to(
+            &mut (),
+            &mut vec![data(1452, false, PEER), data(80, true, PEER)],
+        )
+        .await
+        .unwrap();
+        let mut got = vec![next(&mut rx).await, next(&mut rx).await];
+        got.sort();
+        assert_eq!(got, [("main", 4, 0, peer), ("side", 4, 1, peer)]);
+    }
+
+    /// Without a side socket, or without the reply lane, a marked datagram leaves from the main
+    /// socket and loses its mark, so the peer roams on it as usual.
+    #[tokio::test]
+    async fn without_a_side_socket_marks_are_cleared() {
+        let peer: SocketAddr = PEER.parse().unwrap();
+        for (side, lane) in [(false, true), (false, false), (true, false)] {
+            let (send, mut rx) = queue(side, lane);
+            send.send_many_to(&mut (), &mut vec![data(1452, false, PEER)])
+                .await
+                .unwrap();
+            assert_eq!(next(&mut rx).await, ("main", 4, 0, peer));
+            let (packet, to) = data(96, true, PEER);
+            send.send_to(packet, to).await.unwrap();
+            assert_eq!(
+                next(&mut rx).await,
+                ("main", 4, 0, peer),
+                "send_to {side} {lane}"
+            );
+            send.send_many_to(
+                &mut (),
+                &mut vec![data(80, true, PEER), data(1452, false, PEER)],
+            )
+            .await
+            .unwrap();
+            assert_eq!(next(&mut rx).await, ("main", 4, 0, peer));
+            assert_eq!(next(&mut rx).await, ("main", 4, 0, peer));
+        }
+    }
+
+    /// The Linux socket binds its side socket on its own address with another port.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_side_socket_has_its_own_port() {
+        use crate::udp::socket::{SockOpt, UdpSocket};
+        let main = UdpSocket::bind("127.0.0.1:0".parse().unwrap(), SockOpt::default()).unwrap();
+        let side = UdpSend::bind_side(&main)
+            .unwrap()
+            .expect("Linux has a side socket");
+        let (main_addr, side_addr) = (main.local_addr().unwrap(), side.local_addr().unwrap());
+        assert_eq!(main_addr.ip(), side_addr.ip());
+        assert_ne!(main_addr.port(), side_addr.port());
+        assert_ne!(side_addr.port(), 0);
     }
 }
