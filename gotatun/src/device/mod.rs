@@ -1187,9 +1187,31 @@ impl<T: DeviceTransports> Connection<T> {
         )
         .await;
 
-        let buffered_udp_tx = BufferedUdpSend::new(
+        // The side socket for small data datagrams (#260, J1159; see `crate::side_port`). Bound
+        // only when wanted; a bind failure costs nothing but the separate flow.
+        let side_udp_tx = if crate::side_port::wanted() {
+            match udp_tx.bind_side() {
+                Ok(side) => {
+                    if let Some(addr) = side
+                        .as_ref()
+                        .and_then(|side| side.local_addr().ok().flatten())
+                    {
+                        eprintln!("diag side_socket bound={addr}");
+                    }
+                    side
+                }
+                Err(error) => {
+                    tracing::warn!("Failed to bind the side UDP socket: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let buffered_udp_tx = BufferedUdpSend::with_side_socket(
             crate::diag::capacity("GOTATUN_BENCH_UDP_TX_BUFS", MAX_PACKET_BUFS),
             udp_tx.clone(),
+            side_udp_tx,
         );
 
         // Linux sockets already return recvmmsg/GRO batches here. Avoid queueing them across a

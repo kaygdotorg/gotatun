@@ -200,6 +200,18 @@ pub trait UdpSend: Send + Sync + Clone {
         Ok(None)
     }
 
+    /// Bind a second socket for small data datagrams (#260, J1159), or `None` where there is
+    /// none.
+    ///
+    /// The side socket has its own ephemeral port on the same address and family set-up (and
+    /// fwmark) as this one, so the sending host's flow-fair qdisc gives the datagrams it sends
+    /// their own flow. Nothing is ever received on it. See `side_port` in the crate source for
+    /// which datagrams use it and why the peer does not roam to it. The default has none, so
+    /// channels and other transports keep one path.
+    fn bind_side(&self) -> io::Result<Option<Self>> {
+        Ok(None)
+    }
+
     /// Set `fwmark`.
     ///
     /// This is applicable to UDP sockets, i.e. [`tokio::net::UdpSocket`].
