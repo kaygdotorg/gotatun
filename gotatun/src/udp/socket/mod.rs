@@ -79,6 +79,45 @@ impl UdpTransportFactory for UdpSocketFactory {
         &mut self,
         params: &UdpTransportFactoryParams,
     ) -> io::Result<(Self::Send, Self::Recv)> {
+        let udp = self.bind_socket(params, self.mac_connected, self.recv_buffer_size, self.send_buffer_size)?;
+
+        if let Err(err) = udp.enable_udp_gro() {
+            tracing::warn!("Failed to enable UDP GRO: {err}");
+        }
+
+        Ok((udp.clone(), udp))
+    }
+
+    /// The side socket (#260, J1211): an ephemeral port on the main socket's address family and
+    /// fwmark. It carries only small datagrams, so it keeps the system's default buffer sizes,
+    /// enables no GRO, and on macOS never joins the connected-send pool (the pool shares the
+    /// main port only inside one audited startup window).
+    async fn bind_side(
+        &mut self,
+        _main: &Self::Send,
+        params: &UdpTransportFactoryParams,
+    ) -> io::Result<Option<(Self::Send, Self::Recv)>> {
+        let params = UdpTransportFactoryParams {
+            port: 0,
+            ..params.clone()
+        };
+        let udp = self.bind_socket(&params, Some(false), None, None)?;
+        Ok(Some((udp.clone(), udp)))
+    }
+}
+
+impl UdpSocketFactory {
+    /// Bind one socket for `params`, dual-stack unless `params.addr` names a family, falling
+    /// back to IPv4 alone where IPv6 sockets are unavailable. The main socket and the side
+    /// socket share this so both end up on the same family set-up.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    fn bind_socket(
+        &self,
+        params: &UdpTransportFactoryParams,
+        mac_connected: Option<bool>,
+        recv_buffer_size: Option<usize>,
+        send_buffer_size: Option<usize>,
+    ) -> io::Result<UdpSocket> {
         let dual_stack = params.addr.is_none();
         let only_v6 = match params.addr {
             Some(IpAddr::V6(..)) => Some(true),
@@ -89,28 +128,22 @@ impl UdpTransportFactory for UdpSocketFactory {
         let opts = SockOpt {
             #[cfg(target_os = "linux")]
             fwmark: params.fwmark,
-            recv_buffer_size: self.recv_buffer_size,
-            send_buffer_size: self.send_buffer_size,
+            recv_buffer_size,
+            send_buffer_size,
             only_v6,
             #[cfg(target_os = "macos")]
-            mac_connected: self.mac_connected,
+            mac_connected,
         };
 
         let addr = params.addr.unwrap_or(Ipv6Addr::UNSPECIFIED.into());
-        let udp = match UdpSocket::bind((addr, params.port).into(), opts) {
-            Ok(udp) => udp,
+        match UdpSocket::bind((addr, params.port).into(), opts) {
+            Ok(udp) => Ok(udp),
             Err(e) if dual_stack && is_ipv6_unavailable(&e) => {
                 tracing::warn!("IPv6 UDP sockets are unavailable; continuing with IPv4-only");
-                UdpSocket::bind((Ipv4Addr::UNSPECIFIED, params.port).into(), opts)?
+                UdpSocket::bind((Ipv4Addr::UNSPECIFIED, params.port).into(), opts)
             }
-            Err(e) => return Err(e),
-        };
-
-        if let Err(err) = udp.enable_udp_gro() {
-            tracing::warn!("Failed to enable UDP GRO: {err}");
+            Err(e) => Err(e),
         }
-
-        Ok((udp.clone(), udp))
     }
 }
 

@@ -47,6 +47,7 @@ pub struct DeviceBuilder<Udp, TunTx, TunRx> {
     peers: Vec<Peer>,
     index_table: Option<IndexTable>,
     suspended: bool,
+    side_socket: bool,
 
     #[cfg(target_os = "linux")]
     fwmark: Option<u32>,
@@ -82,6 +83,7 @@ impl DeviceBuilder<Nul, Nul, Nul> {
             peers: Vec::new(),
             index_table: None,
             suspended: false,
+            side_socket: false,
             #[cfg(target_os = "linux")]
             fwmark: None,
         }
@@ -109,6 +111,7 @@ impl<X, Y> DeviceBuilder<Nul, X, Y> {
             peers: self.peers,
             index_table: self.index_table,
             suspended: self.suspended,
+            side_socket: self.side_socket,
             #[cfg(target_os = "linux")]
             fwmark: self.fwmark,
         }
@@ -187,6 +190,7 @@ impl<X> DeviceBuilder<X, Nul, Nul> {
             peers: self.peers,
             index_table: self.index_table,
             suspended: self.suspended,
+            side_socket: self.side_socket,
             #[cfg(target_os = "linux")]
             fwmark: self.fwmark,
         }
@@ -248,6 +252,20 @@ impl<X, Y, Z> DeviceBuilder<X, Y, Z> {
         self
     }
 
+    /// Bind a second ("side") UDP socket beside the main one, and listen on it (#260, J1211).
+    ///
+    /// Off by default. With it on, a peer opted in with [`Peer::with_side_port`] (or
+    /// `PeerMut::set_side_port`) sends its small data datagrams from the side socket while
+    /// bulk flows from the main one, so the sending host's flow-fair qdisc keeps them out of the
+    /// bulk's queue. Peers that are not opted in never see a difference. Opt in only peers that
+    /// run this crate's receive rule: stock WireGuard drops the marked datagrams. See
+    /// `side_port` in the crate source. Needs a transport whose factory implements
+    /// [`UdpTransportFactory::bind_side`]; the default socket factory does.
+    pub const fn with_side_socket(mut self, on: bool) -> Self {
+        self.side_socket = on;
+        self
+    }
+
     /// Specify the `SO_MARK` argument to the [`UdpTransportFactory`].
     ///
     /// You probably only want this when using [`with_default_udp`](Self::with_default_udp).
@@ -284,6 +302,7 @@ impl<Udp: UdpTransportFactory, TunTx: IpSend, TunRx: IpRecv> DeviceBuilder<Udp, 
             tun_rx_mtu: self.tun_rx.mtu(),
             tun_rx: Arc::new(Mutex::new(self.tun_rx)),
             fwmark,
+            side_socket: self.side_socket,
             key_pair: None,
             task_liveness: Arc::new(()),
             timer_queue: Arc::default(),

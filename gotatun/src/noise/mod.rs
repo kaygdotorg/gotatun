@@ -189,6 +189,11 @@ impl<R: RngCore + Send> Tunn<R> {
         self.side_port = on;
     }
 
+    /// Whether small data datagrams to this peer are marked for the side socket.
+    pub(crate) fn side_port(&self) -> bool {
+        self.side_port
+    }
+
     /// Check if the tunnel handshake has expired.
     pub fn is_expired(&self) -> bool {
         self.handshake.is_expired()

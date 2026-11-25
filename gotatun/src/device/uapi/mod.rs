@@ -659,6 +659,8 @@ async fn on_api_set(
                     #[cfg(feature = "daita")]
                     daita_settings: peer.daita_settings().cloned(),
                     danger_timer_params: Some(peer.tunnel.timer_params().clone()),
+                    // A replaced peer keeps its side-socket opt-in (#260, J1211).
+                    side_port: Some(peer.tunnel.side_port()),
                 }
             }
         };

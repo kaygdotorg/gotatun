@@ -25,6 +25,8 @@ use crate::packet::{Packet, PacketBufPool};
 
 #[cfg(feature = "device")]
 pub(crate) mod buffer;
+#[cfg(feature = "device")]
+pub(crate) mod side_recv;
 pub mod channel;
 #[cfg(feature = "socket")]
 pub mod socket;
@@ -44,6 +46,25 @@ pub trait UdpTransportFactory: Send + Sync + 'static {
         &mut self,
         params: &UdpTransportFactoryParams,
     ) -> impl Future<Output = io::Result<(Self::Send, Self::Recv)>> + Send;
+
+    /// Bind the device's second ("side") socket pair (#260, J1211), or return `None` where the
+    /// transport has none (the default).
+    ///
+    /// `main` is the send half [`bind`](Self::bind) returned and `params` the arguments it got.
+    /// The side socket has its own ephemeral port on the same address family set-up (and
+    /// fwmark), so the sending host's flow-fair qdisc gives the small datagrams that leave from
+    /// it their own flow (see `side_port` in the crate source). The receive half is polled by
+    /// the same receive task as the main one: a peer that reaches the side port anyway (a
+    /// roaming mistake, a NAT rebinding) is still heard. Implementations that filter received
+    /// datagrams (an admission guard, say) must give the side receiver the same filter.
+    fn bind_side(
+        &mut self,
+        main: &Self::Send,
+        params: &UdpTransportFactoryParams,
+    ) -> impl Future<Output = io::Result<Option<(Self::Send, Self::Recv)>>> + Send {
+        let _ = (main, params);
+        std::future::ready(Ok(None))
+    }
 }
 
 /// Arguments to [`UdpTransportFactory::bind`].
@@ -205,7 +226,8 @@ pub trait UdpSend: Send + Sync + Clone {
     ///
     /// The side socket has its own ephemeral port on the same address and family set-up (and
     /// fwmark) as this one, so the sending host's flow-fair qdisc gives the datagrams it sends
-    /// their own flow. Nothing is ever received on it. See `side_port` in the crate source for
+    /// their own flow. The device also listens on it (see [`UdpTransportFactory::bind_side`]), but
+    /// nothing is sent to it in normal operation. See `side_port` in the crate source for
     /// which datagrams use it and why the peer does not roam to it. The default has none, so
     /// channels and other transports keep one path.
     fn bind_side(&self) -> io::Result<Option<Self>> {

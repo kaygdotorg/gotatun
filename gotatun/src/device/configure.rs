@@ -222,6 +222,7 @@ impl<T: DeviceTransports> DeviceRead<'_, T> {
                     #[cfg(feature = "daita")]
                     daita_settings: daita,
                     danger_timer_params: Some(p.tunnel.timer_params().clone()),
+                    side_port: Some(p.tunnel.side_port()),
                 },
                 stats,
             });
@@ -307,6 +308,7 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
             peer_mut.set_endpoint(peer.endpoint);
             peer_mut.set_keepalive(peer.keepalive);
             peer_mut.set_preshared_key(peer.preshared_key);
+            peer_mut.set_side_port(peer.side_port.unwrap_or_else(crate::side_port::wanted));
         })
         .await
     }

@@ -46,6 +46,13 @@ pub struct Peer {
     ///
     /// See [TimerParams].
     pub danger_timer_params: Option<TimerParams>,
+
+    /// Whether small data datagrams to this peer may leave from the device's side socket
+    /// (#260, J1211). `None` follows the bench switch `GOTATUN_SIDE_SOCKET` (off unless set).
+    ///
+    /// Set it only for a peer known to run a GotaTun with the side-port receive rule: stock
+    /// WireGuard drops the marked datagrams. No effect while the device has no side socket.
+    pub side_port: Option<bool>,
 }
 
 impl Peer {
@@ -62,6 +69,7 @@ impl Peer {
             #[cfg(feature = "daita")]
             daita_settings: None,
             danger_timer_params: None,
+            side_port: None,
         }
     }
 
@@ -93,6 +101,13 @@ impl Peer {
     #[cfg(feature = "daita")]
     pub fn with_daita(mut self, daita_settings: DaitaSettings) -> Self {
         self.daita_settings = Some(daita_settings);
+        self
+    }
+
+    /// Let small data datagrams to this peer leave from the device's side socket, or not.
+    /// See [`Peer::side_port`].
+    pub const fn with_side_port(mut self, on: bool) -> Self {
+        self.side_port = Some(on);
         self
     }
 

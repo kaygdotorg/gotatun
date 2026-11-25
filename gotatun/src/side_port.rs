@@ -40,8 +40,16 @@
 //! keepalive timers, NAT mappings and roaming behave as with one socket. The side socket's NAT
 //! mapping never needs inbound traffic: nothing is ever sent to it.
 //!
-//! Switch (bench, until the embedding application sets it per peer): `GOTATUN_SIDE_SOCKET=1`
-//! binds the side socket and opts every peer in. Unset, `0` or anything else leaves it off.
+//! **Listening.** The device also receives on the side socket, through the same receive task as
+//! the main socket (`udp::side_recv`), and with the factory's receive filter. A peer that
+//! reaches our side port anyway (an older node's roam, a rebinding NAT) is heard, not
+//! black-holed. Nothing is sent to it in normal operation.
+//!
+//! **Switches.** The embedding application turns the sockets on with
+//! `DeviceBuilder::with_side_socket(true)` and opts each peer in with `Peer::with_side_port` or
+//! `PeerMut::set_side_port`, only for peers that run the receive rule above. For benches,
+//! `GOTATUN_SIDE_SOCKET=1` binds the side socket and opts every peer in that has no explicit
+//! setting. Unset, `0` or anything else leaves the bench switch off.
 
 use std::{
     collections::HashMap,

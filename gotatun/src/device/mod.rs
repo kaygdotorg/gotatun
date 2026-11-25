@@ -1083,6 +1083,9 @@ pub const fn build() -> DeviceBuilder<Nul, Nul, Nul> {
 pub(crate) struct DeviceState<T: DeviceTransports> {
     key_pair: Option<(x25519::StaticSecret, x25519::PublicKey)>,
     fwmark: Option<u32>,
+    /// Whether to bind the side socket when the connection comes up
+    /// ([`DeviceBuilder::with_side_socket`]).
+    side_socket: bool,
 
     /// Strong token used by packet tasks for a lifetime check without access to this device lock.
     task_liveness: Arc<()>,
@@ -1187,26 +1190,27 @@ impl<T: DeviceTransports> Connection<T> {
         )
         .await;
 
-        // The side socket for small data datagrams (#260, J1159; see `crate::side_port`). Bound
-        // only when wanted; a bind failure costs nothing but the separate flow.
-        let side_udp_tx = if crate::side_port::wanted() {
-            match udp_tx.bind_side() {
-                Ok(side) => {
-                    if let Some(addr) = side
-                        .as_ref()
-                        .and_then(|side| side.local_addr().ok().flatten())
-                    {
+        // The side socket for small data datagrams (#260, J1159, J1211; see `crate::side_port`).
+        // Bound when the embedding application asked for it (`DeviceBuilder::with_side_socket`)
+        // or the bench switch is set; a bind failure costs nothing but the separate flow. Its
+        // receive half is polled by the same receive task as the main one.
+        let (side_udp_tx, side_udp_rx) = if device.side_socket || crate::side_port::wanted() {
+            let params = device.listen_params();
+            match device.udp_factory.bind_side(&udp_tx, &params).await {
+                Ok(Some((side_tx, side_rx))) => {
+                    if let Some(addr) = side_tx.local_addr().ok().flatten() {
                         eprintln!("diag side_socket bound={addr}");
                     }
-                    side
+                    (Some(side_tx), Some(side_rx))
                 }
+                Ok(None) => (None, None),
                 Err(error) => {
                     tracing::warn!("Failed to bind the side UDP socket: {error}");
-                    None
+                    (None, None)
                 }
             }
         } else {
-            None
+            (None, None)
         };
         let buffered_udp_tx = BufferedUdpSend::with_side_socket(
             crate::diag::capacity("GOTATUN_BENCH_UDP_TX_BUFS", MAX_PACKET_BUFS),
@@ -1217,9 +1221,13 @@ impl<T: DeviceTransports> Connection<T> {
         // Linux sockets already return recvmmsg/GRO batches here. Avoid queueing them across a
         // second worker handoff before packet processing.
         #[cfg(target_os = "linux")]
-        let incoming_udp_rx = udp_rx;
+        let incoming_udp_rx = crate::udp::side_recv::WithSide::new(udp_rx, side_udp_rx);
         #[cfg(not(target_os = "linux"))]
-        let incoming_udp_rx = BufferedUdpReceive::new(UDP_RECV_BUFS, udp_rx, pool.clone());
+        let incoming_udp_rx = BufferedUdpReceive::new(
+            UDP_RECV_BUFS,
+            crate::udp::side_recv::WithSide::new(udp_rx, side_udp_rx),
+            pool.clone(),
+        );
 
         crate::diag::spawn_queue_sampler(vec![
             ("out_tun", buffered_ip_rx.depth_probe()),
@@ -1653,13 +1661,18 @@ impl<T: DeviceTransports> DeviceState<T> {
             });
         }
 
-        PeerState::new(
+        let mut state = PeerState::new(
             tunn,
             peer_builder.endpoint,
             peer_builder.allowed_ips.as_slice(),
             #[cfg(feature = "daita")]
             peer_builder.daita_settings,
-        )
+        );
+        // An explicit opt-in (or out) beats the bench switch `PeerState::new` started from.
+        if let Some(on) = peer_builder.side_port {
+            state.tunnel.set_side_port(on);
+        }
+        state
     }
 
     fn set_port(&mut self, port: u16) -> Reconfigure {
@@ -1668,6 +1681,16 @@ impl<T: DeviceTransports> DeviceState<T> {
         } else {
             self.port = port;
             Reconfigure::Yes
+        }
+    }
+
+    /// The arguments for binding the listen socket, and for the side socket beside it.
+    fn listen_params(&self) -> UdpTransportFactoryParams {
+        UdpTransportFactoryParams {
+            addr: None,
+            port: self.port,
+            #[cfg(target_os = "linux")]
+            fwmark: self.fwmark,
         }
     }
 
@@ -1681,12 +1704,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         ),
         Error,
     > {
-        let params = UdpTransportFactoryParams {
-            addr: None,
-            port: self.port,
-            #[cfg(target_os = "linux")]
-            fwmark: self.fwmark,
-        };
+        let params = self.listen_params();
         let (udp_tx, udp_rx) = self
             .udp_factory
             .bind(&params)
