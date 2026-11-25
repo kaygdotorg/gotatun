@@ -27,6 +27,8 @@ pub mod device;
 #[cfg(feature = "device")]
 mod diag;
 pub mod noise;
+#[cfg_attr(not(feature = "device"), allow(dead_code))]
+pub(crate) mod packet_hash;
 #[cfg(feature = "device")]
 mod priority;
 pub mod tun;

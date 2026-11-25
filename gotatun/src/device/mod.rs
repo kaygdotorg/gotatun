@@ -63,6 +63,7 @@ pub mod uapi;
 use crate::noise::index_table::IndexTable;
 use builder::Nul;
 use futures::{FutureExt, StreamExt, TryFutureExt, future::BoxFuture, stream::FuturesUnordered};
+use crate::packet_hash::PacketHash;
 use std::collections::{HashMap, HashSet};
 use std::io::{self};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
@@ -320,20 +321,20 @@ struct PacketLookup {
 
 /// All packet-facing indices protected by one short synchronous read/write lock.
 struct PacketLookupState {
-    peers_by_key: HashMap<x25519::PublicKey, Arc<Mutex<PeerState>>>,
-    peer_ids: HashSet<usize>,
+    peers_by_key: HashMap<x25519::PublicKey, Arc<Mutex<PeerState>>, PacketHash>,
+    peer_ids: HashSet<usize, PacketHash>,
     peers_by_ip: AllowedIps<Arc<Mutex<PeerState>>>,
-    peers_by_idx: HashMap<u32, Arc<Mutex<PeerState>>>,
+    peers_by_idx: HashMap<u32, Arc<Mutex<PeerState>>, PacketHash>,
 }
 
 /// Create empty packet indices without requiring the peer handle type to be defaultable.
 impl Default for PacketLookupState {
     fn default() -> Self {
         Self {
-            peers_by_key: HashMap::new(),
-            peer_ids: HashSet::new(),
+            peers_by_key: HashMap::default(),
+            peer_ids: HashSet::default(),
             peers_by_ip: AllowedIps::new(),
-            peers_by_idx: HashMap::new(),
+            peers_by_idx: HashMap::default(),
         }
     }
 }
@@ -802,7 +803,7 @@ fn group_by_key<K, Metadata, Item>(
 where
     K: Copy + Eq + std::hash::Hash,
 {
-    let mut indices = HashMap::new();
+    let mut indices: HashMap<K, usize, PacketHash> = HashMap::default();
     let mut groups = Vec::new();
     for (key, metadata, item) in items {
         let index = if let Some(index) = indices.get(&key).copied() {
@@ -2571,7 +2572,7 @@ impl<T: DeviceTransports> DeviceState<T> {
                 }
             }
 
-            let mut incoming_runs = HashMap::<usize, PreparedIncomingRun>::new();
+            let mut incoming_runs = HashMap::<usize, PreparedIncomingRun, PacketHash>::default();
             let aqm_on = crate::aqm::enabled();
             // This turn's datagrams first; handshake messages among them join the backlog. Then
             // queued handshakes, for at most one serve budget.

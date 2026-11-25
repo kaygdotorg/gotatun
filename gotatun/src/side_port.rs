@@ -51,6 +51,7 @@
 //! `GOTATUN_SIDE_SOCKET=1` binds the side socket and opts every peer in that has no explicit
 //! setting. Unset, `0` or anything else leaves the bench switch off.
 
+use crate::packet_hash::PacketHash;
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -130,7 +131,7 @@ pub(crate) fn clear(datagram: &mut [u8]) {
 /// [`BulkRecency::PRUNE_AT`], so it stays as small as the set of peers with live bulk.
 #[derive(Default)]
 pub(crate) struct BulkRecency {
-    last_bulk: HashMap<SocketAddr, Instant>,
+    last_bulk: HashMap<SocketAddr, Instant, PacketHash>,
 }
 
 impl BulkRecency {
