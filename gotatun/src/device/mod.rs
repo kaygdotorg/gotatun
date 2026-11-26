@@ -1890,6 +1890,8 @@ impl<T: DeviceTransports> DeviceState<T> {
         if diagnostic {
             eprintln!("pipeline stage=incoming_delivery_peer_lock_acquired");
         }
+        // This id stays unique even if the peer is removed while its TUN packets are still queued.
+        let tun_queue_key = peer.tun_queue_key;
         // One clock read for the whole run's timer stamps (#260, J1111).
         peer.tunnel.refresh_timer_clock();
         let mut tunnel_result_count = 0;
@@ -1998,12 +2000,11 @@ impl<T: DeviceTransports> DeviceState<T> {
         }
         let result = match tunnel_packet_count {
             0 => Ok(()),
-            1 => tun_tx
-                .send(tun_packets.pop().expect("one packet was counted"))
-                .await
-                .map_err(Error::IoError),
             _ => tun_tx
-                .send_many(&mut tun_packets)
+                // The peer key is opaque to the TUN writer. Keeping it beside the authenticated
+                // packet run lets the shared writer arbitrate across peers; a future pre-decrypt
+                // split can pass the same identity through this seam without changing flow keys.
+                .send_peer_many(tun_queue_key, &mut tun_packets)
                 .await
                 .map_err(Error::IoError),
         };

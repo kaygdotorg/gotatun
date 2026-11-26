@@ -31,6 +31,9 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod fair_queue;
+use fair_queue::FairQueue;
+
 /// Identifies buffered TUN runs only when GOTATUN_DIAG_SEND_QUEUE is enabled.
 static NEXT_DIAGNOSTIC_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -69,10 +72,12 @@ pub struct BufferedIpSend {
 }
 
 /// A single packet or an ordered run crossing the buffered TUN boundary.
-/// A batch id is present only for opt-in send-queue diagnostics.
+/// A peer batch carries an opaque peer key for fair service; a regular batch id is present only
+/// for opt-in send-queue diagnostics.
 enum BufferedIpMessage {
     Single(Packet<Ip>, OwnedSemaphorePermit),
     Batch(Vec<Packet<Ip>>, OwnedSemaphorePermit, Option<u64>),
+    PeerBatch(Vec<Packet<Ip>>, OwnedSemaphorePermit, u64),
 }
 
 impl BufferedIpSend {
@@ -96,68 +101,135 @@ impl BufferedIpSend {
                 .expect("Deadlock on IpSend. There must be no more than one IpSend active at any given time.");
 
             let mut refused: u64 = 0;
+            let mut fair_dropped: u64 = 0;
+            let mut fair_queue = FairQueue::new(capacity);
+            let mut fair_packets = Vec::with_capacity(64);
+            let mut fair_permits = Vec::with_capacity(64);
             // A message taken off the channel while merging that could not join the run.
             let mut held: Option<BufferedIpMessage> = None;
             loop {
-                let message = match held.take() {
-                    Some(message) => message,
-                    None => match rx.recv().await {
-                        Some(message) => message,
-                        None => break,
-                    },
-                };
-                let diagnostic = crate::diag::PIPELINE.on();
-                let message = if diagnostic {
-                    message
-                } else {
-                    merge_queued(message, &mut rx, &mut held)
-                };
-                let (result, refused_packets) = match message {
-                    BufferedIpMessage::Single(packet, _permit) => {
-                        if diagnostic {
-                            eprintln!("pipeline stage=tun_buffer_dequeue mode=single packets=1");
+                if let Some(message) = held.take() {
+                    match message {
+                        BufferedIpMessage::PeerBatch(packets, permit, peer_key) => {
+                            enqueue_peer_batch(
+                                &mut fair_queue,
+                                peer_key,
+                                packets,
+                                permit,
+                                &mut fair_dropped,
+                            );
+                            continue;
                         }
-                        (inner.send(packet).await, 1)
+                        message => {
+                            if send_buffered_message(
+                                message,
+                                &mut *inner,
+                                &mut rx,
+                                &mut held,
+                                &mut refused,
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                            continue;
+                        }
                     }
-                    BufferedIpMessage::Batch(mut packets, _permit, sequence) => {
-                        let batch_len = packets.len() as u64;
-                        if let Some(sequence) = sequence {
-                            eprintln!(
-                                "send_many dequeue direction=tun sequence={sequence} packets={batch_len}"
-                            );
+                }
+
+                if !fair_queue.is_empty() {
+                    // Pull ready peer runs together before choosing the next DRR turn. Stop at
+                    // ordinary TUN messages so a control packet cannot sit behind sustained bulk.
+                    while let Ok(message) = rx.try_recv() {
+                        match message {
+                            BufferedIpMessage::PeerBatch(packets, permit, peer_key) => {
+                                enqueue_peer_batch(
+                                    &mut fair_queue,
+                                    peer_key,
+                                    packets,
+                                    permit,
+                                    &mut fair_dropped,
+                                )
+                            }
+                            message => {
+                                held = Some(message);
+                                break;
+                            }
                         }
+                    }
+                    if let Some(message) = held.take() {
+                        if send_buffered_message(
+                            message,
+                            &mut *inner,
+                            &mut rx,
+                            &mut held,
+                            &mut refused,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    if fair_queue.dequeue_batch(&mut fair_packets, &mut fair_permits) {
+                        let packet_count = fair_packets.len() as u64;
+                        let diagnostic = crate::diag::PIPELINE.on();
                         if diagnostic {
                             eprintln!(
-                                "pipeline stage=tun_buffer_dequeue mode=batch packets={batch_len}"
+                                "pipeline stage=tun_buffer_dequeue mode=fair packets={packet_count}"
                             );
                         }
-                        let result = inner.send_many(&mut packets).await;
-                        if let Some(sequence) = sequence {
+                        let result = inner.send_many(&mut fair_packets).await;
+                        fair_packets.clear();
+                        fair_permits.clear();
+                        if diagnostic {
                             eprintln!(
-                                "send_many complete direction=tun sequence={sequence} packets={batch_len} success={}",
+                                "pipeline stage=tun_device_write packets={packet_count} success={}",
                                 result.is_ok()
                             );
                         }
-                        (result, batch_len)
+                        if let Err(error) = result {
+                            if is_fatal_tun_error(&error) {
+                                tracing::error!("TUN device was deleted: {error}");
+                                break;
+                            }
+                            refused = refused.saturating_add(packet_count);
+                            if refused.is_power_of_two() {
+                                tracing::warn!(
+                                    "Dropped IP packet(s) the TUN device refused ({refused} so far): {error}"
+                                );
+                            }
+                        }
+                        continue;
                     }
-                };
-                if diagnostic {
-                    eprintln!(
-                        "pipeline stage=tun_device_write packets={refused_packets} success={}",
-                        result.is_ok()
-                    );
+                    tracing::error!("Fair TUN queue has packets but no active peer-flow turn");
+                    break;
                 }
-                if let Err(e) = result {
-                    if is_fatal_tun_error(&e) {
-                        tracing::error!("TUN device was deleted: {e}");
-                        break;
-                    }
-                    // The device refused this packet or run; the next send may be fine.
-                    refused = refused.saturating_add(refused_packets);
-                    if refused.is_power_of_two() {
-                        tracing::warn!(
-                            "Dropped IP packet(s) the TUN device refused ({refused} so far): {e}"
-                        );
+
+                let Some(message) = rx.recv().await else {
+                    break;
+                };
+                match message {
+                    BufferedIpMessage::PeerBatch(packets, permit, peer_key) => enqueue_peer_batch(
+                        &mut fair_queue,
+                        peer_key,
+                        packets,
+                        permit,
+                        &mut fair_dropped,
+                    ),
+                    message => {
+                        if send_buffered_message(
+                            message,
+                            &mut *inner,
+                            &mut rx,
+                            &mut held,
+                            &mut refused,
+                        )
+                        .await
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -176,6 +248,89 @@ impl BufferedIpSend {
             _task: Arc::new(task),
         }
     }
+}
+
+/// Move a peer's packet run into the bounded DRR queue and report drops at powers of two.
+fn enqueue_peer_batch(
+    queue: &mut FairQueue,
+    peer_key: u64,
+    packets: Vec<Packet<Ip>>,
+    permit: OwnedSemaphorePermit,
+    dropped_total: &mut u64,
+) {
+    let dropped = queue.enqueue_run(peer_key, packets, permit) as u64;
+    if dropped != 0 {
+        *dropped_total = dropped_total.saturating_add(dropped);
+        if dropped_total.is_power_of_two() {
+            tracing::warn!("Fair TUN queue dropped packets ({dropped_total} so far)");
+        }
+    }
+}
+
+/// Write a normal TUN message, preserving the existing ordered merge and refusal handling.
+async fn send_buffered_message<I: IpSend>(
+    message: BufferedIpMessage,
+    inner: &mut I,
+    rx: &mut mpsc::Receiver<BufferedIpMessage>,
+    held: &mut Option<BufferedIpMessage>,
+    refused: &mut u64,
+) -> bool {
+    let diagnostic = crate::diag::PIPELINE.on();
+    let message = if diagnostic {
+        message
+    } else {
+        merge_queued(message, rx, held)
+    };
+    let (result, refused_packets) = match message {
+        BufferedIpMessage::Single(packet, _permit) => {
+            if diagnostic {
+                eprintln!("pipeline stage=tun_buffer_dequeue mode=single packets=1");
+            }
+            (inner.send(packet).await, 1)
+        }
+        BufferedIpMessage::Batch(mut packets, _permit, sequence) => {
+            let batch_len = packets.len() as u64;
+            if let Some(sequence) = sequence {
+                eprintln!(
+                    "send_many dequeue direction=tun sequence={sequence} packets={batch_len}"
+                );
+            }
+            if diagnostic {
+                eprintln!("pipeline stage=tun_buffer_dequeue mode=batch packets={batch_len}");
+            }
+            let result = inner.send_many(&mut packets).await;
+            if let Some(sequence) = sequence {
+                eprintln!(
+                    "send_many complete direction=tun sequence={sequence} packets={batch_len} success={}",
+                    result.is_ok()
+                );
+            }
+            (result, batch_len)
+        }
+        BufferedIpMessage::PeerBatch(..) => {
+            unreachable!("peer batches are moved into the fair queue before writing")
+        }
+    };
+    if diagnostic {
+        eprintln!(
+            "pipeline stage=tun_device_write packets={refused_packets} success={}",
+            result.is_ok()
+        );
+    }
+    if let Err(error) = result {
+        if is_fatal_tun_error(&error) {
+            tracing::error!("TUN device was deleted: {error}");
+            return true;
+        }
+        // A nonfatal refusal affects this message only; later writes may still succeed.
+        *refused = refused.saturating_add(refused_packets);
+        if refused.is_power_of_two() {
+            tracing::warn!(
+                "Dropped IP packet(s) the TUN device refused ({refused} so far): {error}"
+            );
+        }
+    }
+    false
 }
 
 /// Most packets one merged TUN write run may hold. Several of the adapter's largest frames
@@ -198,6 +353,7 @@ fn merge_queued(
 ) -> BufferedIpMessage {
     let (mut packets, mut permit) = match message {
         BufferedIpMessage::Batch(packets, permit, None) => (packets, permit),
+        message @ BufferedIpMessage::PeerBatch(..) => return message,
         BufferedIpMessage::Single(packet, permit) => {
             // A lone packet with nothing behind it goes out as it came, without a run.
             match rx.try_recv() {
@@ -228,6 +384,10 @@ fn merge_queued(
                 permit.merge(more_permit);
             }
             next @ BufferedIpMessage::Batch(_, _, Some(_)) => {
+                *held = Some(next);
+                break;
+            }
+            next @ BufferedIpMessage::PeerBatch(..) => {
                 *held = Some(next);
                 break;
             }
@@ -332,6 +492,9 @@ impl IpSend for BufferedIpSend {
                 let mut unsent = match error.0 {
                     BufferedIpMessage::Batch(batch, _, _) => batch,
                     BufferedIpMessage::Single(..) => unreachable!("send_many queues a batch"),
+                    BufferedIpMessage::PeerBatch(..) => {
+                        unreachable!("send_many does not queue peer batches")
+                    }
                 };
                 if let Some(sequence) = sequence {
                     eprintln!(
@@ -350,6 +513,59 @@ impl IpSend for BufferedIpSend {
             }
             if diagnostic {
                 eprintln!("pipeline stage=tun_buffer_channel_sent packets={count} mode=batch");
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_peer_many(
+        &mut self,
+        peer_key: u64,
+        packets: &mut Vec<Packet<Ip>>,
+    ) -> io::Result<()> {
+        // This opt-in diagnostic mode intentionally restores per-packet sends, as it does for
+        // ordinary runs. Production traffic always enters the shared fair scheduler.
+        if crate::diag::TUN_SINGLE_SENDS.on() {
+            for packet in std::mem::take(packets) {
+                self.send(packet).await?;
+            }
+            return Ok(());
+        }
+
+        while !packets.is_empty() {
+            let count = packets.len().min(self.packet_capacity);
+            let permit_count = u32::try_from(count).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("TUN peer run is too large: {error}"),
+                )
+            })?;
+            let permit = Arc::clone(&self.packet_slots)
+                .acquire_many_owned(permit_count)
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))?;
+            let batch = if count == packets.len() {
+                std::mem::take(packets)
+            } else {
+                packets.drain(..count).collect()
+            };
+            if let Err(error) = self
+                .tx
+                .send(BufferedIpMessage::PeerBatch(batch, permit, peer_key))
+                .await
+            {
+                let mut unsent = match error.0 {
+                    BufferedIpMessage::PeerBatch(batch, _, _) => batch,
+                    BufferedIpMessage::Single(..) | BufferedIpMessage::Batch(..) => {
+                        unreachable!("send_peer_many queues a peer batch")
+                    }
+                };
+                unsent.append(packets);
+                *packets = unsent;
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "TUN send task stopped",
+                ));
             }
         }
         Ok(())
@@ -678,6 +894,65 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(ids, [6], "a lone packet goes alone");
+    }
+
+    /// A peer with a bulk run yields after one byte quantum so another peer reaches the TUN.
+    #[tokio::test]
+    async fn peer_runs_take_fair_turns_behind_a_busy_write() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (writes_tx, mut writes_rx) = mpsc::unbounded_channel();
+        let inner = Arc::new(Mutex::new(GatedIpSend {
+            gate: Arc::clone(&gate),
+            started: started_tx,
+            writes: writes_tx,
+        }));
+        let mut send = BufferedIpSend::new(256, inner, CancellationToken::new());
+        let wait = Duration::from_secs(1);
+
+        send.send(packet(1400, 9000)).await.unwrap();
+        tokio::time::timeout(wait, started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut bulk: Vec<_> = (0..100).map(|id| packet(1400, id)).collect();
+        send.send_peer_many(1, &mut bulk).await.unwrap();
+        let mut other: Vec<_> = (1000..1004).map(|id| packet(1400, id)).collect();
+        send.send_peer_many(2, &mut other).await.unwrap();
+        assert!(bulk.is_empty());
+        assert!(other.is_empty());
+
+        gate.add_permits(1);
+        assert_eq!(
+            tokio::time::timeout(wait, writes_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            [9000]
+        );
+        tokio::time::timeout(wait, started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        gate.add_permits(1);
+        let bulk_turn = tokio::time::timeout(wait, writes_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bulk_turn, (0..46).collect::<Vec<_>>());
+
+        tokio::time::timeout(wait, started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        gate.add_permits(1);
+        assert_eq!(
+            tokio::time::timeout(wait, writes_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            [1000, 1001, 1002, 1003]
+        );
     }
 
     async fn scripted_recv(script: Vec<io::Result<Vec<Packet<Ip>>>>) -> BufferedIpRecv<Script> {

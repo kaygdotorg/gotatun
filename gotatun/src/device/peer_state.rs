@@ -15,7 +15,10 @@
 use ipnetwork::IpNetwork;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use tokio::sync::{Notify, watch};
 
@@ -30,6 +33,18 @@ use crate::packet::{Packet, WgData, WgHandshakeInit, WgKind};
 use crate::tun::MtuWatcher;
 #[cfg(feature = "daita")]
 use crate::udp::UdpSend;
+
+/// Gives every peer a distinct TUN-writer key, even after the peer state is removed.
+static NEXT_TUN_QUEUE_KEY: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate a process-wide peer key without wrapping back to a key that may still be queued.
+fn next_tun_queue_key() -> u64 {
+    NEXT_TUN_QUEUE_KEY
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |key| {
+            key.checked_add(1)
+        })
+        .expect("the process exhausted its unique TUN queue peer keys")
+}
 
 #[derive(Default, Debug)]
 pub struct Endpoint {
@@ -54,7 +69,10 @@ pub struct PendingHandshake {
     pub initiation: Option<(Packet<WgHandshakeInit>, SocketAddr)>,
 }
 
+/// Holds one peer's tunnel state and identity for packets waiting at the shared TUN writer.
 pub struct PeerState {
+    /// Unique opaque identity kept distinct while packets from this peer may remain queued.
+    pub(crate) tun_queue_key: u64,
     /// The associated tunnel struct
     pub(crate) tunnel: Tunn,
     pub(crate) endpoint: Endpoint,
@@ -89,6 +107,7 @@ fn normalize_allowed_ips(allowed_ips: &mut Vec<IpNetwork>) {
 }
 
 impl PeerState {
+    /// Create peer state with normalized routes and a unique TUN-writer identity.
     pub fn new(
         tunnel: Tunn,
         endpoint: Option<SocketAddr>,
@@ -103,6 +122,7 @@ impl PeerState {
         let mut tunnel = tunnel;
         tunnel.set_side_port(crate::side_port::wanted());
         Self {
+            tun_queue_key: next_tun_queue_key(),
             tunnel,
             endpoint: Endpoint {
                 addr: endpoint,

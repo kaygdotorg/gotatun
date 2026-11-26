@@ -70,6 +70,20 @@ pub trait IpSend: Send + Sync + 'static {
             first_error.map_or(Ok(()), Err)
         }
     }
+
+    /// Send a consecutive run received from one peer.
+    ///
+    /// Implementations with a shared writer can use `peer_key` to schedule packets fairly across
+    /// peers and their inner flows. The key is opaque and must remain distinct while any packets
+    /// from that peer may still be queued, including after the device removes the peer.
+    /// Implementations without a scheduler preserve the run's input order.
+    fn send_peer_many(
+        &mut self,
+        _peer_key: u64,
+        packets: &mut Vec<Packet<Ip>>,
+    ) -> impl Future<Output = io::Result<()>> + Send {
+        self.send_many(packets)
+    }
 }
 
 /// Return whether an I/O error means the TUN device has been deleted or is unusable.
