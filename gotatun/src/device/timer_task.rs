@@ -13,6 +13,11 @@
 //! The device's timer task: it runs each peer's WireGuard timers when they are due and sends
 //! what they produce (keepalives, handshake initiations) in the peer's output order.
 //!
+//! The packets one pass over the due peers produces are held until the pass ends (or the batch
+//! is full) and then handed to the UDP writer back to back ([`PassOutbox`]), so thousands of
+//! idle peers' keepalives and retries wake the writer once per batch, not once each
+//! (infraternal #260, J1253).
+//!
 //! The task sleeps until the earliest deadline in the device's [`TimerQueue`] and visits only the
 //! peers that are due. What one visit does is unchanged from the old 250 ms poll over every peer
 //! (infraternal #260, J1111): run `update_timers` under the peer lock, then hand its packet to
@@ -26,6 +31,8 @@
 //! polling. The first pass after start or resume visits every peer once so no initial deadline
 //! can be missed.
 
+use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,8 +48,91 @@ use super::{
 use crate::noise::errors::WireGuardError;
 use crate::noise::index_table::IndexTable;
 use crate::noise::{PreparedOutgoing, TIMER_TICK};
-use crate::packet::WgKind;
+use crate::packet::{Packet, WgKind};
 use crate::udp::UdpSend;
+
+/// The most packets a pass holds before it sends them, one UDP batch's worth.
+const OUTBOX_PACKETS: usize = 64;
+
+/// The packets a timer pass has produced but not yet sent.
+///
+/// A UDP writer in front of the device's writer: while a batch is open, [`UdpSend::send_to`]
+/// holds the packet and returns; [`PassOutbox::flush`] sends the held ones back to back. With no
+/// batch open it sends at once, so a packet whose ordered output slot is released after its
+/// pass ended is not held back. Clones share the batch.
+#[derive(Clone)]
+struct PassOutbox<U> {
+    /// The device's UDP writer.
+    udp: U,
+    /// `Some` while a pass is collecting; the lock is never held across an await.
+    held: Held,
+}
+
+/// An outbox's shared batch.
+type Held = Arc<parking_lot::Mutex<Option<Batch>>>;
+
+/// Packets waiting to be sent, each with its destination.
+type Batch = Vec<(Packet, SocketAddr)>;
+
+impl<U: UdpSend> PassOutbox<U> {
+    /// An outbox in front of `udp`, collecting nothing yet.
+    fn new(udp: U) -> Self {
+        Self {
+            udp,
+            held: Arc::default(),
+        }
+    }
+
+    /// Start (or continue) collecting.
+    fn open(&self) {
+        self.held.lock().get_or_insert_with(Vec::new);
+    }
+
+    /// Whether the open batch has reached [`OUTBOX_PACKETS`].
+    fn is_full(&self) -> bool {
+        self.held
+            .lock()
+            .as_ref()
+            .is_some_and(|batch| batch.len() >= OUTBOX_PACKETS)
+    }
+
+    /// Close the batch and send what it holds, in order. A fatal socket error stops the device
+    /// through `failures`, as it would have for a packet sent at once; other errors drop that
+    /// packet only.
+    async fn flush(&self, failures: &OrderStore<WgKind>) {
+        let Some(batch) = self.held.lock().take() else {
+            return;
+        };
+        for (packet, destination) in batch {
+            match self.udp.send_to(packet, destination).await {
+                Err(err) if crate::udp::is_fatal_udp_error(&err) => {
+                    failures.fail(format!("UDP send failed: {err}"));
+                }
+                Err(_) => tracing::trace!("udp.send_to failed"),
+                Ok(()) => {}
+            }
+        }
+    }
+}
+
+impl<U: UdpSend> UdpSend for PassOutbox<U> {
+    type SendManyBuf = U::SendManyBuf;
+
+    /// Hold `packet` while a batch is open, else send it now.
+    async fn send_to(&self, packet: Packet, destination: SocketAddr) -> io::Result<()> {
+        let unsent = match self.held.lock().as_mut() {
+            Some(batch) => {
+                batch.push((packet, destination));
+                None
+            }
+            None => Some(packet),
+        };
+        match unsent {
+            Some(packet) => self.udp.send_to(packet, destination).await,
+            None => Ok(()),
+        }
+    }
+}
 
 /// How often stale session indices are dropped from the packet lookup at most.
 ///
@@ -173,8 +263,8 @@ struct TimerContext<'a, U: UdpSend> {
     outgoing_order: &'a Arc<OrderStore<WgKind>>,
     /// Worker pool handle for packet encryption.
     crypto: &'a CryptoHandle,
-    /// UDP writer for the packets the timers produce.
-    udp: &'a U,
+    /// UDP writer for the packets the timers produce, batching one pass's worth.
+    udp: &'a PassOutbox<U>,
     /// The device's deadline queue.
     queue: &'a TimerQueue,
 }
@@ -196,11 +286,12 @@ pub(super) async fn run(
         lookup: packet_lookup,
         flush_requests: _,
     } = handles;
+    let outbox = PassOutbox::new(udp);
     let context = TimerContext {
         lookup: &packet_lookup,
         outgoing_order: &outgoing_order,
         crypto: &crypto,
-        udp: &udp,
+        udp: &outbox,
         queue: &queue,
     };
     let sleeper = DeadlineSleeper::new();
@@ -232,8 +323,13 @@ pub(super) async fn run(
 
         // This snapshot owns peer handles and does not retain lookup state during timer work.
         for peer in due {
+            outbox.open();
             visit_peer(peer, &context).await;
+            if outbox.is_full() {
+                outbox.flush(&outgoing_order).await;
+            }
         }
+        outbox.flush(&outgoing_order).await;
 
         let now = queue.now();
         match queue.sleep_for(now) {
@@ -329,5 +425,55 @@ async fn visit_peer<U: UdpSend>(peer: Arc<Mutex<PeerState>>, context: &TimerCont
         Ok(None) => {}
         Err(WireGuardError::ConnectionExpired) => {}
         Err(e) => tracing::error!("Timer error = {e:?}: {e:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packet::PacketBufPool;
+    use std::net::Ipv4Addr;
+
+    /// A UDP writer that records the length of every packet it is given.
+    #[derive(Clone, Default)]
+    struct Recording(Arc<parking_lot::Mutex<Vec<usize>>>);
+
+    impl UdpSend for Recording {
+        type SendManyBuf = ();
+
+        /// Record the packet instead of sending it.
+        async fn send_to(&self, packet: Packet, _: SocketAddr) -> io::Result<()> {
+            self.0.lock().push(packet.len());
+            Ok(())
+        }
+    }
+
+    /// While a batch is open nothing is sent; the flush sends it all in order, and after it
+    /// packets go out at once again.
+    #[tokio::test]
+    async fn a_pass_holds_its_packets_until_the_flush() {
+        let recording = Recording::default();
+        let outbox = PassOutbox::new(recording.clone());
+        let pool = PacketBufPool::<4096>::new(8);
+        let target: SocketAddr = (Ipv4Addr::LOCALHOST, 9).into();
+        let packet = |len| {
+            let mut packet = pool.get();
+            packet.truncate(len);
+            packet
+        };
+
+        outbox.open();
+        for len in [32, 148, 32] {
+            outbox.send_to(packet(len), target).await.unwrap();
+        }
+        assert!(recording.0.lock().is_empty(), "held while the pass runs");
+        assert!(!outbox.is_full());
+
+        let failures: OrderStore<WgKind> = OrderStore::default();
+        outbox.flush(&failures).await;
+        assert_eq!(*recording.0.lock(), vec![32, 148, 32]);
+
+        outbox.send_to(packet(64), target).await.unwrap();
+        assert_eq!(*recording.0.lock(), vec![32, 148, 32, 64]);
     }
 }
