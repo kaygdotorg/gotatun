@@ -26,13 +26,14 @@ use std::time::Duration;
 use crate::noise::Tunn;
 use rand::Rng;
 
-use super::{REKEY_AFTER_TIME, TimerName, Timers};
+use super::{REJECT_AFTER_TIME, REKEY_AFTER_TIME, REKEY_ATTEMPT_TIME, TimerName};
 
 /// How often the retry interval doubles for a peer that only keepalives wait for: 5, 10, 20 s.
 const RETRY_DOUBLINGS: u32 = 2;
 
-/// One window of early rekeys. Seconds are enough to spread the initial session cohort.
-const FIRST_REKEY_EARLIEST: Duration = Duration::from_secs(60);
+/// Earliest rephase that gives the usual retry budget before the old key would expire.
+const FIRST_REKEY_EARLIEST: Duration =
+    Duration::from_secs(REJECT_AFTER_TIME.as_secs() - REKEY_ATTEMPT_TIME.as_secs());
 
 /// Whether a peer's first authenticated session can still be rephased.
 #[derive(Debug, Clone, Copy, Default)]
@@ -44,21 +45,6 @@ pub(super) enum FirstRekey {
     Pending(Duration),
     /// The first session was replaced, reset, or already started an early rekey.
     Done,
-}
-
-impl Timers {
-    /// Return the early rekey deadline only while a default-timed first session stays quiet.
-    pub(super) fn first_idle_rekey_deadline(&self) -> Option<Duration> {
-        let FirstRekey::Pending(at) = self.first_rekey else {
-            return None;
-        };
-        let established = self[TimerName::TimeSessionEstablished];
-        (self.persistent_keepalive.is_some()
-            && self.params.rekey_after_time == (REKEY_AFTER_TIME..=REKEY_AFTER_TIME)
-            && self[TimerName::TimeLastDataPacketSent] <= established
-            && self[TimerName::TimeLastDataPacketReceived] <= established)
-            .then_some(at)
-    }
 }
 
 /// The policy a device applies to idle peers. The default, for a bare [`Tunn`], is none.
@@ -76,6 +62,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
             FirstRekey::Unset
                 if timers.idle.retry_doublings != 0
                     && timers.persistent_keepalive.is_some()
+                    && timers.params.rekey_attempt_time >= REKEY_ATTEMPT_TIME
                     && timers.params.rekey_after_time == (REKEY_AFTER_TIME..=REKEY_AFTER_TIME) =>
             {
                 let age = self
@@ -89,13 +76,21 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         };
     }
 
-    /// The early rekey is usable only once the first session can send authenticated packets.
+    /// Report the early deadline only while the first confirmed session stays quiet and the
+    /// configured rekey and retry limits still allow it.
     pub(super) fn first_idle_rekey_deadline(&self) -> Option<Duration> {
-        if self.has_current_session() {
-            self.timers.first_idle_rekey_deadline()
-        } else {
-            None
-        }
+        let timers = &self.timers;
+        let FirstRekey::Pending(at) = timers.first_rekey else {
+            return None;
+        };
+        let established = timers[TimerName::TimeSessionEstablished];
+        (timers.persistent_keepalive.is_some()
+            && timers.params.rekey_attempt_time >= REKEY_ATTEMPT_TIME
+            && timers.params.rekey_after_time == (REKEY_AFTER_TIME..=REKEY_AFTER_TIME)
+            && timers[TimerName::TimeLastDataPacketSent] <= established
+            && timers[TimerName::TimeLastDataPacketReceived] <= established
+            && self.has_current_session())
+        .then_some(at)
     }
 
     /// Apply the device's idle policy to this tunnel (see the module docs).

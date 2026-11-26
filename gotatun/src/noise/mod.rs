@@ -1211,7 +1211,7 @@ mod tests {
             }
         }
         let age = MockClock::time() - established;
-        assert!((Duration::from_secs(60)..=REKEY_AFTER_TIME).contains(&age));
+        assert!((Duration::from_secs(90)..REKEY_AFTER_TIME).contains(&age));
         let response = create_handshake_response(&mut initiator, early_handshake.unwrap());
         let TunnResult::WriteToNetwork(WgKind::Data(keepalive)) =
             hub.handle_incoming_packet(response.into())
