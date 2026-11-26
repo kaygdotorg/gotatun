@@ -10,57 +10,99 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+//! Longest-prefix routing with a seeded cache for exact host routes.
+
+use crate::packet_hash::PacketHash;
 use ip_network_table::IpNetworkTable;
 use ipnetwork::IpNetwork;
 
-use std::iter::FromIterator;
+use std::collections::HashMap;
 use std::net::IpAddr;
 
-/// A trie of IP/cidr addresses
-// TODO: delete me
+/// The authoritative allowed-IP trie and its derived exact-match cache.
 #[derive(Default)]
 pub struct AllowedIps<D = ()> {
     ips: IpNetworkTable<D>,
+    hosts: HashMap<IpAddr, D, PacketHash>,
 }
 
-impl<'a, D> FromIterator<(&'a IpNetwork, D)> for AllowedIps<D> {
+impl<'a, D: Clone> FromIterator<(&'a IpNetwork, D)> for AllowedIps<D> {
+    /// Build the trie and the exact-match cache from a batch of routes.
     fn from_iter<I: IntoIterator<Item = (&'a IpNetwork, D)>>(iter: I) -> Self {
-        let mut allowed_ips = AllowedIps::new();
-
-        for (ip, data) in iter {
-            allowed_ips.insert(ip.network(), ip.prefix(), data);
-        }
-
+        let mut allowed_ips = Self::new();
+        allowed_ips.extend(iter.into_iter().map(|(network, data)| (*network, data)));
         allowed_ips
     }
 }
 
-impl<D> AllowedIps<D> {
+impl<D: Clone> AllowedIps<D> {
+    /// Create an empty route table.
     pub fn new() -> Self {
         Self {
             ips: IpNetworkTable::new(),
+            hosts: HashMap::default(),
         }
     }
 
+    /// Add or replace routes, keeping the last value for each prefix.
+    pub fn extend(&mut self, routes: impl IntoIterator<Item = (IpNetwork, D)>) {
+        for (network, data) in routes {
+            let network = ip_network::IpNetwork::new_truncate(network.network(), network.prefix())
+                .expect("cidr is valid length");
+            self.ips.insert(network, data);
+        }
+        self.rebuild_hosts();
+    }
+
+    /// Remove matching routes and add their replacements in one batch.
+    pub fn replace(
+        &mut self,
+        predicate: &dyn Fn(&D) -> bool,
+        routes: impl IntoIterator<Item = (IpNetwork, D)>,
+    ) {
+        self.ips.retain(|_, v| !predicate(v));
+        self.extend(routes);
+    }
+
+    /// Remove matching routes and refresh the derived cache.
+    pub fn remove(&mut self, predicate: &dyn Fn(&D) -> bool) {
+        self.replace(predicate, []);
+    }
+
+    /// Rebuild from the final trie while the caller still holds its write guard.
+    fn rebuild_hosts(&mut self) {
+        self.hosts.clear();
+        self.hosts
+            .extend(self.ips.iter().filter_map(|(network, data)| {
+                let addr = network.network_address();
+                let full_prefix = if addr.is_ipv4() { 32 } else { 128 };
+                (network.netmask() == full_prefix).then(|| (addr, data.clone()))
+            }));
+    }
+
+    /// Find the longest matching route. An exact hit already has the longest possible prefix.
+    pub fn find(&self, key: IpAddr) -> Option<&D> {
+        self.hosts
+            .get(&key)
+            .or_else(|| self.ips.longest_match(key).map(|(_net, data)| data))
+    }
+
+    /// Clear all routes and cached entries.
     #[cfg(test)]
     pub fn clear(&mut self) {
-        self.ips = IpNetworkTable::new();
+        *self = Self::new();
     }
 
-    pub fn insert(&mut self, key: IpAddr, cidr: u8, data: D) -> Option<D> {
-        // Use new_truncate to remove the host bits
-        let network = ip_network::IpNetwork::new_truncate(key, cidr).expect("cidr is valid length");
-        self.ips.insert(network, data)
+    /// Insert and publish one route for the single-route test fixtures.
+    #[cfg(test)]
+    fn insert(&mut self, key: IpAddr, cidr: u8, data: D) {
+        self.extend([(
+            IpNetwork::new(key, cidr).expect("cidr is valid length"),
+            data,
+        )]);
     }
 
-    pub fn find(&self, key: IpAddr) -> Option<&D> {
-        self.ips.longest_match(key).map(|(_net, data)| data)
-    }
-
-    pub fn remove(&mut self, predicate: &dyn Fn(&D) -> bool) {
-        self.ips.retain(|_, v| !predicate(v));
-    }
-
+    /// Inspect routes in trie order for assertions.
     #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = (&D, IpNetwork)> {
         self.ips.iter().map(|(ip_network, d)| {
@@ -74,6 +116,54 @@ impl<D> AllowedIps<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Check cache hits and trie fallbacks after each batch, replacement, removal and clear.
+    #[test]
+    fn host_route_lookups_match_the_trie_after_updates() {
+        for (host, neighbor, outside, subnet, broad) in [
+            ("192.0.2.9", "192.0.2.8", "198.51.100.9", 24, 16),
+            ("2001:db8:1::9", "2001:db8:1::8", "2001:db8:2::9", 64, 48),
+        ] {
+            let mut table = AllowedIps::new();
+            let host: IpAddr = host.parse().unwrap();
+            let neighbor = neighbor.parse().unwrap();
+            let outside = outside.parse().unwrap();
+            let exact = IpNetwork::new(host, if host.is_ipv4() { 32 } else { 128 }).unwrap();
+            let subnet = IpNetwork::new(neighbor, subnet).unwrap();
+            let broad = IpNetwork::new(neighbor, broad).unwrap();
+            let matches_trie = |table: &AllowedIps<u8>| {
+                for probe in [host, neighbor, outside, "::ffff:192.0.2.9".parse().unwrap()] {
+                    assert_eq!(
+                        table.find(probe),
+                        table.ips.longest_match(probe).map(|(_, data)| data),
+                        "route for {probe}"
+                    );
+                }
+            };
+
+            table.extend([(broad, 1), (subnet, 2), (exact, 3)]);
+            matches_trie(&table);
+            assert_eq!(table.hosts.get(&host), Some(&3));
+            table.extend([(exact, 4)]);
+            matches_trie(&table);
+            table.remove(&|data| *data == 3);
+            matches_trie(&table);
+            assert_eq!(table.find(host), Some(&4));
+
+            table.replace(&|data| *data == 4, [(subnet, 5)]);
+            matches_trie(&table);
+            assert_eq!(table.find(host), Some(&5));
+            assert!(table.hosts.is_empty());
+            table.remove(&|data| *data == 5);
+            matches_trie(&table);
+            assert_eq!(table.find(host), Some(&1));
+
+            table.extend([(exact, 6)]);
+            table.clear();
+            matches_trie(&table);
+            assert_eq!(table.find(host), None);
+        }
+    }
 
     fn build_allowed_ips() -> AllowedIps<char> {
         let mut map: AllowedIps<char> = Default::default();

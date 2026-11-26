@@ -350,11 +350,11 @@ impl PacketLookup {
         let mut state = self.state.write();
         state.peers_by_key.insert(public_key, Arc::clone(&peer));
         state.peer_ids.insert(peer_order_key(&peer));
-        for allowed_ip in allowed_ips {
-            state
-                .peers_by_ip
-                .insert(allowed_ip.network(), allowed_ip.prefix(), Arc::clone(&peer));
-        }
+        state.peers_by_ip.extend(
+            allowed_ips
+                .into_iter()
+                .map(|network| (network, Arc::clone(&peer))),
+        );
     }
 
     /// Remove every packet index that points at a peer being removed.
@@ -383,14 +383,12 @@ impl PacketLookup {
         allowed_ips: impl IntoIterator<Item = ipnetwork::IpNetwork>,
     ) {
         let mut state = self.state.write();
-        state
-            .peers_by_ip
-            .remove(&|current: &Arc<Mutex<PeerState>>| Arc::ptr_eq(current, peer));
-        for allowed_ip in allowed_ips {
-            state
-                .peers_by_ip
-                .insert(allowed_ip.network(), allowed_ip.prefix(), Arc::clone(peer));
-        }
+        state.peers_by_ip.replace(
+            &|current| Arc::ptr_eq(current, peer),
+            allowed_ips
+                .into_iter()
+                .map(|network| (network, Arc::clone(peer))),
+        );
     }
 
     /// Remove all packet-facing indices when the device clears its peer set.
