@@ -1072,6 +1072,8 @@ async fn complete_outgoing_batch<U: UdpSend + 'static>(
 pub struct Device<T: DeviceTransports> {
     inner: Arc<RwLock<DeviceState<T>>>,
     fatal_error: watch::Receiver<Option<Error>>,
+    /// See [`Device::confirmed_endpoint_changes`].
+    confirmed_changes: Arc<tokio::sync::Notify>,
 }
 
 /// Entry point for building a [`Device`].
@@ -1090,6 +1092,9 @@ pub(crate) struct DeviceState<T: DeviceTransports> {
 
     /// Strong token used by packet tasks for a lifetime check without access to this device lock.
     task_liveness: Arc<()>,
+
+    /// Signalled whenever any peer's confirmed endpoint changes (infraternal #260, J1253).
+    confirmed_changes: Arc<tokio::sync::Notify>,
 
     /// Every peer's next timer deadline. The timer task sleeps until the earliest one, and a
     /// peer that reports an earlier deadline (a requested keepalive, for one) wakes it at once.
@@ -1474,6 +1479,17 @@ impl<T: DeviceTransports> Device<T> {
         requested
     }
 
+    /// A signal that some peer's confirmed endpoint changed: the source of its latest packet
+    /// that proved possession of its key (see [`PeerStats`]'s `confirmed_endpoint`).
+    ///
+    /// Await [`tokio::sync::Notify::notified`] on it and then read the peers, instead of polling
+    /// them (infraternal #260, J1253: an idle node must not wake to look). One permit is kept,
+    /// so a change made while nobody waits is seen by the next wait; changes made between two
+    /// reads coalesce into one signal. One waiter is woken per change.
+    pub fn confirmed_endpoint_changes(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.confirmed_changes)
+    }
+
     /// Wait until there is a session with the peer with `public_key` that is not yet due for
     /// rekeying.
     ///
@@ -1621,6 +1637,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         // the hook needs the handle before the state is shared. Installing it reports the first
         // deadline, which brings the peer to the timer task's attention at once (#260, J1111).
         peer.tunnel.coalesce_idle_timers(self.timer_queue.origin());
+        peer.confirmed_changes = Some(Arc::clone(&self.confirmed_changes));
         let peer = Arc::new_cyclic(|handle| {
             peer.tunnel
                 .set_timer_hook(self.timer_queue.hook(handle.clone()));
