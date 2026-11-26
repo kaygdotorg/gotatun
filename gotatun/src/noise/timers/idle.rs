@@ -16,15 +16,27 @@
 //!   the 30 s that connection trackers keep an unanswered UDP mapping, so a NAT opened by one
 //!   attempt is still open at the next. As soon as data waits for the peer, or the caller forces
 //!   a handshake, the ordinary retry interval applies again.
+//! - **An active peer gets one earlier retry** when it has a current session or queued data:
+//!   1–2 s with jitter. This spreads the first retransmissions across the receiver's next
+//!   admission window while later retries keep the ordinary interval (infraternal #260, J1265).
 
 use std::time::Duration;
 
-use crate::noise::Tunn;
+use crate::noise::{
+    Tunn,
+    timers::{MAX_JITTER, REKEY_TIMEOUT},
+};
 
 /// How often the retry interval doubles for a peer that only keepalives wait for: 5, 10, 20 s.
 const RETRY_DOUBLINGS: u32 = 2;
 
-/// The policy a device applies to idle peers. The default, for a bare [`Tunn`], is none.
+/// Minimum delay before the first retransmission to an active peer.
+const ACTIVE_FIRST_RETRY: Duration = Duration::from_secs(1);
+
+/// First-retry jitter spans one whole admission window.
+const ACTIVE_FIRST_JITTER: Duration = Duration::from_secs(1);
+
+/// The device's retry policy. A bare [`Tunn`] keeps its configured timer range.
 #[derive(Debug, Clone, Copy, Default)]
 pub(in crate::noise) struct IdlePolicy {
     /// How often the handshake retry interval doubles while only keepalives wait for a peer.
@@ -45,21 +57,31 @@ impl<R: rand::RngCore + Send> Tunn<R> {
 
     /// How long after the last initiation the next retransmission is due.
     ///
-    /// The sampled rekey timeout. While the peer has no session and no data waits for it, the
+    /// An active peer with default timings gets a shorter, jittered first retry. While the peer
+    /// has no session and no data waits for it, the
     /// shortest rekey timeout is doubled once per retransmission (at most [`RETRY_DOUBLINGS`]
     /// times) and the sample's jitter is added once, so the gap never grows past 21 s.
     pub(in crate::noise) fn handshake_retry_delay(&self) -> Duration {
         let base = self.timers.rekey_timeout;
-        let doublings = self
-            .timers
-            .unanswered_retries
-            .min(self.timers.idle.retry_doublings);
-        if doublings == 0
-            || self.has_current_session()
-            || self.packet_queue.iter().any(|packet| !packet.is_empty())
-        {
+        let limit = self.timers.idle.retry_doublings;
+        if limit == 0 {
             return base;
         }
+        let retries = self.timers.unanswered_retries;
+        let active =
+            self.has_current_session() || self.packet_queue.iter().any(|packet| !packet.is_empty());
+        if active {
+            if retries == 0
+                && self.timers.params.rekey_timeout == (REKEY_TIMEOUT..=REKEY_TIMEOUT + MAX_JITTER)
+            {
+                // Reuse the uniform rekey sample so rescheduling never changes this deadline.
+                let fraction =
+                    base.saturating_sub(REKEY_TIMEOUT).as_secs_f64() / MAX_JITTER.as_secs_f64();
+                return ACTIVE_FIRST_RETRY + ACTIVE_FIRST_JITTER.mul_f64(fraction);
+            }
+            return base;
+        }
+        let doublings = retries.min(limit);
         let shortest = *self.timers.params.rekey_timeout.start();
         base.saturating_add(shortest.saturating_mul((1 << doublings) - 1))
     }
@@ -145,5 +167,30 @@ mod tests {
         );
         let sent = run_until(&mut tunnel, Duration::from_secs(60));
         assert_near(&sent, &[42, 47, 52, 57]);
+    }
+
+    /// A handshake with queued traffic retries between 1 and 2 s, even if more data arrives
+    /// afterward. The second retry still uses the ordinary 5 s interval.
+    #[test]
+    fn only_the_first_active_retry_is_early() {
+        let mut tunnel = offline_tunnel();
+        let data = || Packet::from_bytes(BytesMut::from(&[0x45_u8; 40][..]));
+        assert!(matches!(
+            tunnel.handle_outgoing_packet(data(), None),
+            Some(WgKind::HandshakeInit(_))
+        ));
+        let first = tunnel.handshake_retry_delay();
+        assert!((ACTIVE_FIRST_RETRY..=ACTIVE_FIRST_RETRY + ACTIVE_FIRST_JITTER).contains(&first));
+        let tick = Duration::from_millis(1);
+        MockClock::advance(first - tick);
+        assert!(matches!(tunnel.update_timers(), Ok(None)));
+        MockClock::advance(tick);
+        assert!(matches!(
+            tunnel.update_timers(),
+            Ok(Some(WgKind::HandshakeInit(_)))
+        ));
+        assert!(tunnel.handle_outgoing_packet(data(), None).is_none());
+        let next = tunnel.handshake_retry_delay();
+        assert!((REKEY_TIMEOUT..=REKEY_TIMEOUT + MAX_JITTER).contains(&next));
     }
 }
