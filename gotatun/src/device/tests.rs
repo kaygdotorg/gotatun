@@ -1674,6 +1674,26 @@ async fn rehandshake_sends_over_an_active_session() {
         alice.device.rehandshake(&unknown_peer).await,
         Err(Error::PeerNotFound)
     ));
+
+    // The bulk form sends to every known peer with an endpoint and skips the rest, without
+    // waiting for an answer.
+    advance_mock_clock();
+    let sent = timeout(
+        Duration::from_secs(2),
+        alice
+            .device
+            .rehandshake_all(&[bob_public_key, unknown_peer]),
+    )
+    .await
+    .expect("sending does not wait for a session")
+    .expect("the device is up");
+    assert_eq!(sent, 1);
+    assert!(
+        timeout(Duration::from_secs(1), inits.next())
+            .await
+            .expect("rehandshake_all should send an init")
+            .is_some()
+    );
 }
 
 /// Helper method to test that packets can be sent from one [`Device`] to another.
