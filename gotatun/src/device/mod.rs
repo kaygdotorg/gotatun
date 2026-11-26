@@ -1620,6 +1620,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         // The tunnel reports its deadlines to the timer queue, keyed by this peer's address, so
         // the hook needs the handle before the state is shared. Installing it reports the first
         // deadline, which brings the peer to the timer task's attention at once (#260, J1111).
+        peer.tunnel.back_off_when_idle();
         let peer = Arc::new_cyclic(|handle| {
             peer.tunnel
                 .set_timer_hook(self.timer_queue.hook(handle.clone()));

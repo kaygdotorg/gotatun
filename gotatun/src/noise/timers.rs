@@ -15,6 +15,7 @@ use crate::noise::Tunn;
 use crate::packet::WgKind;
 
 mod deadline;
+mod idle;
 #[cfg(feature = "device")]
 pub(crate) use deadline::{TIMER_TICK, TimerHook};
 
@@ -94,6 +95,9 @@ pub struct TimerParams {
     ///
     /// Sampled when a session is established.
     pub rekey_after_time: RangeInclusive<Duration>,
+    /// How long unanswered handshake initiations are retried before the tunnel gives up, drops
+    /// its queued packets and goes quiet until a new packet or handshake arrives.
+    pub rekey_attempt_time: Duration,
 }
 
 impl Default for TimerParams {
@@ -104,6 +108,7 @@ impl Default for TimerParams {
                 ..=(KEEPALIVE_TIMEOUT + REKEY_TIMEOUT + MAX_JITTER),
             rekey_timeout: REKEY_TIMEOUT..=(REKEY_TIMEOUT + MAX_JITTER),
             rekey_after_time: REKEY_AFTER_TIME..=REKEY_AFTER_TIME,
+            rekey_attempt_time: REKEY_ATTEMPT_TIME,
         }
     }
 }
@@ -141,6 +146,12 @@ pub struct Timers {
     /// Current handshake retransmit deadline (including jitter).
     /// Sampled from [`TimerParams::rekey_timeout`] on each handshake initiation.
     pub(super) rekey_timeout: Duration,
+    /// Retransmissions of the current handshake attempt so far; every other initiation (new,
+    /// forced by the caller, or restarted by queued data) sets it back to zero. Only read while
+    /// the idle policy backs off ([`Tunn::handshake_retry_delay`]; #260, J1253).
+    pub(super) unanswered_retries: u32,
+    /// The policy a device applies to idle peers (#260, J1253). Off for a bare [`Tunn`].
+    pub(super) idle: idle::IdlePolicy,
     /// Current rekey-after-time deadline.
     /// Sampled from [`TimerParams::rekey_after_time`] when a session is established.
     rekey_after_time: Duration,
@@ -167,6 +178,8 @@ impl Timers {
             keepalive_timeout: Duration::ZERO,
             new_handshake_timeout: Duration::ZERO,
             rekey_timeout: Duration::ZERO,
+            unanswered_retries: 0,
+            idle: idle::IdlePolicy::default(),
             rekey_after_time: Duration::ZERO,
             schedule: deadline::Schedule::default(),
         };
@@ -200,6 +213,7 @@ impl Timers {
         self.want_keepalive = None;
         self.keepalive_requested = false;
         self.persistent_keepalive_due = self.persistent_keepalive.is_some();
+        self.unanswered_retries = 0;
         self.dangerously_set_params(self.params.clone());
     }
 
@@ -331,6 +345,8 @@ impl<R: rand::RngCore + Send> Tunn<R> {
     pub fn update_timers(&mut self) -> Result<Option<WgKind>, WireGuardError> {
         let mut handshake_initiation_required = false;
         let mut keepalive_required = false;
+        // How many retransmissions this one makes, if it is one.
+        let mut retransmission = None;
 
         // All the times are counted from tunnel initiation, for efficiency our timers are rounded
         // to a second, as there is no real benefit to having highly accurate timers.
@@ -345,6 +361,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         let data_packet_received = self.timers[TimeLastDataPacketReceived];
         let data_packet_sent = self.timers[TimeLastDataPacketSent];
         let persistent_keepalive = self.timers.persistent_keepalive;
+        let retry_delay = self.handshake_retry_delay();
 
         {
             if self.handshake.is_expired() {
@@ -371,7 +388,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
 
             if let Some(time_init_sent) = self.handshake.timer() {
                 // Handshake Initiation Retransmission
-                if now - handshake_started >= REKEY_ATTEMPT_TIME {
+                if now - handshake_started >= self.timers.params.rekey_attempt_time {
                     // After REKEY_ATTEMPT_TIME ms of trying to initiate a new handshake,
                     // the retries give up and cease, and clear all existing packets queued
                     // up to be sent. If a packet is explicitly queued up to be sent, then
@@ -382,13 +399,15 @@ impl<R: rand::RngCore + Send> Tunn<R> {
                     return Err(WireGuardError::ConnectionExpired);
                 }
 
-                if time_init_sent.elapsed() >= self.timers.rekey_timeout {
+                if time_init_sent.elapsed() >= retry_delay {
                     // We avoid using `time` here, because it can be earlier than `time_init_sent`.
                     // Once `checked_duration_since` is stable we can use that.
                     // A handshake initiation is retried after the sampled rekey timeout,
-                    // by default REKEY_TIMEOUT plus some random jitter between 0 and 333 ms.
+                    // by default REKEY_TIMEOUT plus some random jitter between 0 and 333 ms,
+                    // longer for a peer that only keepalives wait for.
                     tracing::debug!("HANDSHAKE(REKEY_TIMEOUT)");
                     handshake_initiation_required = true;
+                    retransmission = Some(self.timers.unanswered_retries.saturating_add(1));
                 }
             } else {
                 if self.timers.is_initiator() {
@@ -460,7 +479,13 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         }
 
         if handshake_initiation_required {
-            return Ok(self.format_handshake_initiation(true).map(Into::into));
+            let initiation = self.format_handshake_initiation(true);
+            if let Some(retries) = retransmission {
+                // A formatted initiation starts the count again; this one continues it.
+                self.timers.unanswered_retries = retries;
+                self.reschedule_timers(Duration::ZERO);
+            }
+            return Ok(initiation.map(Into::into));
         }
 
         if keepalive_required {
