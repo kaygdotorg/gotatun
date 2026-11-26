@@ -214,6 +214,9 @@ impl<R: rand::RngCore + Send> Tunn<R> {
             return Some(due);
         }
 
+        if let Some(at) = self.first_idle_rekey_deadline() {
+            due = due.min(at);
+        }
         if timers.is_initiator {
             // Rekey after REKEY_AFTER_TIME, once data was sent on this session.
             if session_established < timers[TimeLastDataPacketSent] {

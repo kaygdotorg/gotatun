@@ -1185,6 +1185,47 @@ mod tests {
         update_timer_results_in_handshake(&mut my_tun);
     }
 
+    /// A device peer rephases a quiet first session even as responder, then returns to the
+    /// ordinary keepalive cadence. The initial rekey is armed on the shared deadline queue.
+    #[test]
+    #[cfg(feature = "mock_instant")]
+    fn a_quiet_first_session_rekeys_once_before_the_data_rekey_limit() {
+        let (mut initiator, mut hub) = create_two_tuns();
+        hub.set_persistent_keepalive(Some(25));
+        hub.back_off_when_idle();
+        complete_handshake(&mut initiator, &mut hub);
+
+        let established = MockClock::time();
+        let mut early_handshake = None;
+        loop {
+            let due = hub.next_timer_deadline().expect("persistent keepalive");
+            let age = MockClock::time() - established;
+            assert!(due >= age, "deadline {due:?} preceded clock {age:?}");
+            MockClock::advance(due - age);
+            if let Some(WgKind::HandshakeInit(init)) = hub.update_timers().unwrap() {
+                early_handshake = Some(init);
+                break;
+            }
+            if MockClock::time() - established >= REKEY_AFTER_TIME {
+                break;
+            }
+        }
+        let age = MockClock::time() - established;
+        assert!((Duration::from_secs(60)..=REKEY_AFTER_TIME).contains(&age));
+        let response = create_handshake_response(&mut initiator, early_handshake.unwrap());
+        let TunnResult::WriteToNetwork(WgKind::Data(keepalive)) =
+            hub.handle_incoming_packet(response.into())
+        else {
+            panic!("early rekey did not establish a session");
+        };
+        parse_keepalive(&mut initiator, keepalive);
+
+        for _ in 0..6 {
+            MockClock::advance(Duration::from_secs(25));
+            assert!(matches!(hub.update_timers(), Ok(Some(WgKind::Data(_)))));
+        }
+    }
+
     #[test]
     #[cfg(feature = "mock_instant")]
     fn handshake_no_resp_rekey_timeout() {

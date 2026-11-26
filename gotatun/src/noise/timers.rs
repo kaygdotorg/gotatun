@@ -152,6 +152,8 @@ pub struct Timers {
     pub(super) unanswered_retries: u32,
     /// The policy a device applies to idle peers (#260, J1253). Off for a bare [`Tunn`].
     pub(super) idle: idle::IdlePolicy,
+    /// A one-time rekey phase for a persistent-keepalive peer's first quiet session.
+    first_rekey: idle::FirstRekey,
     /// Current rekey-after-time deadline.
     /// Sampled from [`TimerParams::rekey_after_time`] when a session is established.
     rekey_after_time: Duration,
@@ -180,6 +182,7 @@ impl Timers {
             rekey_timeout: Duration::ZERO,
             unanswered_retries: 0,
             idle: idle::IdlePolicy::default(),
+            first_rekey: idle::FirstRekey::default(),
             rekey_after_time: Duration::ZERO,
             schedule: deadline::Schedule::default(),
         };
@@ -214,6 +217,9 @@ impl Timers {
         self.keepalive_requested = false;
         self.persistent_keepalive_due = self.persistent_keepalive.is_some();
         self.unanswered_retries = 0;
+        if matches!(self.first_rekey, idle::FirstRekey::Pending(_)) {
+            self.first_rekey = idle::FirstRekey::Done;
+        }
         self.dangerously_set_params(self.params.clone());
     }
 
@@ -307,6 +313,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
             self.timers[TimeCurrent];
         self.timers.is_initiator = is_initiator;
         self.timers.rekey_after_time = self.sample_timer(|p| &p.rekey_after_time);
+        self.sample_first_idle_rekey();
         self.reschedule_timers(Duration::ZERO);
     }
 
@@ -410,6 +417,10 @@ impl<R: rand::RngCore + Send> Tunn<R> {
                     retransmission = Some(self.timers.unanswered_retries.saturating_add(1));
                 }
             } else {
+                if self.first_idle_rekey_deadline().is_some_and(|at| now >= at) {
+                    self.timers.first_rekey = idle::FirstRekey::Done;
+                    handshake_initiation_required = true;
+                }
                 if self.timers.is_initiator() {
                     // After sending a packet, if the sender was the original initiator
                     // of the handshake and if the current session key is REKEY_AFTER_TIME

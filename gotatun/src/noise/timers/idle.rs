@@ -16,13 +16,50 @@
 //!   the 30 s that connection trackers keep an unanswered UDP mapping, so a NAT opened by one
 //!   attempt is still open at the next. As soon as data waits for the peer, or the caller forces
 //!   a handshake, the ordinary retry interval applies again.
+//! - **The first quiet session is rekeyed early.** A newly provisioned hub can establish thousands
+//!   of sessions together and then renegotiate all of them after their keys expire. Rephase each
+//!   persistent-keepalive session once, before the ordinary data rekey limit. Later sessions
+//!   follow the normal rules from their new, spread-out establishment times.
 
 use std::time::Duration;
 
 use crate::noise::Tunn;
+use rand::Rng;
+
+use super::{REKEY_AFTER_TIME, TimerName, Timers};
 
 /// How often the retry interval doubles for a peer that only keepalives wait for: 5, 10, 20 s.
 const RETRY_DOUBLINGS: u32 = 2;
+
+/// One window of early rekeys. Seconds are enough to spread the initial session cohort.
+const FIRST_REKEY_EARLIEST: Duration = Duration::from_secs(60);
+
+/// Whether a peer's first authenticated session can still be rephased.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) enum FirstRekey {
+    /// No session has been established yet.
+    #[default]
+    Unset,
+    /// This first session is eligible for one early rekey at the sampled time.
+    Pending(Duration),
+    /// The first session was replaced, reset, or already started an early rekey.
+    Done,
+}
+
+impl Timers {
+    /// Return the early rekey deadline only while a default-timed first session stays quiet.
+    pub(super) fn first_idle_rekey_deadline(&self) -> Option<Duration> {
+        let FirstRekey::Pending(at) = self.first_rekey else {
+            return None;
+        };
+        let established = self[TimerName::TimeSessionEstablished];
+        (self.persistent_keepalive.is_some()
+            && self.params.rekey_after_time == (REKEY_AFTER_TIME..=REKEY_AFTER_TIME)
+            && self[TimerName::TimeLastDataPacketSent] <= established
+            && self[TimerName::TimeLastDataPacketReceived] <= established)
+            .then_some(at)
+    }
+}
 
 /// The policy a device applies to idle peers. The default, for a bare [`Tunn`], is none.
 #[derive(Debug, Clone, Copy, Default)]
@@ -32,6 +69,35 @@ pub(in crate::noise) struct IdlePolicy {
 }
 
 impl<R: rand::RngCore + Send> Tunn<R> {
+    /// Give a device peer's initial quiet session a phase, or retire it on replacement.
+    pub(super) fn sample_first_idle_rekey(&mut self) {
+        let timers = &mut self.timers;
+        timers.first_rekey = match timers.first_rekey {
+            FirstRekey::Unset
+                if timers.idle.retry_doublings != 0
+                    && timers.persistent_keepalive.is_some()
+                    && timers.params.rekey_after_time == (REKEY_AFTER_TIME..=REKEY_AFTER_TIME) =>
+            {
+                let age = self
+                    .jitter_rng
+                    .random_range(FIRST_REKEY_EARLIEST.as_secs()..REKEY_AFTER_TIME.as_secs());
+                FirstRekey::Pending(
+                    timers[TimerName::TimeSessionEstablished] + Duration::from_secs(age),
+                )
+            }
+            _ => FirstRekey::Done,
+        };
+    }
+
+    /// The early rekey is usable only once the first session can send authenticated packets.
+    pub(super) fn first_idle_rekey_deadline(&self) -> Option<Duration> {
+        if self.has_current_session() {
+            self.timers.first_idle_rekey_deadline()
+        } else {
+            None
+        }
+    }
+
     /// Apply the device's idle policy to this tunnel (see the module docs).
     ///
     /// Call it once, before the tunnel sees traffic; the device does so when it adds a peer.
