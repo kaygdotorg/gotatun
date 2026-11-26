@@ -1696,6 +1696,51 @@ async fn rehandshake_sends_over_an_active_session() {
     );
 }
 
+/// Peers that never answer leave the timer task nothing to wake for once each attempt has
+/// given up: zero idle wakeups for any number of offline peers (infraternal #260, J1253, D81).
+///
+/// The attempt time and retry interval are shortened so the settle takes seconds; a frozen
+/// mock clock would never reach it.
+#[cfg(not(feature = "mock_instant"))]
+#[tokio::test]
+#[test_log::test]
+async fn offline_peers_leave_no_timer_deadline_after_giving_up() {
+    use crate::device::Peer;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    const PEERS: u16 = 200;
+    let (alice, _bob, _eve) = mock::device_pair().await;
+    let bob_public_key = get_first_and_only_peer(&alice).await.public_key;
+    let short = TimerParams {
+        rekey_timeout: Duration::from_millis(300)..=Duration::from_millis(300),
+        rekey_attempt_time: Duration::from_secs(2),
+        ..TimerParams::default()
+    };
+    let peers = (0..PEERS).map(|index| {
+        let mut peer = Peer::new(PublicKey::from(&StaticSecret::random()));
+        // The channel transport delivers to the other test device, which ignores strangers.
+        peer.endpoint = Some((Ipv4Addr::LOCALHOST, 20_000 + index).into());
+        peer.keepalive = Some(25);
+        peer.danger_timer_params = Some(short.clone());
+        peer
+    });
+    alice
+        .device
+        .remove_peer(&bob_public_key)
+        .await
+        .expect("the connected peer is removed");
+    alice
+        .device
+        .add_peers(peers)
+        .await
+        .expect("peers are added");
+    let queue = Arc::clone(&alice.device.inner.read().await.timer_queue);
+    assert!(queue.next_due().is_some(), "the attempts are scheduled");
+
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(queue.next_due(), None, "every offline peer has gone quiet");
+}
+
 /// Helper method to test that packets can be sent from one [`Device`] to another.
 /// Use `eavesdrop` to sniff wireguard packets and assert things about the connection.
 async fn test_device_pair(eavesdrop: impl AsyncFnOnce(MockEavesdropper) + Send) {
