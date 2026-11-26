@@ -1348,6 +1348,34 @@ mod tests {
         UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0).into(), opts).expect("bind [::]:0")
     }
 
+    /// Whether the kernel list can support a connected-send pool in this process.
+    fn pool_audit_available() -> bool {
+        port_users(0).sees_other_processes()
+    }
+
+    /// Report when a test needs a real pool that the kernel's UDP list cannot safely audit.
+    fn require_pool_audit() -> bool {
+        let available = pool_audit_available();
+        if !available {
+            eprintln!("skipped connected-pool assertions: the UDP socket list is filtered");
+        }
+        available
+    }
+
+    /// Bind a listener for tests that exercise connected slots. A bind must create the pool
+    /// whenever the audit can see other processes, so a broken pool still fails those tests.
+    fn connected_socket() -> Option<UdpSocket> {
+        if !require_pool_audit() {
+            return None;
+        }
+        let wireguard = wireguard_socket(true);
+        assert!(
+            wireguard.inner.connected.is_enabled(),
+            "a visible audit enables the pool"
+        );
+        Some(wireguard)
+    }
+
     /// A plain loopback peer.
     async fn peer() -> (tokio::net::UdpSocket, SocketAddr) {
         let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
@@ -1419,7 +1447,9 @@ mod tests {
     /// to the connected socket) still arrive, and so do datagrams from other endpoints.
     #[tokio::test]
     async fn an_endpoint_gets_a_connected_socket_and_its_replies_still_arrive() {
-        let mut wireguard = wireguard_socket(true);
+        let Some(mut wireguard) = connected_socket() else {
+            return;
+        };
         let port = wireguard.local_addr().expect("local").port();
         let (a, a_address) = peer().await;
         let (b, _) = peer().await;
@@ -1455,7 +1485,9 @@ mod tests {
     /// race harness is `j815_race_holder` (#260).
     #[tokio::test]
     async fn the_port_stays_closed_to_other_sockets() {
-        let wireguard = wireguard_socket(true);
+        let Some(wireguard) = connected_socket() else {
+            return;
+        };
         let port = wireguard.local_addr().expect("local").port();
         let (a, a_address) = peer().await;
         send(&wireguard, &data(64), a_address).await;
@@ -1490,7 +1522,9 @@ mod tests {
     /// Sending to mapped IPv4 selects an AF_INET slot, and the slot families never change.
     #[tokio::test]
     async fn the_split_pool_keeps_every_socket_exclusive_and_per_family() {
-        let wireguard = wireguard_socket(true);
+        let Some(wireguard) = connected_socket() else {
+            return;
+        };
         let slots = &wireguard.inner.connected.slots;
         assert_eq!(slots.len(), 2 * super::POOL_SIZE);
         let mut v4_count = 0;
@@ -1531,7 +1565,9 @@ mod tests {
     /// A network change marks every pool socket stale; the next data re-connects and arrives.
     #[tokio::test]
     async fn a_network_change_reconnects_every_endpoint() {
-        let wireguard = wireguard_socket(true);
+        let Some(wireguard) = connected_socket() else {
+            return;
+        };
         let (a, a_address) = peer().await;
         let (b, b_address) = peer().await;
         send(&wireguard, &data(64), a_address).await;
@@ -1562,7 +1598,9 @@ mod tests {
     /// anything (J763's version re-created sockets and had to avoid that collision).
     #[tokio::test]
     async fn a_network_change_reconnects_while_the_receiver_runs() {
-        let wireguard = wireguard_socket(true);
+        let Some(wireguard) = connected_socket() else {
+            return;
+        };
         let mut receiver = wireguard.clone();
         let task = tokio::spawn(async move {
             let mut pool = PacketBufPool::new(4);
@@ -1591,7 +1629,9 @@ mod tests {
     /// socket stale, so a stale source ends at WireGuard's own retry even with no signal.
     #[tokio::test]
     async fn a_handshake_initiation_reconnects_its_endpoint() {
-        let wireguard = wireguard_socket(true);
+        let Some(wireguard) = connected_socket() else {
+            return;
+        };
         let (a, a_address) = peer().await;
         send(&wireguard, &data(64), a_address).await;
         peer_recv(&a).await;
@@ -1618,7 +1658,9 @@ mod tests {
     /// Through `sendto` they leave from the current source, so the peer roams to it.
     #[tokio::test]
     async fn keepalives_and_responses_reconnect_their_endpoint() {
-        let wireguard = wireguard_socket(true);
+        let Some(wireguard) = connected_socket() else {
+            return;
+        };
         let (a, a_address) = peer().await;
         let mut response = vec![0u8; 92];
         response[0] = 2;
@@ -1663,47 +1705,43 @@ mod tests {
     }
 
     /// An endpoint the kernel cannot reach right now gets `sendto` for that datagram, and
-    /// connected sends stay on for everyone else: neither a failed `connect` nor a failed `send`
-    /// is a refused port. On macOS 26 `connect` succeeds for unroutable addresses and the
-    /// `send` fails (`0.0.0.1`: `EHOSTUNREACH`); `connect` itself fails with `EADDRNOTAVAIL`
-    /// when no source can reach the endpoint, as when the Mac has no network at all, and port 0
-    /// reproduces that error on loopback (J763 probe on #260).
+    /// connected sends stay on for everyone else. Loopback port 0 reproduces the kernel
+    /// error without sending any datagrams outside loopback (J763 probe on #260).
     #[tokio::test]
     async fn an_unreachable_endpoint_does_not_turn_the_feature_off() {
         let wireguard = wireguard_socket(true);
-        for nowhere in [
-            SocketAddr::from((Ipv4Addr::new(0, 0, 0, 1), 9)),
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-        ] {
-            let result = wireguard
-                .send_to(
-                    Packet::from_bytes(bytes::BytesMut::from(&data(64)[..])),
-                    nowhere,
-                )
-                .await;
-            assert!(
-                result.is_err(),
-                "{nowhere} must be unreachable for this test"
-            );
-            assert!(
-                wireguard.inner.connected.is_enabled(),
-                "still on after {nowhere}"
-            );
-            assert_eq!(
-                wireguard.inner.connected.len(),
-                0,
-                "no entry left for {nowhere}"
-            );
-        }
+        let pool_expected = pool_audit_available();
+        let nowhere = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let result = wireguard
+            .send_to(
+                Packet::from_bytes(bytes::BytesMut::from(&data(64)[..])),
+                nowhere,
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "{nowhere} must be unreachable for this test"
+        );
+        assert_eq!(
+            wireguard.inner.connected.is_enabled(),
+            pool_expected,
+            "pool state after {nowhere}"
+        );
+        assert_eq!(
+            wireguard.inner.connected.len(),
+            0,
+            "no entry left for {nowhere}"
+        );
 
         let (a, a_address) = peer().await;
         send(&wireguard, &data(64), a_address).await;
         peer_recv(&a).await;
-        assert_eq!(wireguard.inner.connected.len(), 1);
+        assert_eq!(wireguard.inner.connected.len(), usize::from(pool_expected));
     }
 
     /// An ICMP "port unreachable" for a connected endpoint is reported on that socket's next
-    /// call. It must neither stop the receive loop nor fail later sends.
+    /// call. Sending to a closed port must neither stop the receive loop nor fail later sends
+    /// when the listener uses the pool or sendto.
     #[tokio::test]
     async fn icmp_errors_on_a_connected_socket_do_not_stop_sends_or_receives() {
         let mut wireguard = wireguard_socket(true);
@@ -1753,7 +1791,9 @@ mod tests {
     /// did not poll it would miss them until some other datagram woke it (J789 mutation run).
     #[tokio::test]
     async fn a_parked_receiver_reads_a_new_connected_socket() {
-        let wireguard = wireguard_socket(true);
+        let Some(wireguard) = connected_socket() else {
+            return;
+        };
         let port = wireguard.local_addr().expect("local").port();
         let mut receiver = wireguard.clone();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1788,7 +1828,9 @@ mod tests {
     /// (J789 mutation run: polling the wildcard socket first hid the error path).
     #[tokio::test]
     async fn an_icmp_error_never_reaches_the_receiver() {
-        let mut wireguard = wireguard_socket(true);
+        let Some(mut wireguard) = connected_socket() else {
+            return;
+        };
         let port = wireguard.local_addr().expect("local").port();
         let (closed, closed_address) = peer().await;
         drop(closed);
@@ -1845,7 +1887,9 @@ mod tests {
     /// working.
     #[tokio::test]
     async fn a_full_table_evicts_only_idle_entries() {
-        let wireguard = wireguard_socket(true);
+        let Some(wireguard) = connected_socket() else {
+            return;
+        };
         let mut peers = Vec::new();
         for _ in 0..super::POOL_SIZE {
             let (socket, address) = peer().await;
@@ -1889,8 +1933,8 @@ mod tests {
         }
     }
 
-    /// The socket factory passes its owner's choice through: `Some(true)` binds a pool,
-    /// `Some(false)` binds none, whatever the environment switch says (J1108).
+    /// Explicit factory settings override the environment switch. The pool requires both
+    /// opt-in and a socket list that can support the audit (J1108).
     #[tokio::test]
     async fn the_factory_passes_the_owners_choice_through() {
         use crate::udp::{UdpTransportFactory, UdpTransportFactoryParams};
@@ -1908,8 +1952,46 @@ mod tests {
                 .expect("bind");
             assert_eq!(
                 send.inner.connected.is_enabled(),
-                wanted,
+                wanted && pool_audit_available(),
                 "mac_connected: Some({wanted})"
+            );
+        }
+    }
+
+    /// A filtered socket list leaves the exclusive split listener usable even with connected
+    /// sends requested. Both families use the original port in each direction (J1288).
+    #[tokio::test]
+    async fn a_filtered_list_keeps_split_udp_working() {
+        if pool_audit_available() {
+            eprintln!("skipped live fallback: the UDP socket list shows other processes");
+            return;
+        }
+        let mut wireguard = wireguard_socket(true);
+        assert!(!wireguard.inner.connected.is_enabled());
+        let port = wireguard.local_addr().expect("local").port();
+        for socket in wireguard.bound_sockets() {
+            assert!(
+                !socket2::SockRef::from(socket)
+                    .reuse_port()
+                    .expect("SO_REUSEPORT")
+            );
+        }
+        for ip in [
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+            std::net::IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            let peer = tokio::net::UdpSocket::bind((ip, 0))
+                .await
+                .expect("loopback peer");
+            let peer_address = peer.local_addr().expect("peer address");
+            let listener = SocketAddr::new(ip, port);
+            let payload = data(64);
+            send(&wireguard, &payload, peer_address).await;
+            assert_eq!(peer_recv(&peer).await, (payload, listener));
+            peer.send_to(b"reply", listener).await.expect("peer reply");
+            assert_eq!(
+                recv(&mut wireguard).await,
+                (b"reply".to_vec(), peer_address)
             );
         }
     }
@@ -1955,6 +2037,28 @@ mod tests {
         destination
     }
 
+    /// Disconnect the kernel socket while leaving the pool's recorded destination in place.
+    /// Its next send fails with `EDESTADDRREQ`, which exercises the path-error handling on
+    /// loopback without depending on the host's routes.
+    fn disconnect(socket: &tokio::net::UdpSocket) {
+        use std::os::fd::AsRawFd;
+        let unspec = libc::sockaddr {
+            sa_len: std::mem::size_of::<libc::sockaddr>() as u8,
+            sa_family: libc::AF_UNSPEC as libc::sa_family_t,
+            sa_data: [0; 14],
+        };
+        // SAFETY: a valid socket descriptor and a valid `sockaddr` of the given length. xnu
+        // disconnects a connected UDP socket before it looks at the new address, so the
+        // socket ends up disconnected whatever this call returns.
+        let _ = unsafe {
+            libc::connect(
+                socket.as_raw_fd(),
+                &unspec,
+                std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
+            )
+        };
+    }
+
     /// A send error that says the pool socket's path is gone does not lose the datagram or
     /// fail the send: it leaves through `sendto`, and the next data re-connects the socket
     /// (J826 mutation run: ignoring path errors at the send survived, since only the error
@@ -1962,8 +2066,9 @@ mod tests {
     /// disconnected behind the table's back.
     #[tokio::test]
     async fn a_path_error_falls_back_and_reconnects() {
-        use std::os::fd::AsRawFd;
-        let wireguard = wireguard_socket(true);
+        let Some(wireguard) = connected_socket() else {
+            return;
+        };
         let (peer_socket, address) = peer().await;
         send(&wireguard, &data(64), address).await;
         peer_recv(&peer_socket).await;
@@ -1976,21 +2081,7 @@ mod tests {
             .expect("the endpoint has a pool socket");
         let connects = pool.connects();
 
-        let unspec = libc::sockaddr {
-            sa_len: std::mem::size_of::<libc::sockaddr>() as u8,
-            sa_family: libc::AF_UNSPEC as libc::sa_family_t,
-            sa_data: [0; 14],
-        };
-        // SAFETY: a valid socket descriptor and a valid `sockaddr` of the given length. xnu
-        // disconnects a connected UDP socket before it looks at the new address, so the
-        // socket ends up disconnected whatever this call returns.
-        let _ = unsafe {
-            libc::connect(
-                pool.slots[index].socket.as_raw_fd(),
-                &unspec,
-                std::mem::size_of::<libc::sockaddr>() as libc::socklen_t,
-            )
-        };
+        disconnect(&pool.slots[index].socket);
 
         send(&wireguard, &data(65), address).await;
         assert_eq!(
@@ -2036,7 +2127,9 @@ mod tests {
     #[tokio::test]
     async fn a_refused_pool_socket_is_retired_and_its_endpoint_uses_sendto() {
         use std::os::fd::AsRawFd;
-        let mut wireguard = wireguard_socket(true);
+        let Some(mut wireguard) = connected_socket() else {
+            return;
+        };
         let port = wireguard.local_addr().expect("local").port();
         let (peer_socket, address) = peer().await;
         send(&wireguard, &data(64), address).await;
@@ -2093,28 +2186,31 @@ mod tests {
         assert_eq!(pool.len(), 1);
     }
 
-    /// An endpoint whose path keeps failing (`0.0.0.1`: `connect` works, every `send` answers
-    /// `EHOSTUNREACH`) re-connects once at once, then backs off, so it does not cost a `connect`
-    /// per datagram; the back-off ends at its deadline and at a network change (J1108).
+    /// Repeated path errors re-connect once, then back off. The deadline and a network change
+    /// allow another attempt (J1108). Disconnect each selected slot before sending to model a
+    /// route that fails after connect.
     #[tokio::test]
     async fn a_path_that_keeps_failing_backs_off() {
-        let wireguard = wireguard_socket(true);
-        let nowhere = SocketAddr::from((Ipv4Addr::new(0, 0, 0, 1), 9));
-        let attempt = async || {
-            let _ = wireguard
-                .send_to(
-                    Packet::from_bytes(bytes::BytesMut::from(&data(64)[..])),
-                    nowhere,
-                )
-                .await;
+        let Some(wireguard) = connected_socket() else {
+            return;
         };
+        let (_peer_socket, address) = peer().await;
         let pool = &wireguard.inner.connected;
+        let attempt = async || {
+            if let Some(index) = pool.slot_for(address) {
+                disconnect(&pool.slots[index].socket);
+                assert!(matches!(
+                    pool.send_on(index, &data(64), address).await,
+                    super::Sent::Fallback
+                ));
+            }
+        };
         let connects = pool.connects();
         attempt().await;
         assert_eq!(pool.connects(), connects + 1, "the first data connects");
         attempt().await;
         assert_eq!(pool.connects(), connects + 2, "one re-connect at once");
-        let index = pool_index(&wireguard, nowhere);
+        let index = pool_index(&wireguard, address);
         let first = pool.table.lock()[index];
         assert_eq!(first.failures, 2);
         let wait = first
@@ -2194,7 +2290,9 @@ mod tests {
     /// the gap on purpose.
     #[tokio::test]
     async fn a_moved_pool_socket_never_carries_the_old_endpoints_datagram() {
-        let wireguard = wireguard_socket(true);
+        let Some(wireguard) = connected_socket() else {
+            return;
+        };
         let (first, first_address) = peer().await;
         let (second, second_address) = peer().await;
         send(&wireguard, &data(64), first_address).await;
@@ -2258,7 +2356,9 @@ mod tests {
     /// record offsets it relies on.
     #[tokio::test]
     async fn the_pool_binds_once_and_never_again() {
-        let wireguard = wireguard_socket(true);
+        let Some(wireguard) = connected_socket() else {
+            return;
+        };
         let port = wireguard.local_addr().expect("local").port();
         let check = |when: &str| {
             let users = port_users(port);
@@ -2301,6 +2401,9 @@ mod tests {
     /// ours, so the port is closed to everyone from then on.
     #[test]
     fn the_pool_bind_clears_the_option_everywhere() {
+        if !require_pool_audit() {
+            return;
+        }
         let (wildcard, local) = bare_wildcard(0).expect("wildcard");
         let pool = super::bind_pool(&wildcard, local, 4).expect("pool");
         assert_eq!(pool.len(), 4);
@@ -2317,6 +2420,9 @@ mod tests {
     /// this process (a test cannot switch users); the cross-user run is the race harness below.
     #[test]
     fn a_socket_that_joins_during_the_pool_bind_is_refused() {
+        if !require_pool_audit() {
+            return;
+        }
         let (wildcard, local) = bare_wildcard(0).expect("wildcard");
         let mut joiner = None;
         let result = super::bind_pool_with(
@@ -2465,8 +2571,9 @@ mod tests {
     /// A socket that holds `0.0.0.0:<port>` with `SO_REUSEPORT` before the WireGuard socket
     /// binds is found too. xnu lets the exclusive dual-stack `[::]:<port>` bind succeed beside
     /// it, and that socket then receives the port's IPv4 datagrams (J815 probe on #260: another
-    /// uid's squatter got a datagram sent to `127.0.0.1:<port>`). With connected sends on, the
-    /// audit refuses the WireGuard socket instead of running beside it.
+    /// uid's squatter got a datagram sent to `127.0.0.1:<port>`). A visible audit refuses
+    /// the pool, and a filtered list keeps the bind window shut. The production split listener
+    /// refuses the port on either host because its IPv4 wildcard cannot bind.
     #[tokio::test]
     async fn a_socket_already_on_the_port_is_found() {
         let squatter = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)
@@ -2482,11 +2589,20 @@ mod tests {
             .expect("ip")
             .port();
         let (wildcard, local) = bare_wildcard(port).expect("xnu binds [::] beside the squatter");
+        let visible = pool_audit_available();
         let result = super::bind_pool(&wildcard, local, 2);
-        assert!(
-            matches!(result, Err(super::PoolError::Joined(_))),
-            "{result:?}"
-        );
+        if visible {
+            assert!(
+                matches!(result, Err(super::PoolError::Joined(_))),
+                "{result:?}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(super::PoolError::Unavailable(_))),
+                "{result:?}"
+            );
+        }
+        assert!(!wildcard.reuse_port().expect("SO_REUSEPORT"));
         drop(wildcard);
 
         let opts = SockOpt {
@@ -2504,7 +2620,9 @@ mod tests {
     /// first connect), each sees the WireGuard port as the source, and both replies arrive.
     #[tokio::test]
     async fn ipv4_and_ipv6_endpoints_each_get_a_pool_socket() {
-        let mut wireguard = wireguard_socket(true);
+        let Some(mut wireguard) = connected_socket() else {
+            return;
+        };
         let port = wireguard.local_addr().expect("local").port();
         let (a, a_address) = peer().await;
         let b = tokio::net::UdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
@@ -2604,6 +2722,9 @@ mod tests {
             Arc,
             atomic::{AtomicBool, AtomicU64, Ordering},
         };
+        if !require_pool_audit() {
+            return;
+        }
         let wildcard = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)
             .expect("IPv4 socket");
         wildcard.set_nonblocking(true).expect("nonblocking");
@@ -2970,7 +3091,9 @@ mod tests {
     /// it, once, and the other endpoint sees none of it.
     #[tokio::test]
     async fn a_moved_pool_socket_never_carries_a_batched_run() {
-        let wireguard = wireguard_socket(true);
+        let Some(wireguard) = connected_socket() else {
+            return;
+        };
         let (first, first_address) = peer().await;
         let (second, second_address) = peer().await;
         send(&wireguard, &data(64), first_address).await;
@@ -3019,7 +3142,9 @@ mod tests {
     #[tokio::test]
     async fn a_failing_pool_socket_loses_no_batched_run() {
         use std::os::fd::AsRawFd;
-        let wireguard = wireguard_socket(true);
+        let Some(wireguard) = connected_socket() else {
+            return;
+        };
         let (peer_socket, address) = peer().await;
         send(&wireguard, &data(64), address).await;
         peer_recv(&peer_socket).await;
@@ -3061,8 +3186,8 @@ mod tests {
     }
 
     /// Batched data to an endpoint whose port is closed: the ICMP errors the connected socket
-    /// reports neither stop later runs nor reach the caller as a fatal error, and data to a
-    /// live endpoint in the same and later runs still arrives in full and in order.
+    /// can report neither stop later runs nor reach the caller as a fatal error. On both send
+    /// paths, data to a live endpoint in the same and later runs still arrives in order.
     #[tokio::test]
     async fn icmp_errors_mid_batch_do_not_stop_other_endpoints() {
         let wireguard = wireguard_socket(true);
