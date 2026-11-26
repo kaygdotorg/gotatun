@@ -147,8 +147,8 @@ pub struct Timers {
     /// Sampled from [`TimerParams::rekey_timeout`] on each handshake initiation.
     pub(super) rekey_timeout: Duration,
     /// Retransmissions of the current handshake attempt so far; every other initiation (new,
-    /// forced by the caller, or restarted by queued data) sets it back to zero. Only read while
-    /// the idle policy backs off ([`Tunn::handshake_retry_delay`]; #260, J1253).
+    /// or forced by the caller) sets it back to zero. Used for the first active retry and the
+    /// idle backoff ([`Tunn::handshake_retry_delay`]; #260, J1253 and J1265).
     pub(super) unanswered_retries: u32,
     /// The policy a device applies to idle peers (#260, J1253). Off for a bare [`Tunn`].
     pub(super) idle: idle::IdlePolicy,
@@ -402,9 +402,8 @@ impl<R: rand::RngCore + Send> Tunn<R> {
                 if time_init_sent.elapsed() >= retry_delay {
                     // We avoid using `time` here, because it can be earlier than `time_init_sent`.
                     // Once `checked_duration_since` is stable we can use that.
-                    // A handshake initiation is retried after the sampled rekey timeout,
-                    // by default REKEY_TIMEOUT plus some random jitter between 0 and 333 ms,
-                    // longer for a peer that only keepalives wait for.
+                    // The device's retry policy may shorten the first active retry or back
+                    // off later idle retries. Each initiation samples its own jitter.
                     tracing::debug!("HANDSHAKE(REKEY_TIMEOUT)");
                     handshake_initiation_required = true;
                     retransmission = Some(self.timers.unanswered_retries.saturating_add(1));

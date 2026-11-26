@@ -341,16 +341,16 @@ impl<R: RngCore + Send> Tunn<R> {
         }
     }
 
+    /// Queue a packet for the next session and advance an in-flight retry when data first waits.
     fn queue_packet_and_start_handshake(&mut self, packet: Packet) -> Option<PreparedOutgoing> {
-        // Data waiting for the peer ends any back-off: the retry it holds up is due one
-        // ordinary retry interval after the last initiation (#260, J1253).
-        if !packet.is_empty() && self.timers.unanswered_retries > 0 {
-            self.timers.unanswered_retries = 0;
-            self.queue_packet(packet);
+        let first_data = self.handshake.is_in_progress()
+            && !packet.is_empty()
+            && !self.packet_queue.iter().any(|queued| !queued.is_empty());
+        self.queue_packet(packet);
+        if first_data {
+            // The active deadline is earlier. Keep the attempt count so another data packet
+            // cannot rearm the first-retry interval for an initiation already retransmitted.
             self.reschedule_timers(Duration::ZERO);
-        } else {
-            // If there is no session, queue the packet for future retry.
-            self.queue_packet(packet);
         }
         // Initiate a new handshake if none is in progress.
         self.format_handshake_initiation(false)
