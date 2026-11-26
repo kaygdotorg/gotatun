@@ -16,29 +16,59 @@
 //!   the 30 s that connection trackers keep an unanswered UDP mapping, so a NAT opened by one
 //!   attempt is still open at the next. As soon as data waits for the peer, or the caller forces
 //!   a handshake, the ordinary retry interval applies again.
+//! - **Persistent keepalives share a grid.** Each is sent on the last multiple of one second
+//!   (counted from the device's own origin) at or before it is due, so at most one second early
+//!   and never late. Thousands of peers' keepalives then wake the device once a second at most
+//!   instead of on every 250 ms tick, and the NAT mappings they keep open are never older than
+//!   the configured interval. Intervals under two seconds are left alone.
 
 use std::time::Duration;
 
+use super::TimerName::TimePersistentKeepalive;
+use super::Timers;
 use crate::noise::Tunn;
+
+#[cfg(feature = "mock_instant")]
+use mock_instant::thread_local::Instant;
+
+#[cfg(not(feature = "mock_instant"))]
+use crate::sleepyinstant::Instant;
 
 /// How often the retry interval doubles for a peer that only keepalives wait for: 5, 10, 20 s.
 const RETRY_DOUBLINGS: u32 = 2;
+
+/// The grid persistent keepalives share. A multiple of the timer tick, so the device wakes on it.
+const KEEPALIVE_GRID: Duration = Duration::from_secs(1);
 
 /// Coalescing a device applies to idle peers. The default, for a bare [`Tunn`], is none.
 #[derive(Debug, Clone, Copy, Default)]
 pub(in crate::noise) struct IdlePolicy {
     /// How often the handshake retry interval doubles while only keepalives wait for a peer.
     retry_doublings: u32,
+    /// Persistent keepalives go out on multiples of this, up to one step early. Zero: off.
+    keepalive_grid: Duration,
+    /// How far this tunnel's start is past a multiple of the grid, counted from the device's
+    /// origin, so every tunnel of one device shares the same grid points.
+    grid_phase: Duration,
 }
 
 impl<R: rand::RngCore + Send> Tunn<R> {
-    /// Apply the device's idle policy to this tunnel (see the module docs).
+    /// Apply the device's idle policy to this tunnel (see the module docs). `origin` is where
+    /// the device's grid starts; every tunnel of one device gets the same one.
     ///
     /// Call it once, before the tunnel sees traffic; the device does so when it adds a peer.
     #[cfg_attr(not(feature = "device"), allow(dead_code))]
-    pub(crate) fn coalesce_idle_timers(&mut self) {
+    pub(crate) fn coalesce_idle_timers(&mut self, origin: Instant) {
+        let since_origin = self
+            .timers
+            .time_started
+            .checked_duration_since(origin)
+            .unwrap_or(Duration::ZERO);
+        let phase = since_origin.as_nanos() % KEEPALIVE_GRID.as_nanos();
         self.timers.idle = IdlePolicy {
             retry_doublings: RETRY_DOUBLINGS,
+            keepalive_grid: KEEPALIVE_GRID,
+            grid_phase: Duration::from_nanos(u64::try_from(phase).unwrap_or(0)),
         };
         self.reschedule_timers(Duration::ZERO);
     }
@@ -62,6 +92,22 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         }
         let shortest = *self.timers.params.rekey_timeout.start();
         base.saturating_add(shortest.saturating_mul((1 << doublings) - 1))
+    }
+}
+
+impl Timers {
+    /// When the next persistent keepalive is due, in the tunnel's own time frame: one `interval`
+    /// after the last packet either way, moved back to the grid point at or before it.
+    pub(in crate::noise) fn persistent_keepalive_at(&self, interval: Duration) -> Duration {
+        let due = self[TimePersistentKeepalive] + interval;
+        let grid = self.idle.keepalive_grid;
+        if grid.is_zero() || interval < grid * 2 {
+            return due;
+        }
+        let shifted = due + self.idle.grid_phase;
+        let past =
+            Duration::from_nanos(u64::try_from(shifted.as_nanos() % grid.as_nanos()).unwrap_or(0));
+        due.saturating_sub(past)
     }
 }
 
@@ -93,7 +139,7 @@ mod tests {
             IndexTable::from_os_rng(),
             limiter,
         );
-        tunnel.coalesce_idle_timers();
+        tunnel.coalesce_idle_timers(Instant::now());
         tunnel
     }
 
@@ -116,6 +162,45 @@ mod tests {
             assert!(
                 at >= want && at <= want + 3,
                 "initiations at {sent:?}, expected about {expected:?}"
+            );
+        }
+    }
+
+    /// Keepalives of tunnels started at different moments leave on the same grid points, one
+    /// interval apart, and never later than the interval after the last packet.
+    #[test]
+    fn persistent_keepalives_share_the_grid_and_are_never_late() {
+        MockClock::set_time(Duration::ZERO);
+        let origin = Instant::now();
+        for start_ms in [0_u64, 130, 480, 990, 1700] {
+            MockClock::set_time(Duration::from_millis(start_ms));
+            let own = StaticSecret::random_from_rng(rand_core::OsRng);
+            let theirs = PublicKey::from(&StaticSecret::random_from_rng(rand_core::OsRng));
+            let limiter = Arc::new(RateLimiter::new(&PublicKey::from(&own), 100));
+            let mut tunnel = Tunn::new(
+                own,
+                theirs,
+                None,
+                Some(25),
+                IndexTable::from_os_rng(),
+                limiter,
+            );
+            tunnel.coalesce_idle_timers(origin);
+            // A packet 2.37 s after the tunnel started resets the keepalive timer.
+            MockClock::set_time(Duration::from_millis(start_ms + 2370));
+            tunnel.timers[super::super::TimerName::TimeCurrent] = Duration::from_millis(2370);
+            tunnel.timers[TimePersistentKeepalive] = Duration::from_millis(2370);
+            let due = tunnel
+                .timers
+                .persistent_keepalive_at(Duration::from_secs(25));
+            let latest = Duration::from_millis(27_370);
+            assert!(due <= latest && due > latest - KEEPALIVE_GRID, "{due:?}");
+            // On the shared grid: a whole second after the origin.
+            let on_grid = Duration::from_millis(start_ms) + due;
+            assert_eq!(
+                on_grid.subsec_nanos(),
+                0,
+                "start {start_ms} ms: {on_grid:?}"
             );
         }
     }

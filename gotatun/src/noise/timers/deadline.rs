@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use super::TimerName::{
     TimeCookieReceived, TimeCurrent, TimeLastDataPacketReceived, TimeLastDataPacketSent,
-    TimeLastHandshakeStarted, TimePersistentKeepalive, TimeSessionEstablished,
+    TimeLastHandshakeStarted, TimeSessionEstablished,
 };
 use super::{
     COOKIE_EXPIRATION_TIME, KEEPALIVE_TIMEOUT, REJECT_AFTER_TIME, REKEY_TIMEOUT, TimerName, Timers,
@@ -239,7 +239,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
             due = due.min(if timers.persistent_keepalive_due {
                 current
             } else {
-                timers[TimePersistentKeepalive] + interval
+                timers.persistent_keepalive_at(interval)
             });
         }
         Some(due)
@@ -452,8 +452,10 @@ mod tests {
 
     impl World {
         /// Two fresh tunnels at mock time zero; A has a persistent keepalive if `keepalive`.
-        fn new(seed: u64, hooked: bool, keepalive: Option<u16>) -> Self {
+        /// With `coalesced`, both follow a device's idle policy.
+        fn new(seed: u64, hooked: bool, keepalive: Option<u16>, coalesced: bool) -> Self {
             MockClock::set_time(Duration::ZERO);
+            let origin = Instant::now();
             let a_key = StaticSecret::random_from_rng(rand_core::OsRng);
             let b_key = StaticSecret::random_from_rng(rand_core::OsRng);
             let make = |own: &StaticSecret, other: &StaticSecret, keepalive, jitter_seed| {
@@ -467,6 +469,9 @@ mod tests {
                     limiter,
                     StdRng::seed_from_u64(jitter_seed),
                 );
+                if coalesced {
+                    tunnel.coalesce_idle_timers(origin);
+                }
                 let due = Arc::new(Mutex::new(None));
                 if hooked {
                     let report = Arc::clone(&due);
@@ -588,10 +593,10 @@ mod tests {
     }
 
     /// Run one seeded script for `ticks` ticks and return the log.
-    fn simulate(seed: u64, hooked: bool, ticks: u64) -> Vec<Entry> {
+    fn simulate(seed: u64, hooked: bool, coalesced: bool, ticks: u64) -> Vec<Entry> {
         let mut script = StdRng::seed_from_u64(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
         let keepalive = script.random_bool(0.5).then_some(25);
-        let mut world = World::new(seed, hooked, keepalive);
+        let mut world = World::new(seed, hooked, keepalive, coalesced);
         let mut rate = [0.0, 0.0];
         for tick in 0..ticks {
             let start = TIMER_TICK * u32::try_from(tick).unwrap();
@@ -625,9 +630,9 @@ mod tests {
         // zeroing (9 minutes without a new session) to happen.
         const TICKS: u64 = 4 * 60 * 20;
         let mut packets = 0;
-        for seed in 0..48 {
-            let polled = simulate(seed, false, TICKS);
-            let scheduled = simulate(seed, true, TICKS);
+        for (seed, coalesced) in (0..48).map(|seed| (seed, seed % 2 == 1)) {
+            let polled = simulate(seed, false, coalesced, TICKS);
+            let scheduled = simulate(seed, true, coalesced, TICKS);
             if let Some(at) = polled.iter().zip(&scheduled).position(|(a, b)| a != b) {
                 panic!(
                     "seed {seed}: first difference at entry {at}: polled {:?}, scheduled {:?}",
@@ -651,7 +656,7 @@ mod tests {
     /// An idle tunnel with nothing due is not visited at all between its deadlines.
     #[test]
     fn an_idle_tunnel_reports_no_deadline_once_expired() {
-        let mut world = World::new(7, true, None);
+        let mut world = World::new(7, true, None, false);
         // Never any traffic: the only deadlines are session-slot restarts and key zeroing.
         let mut visits = 0;
         for tick in 0..(4 * 60 * 12) {

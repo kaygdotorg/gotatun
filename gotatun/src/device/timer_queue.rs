@@ -94,6 +94,11 @@ struct Entry {
 }
 
 impl TimerQueue {
+    /// Where the queue's clock, and so its tick and keepalive grids, start.
+    pub(crate) fn origin(&self) -> Instant {
+        self.epoch.0
+    }
+
     /// The current time on the queue's clock.
     pub(crate) fn now(&self) -> Duration {
         Instant::now()

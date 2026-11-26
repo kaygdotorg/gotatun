@@ -466,8 +466,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
                     // Persistent KEEPALIVE
                     if let Some(persistent_keepalive) = persistent_keepalive
                         && (self.timers.persistent_keepalive_due
-                            || now.saturating_sub(self.timers[TimePersistentKeepalive])
-                                >= persistent_keepalive)
+                            || now >= self.timers.persistent_keepalive_at(persistent_keepalive))
                     {
                         tracing::trace!("KEEPALIVE(PERSISTENT_KEEPALIVE)");
                         self.timers.persistent_keepalive_due = false;
