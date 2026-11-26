@@ -1076,6 +1076,9 @@ pub struct Device<T: DeviceTransports> {
     confirmed_changes: Arc<tokio::sync::Notify>,
 }
 
+/// How many peers' initiations [`Device::rehandshake_all`] formats before it sends them.
+const REHANDSHAKE_BATCH: usize = 64;
+
 /// Entry point for building a [`Device`].
 ///
 /// See [`DeviceBuilder`] for options.
@@ -1488,6 +1491,65 @@ impl<T: DeviceTransports> Device<T> {
     /// reads coalesce into one signal. One waiter is woken per change.
     pub fn confirmed_endpoint_changes(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.confirmed_changes)
+    }
+
+    /// Send a new handshake initiation to each of these peers now, without waiting for any
+    /// answer.
+    ///
+    /// For a caller that moves many endpoints at once (infraternal #260, J1253):
+    /// [`Self::rehandshake`] waits for the new session, so one waiting task and timeout per peer
+    /// woke an idle node thousands of times while it walked unreachable peers. The initiations
+    /// leave back to back; an unanswered one is retried by the peer's rekey timer. Unknown
+    /// peers and peers without an endpoint are skipped. Returns how many were sent.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotConnected`] while the device is down.
+    pub async fn rehandshake_all(&self, public_keys: &[x25519::PublicKey]) -> Result<usize, Error> {
+        let (peers, udp, packet_lookup) = {
+            let device = self.inner.read().await;
+            let connection = device.connection.as_ref().ok_or(Error::NotConnected)?;
+            let peers: Vec<_> = public_keys
+                .iter()
+                .filter_map(|key| device.peers.get(key).cloned())
+                .collect();
+            (
+                peers,
+                connection.udp.clone(),
+                Arc::clone(&device.packet_lookup),
+            )
+        };
+        let mut sent = 0;
+        let mut batch = Vec::with_capacity(REHANDSHAKE_BATCH);
+        for chunk in peers.chunks(REHANDSHAKE_BATCH) {
+            for peer_arc in chunk {
+                let peer_key = peer_order_key(peer_arc);
+                let mut trace = PeerLockDiagnostic::waiting("rehandshake_all", peer_key);
+                let mut peer =
+                    lock_peer_state(peer_arc, "rehandshake_all", peer_key, &mut trace).await;
+                if !packet_lookup.contains_peer(peer_arc) {
+                    continue;
+                }
+                let Ok(PendingHandshake {
+                    initiation: Some((packet, endpoint)),
+                    ..
+                }) = peer.rehandshake()
+                else {
+                    continue;
+                };
+                let packet = WgKind::from(packet);
+                if packet_lookup.register_handshake_idx(&packet, peer_arc) {
+                    batch.push((packet, endpoint));
+                }
+            }
+            for (packet, endpoint) in batch.drain(..) {
+                // As for a timer's initiation, one unsendable packet drops only itself.
+                if udp.send_to(packet.into(), endpoint).await.is_ok() {
+                    sent += 1;
+                }
+            }
+        }
+        Ok(sent)
     }
 
     /// Wait until there is a session with the peer with `public_key` that is not yet due for
