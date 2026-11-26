@@ -177,6 +177,14 @@ impl<T: DeviceTransports> DeviceRead<'_, T> {
         self.device.fwmark
     }
 
+    /// Iterate over the public keys installed on the device.
+    ///
+    /// The device read guard keeps membership stable. Listing keys needs no peer-state locks
+    /// and does not copy endpoints, statistics, or allowed IPs.
+    pub fn peer_keys(&self) -> impl Iterator<Item = PublicKey> + '_ {
+        self.device.peers.keys().copied()
+    }
+
     /// Return all peers on the device
     pub async fn peers(&self) -> Vec<PeerStats> {
         let mut peers = vec![];
