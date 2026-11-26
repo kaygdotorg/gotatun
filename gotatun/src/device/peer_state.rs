@@ -15,8 +15,9 @@
 use ipnetwork::IpNetwork;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 #[cfg(feature = "daita")]
 use crate::device::daita::{DaitaHooks, DaitaSettings};
@@ -67,6 +68,10 @@ pub struct PeerState {
     /// Notified whenever a handshake that we initiated completes.
     handshake_completed: watch::Sender<()>,
 
+    /// The device's "a confirmed endpoint changed" signal, set when the device adds the peer
+    /// (infraternal #260, J1253; see [`crate::device::Device::confirmed_endpoint_changes`]).
+    pub(crate) confirmed_changes: Option<Arc<Notify>>,
+
     /// CoDel state for this peer's receive path (idle when `GOTATUN_AQM=off` or off Linux).
     /// Lives here because in-order delivery already holds the peer lock.
     pub(crate) aqm: crate::aqm::Codel,
@@ -109,6 +114,7 @@ impl PeerState {
             #[cfg(feature = "daita")]
             daita: None,
             handshake_completed: watch::Sender::new(()),
+            confirmed_changes: None,
             aqm: crate::aqm::Codel::default(),
         }
     }
@@ -171,11 +177,15 @@ impl PeerState {
     /// Record `addr` as the confirmed endpoint after a packet proved key possession.
     ///
     /// This runs on every decrypted packet under the peer lock the caller already holds. It is a
-    /// compare and, only when the source moved, a store: no allocation or extra synchronisation.
+    /// compare and, only when the source moved, a store and the device's change signal: no
+    /// allocation.
     #[inline]
     fn confirm_endpoint(&mut self, addr: SocketAddr) {
         if self.endpoint.confirmed != Some(addr) {
             self.endpoint.confirmed = Some(addr);
+            if let Some(changes) = &self.confirmed_changes {
+                changes.notify_one();
+            }
         }
     }
 
@@ -335,6 +345,7 @@ mod confirmed_endpoint_tests {
     use crate::noise::{Tunn, TunnResult, index_table::IndexTable, rate_limiter::RateLimiter};
     use crate::packet::{Packet, WgKind};
     use crate::x25519::{PublicKey, StaticSecret};
+    use futures::FutureExt as _;
     use std::net::SocketAddr;
     use std::sync::Arc;
 
@@ -389,6 +400,11 @@ mod confirmed_endpoint_tests {
         assert_eq!(responder.endpoint().addr, Some(real));
         assert_eq!(responder.endpoint().confirmed, None);
 
+        // The device's change signal fires once per change of a confirmed endpoint.
+        let changes = Arc::new(tokio::sync::Notify::new());
+        responder.confirmed_changes = Some(Arc::clone(&changes));
+        let signalled = |changes: &tokio::sync::Notify| changes.notified().now_or_never().is_some();
+
         // Our own completed handshake confirms the responder's address on the initiator.
         let keepalive = network(initiator.handle_incoming_packet(response, responder_addr));
         assert_eq!(initiator.endpoint().confirmed, Some(responder_addr));
@@ -399,6 +415,7 @@ mod confirmed_endpoint_tests {
             TunnResult::WriteToTunnel(_)
         ));
         assert_eq!(responder.endpoint().confirmed, Some(real));
+        assert!(signalled(&changes), "the first proof is a change");
 
         // A fresh initiation the responder has not seen, delivered from another source, as a
         // replay would be: GotaTun accepts it and moves `addr`, `confirmed` must stay put.
@@ -409,6 +426,7 @@ mod confirmed_endpoint_tests {
         let _ = network(responder.handle_incoming_packet(WgKind::from(replayed), forged));
         assert_eq!(responder.endpoint().addr, Some(forged));
         assert_eq!(responder.endpoint().confirmed, Some(real));
+        assert!(!signalled(&changes), "an unproven source is no change");
 
         // Authenticated data from a new source is a real roam and moves the confirmed endpoint.
         let roamed: SocketAddr = "192.0.2.20:51820".parse().unwrap();
@@ -422,6 +440,13 @@ mod confirmed_endpoint_tests {
         ));
         assert_eq!(responder.endpoint().addr, Some(roamed));
         assert_eq!(responder.endpoint().confirmed, Some(roamed));
+        assert!(signalled(&changes), "a roam is a change");
+        let again = initiator
+            .tunnel
+            .handle_outgoing_packet(Packet::from_bytes(bytes::BytesMut::new()), None)
+            .unwrap();
+        let _ = responder.handle_incoming_packet(again, roamed);
+        assert!(!signalled(&changes), "the same source again is no change");
     }
 
     /// Data from the peer's side socket (side mark, #260 J1159) is delivered but moves neither

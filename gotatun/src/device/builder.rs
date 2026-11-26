@@ -305,6 +305,7 @@ impl<Udp: UdpTransportFactory, TunTx: IpSend, TunRx: IpRecv> DeviceBuilder<Udp, 
             side_socket: self.side_socket,
             key_pair: None,
             task_liveness: Arc::new(()),
+            confirmed_changes: Arc::default(),
             timer_queue: Arc::default(),
             index_table: self.index_table.unwrap_or_else(IndexTable::from_os_rng),
             peers: Default::default(),
@@ -317,6 +318,7 @@ impl<Udp: UdpTransportFactory, TunTx: IpSend, TunRx: IpRecv> DeviceBuilder<Udp, 
         };
 
         let fatal_error = state.fatal_error.subscribe();
+        let confirmed_changes = Arc::clone(&state.confirmed_changes);
 
         if let Some(private_key) = self.private_key {
             let _ = state.set_key(private_key).await;
@@ -340,7 +342,11 @@ impl<Udp: UdpTransportFactory, TunTx: IpSend, TunRx: IpRecv> DeviceBuilder<Udp, 
             Connection::set_up(inner.clone()).await?;
         }
 
-        Ok(Device { inner, fatal_error })
+        Ok(Device {
+            inner,
+            fatal_error,
+            confirmed_changes,
+        })
     }
 }
 
