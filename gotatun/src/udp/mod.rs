@@ -25,9 +25,9 @@ use crate::packet::{Packet, PacketBufPool};
 
 #[cfg(feature = "device")]
 pub(crate) mod buffer;
+pub mod channel;
 #[cfg(feature = "device")]
 pub(crate) mod side_recv;
-pub mod channel;
 #[cfg(feature = "socket")]
 pub mod socket;
 
