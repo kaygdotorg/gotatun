@@ -54,8 +54,7 @@ use super::TimerName::{
     TimeLastHandshakeStarted, TimePersistentKeepalive, TimeSessionEstablished,
 };
 use super::{
-    COOKIE_EXPIRATION_TIME, KEEPALIVE_TIMEOUT, REJECT_AFTER_TIME, REKEY_ATTEMPT_TIME,
-    REKEY_TIMEOUT, TimerName, Timers,
+    COOKIE_EXPIRATION_TIME, KEEPALIVE_TIMEOUT, REJECT_AFTER_TIME, REKEY_TIMEOUT, TimerName, Timers,
 };
 use crate::noise::Tunn;
 
@@ -207,9 +206,9 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         if let Some(time_init_sent) = self.handshake.timer() {
             // A handshake is in flight: only the give-up time and the retry matter, as in
             // `update_timers`, which skips every other rule in this state.
-            due = due.min(timers[TimeLastHandshakeStarted] + REKEY_ATTEMPT_TIME);
-            let retry_in = timers
-                .rekey_timeout
+            due = due.min(timers[TimeLastHandshakeStarted] + timers.params.rekey_attempt_time);
+            let retry_in = self
+                .handshake_retry_delay()
                 .saturating_sub(time_init_sent.elapsed());
             due = due.min(timers.now() + retry_in);
             return Some(due);

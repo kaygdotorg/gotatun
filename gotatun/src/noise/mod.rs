@@ -342,8 +342,16 @@ impl<R: RngCore + Send> Tunn<R> {
     }
 
     fn queue_packet_and_start_handshake(&mut self, packet: Packet) -> Option<PreparedOutgoing> {
-        // If there is no session, queue the packet for future retry.
-        self.queue_packet(packet);
+        // Data waiting for the peer ends any back-off: the retry it holds up is due one
+        // ordinary retry interval after the last initiation (#260, J1253).
+        if !packet.is_empty() && self.timers.unanswered_retries > 0 {
+            self.timers.unanswered_retries = 0;
+            self.queue_packet(packet);
+            self.reschedule_timers(Duration::ZERO);
+        } else {
+            // If there is no session, queue the packet for future retry.
+            self.queue_packet(packet);
+        }
         // Initiate a new handshake if none is in progress.
         self.format_handshake_initiation(false)
             .map(|packet| PreparedOutgoing::Ready(packet.into()))
@@ -663,6 +671,7 @@ impl<R: RngCore + Send> Tunn<R> {
         }
         self.timer_tick(TimerName::TimeLastPacketSent);
         self.update_rekey_timeout();
+        self.timers.unanswered_retries = 0;
         // The retry and give-up deadlines start now (#260, J1111).
         self.reschedule_timers(Duration::ZERO);
 
