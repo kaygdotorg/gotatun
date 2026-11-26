@@ -79,7 +79,12 @@ impl UdpTransportFactory for UdpSocketFactory {
         &mut self,
         params: &UdpTransportFactoryParams,
     ) -> io::Result<(Self::Send, Self::Recv)> {
-        let udp = self.bind_socket(params, self.mac_connected, self.recv_buffer_size, self.send_buffer_size)?;
+        let udp = self.bind_socket(
+            params,
+            self.mac_connected,
+            self.recv_buffer_size,
+            self.send_buffer_size,
+        )?;
 
         if let Err(err) = udp.enable_udp_gro() {
             tracing::warn!("Failed to enable UDP GRO: {err}");

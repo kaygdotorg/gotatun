@@ -131,9 +131,7 @@ mod tests {
     use super::WithSide;
     use crate::{
         packet::{Packet, PacketBufPool},
-        udp::{
-            UdpRecv, UdpTransportFactory, UdpTransportFactoryParams, socket::UdpSocketFactory,
-        },
+        udp::{UdpRecv, UdpTransportFactory, UdpTransportFactoryParams, socket::UdpSocketFactory},
     };
 
     /// The default socket factory binds a side pair on its own port, and one receiver hears a
@@ -162,7 +160,10 @@ mod tests {
         let mut buf = Default::default();
         let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        for (port, body) in [(main_port, b"main".as_slice()), (side_port, b"side".as_slice())] {
+        for (port, body) in [
+            (main_port, b"main".as_slice()),
+            (side_port, b"side".as_slice()),
+        ] {
             sender
                 .send_to(body, ("127.0.0.1", port))
                 .await

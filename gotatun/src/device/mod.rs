@@ -61,9 +61,9 @@ mod transports;
 pub mod uapi;
 
 use crate::noise::index_table::IndexTable;
+use crate::packet_hash::PacketHash;
 use builder::Nul;
 use futures::{FutureExt, StreamExt, TryFutureExt, future::BoxFuture, stream::FuturesUnordered};
-use crate::packet_hash::PacketHash;
 use std::collections::{HashMap, HashSet};
 use std::io::{self};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
