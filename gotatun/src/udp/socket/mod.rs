@@ -52,6 +52,11 @@ pub fn macos_batch_stats() -> [u64; 4] {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
 
+/// The Linux and Android registration with tokio: readable always, writable only while a send
+/// is blocked (infraternal #260, J1255).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod read_watched;
+
 /// Implementations of [`super::UdpSend`]/[`super::UdpRecv`] for windows
 #[cfg(target_os = "windows")]
 mod windows;
@@ -181,9 +186,17 @@ const SPLIT_PICKS: usize = 16;
 static LIVE_SOCKETS: std::sync::Mutex<Vec<std::sync::Weak<UdpSocketState>>> =
     std::sync::Mutex::new(Vec::new());
 
+/// The registered OS socket inside a [`UdpSocket`]: on Linux and Android one that watches
+/// writability only while a send is blocked (see `read_watched`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+type OsSocket = read_watched::ReadWatchedSocket;
+/// The registered OS socket inside a [`UdpSocket`].
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+type OsSocket = tokio::net::UdpSocket;
+
 struct UdpSocketState {
     /// The socket, or on a macOS split pair its `IPV6_V6ONLY` `[::]:<port>` side.
-    socket: tokio::net::UdpSocket,
+    socket: OsSocket,
     /// macOS: the AF_INET `0.0.0.0:<port>` side of a split pair, which carries all IPv4 traffic
     /// (#260, J826 finding 1, J834). `None` for a single socket.
     #[cfg(target_os = "macos")]
@@ -360,6 +373,9 @@ impl UdpSocket {
         #[cfg(target_os = "linux")]
         let udp_gso_supported = getsockopt(&socket, sockopt::UdpGsoSegment).is_ok();
 
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let inner = read_watched::ReadWatchedSocket::new(socket.into())?;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let inner = tokio::net::UdpSocket::from_std(socket.into())?;
         #[cfg(target_os = "macos")]
         let v4 = v4
@@ -397,7 +413,19 @@ impl UdpSocket {
         Ok(socket)
     }
 
+    /// Get the inner socket, for options and other calls that never wait.
+    ///
+    /// On Linux and Android it is the standard library's socket, in nonblocking mode. It is
+    /// registered with tokio for readability only, so it is not a [`tokio::net::UdpSocket`]:
+    /// send and receive through this type (see `read_watched`).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[inline(always)]
+    pub fn socket(&self) -> &std::net::UdpSocket {
+        self.inner.socket.get_ref()
+    }
+
     /// Get the inner [`tokio::net::UdpSocket`].
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     #[inline(always)]
     pub fn socket(&self) -> &tokio::net::UdpSocket {
         &self.inner.socket
@@ -405,7 +433,7 @@ impl UdpSocket {
 
     /// Returns the local address that this socket is bound to.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.socket.local_addr()
+        self.socket().local_addr()
     }
 
     /// Tell every WireGuard socket of this process that the host's network changed.
@@ -531,7 +559,7 @@ impl UdpSocket {
 #[cfg(not(windows))]
 impl std::os::fd::AsFd for UdpSocket {
     fn as_fd(&self) -> std::os::unix::prelude::BorrowedFd<'_> {
-        self.inner.socket.as_fd()
+        self.socket().as_fd()
     }
 }
 

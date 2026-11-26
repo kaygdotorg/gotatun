@@ -21,8 +21,8 @@ use std::{
     net::SocketAddr,
     os::fd::{AsRawFd, RawFd},
 };
-use tokio::io::Interest;
 
+use super::read_watched::ReadWatchedSocket;
 use crate::{
     packet::Packet,
     udp::{
@@ -145,7 +145,7 @@ fn should_disable_udp_gso(err: &io::Error) -> bool {
 }
 
 struct SendBatch<'a, 'p> {
-    socket: &'a tokio::net::UdpSocket,
+    socket: &'a ReadWatchedSocket,
     fd: RawFd,
     pkts: &'a [[IoSlice<'p>; 1]],
     targets: &'a [Option<SockaddrStorage>],
@@ -159,7 +159,7 @@ async fn send_plain_range(
     while packet_buf_start < packet_buf_end {
         let result = batch
             .socket
-            .async_io(Interest::WRITABLE, || {
+            .send(|| {
                 let mut multiheaders =
                     MultiHeaders::preallocate(packet_buf_end - packet_buf_start, None);
                 let multiresult = nix::sys::socket::sendmmsg(
@@ -204,7 +204,7 @@ async fn send_gso_segment(
 
     let result = batch
         .socket
-        .async_io(Interest::WRITABLE, || {
+        .send(|| {
             let mut multiheaders = MultiHeaders::preallocate(1, Some(nix::cmsg_space!(u16)));
             let multiresult = nix::sys::socket::sendmmsg(
                 batch.fd,
@@ -745,7 +745,11 @@ impl UdpSend for super::UdpSocket {
     type SendManyBuf = SendmmsgBuf;
 
     async fn send_to(&self, packet: Packet, target: SocketAddr) -> io::Result<()> {
-        self.socket().send_to(&packet, target).await?;
+        let socket = self.socket();
+        self.inner
+            .socket
+            .send(|| socket.send_to(&packet, target))
+            .await?;
         Ok(())
     }
 
@@ -756,8 +760,7 @@ impl UdpSend for super::UdpSocket {
     ) -> io::Result<()> {
         check_send_max_number_of_packets(MAX_PACKET_COUNT, packets)?;
 
-        let socket = self.socket();
-        let fd = socket.as_raw_fd();
+        let fd = self.socket().as_raw_fd();
 
         buf.targets.clear();
 
@@ -771,7 +774,7 @@ impl UdpSend for super::UdpSocket {
 
         let pkts = &packets_buf[..buf.targets.len()];
         let batch = SendBatch {
-            socket,
+            socket: &self.inner.socket,
             fd,
             pkts,
             targets: &buf.targets,
@@ -1093,7 +1096,7 @@ mod gro {
             pool: &mut PacketBufPool,
         ) -> io::Result<(Packet, SocketAddr)> {
             let mut buf = pool.get();
-            let (n, src) = self.socket().recv_from(&mut buf).await?;
+            let (n, src) = self.inner.socket.receive_from(&mut buf).await?;
             buf.truncate(n);
             let src = self.map_src(src);
             Ok((buf, src))
@@ -1105,8 +1108,7 @@ mod gro {
             pool: &mut PacketBufPool,
             packets: &mut Vec<(Packet, SocketAddr)>,
         ) -> io::Result<()> {
-            let socket = self.socket();
-            let fd = socket.as_raw_fd();
+            let fd = self.socket().as_raw_fd();
             let map_ipv4_to_ipv6 = self.map_ipv4_to_ipv6;
             let stamp = crate::aqm::enabled();
             if stamp {
@@ -1114,8 +1116,9 @@ mod gro {
                 recv_many_bufs.rx_stamps.resize(packets.len(), 0);
             }
 
-            socket
-                .async_io(Interest::READABLE, move || {
+            self.inner
+                .socket
+                .receive(Interest::READABLE, move || {
                     // TODO: the CMSG space cannot be reused, so we must allocate new headers each
                     // time [ControlMessageOwned::UdpGroSegments(i32)] contains
                     // the size of all smaller packets/segments
@@ -1565,7 +1568,7 @@ mod android {
             pool: &mut PacketBufPool,
         ) -> io::Result<(Packet, SocketAddr)> {
             let mut buf = pool.get();
-            let (n, src) = self.socket().recv_from(&mut buf).await?;
+            let (n, src) = self.inner.socket.receive_from(&mut buf).await?;
             buf.truncate(n);
             let src = self.map_src(src);
             Ok((buf, src))
