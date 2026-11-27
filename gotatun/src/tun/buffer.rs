@@ -264,13 +264,9 @@ fn queue_ready_peer_batches(
 ) -> Option<BufferedIpMessage> {
     for _ in 0..FAIR_INGRESS_BATCH_BUDGET {
         match rx.try_recv() {
-            Ok(BufferedIpMessage::PeerBatch(packets, permit, peer_key)) => enqueue_peer_batch(
-                fair_queue,
-                peer_key,
-                packets,
-                permit,
-                dropped_total,
-            ),
+            Ok(BufferedIpMessage::PeerBatch(packets, permit, peer_key)) => {
+                enqueue_peer_batch(fair_queue, peer_key, packets, permit, dropped_total)
+            }
             Ok(message) => return Some(message),
             Err(_) => return None,
         }
@@ -997,7 +993,10 @@ mod tests {
         let mut permits = Vec::with_capacity(FAIR_INGRESS_BATCH_BUDGET);
         assert!(queue.dequeue_batch(&mut packets, &mut permits));
         assert_eq!(packets.len(), FAIR_INGRESS_BATCH_BUDGET);
-        assert!(matches!(rx.try_recv(), Ok(BufferedIpMessage::PeerBatch(..))));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(BufferedIpMessage::PeerBatch(..))
+        ));
     }
 
     async fn scripted_recv(script: Vec<io::Result<Vec<Packet<Ip>>>>) -> BufferedIpRecv<Script> {
