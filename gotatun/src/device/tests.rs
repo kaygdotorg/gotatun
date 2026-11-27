@@ -2247,3 +2247,80 @@ async fn requested_keepalives_cost_at_design_scale() {
         );
     }
 }
+
+/// Adding a peer with a persistent keepalive to a running device whose timer task is sleeping
+/// must schedule its first timer visit only after `Arc::new_cyclic` returns and `packet_lookup`
+/// contains the peer (infraternal #605).
+///
+/// Before the fix, `add_peer` called `set_timer_hook` inside `Arc::new_cyclic`, waking the
+/// sleeping timer task immediately; `take_due` could then drop the un-upgradable `Weak` or
+/// `visit_peer` could see `!packet_lookup.contains_peer` and return without rescheduling,
+/// leaving the peer permanently absent from `timer_queue` while its tunnel thought a deadline
+/// was pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamically_added_peer_with_keepalive_always_initiates_handshake() {
+    use crate::device::{DeviceBuilder, Peer};
+    use crate::udp::channel::{UdpChannelFactory, UdpChannelV4, UdpChannelV6};
+    use ipnetwork::Ipv4Network;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    let (mock_tun, _app_tx, _app_rx) = mock::mock_tun();
+    let local_ip = Ipv4Addr::new(10, 0, 0, 1);
+    let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
+    let port: u16 = 51820;
+    let (dev_v4, mut peer_v4) = UdpChannelV4::new_pair(64);
+    let (dev_v6, _peer_v6) = UdpChannelV6::new_pair(8);
+    let udp = UdpChannelFactory::new(local_ip, dev_v4, Ipv6Addr::UNSPECIFIED, dev_v6);
+
+    let initial_peer = Peer::new(PublicKey::from(&StaticSecret::random()))
+        .with_endpoint((peer_ip, port).into())
+        .with_allowed_ip(
+            Ipv4Network::new(Ipv4Addr::new(10, 1, 0, 1), 32)
+                .unwrap()
+                .into(),
+        );
+
+    let device = DeviceBuilder::new()
+        .with_private_key(StaticSecret::random())
+        .with_ip(mock_tun)
+        .with_udp(udp)
+        .with_listen_port(port)
+        .with_peer(initial_peer)
+        .build()
+        .await
+        .expect("build device");
+
+    // Remove the initial peer so the timer task empties its queue and parks on `notified()`.
+    assert_eq!(device.clear_peers().await.unwrap(), 1);
+    // Drain any packet from the initial peer and let the timer task park.
+    while timeout(Duration::from_millis(20), peer_v4.rx.recv())
+        .await
+        .is_ok()
+    {}
+
+    let target_key = PublicKey::from(&StaticSecret::random());
+    for trial in 0..50_u32 {
+        let mut peer = Peer::new(target_key)
+            .with_endpoint((peer_ip, port).into())
+            .with_allowed_ip(
+                Ipv4Network::new(Ipv4Addr::new(10, 1, 0, 2), 32)
+                    .unwrap()
+                    .into(),
+            );
+        peer.keepalive = Some(25);
+        assert!(device.add_peer(peer).await.unwrap());
+
+        let sent = timeout(Duration::from_millis(500), peer_v4.rx.recv()).await;
+        assert!(
+            sent.is_ok(),
+            "trial {trial}: dynamically added peer with keepalive did not initiate a handshake"
+        );
+
+        assert!(device.remove_peer(&target_key).await.unwrap());
+        // Let the timer task return to `queue.notified().await` before the next trial.
+        sleep(Duration::from_millis(2)).await;
+        while peer_v4.rx.try_recv().is_ok() {}
+    }
+
+    device.stop().await;
+}
