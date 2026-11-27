@@ -41,8 +41,8 @@ pub struct Endpoint {
     ///
     /// Unlike `addr`, an initiation never moves it. An initiation can be replayed from any
     /// address before the sender proves anything, so a caller that derives routing state from a
-    /// peer's path (for example its MTU) should read this field. It is `None` until the first
-    /// proof and is not changed by configuration.
+    /// peer's path (for example its MTU) should read this field. It is unset until the first
+    /// proof and is cleared when the tunnel loses its last session.
     pub confirmed: Option<SocketAddr>,
 }
 
@@ -189,6 +189,16 @@ impl PeerState {
         }
     }
 
+    /// Withdraw the authenticated endpoint when its sessions are gone. Keep the send address
+    /// so the next handshake can try the same path.
+    pub(super) fn clear_confirmed_endpoint(&mut self) {
+        if self.endpoint.confirmed.take().is_some()
+            && let Some(changes) = &self.confirmed_changes
+        {
+            changes.notify_one();
+        }
+    }
+
     /// Prepare a data packet for parallel decryption under its selected session.
     pub(crate) fn prepare_incoming_data(
         &mut self,
@@ -242,13 +252,19 @@ impl PeerState {
         self.tunnel.request_keepalive()
     }
 
+    /// Run the tunnel timers and withdraw confirmation when the final session expires.
     pub fn update_timers(&mut self) -> Result<Option<WgKind>, WireGuardError> {
-        self.tunnel.update_timers()
+        let result = self.tunnel.update_timers();
+        if self.endpoint.confirmed.is_some() && !self.tunnel.has_session() {
+            self.clear_confirmed_endpoint();
+        }
+        result
     }
 
-    /// Drop all sessions and reset the tunnel, forcing a fresh handshake.
+    /// Drop all sessions and endpoint confirmation, forcing a fresh handshake.
     pub fn reset(&mut self) {
         self.tunnel.reset();
+        self.clear_confirmed_endpoint();
     }
 
     /// Start a handshake unless there is an active session or our own initiation is in flight.
@@ -372,6 +388,7 @@ mod confirmed_endpoint_tests {
 
     /// A replayed initiation from a new source moves `addr` but never `confirmed`;
     /// authenticated data, and the response to our own initiation, move both (#489 J549 P1).
+    /// A reset withdraws confirmation and keeps the last send address (#260 J1297 P1).
     #[test]
     fn only_authenticated_packets_move_the_confirmed_endpoint() {
         let initiator_key = StaticSecret::random_from_rng(rand_core::OsRng);
@@ -447,6 +464,53 @@ mod confirmed_endpoint_tests {
             .unwrap();
         let _ = responder.handle_incoming_packet(again, roamed);
         assert!(!signalled(&changes), "the same source again is no change");
+
+        responder.reset();
+        assert_eq!(responder.endpoint().confirmed, None);
+        assert_eq!(responder.endpoint().addr, Some(roamed));
+        assert!(signalled(&changes), "reset withdraws the proof");
+        responder.reset();
+        assert!(!signalled(&changes), "no proof remains to withdraw");
+    }
+
+    /// The endpoint stays confirmed before expiry and is withdrawn as soon as the last
+    /// session expires. A subsequent handshake can still use the send address (#260 J1297 P1).
+    #[cfg(feature = "mock_instant")]
+    #[test]
+    fn the_last_session_expiry_withdraws_endpoint_confirmation() {
+        use mock_instant::thread_local::MockClock;
+        use std::time::Duration;
+
+        let initiator_key = StaticSecret::random_from_rng(rand_core::OsRng);
+        let responder_key = StaticSecret::random_from_rng(rand_core::OsRng);
+        let mut initiator = tunnel(&initiator_key, &responder_key);
+        let mut responder = PeerState::new(
+            tunnel(&responder_key, &initiator_key),
+            None,
+            &[],
+            #[cfg(feature = "daita")]
+            None,
+        );
+        let changes = Arc::new(tokio::sync::Notify::new());
+        responder.confirmed_changes = Some(Arc::clone(&changes));
+        let addr = "192.0.2.10:51820".parse().unwrap();
+        let init = initiator.format_handshake_initiation(false).unwrap();
+        let response = network(responder.handle_incoming_packet(WgKind::from(init), addr));
+        let keepalive = network(initiator.handle_incoming_packet(response));
+        let _ = responder.handle_incoming_packet(keepalive, addr);
+        assert_eq!(responder.endpoint().confirmed, Some(addr));
+        assert!(changes.notified().now_or_never().is_some());
+
+        MockClock::advance(Duration::from_secs(179));
+        let _ = responder.update_timers();
+        assert_eq!(responder.endpoint().confirmed, Some(addr));
+        assert!(changes.notified().now_or_never().is_none());
+
+        MockClock::advance(Duration::from_secs(2));
+        let _ = responder.update_timers();
+        assert_eq!(responder.endpoint().confirmed, None);
+        assert_eq!(responder.endpoint().addr, Some(addr));
+        assert!(changes.notified().now_or_never().is_some());
     }
 
     /// Data from the peer's side socket (side mark, #260 J1159) is delivered but moves neither

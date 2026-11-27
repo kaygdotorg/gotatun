@@ -1480,8 +1480,8 @@ impl<T: DeviceTransports> Device<T> {
         requested
     }
 
-    /// A signal that some peer's confirmed endpoint changed: the source of its latest packet
-    /// that proved possession of its key (see [`PeerStats`]'s `confirmed_endpoint`).
+    /// A signal that some peer's confirmed endpoint changed or that its last session was lost
+    /// (see [`PeerStats`]'s `confirmed_endpoint`).
     ///
     /// Await [`tokio::sync::Notify::notified`] on it and then read the peers, instead of polling
     /// them (infraternal #260, J1253: an idle node must not wake to look). One permit is kept,
@@ -1815,7 +1815,8 @@ impl<T: DeviceTransports> DeviceState<T> {
                 private_key.clone(),
                 public_key,
                 Arc::clone(&rate_limiter),
-            )
+            );
+            peer.clear_confirmed_endpoint();
         }
 
         self.key_pair = Some((private_key, public_key));

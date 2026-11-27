@@ -33,9 +33,9 @@ pub struct Stats {
     pub last_handshake: Option<Duration>,
     /// Total number of bytes received from this peer.
     pub rx_bytes: usize,
-    /// The source of the latest packet that proved this peer holds its key; `None` before the
-    /// first. Unlike [`Peer::endpoint`], an unconfirmed handshake initiation never changes it, so
-    /// read this before deriving routing state from the peer's network path.
+    /// The source of the latest packet that proved this peer holds its key. It is unset before
+    /// the first proof and after the last session is lost. Unlike [`Peer::endpoint`], an
+    /// unconfirmed handshake initiation never changes it, so use this to derive routing state.
     pub confirmed_endpoint: Option<SocketAddr>,
     /// Total number of bytes sent to this peer.
     pub tx_bytes: usize,

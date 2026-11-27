@@ -390,6 +390,15 @@ impl<R: RngCore + Send> Tunn<R> {
             .is_some_and(|sessions| sessions[self.current % N_SESSIONS].is_some())
     }
 
+    /// Whether any session remains after a timer pass. A previous session can still receive
+    /// packets while a replacement handshake is in progress.
+    #[cfg(feature = "device")]
+    pub(crate) fn has_session(&self) -> bool {
+        self.sessions
+            .as_ref()
+            .is_some_and(|sessions| sessions.iter().any(Option::is_some))
+    }
+
     /// Whether packets remain queued after the most recent bounded flush chunk.
     pub(crate) fn has_queued_packets(&self) -> bool {
         !self.packet_queue.is_empty()
