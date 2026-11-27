@@ -48,6 +48,9 @@ pub mod configure;
 #[cfg(feature = "daita")]
 pub mod daita;
 mod handshake_backlog;
+mod incoming_fair;
+#[cfg(test)]
+mod incoming_fair_tests;
 #[cfg(test)]
 mod integration_tests;
 mod parallel_crypto;
@@ -75,11 +78,12 @@ use tokio::join;
 use tokio::sync::RwLock;
 use tokio::sync::{Mutex, MutexGuard, watch};
 use tracing::{Level, instrument};
+use zerocopy::IntoBytes;
 
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{PreparedDecryption, PreparedOutgoing, Tunn, TunnResult};
-use crate::packet::{PacketBufPool, WgKind};
+use crate::packet::{Packet, PacketBufPool, WgData, WgKind};
 use crate::task::Task;
 use crate::tun::{IpRecv, IpSend, MtuWatcher};
 #[cfg(not(target_os = "linux"))]
@@ -88,6 +92,7 @@ use crate::udp::buffer::BufferedUdpSend;
 use crate::udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams};
 use allowed_ips::AllowedIps;
 use gotatun_crypto::x25519;
+use incoming_fair::{DATAGRAM_WORK_BYTES, IncomingFairQueue};
 use parallel_crypto::{
     CRYPTO_BATCH_SIZE, CRYPTO_CHUNK_SIZE, CryptoHandle, CryptoWorkers, IncomingCompletion,
     OrderStore, OrderedCompletions,
@@ -447,7 +452,7 @@ impl PacketLookup {
     }
 }
 
-/// Prepared authenticated work gathered from one peer in a receive batch.
+/// Prepared decryption work grouped by peer from one receive batch.
 struct PreparedIncomingRun {
     peer_key: usize,
     peer_arc: Arc<Mutex<PeerState>>,
@@ -455,6 +460,113 @@ struct PreparedIncomingRun {
     /// Kernel receive time (ns) of each packet's datagram, aligned with `packets`; empty when the
     /// receive-side queue bound is off.
     rx_stamps: Vec<u64>,
+}
+
+/// One data packet classified by its receiver index and waiting for its peer's crypto turn.
+struct QueuedIncomingData {
+    /// The stable key used by the per-peer DRR lane.
+    peer_key: usize,
+    /// The session index that selected this peer before any AEAD or endpoint change.
+    receiver_index: u32,
+    /// The configured peer that owns `receiver_index` at receive time.
+    peer_arc: Arc<Mutex<PeerState>>,
+    /// The encrypted WireGuard datagram, including forged bytes until crypto rejects it.
+    packet: Packet<WgData>,
+    /// The untrusted outer UDP source, used as a scheduling hint and committed only after AEAD.
+    addr: std::net::SocketAddr,
+    /// Whether the source missed the authenticated endpoint or could not be checked promptly.
+    roaming_hint: bool,
+    /// Kernel receive time carried to D397's delivery decision, or zero when unavailable.
+    rx_stamp: u64,
+}
+
+/// Shared receive-path state passed while the fair queue prepares one peer's packet.
+struct IncomingPrepareContext<'a, TunTx> {
+    /// Pending crypto completions that peer-lock waits must continue to drive.
+    pending: &'a mut PendingIncoming,
+    /// Outgoing completions that peer-lock waits must continue to drive.
+    outgoing_pending: &'a mut PendingOutgoing,
+    /// Partial per-peer runs assembled from scheduled packets.
+    incoming_runs: &'a mut HashMap<usize, PreparedIncomingRun, PacketHash>,
+    /// Peer keys in the order the scheduler first selected their partial runs.
+    run_order: &'a mut Vec<usize>,
+    /// Workers used after the packet leaves this queue.
+    crypto: CryptoHandle,
+    /// Per-peer completion lanes that retain receive order.
+    ordered: Arc<OrderStore<IncomingCompletion>>,
+    /// Weak token used to stop work after device removal.
+    device: Weak<()>,
+    /// Current peer and receiver-index map.
+    lookup: Arc<PacketLookup>,
+    /// TUN sink used by ordered authenticated completion.
+    tun_tx: TunTx,
+    /// Whether receive timestamps need to be retained for D397.
+    aqm_on: bool,
+}
+
+/// The live peer selected from a data packet's visible receiver index.
+struct ClassifiedIncomingPeer {
+    /// The session index that selected this peer before any AEAD or endpoint change.
+    receiver_index: u32,
+    /// The stable key used by the per-peer DRR lane.
+    peer_key: usize,
+    /// The configured peer that owns `receiver_index` at receive time.
+    peer_arc: Arc<Mutex<PeerState>>,
+    /// A non-authenticating hint used only to select the bounded endpoint-class budget.
+    roaming_hint: bool,
+}
+
+/// Resolve a data packet to its configured peer and take a non-blocking endpoint scheduling hint.
+///
+/// If peer state is busy, classify the source as a roaming candidate. Only a confirmed endpoint
+/// earns the provisional normal budget. The hint never authenticates a packet, creates a queue
+/// identity, or changes endpoint state.
+fn classify_incoming_peer(
+    packet: &Packet<WgData>,
+    lookup: &PacketLookup,
+    addr: std::net::SocketAddr,
+) -> Option<ClassifiedIncomingPeer> {
+    let receiver_index = packet.header.receiver_idx.get();
+    let peer_arc = lookup.peer_by_index(receiver_index)?;
+    let roaming_hint = peer_arc
+        .try_lock()
+        .map_or(true, |peer| peer.endpoint().confirmed != Some(addr));
+    Some(ClassifiedIncomingPeer {
+        receiver_index,
+        peer_key: peer_order_key(&peer_arc),
+        peer_arc,
+        roaming_hint,
+    })
+}
+
+/// Classify and queue one data packet without authenticating it or creating unknown-peer state.
+///
+/// A visible receiver index only chooses the peer whose bounded budget pays for decryption. The
+/// packet still has to pass AEAD, replay, and allowed-source checks before delivery or roaming.
+fn queue_incoming_data(
+    queue: &mut IncomingFairQueue<QueuedIncomingData>,
+    classified: ClassifiedIncomingPeer,
+    packet: Packet<WgData>,
+    addr: std::net::SocketAddr,
+    rx_stamp: u64,
+) -> Result<(), QueuedIncomingData> {
+    let ClassifiedIncomingPeer {
+        receiver_index,
+        peer_key,
+        peer_arc,
+        roaming_hint,
+    } = classified;
+    let cost = packet.as_bytes().len().saturating_add(DATAGRAM_WORK_BYTES);
+    let incoming = QueuedIncomingData {
+        peer_key,
+        receiver_index,
+        peer_arc,
+        packet,
+        addr,
+        roaming_hint,
+        rx_stamp,
+    };
+    queue.try_push(peer_key, cost, roaming_hint, incoming)
 }
 
 /// The kernel receive timestamp of `packets[index]` from `udp_rx`'s last batch (see
@@ -2156,6 +2268,127 @@ impl<T: DeviceTransports> DeviceState<T> {
         }
     }
 
+    /// Prepare one receiver-index-classified packet, then add peer-bound work to a crypto run.
+    ///
+    /// The scheduler charges a forged datagram to the peer named by its live receiver index before
+    /// AEAD. The index grants no trust: this function checks that it still names the same configured
+    /// peer before and after acquiring peer state, and endpoint changes remain in authenticated
+    /// completion.
+    async fn prepare_next_incoming_data<TunTx: IpSend + Clone>(
+        queue: &mut IncomingFairQueue<QueuedIncomingData>,
+        context: IncomingPrepareContext<'_, TunTx>,
+    ) -> Result<bool, Error> {
+        let IncomingPrepareContext {
+            pending,
+            outgoing_pending,
+            incoming_runs,
+            run_order,
+            crypto,
+            ordered,
+            device,
+            lookup,
+            tun_tx,
+            aqm_on,
+        } = context;
+        let Some((peer_key, queued)) = queue.pop_next() else {
+            return Ok(false);
+        };
+        if device.upgrade().is_none() {
+            return Ok(true);
+        }
+        let selected_peer_is_live = lookup
+            .peer_by_index(queued.receiver_index)
+            .is_some_and(|current| Arc::ptr_eq(&current, &queued.peer_arc));
+        if !selected_peer_is_live || !lookup.contains_peer(&queued.peer_arc) {
+            return Ok(true);
+        }
+
+        let mut peer_trace = PeerLockDiagnostic::waiting("incoming_prepare", peer_key);
+        let mut pending_completions = PendingCompletions::Incoming(pending, outgoing_pending);
+        let mut peer = lock_peer_state_while_completing(
+            &queued.peer_arc,
+            "incoming_prepare",
+            peer_key,
+            &mut peer_trace,
+            &mut pending_completions,
+        )
+        .await?;
+        let selected_peer_is_live = lookup
+            .peer_by_index(queued.receiver_index)
+            .is_some_and(|current| Arc::ptr_eq(&current, &queued.peer_arc));
+        if !selected_peer_is_live || !lookup.contains_peer(&queued.peer_arc) {
+            return Ok(true);
+        }
+        match peer.prepare_incoming_data(queued.packet) {
+            crate::noise::PreparedIncoming::Immediate(result) => {
+                // A missing session or unusable counter costs only this peer's bounded turn.
+                drop(result);
+            }
+            crate::noise::PreparedIncoming::Decrypt { packet } => {
+                drop(peer);
+                drop(peer_trace);
+                if !incoming_runs.contains_key(&peer_key) {
+                    run_order.push(peer_key);
+                    incoming_runs.insert(
+                        peer_key,
+                        PreparedIncomingRun {
+                            peer_key,
+                            peer_arc: Arc::clone(&queued.peer_arc),
+                            packets: Vec::with_capacity(CRYPTO_CHUNK_SIZE),
+                            rx_stamps: Vec::new(),
+                        },
+                    );
+                }
+                let run = incoming_runs
+                    .get_mut(&peer_key)
+                    .expect("the peer run was inserted above");
+                run.packets.push((packet, queued.addr));
+                if aqm_on {
+                    run.rx_stamps.push(queued.rx_stamp);
+                }
+                if run.packets.len() == CRYPTO_CHUNK_SIZE {
+                    let run = incoming_runs
+                        .remove(&peer_key)
+                        .expect("a full incoming run remains registered");
+                    run_order.retain(|current| *current != peer_key);
+                    Self::flush_incoming_run(pending, crypto, ordered, device, lookup, tun_tx, run)
+                        .await?;
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Flush prepared runs in the order the DRR scheduler first selected their peers.
+    async fn flush_incoming_runs<TunTx: IpSend + Clone>(
+        pending: &mut PendingIncoming,
+        incoming_runs: &mut HashMap<usize, PreparedIncomingRun, PacketHash>,
+        run_order: &mut Vec<usize>,
+        crypto: CryptoHandle,
+        ordered: Arc<OrderStore<IncomingCompletion>>,
+        device: Weak<()>,
+        lookup: Arc<PacketLookup>,
+        tun_tx: TunTx,
+    ) -> Result<(), Error> {
+        for peer_key in std::mem::take(run_order) {
+            let Some(run) = incoming_runs.remove(&peer_key) else {
+                continue;
+            };
+            Self::flush_incoming_run(
+                pending,
+                crypto.clone(),
+                Arc::clone(&ordered),
+                device.clone(),
+                Arc::clone(&lookup),
+                tun_tx.clone(),
+                run,
+            )
+            .await?;
+        }
+        debug_assert!(incoming_runs.is_empty());
+        Ok(())
+    }
+
     /// Reserve one contiguous receive range and add its batches to the bounded completion set.
     ///
     /// A shallow peer lane stays inline and avoids a worker wake for low-rate traffic.
@@ -2568,6 +2801,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         let mut handshake_backlog = handshake_backlog::HandshakeBacklog::new();
         let mut incoming_pending = PendingIncoming::new();
         let mut outgoing_pending = PendingOutgoing::new();
+        let mut incoming_fair = IncomingFairQueue::<QueuedIncomingData>::new();
 
         // Idle memory release (#260, J1150). No timer is armed while the device is already idle:
         // `idle_wake` fires once when the first packet after idle is taken from the pool or
@@ -2660,6 +2894,7 @@ impl<T: DeviceTransports> DeviceState<T> {
             }
 
             let mut incoming_runs = HashMap::<usize, PreparedIncomingRun, PacketHash>::default();
+            let mut run_order = Vec::new();
             let aqm_on = crate::aqm::enabled();
             // This turn's datagrams first; handshake messages among them join the backlog. Then
             // queued handshakes, for at most one serve budget.
@@ -2691,18 +2926,17 @@ impl<T: DeviceTransports> DeviceState<T> {
                 let parsed_packet = match verified {
                     Ok(packet) => packet,
                     Err(TunnResult::WriteToNetwork(WgKind::CookieReply(cookie))) => {
-                        for run in std::mem::take(&mut incoming_runs).into_values() {
-                            Self::flush_incoming_run(
-                                &mut incoming_pending,
-                                crypto.clone(),
-                                Arc::clone(&incoming_order),
-                                device.clone(),
-                                Arc::clone(&packet_lookup),
-                                tun_tx.clone(),
-                                run,
-                            )
-                            .await?;
-                        }
+                        Self::flush_incoming_runs(
+                            &mut incoming_pending,
+                            &mut incoming_runs,
+                            &mut run_order,
+                            crypto.clone(),
+                            Arc::clone(&incoming_order),
+                            device.clone(),
+                            Arc::clone(&packet_lookup),
+                            tun_tx.clone(),
+                        )
+                        .await?;
                         // Note: Cookies should not affect counters.
                         udp_tx
                             .send_to(cookie.into(), addr)
@@ -2713,25 +2947,14 @@ impl<T: DeviceTransports> DeviceState<T> {
                     Err(_) => continue,
                 };
 
-                if !matches!(&parsed_packet, WgKind::Data(_)) && !incoming_runs.is_empty() {
-                    for run in std::mem::take(&mut incoming_runs).into_values() {
-                        Self::flush_incoming_run(
-                            &mut incoming_pending,
-                            crypto.clone(),
-                            Arc::clone(&incoming_order),
-                            device.clone(),
-                            Arc::clone(&packet_lookup),
-                            tun_tx.clone(),
-                            run,
-                        )
-                        .await?;
-                    }
-                }
-
                 if device.upgrade().is_none() {
                     return Ok(());
                 }
 
+                let classified_data_peer = match &parsed_packet {
+                    WgKind::Data(packet) => classify_incoming_peer(packet, &packet_lookup, addr),
+                    _ => None,
+                };
                 let peer = match &parsed_packet {
                     WgKind::HandshakeInit(p) => parse_handshake_anon(&private_key, &public_key, p)
                         .ok()
@@ -2741,7 +2964,9 @@ impl<T: DeviceTransports> DeviceState<T> {
                         }),
                     WgKind::HandshakeResp(p) => packet_lookup.peer_by_index(p.receiver_idx.get()),
                     WgKind::CookieReply(p) => packet_lookup.peer_by_index(p.receiver_idx.get()),
-                    WgKind::Data(p) => packet_lookup.peer_by_index(p.header.receiver_idx.get()),
+                    WgKind::Data(_) => classified_data_peer
+                        .as_ref()
+                        .map(|classified| Arc::clone(&classified.peer_arc)),
                 };
                 let Some(peer_arc) = peer else { continue };
                 let peer_key = peer_order_key(&peer_arc);
@@ -2751,81 +2976,97 @@ impl<T: DeviceTransports> DeviceState<T> {
                         let counter = packet.header.counter.get();
                         if crate::diag::PIPELINE.on() {
                             eprintln!("pipeline stage=udp_data_arrival counter={counter}");
-                            eprintln!("pipeline stage=incoming_peer_lock_wait counter={counter}");
                         }
-                        let mut peer_trace =
-                            PeerLockDiagnostic::waiting("incoming_prepare", peer_key);
-                        let mut pending_completions = PendingCompletions::Incoming(
-                            &mut incoming_pending,
-                            &mut outgoing_pending,
-                        );
-                        let mut peer = lock_peer_state_while_completing(
-                            &peer_arc,
-                            "incoming_prepare",
-                            peer_key,
-                            &mut peer_trace,
-                            &mut pending_completions,
-                        )
-                        .await?;
-                        if !packet_lookup.contains_peer(&peer_arc) {
+                        let Some(classified) = classified_data_peer else {
+                            // An unknown receiver index is rejected before queue state or peer work.
                             continue;
-                        }
-                        if crate::diag::PIPELINE.on() {
-                            eprintln!(
-                                "pipeline stage=incoming_peer_lock_acquired counter={counter}"
-                            );
-                        }
-                        match peer.prepare_incoming_data(packet) {
-                            crate::noise::PreparedIncoming::Immediate(result) => {
-                                // The serial data path also discarded packets without a session.
-                                if crate::diag::PIPELINE.on() {
-                                    eprintln!(
-                                        "pipeline stage=incoming_prepare_immediate counter={counter}"
-                                    );
-                                }
-                                drop(result);
-                            }
-                            crate::noise::PreparedIncoming::Decrypt { packet } => {
-                                if crate::diag::PIPELINE.on() {
-                                    eprintln!(
-                                        "pipeline stage=incoming_prepare_decrypt counter={counter}"
-                                    );
-                                }
-                                drop(peer);
-                                drop(peer_trace);
-                                let reached_limit = {
-                                    let run = incoming_runs.entry(peer_key).or_insert_with(|| {
-                                        PreparedIncomingRun {
-                                            peer_key,
-                                            peer_arc: Arc::clone(&peer_arc),
-                                            packets: Vec::with_capacity(CRYPTO_CHUNK_SIZE),
-                                            rx_stamps: Vec::new(),
-                                        }
-                                    });
-                                    run.packets.push((packet, addr));
-                                    if aqm_on {
-                                        run.rx_stamps.push(rx_ns);
-                                    }
-                                    run.packets.len() == CRYPTO_CHUNK_SIZE
-                                };
-                                if reached_limit {
-                                    Self::flush_incoming_run(
-                                        &mut incoming_pending,
-                                        crypto.clone(),
-                                        Arc::clone(&incoming_order),
-                                        device.clone(),
-                                        Arc::clone(&packet_lookup),
-                                        tun_tx.clone(),
-                                        incoming_runs
-                                            .remove(&peer_key)
-                                            .expect("the receive run reached its bound"),
+                        };
+                        let mut deferred = queue_incoming_data(
+                            &mut incoming_fair,
+                            classified,
+                            packet,
+                            addr,
+                            rx_ns,
+                        )
+                        .err();
+                        while let Some(incoming) = deferred.take() {
+                            let cost = incoming
+                                .packet
+                                .as_bytes()
+                                .len()
+                                .saturating_add(DATAGRAM_WORK_BYTES);
+                            match incoming_fair.try_push(
+                                incoming.peer_key,
+                                cost,
+                                incoming.roaming_hint,
+                                incoming,
+                            ) {
+                                Ok(()) => break,
+                                Err(incoming) => {
+                                    deferred = Some(incoming);
+                                    let serviced = Self::prepare_next_incoming_data(
+                                        &mut incoming_fair,
+                                        IncomingPrepareContext {
+                                            pending: &mut incoming_pending,
+                                            outgoing_pending: &mut outgoing_pending,
+                                            incoming_runs: &mut incoming_runs,
+                                            run_order: &mut run_order,
+                                            crypto: crypto.clone(),
+                                            ordered: Arc::clone(&incoming_order),
+                                            device: device.clone(),
+                                            lookup: Arc::clone(&packet_lookup),
+                                            tun_tx: tun_tx.clone(),
+                                            aqm_on,
+                                        },
                                     )
                                     .await?;
+                                    if !serviced {
+                                        // A single UDP datagram always fits the scheduler's byte caps.
+                                        debug_assert!(
+                                            false,
+                                            "a rejected packet must have queued work"
+                                        );
+                                        deferred = None;
+                                    }
                                 }
                             }
                         }
                     }
                     packet => {
+                        // Data that arrived first for this peer must reach its ordered lane before
+                        // the following handshake or cookie changes session state.
+                        while incoming_fair.peer_len(peer_key) > 0 {
+                            if !Self::prepare_next_incoming_data(
+                                &mut incoming_fair,
+                                IncomingPrepareContext {
+                                    pending: &mut incoming_pending,
+                                    outgoing_pending: &mut outgoing_pending,
+                                    incoming_runs: &mut incoming_runs,
+                                    run_order: &mut run_order,
+                                    crypto: crypto.clone(),
+                                    ordered: Arc::clone(&incoming_order),
+                                    device: device.clone(),
+                                    lookup: Arc::clone(&packet_lookup),
+                                    tun_tx: tun_tx.clone(),
+                                    aqm_on,
+                                },
+                            )
+                            .await?
+                            {
+                                break;
+                            }
+                        }
+                        Self::flush_incoming_runs(
+                            &mut incoming_pending,
+                            &mut incoming_runs,
+                            &mut run_order,
+                            crypto.clone(),
+                            Arc::clone(&incoming_order),
+                            device.clone(),
+                            Arc::clone(&packet_lookup),
+                            tun_tx.clone(),
+                        )
+                        .await?;
                         drain_incoming_before_control(
                             incoming_order.lane(peer_key),
                             &mut incoming_pending,
@@ -3003,18 +3244,36 @@ impl<T: DeviceTransports> DeviceState<T> {
                     }
                 }
             }
-            for run in std::mem::take(&mut incoming_runs).into_values() {
-                Self::flush_incoming_run(
-                    &mut incoming_pending,
-                    crypto.clone(),
-                    Arc::clone(&incoming_order),
-                    device.clone(),
-                    Arc::clone(&packet_lookup),
-                    tun_tx.clone(),
-                    run,
+            while !incoming_fair.is_empty() {
+                if !Self::prepare_next_incoming_data(
+                    &mut incoming_fair,
+                    IncomingPrepareContext {
+                        pending: &mut incoming_pending,
+                        outgoing_pending: &mut outgoing_pending,
+                        incoming_runs: &mut incoming_runs,
+                        run_order: &mut run_order,
+                        crypto: crypto.clone(),
+                        ordered: Arc::clone(&incoming_order),
+                        device: device.clone(),
+                        lookup: Arc::clone(&packet_lookup),
+                        tun_tx: tun_tx.clone(),
+                        aqm_on,
+                    },
                 )
-                .await?;
+                .await?
+                {}
             }
+            Self::flush_incoming_runs(
+                &mut incoming_pending,
+                &mut incoming_runs,
+                &mut run_order,
+                crypto.clone(),
+                Arc::clone(&incoming_order),
+                device.clone(),
+                Arc::clone(&packet_lookup),
+                tun_tx.clone(),
+            )
+            .await?;
             if !handshake_backlog.is_empty() {
                 // The serve budget ran out with handshakes left. The branch that serves them is
                 // always ready, so give the runtime's other tasks (the send task and the TUN
