@@ -1694,18 +1694,26 @@ impl<T: DeviceTransports> DeviceState<T> {
         let allowed_ips = peer_builder.allowed_ips.clone();
         let mut peer = self.create_peer(peer_builder);
         // The tunnel reports its deadlines to the timer queue, keyed by this peer's address, so
-        // the hook needs the handle before the state is shared. Installing it reports the first
-        // deadline, which brings the peer to the timer task's attention at once (#260, J1111).
+        // the hook needs the handle before the state is shared. Defer the initial queue report
+        // until after `Arc::new_cyclic` returns and `packet_lookup` contains the peer, or a woken
+        // timer task can see `Weak::upgrade() == None` or `!packet_lookup.contains_peer` and drop
+        // the peer from `timer_queue` permanently (#260, J1111; infraternal #605).
         peer.tunnel.back_off_when_idle();
         peer.confirmed_changes = Some(Arc::clone(&self.confirmed_changes));
+        let mut initial_due = None;
         let peer = Arc::new_cyclic(|handle| {
-            peer.tunnel
-                .set_timer_hook(self.timer_queue.hook(handle.clone()));
+            initial_due = peer
+                .tunnel
+                .install_timer_hook_deferred(self.timer_queue.hook(handle.clone()));
             Mutex::new(peer)
         });
 
         self.peers.insert(pub_key, Arc::clone(&peer));
-        self.packet_lookup.insert_peer(pub_key, peer, allowed_ips);
+        self.packet_lookup
+            .insert_peer(pub_key, Arc::clone(&peer), allowed_ips);
+        if let Some(due_in) = initial_due {
+            self.timer_queue.set(&Arc::downgrade(&peer), Some(due_in));
+        }
 
         tracing::info!("Peer added");
     }
