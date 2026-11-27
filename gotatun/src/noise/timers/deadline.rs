@@ -163,12 +163,29 @@ impl<R: rand::RngCore + Send> Tunn<R> {
 
     /// Report this tunnel's deadlines to `hook` from now on, and report the first one at once.
     ///
-    /// Also starts the event clock (see the module docs). Call it once, before the tunnel sees
-    /// any traffic; the device does so when it adds a peer.
-    #[cfg_attr(not(feature = "device"), allow(dead_code))]
+    /// Also starts the event clock (see the module docs). Unit tests install a hook directly;
+    /// a live device uses [`Self::install_timer_hook_deferred`] so the first deadline is published
+    /// only after the peer handle is initialized and visible to packet and timer tasks.
+    #[cfg(test)]
     pub(crate) fn set_timer_hook(&mut self, hook: TimerHook) {
         self.timers.schedule.hook = Some(hook);
         self.reschedule_timers(Duration::ZERO);
+    }
+
+    /// Attach `hook` and record the tunnel's initial pending deadline without notifying `hook` yet.
+    ///
+    /// Returns the delay to report to the device's timer queue once the peer's `Arc` is
+    /// constructed and inserted into `packet_lookup`. Notifying from inside `Arc::new_cyclic`
+    /// can wake a sleeping timer task before `Weak::upgrade` succeeds or before `packet_lookup`
+    /// contains the peer, causing the timer task to discard the peer without rescheduling while
+    /// `schedule.scheduled` stays set (infraternal #605).
+    #[cfg_attr(not(feature = "device"), allow(dead_code))]
+    pub(crate) fn install_timer_hook_deferred(&mut self, hook: TimerHook) -> Option<Duration> {
+        self.timers.schedule.hook = Some(hook);
+        let now = self.timers.now();
+        let deadline = self.next_timer_deadline();
+        self.timers.schedule.scheduled = deadline;
+        deadline.map(|due| due.saturating_sub(now))
     }
 
     /// The earliest time, in this tunnel's frame (time since it started), at which
