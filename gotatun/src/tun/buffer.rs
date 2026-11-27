@@ -80,6 +80,9 @@ enum BufferedIpMessage {
     PeerBatch(Vec<Packet<Ip>>, OwnedSemaphorePermit, u64),
 }
 
+/// Keep channel ingestion from running ahead of a ready TUN service turn.
+const FAIR_INGRESS_BATCH_BUDGET: usize = 64;
+
 impl BufferedIpSend {
     /// Create a [`BufferedIpSend`] with `capacity`.
     ///
@@ -138,25 +141,7 @@ impl BufferedIpSend {
                 }
 
                 if !fair_queue.is_empty() {
-                    // Pull ready peer runs together before choosing the next DRR turn. Stop at
-                    // ordinary TUN messages so a control packet cannot sit behind sustained bulk.
-                    while let Ok(message) = rx.try_recv() {
-                        match message {
-                            BufferedIpMessage::PeerBatch(packets, permit, peer_key) => {
-                                enqueue_peer_batch(
-                                    &mut fair_queue,
-                                    peer_key,
-                                    packets,
-                                    permit,
-                                    &mut fair_dropped,
-                                )
-                            }
-                            message => {
-                                held = Some(message);
-                                break;
-                            }
-                        }
-                    }
+                    held = queue_ready_peer_batches(&mut rx, &mut fair_queue, &mut fair_dropped);
                     if let Some(message) = held.take() {
                         if send_buffered_message(
                             message,
@@ -265,6 +250,32 @@ fn enqueue_peer_batch(
             tracing::warn!("Fair TUN queue dropped packets ({dropped_total} so far)");
         }
     }
+}
+
+/// Admit only a bounded number of ready peer runs before the writer serves queued packets.
+///
+/// Producers can keep the channel ready while one writer drains it. This fixed budget gives the
+/// DRR queue a service turn even when ingress never becomes idle, and returns ordinary messages
+/// immediately so they keep their existing priority.
+fn queue_ready_peer_batches(
+    rx: &mut mpsc::Receiver<BufferedIpMessage>,
+    fair_queue: &mut FairQueue,
+    dropped_total: &mut u64,
+) -> Option<BufferedIpMessage> {
+    for _ in 0..FAIR_INGRESS_BATCH_BUDGET {
+        match rx.try_recv() {
+            Ok(BufferedIpMessage::PeerBatch(packets, permit, peer_key)) => enqueue_peer_batch(
+                fair_queue,
+                peer_key,
+                packets,
+                permit,
+                dropped_total,
+            ),
+            Ok(message) => return Some(message),
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 /// Write a normal TUN message, preserving the existing ordered merge and refusal handling.
@@ -699,14 +710,17 @@ impl<I: IpRecv> IpRecv for BufferedIpRecv<I> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BufferedIpRecv, BufferedIpSend};
+    use super::{
+        BufferedIpMessage, BufferedIpRecv, BufferedIpSend, FAIR_INGRESS_BATCH_BUDGET, FairQueue,
+        queue_ready_peer_batches,
+    };
     use crate::{
         packet::{Ip, Packet, PacketBufPool},
         tun::{IpRecv, IpSend, MtuWatcher},
     };
     use bytes::BytesMut;
     use std::{collections::VecDeque, io, sync::Arc, time::Duration};
-    use tokio::sync::{Mutex, mpsc};
+    use tokio::sync::{Mutex, Semaphore, mpsc};
     use tokio_util::sync::CancellationToken;
     use zerocopy::IntoBytes;
 
@@ -953,6 +967,37 @@ mod tests {
                 .unwrap(),
             [1000, 1001, 1002, 1003]
         );
+    }
+
+    /// A ready ingress backlog cannot postpone the writer's next fair-queue service turn.
+    #[tokio::test]
+    async fn ready_peer_batches_are_bounded_before_the_writer_service_turn() {
+        let count = FAIR_INGRESS_BATCH_BUDGET + 1;
+        let (tx, mut rx) = mpsc::channel(count);
+        let slots = Arc::new(Semaphore::new(count));
+        for id in 0..count {
+            let permit = Arc::clone(&slots)
+                .acquire_many_owned(1)
+                .await
+                .expect("the test's packet slots remain open");
+            tx.send(BufferedIpMessage::PeerBatch(
+                vec![packet(64, id as u16)],
+                permit,
+                1,
+            ))
+            .await
+            .expect("the test channel remains open");
+        }
+
+        let mut queue = FairQueue::new(count);
+        let mut dropped = 0;
+        assert!(queue_ready_peer_batches(&mut rx, &mut queue, &mut dropped).is_none());
+
+        let mut packets = Vec::with_capacity(FAIR_INGRESS_BATCH_BUDGET);
+        let mut permits = Vec::with_capacity(FAIR_INGRESS_BATCH_BUDGET);
+        assert!(queue.dequeue_batch(&mut packets, &mut permits));
+        assert_eq!(packets.len(), FAIR_INGRESS_BATCH_BUDGET);
+        assert!(matches!(rx.try_recv(), Ok(BufferedIpMessage::PeerBatch(..))));
     }
 
     async fn scripted_recv(script: Vec<io::Result<Vec<Packet<Ip>>>>) -> BufferedIpRecv<Script> {
